@@ -1,15 +1,22 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  cloneRepository,
+  commitRepository,
+  connectRepository,
   createWorkspace,
   deleteWorkspaceEnvVar,
   getCurrentUser,
   getHealth,
+  getRepositoryDiff,
+  getRepositoryStatus,
   getWorkspaceStatus,
   listWorkspaceEnvVars,
   listWorkspaces,
   login,
   logout,
+  pullRepository,
+  pushRepository,
   register,
   updateWorkspace,
   upsertWorkspaceEnvVar,
@@ -171,6 +178,62 @@ describe("getHealth", () => {
       4,
       `http://localhost:8000/workspaces/${workspaceId}/env-vars?key=SECRET_TOKEN`,
       expect.objectContaining({ credentials: "include", method: "DELETE" }),
+    );
+  });
+
+  it("sends credentialed repository requests", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ok: true, message: "Done" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await connectRepository(workspaceId, {
+      repo_url: "https://github.com/example/demo",
+      token: "raw-secret",
+    });
+    await cloneRepository(workspaceId);
+    await getRepositoryStatus(workspaceId);
+    await getRepositoryDiff(workspaceId, "README.md");
+    await pullRepository(workspaceId);
+    await commitRepository(workspaceId, { message: "Update README" });
+    await pushRepository(workspaceId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/connect`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/clone`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/status`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/diff?path=README.md`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/pull`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/commit`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      7,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/push`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
     );
   });
 });

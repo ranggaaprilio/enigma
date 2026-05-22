@@ -8,6 +8,14 @@ from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.models import User, Workspace, WorkspaceEnvVar
+from app.schemas.repositories import (
+    RepositoryCommitRequest,
+    RepositoryConnectRequest,
+    RepositoryDiffResponse,
+    RepositoryFileStatus,
+    RepositoryOperationResponse,
+    RepositoryStatusResponse,
+)
 from app.schemas.workspaces import (
     DeleteResponse,
     WorkspaceCreateRequest,
@@ -16,6 +24,17 @@ from app.schemas.workspaces import (
     WorkspaceResponse,
     WorkspaceStatusResponse,
     WorkspaceUpdateRequest,
+)
+from app.services.repositories import (
+    GitCommandError,
+    InvalidRepositoryUrlError,
+    NoChangesToCommitError,
+    RepositoryAlreadyClonedError,
+    RepositoryCredentialNotFoundError,
+    RepositoryNotClonedError,
+    RepositoryPathError,
+    RepositoryService,
+    RepositoryTokenError,
 )
 from app.services.workspaces import (
     InvalidEnvVarKeyError,
@@ -84,8 +103,63 @@ async def get_workspace_service(
 WORKSPACE_SERVICE_DEP = Depends(get_workspace_service)
 
 
+async def get_repository_service(
+    session: AsyncSession = DB_SESSION_DEP,
+    settings: Settings = SETTINGS_DEP,
+) -> RepositoryService:
+    return RepositoryService(
+        session=session,
+        workspace_root=settings.workspace_root,
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+    )
+
+
+REPOSITORY_SERVICE_DEP = Depends(get_repository_service)
+
+
 def not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+
+
+def repository_error(error: Exception) -> HTTPException:
+    if isinstance(error, InvalidRepositoryUrlError):
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Only GitHub HTTPS repository URLs are supported",
+        )
+    if isinstance(error, RepositoryPathError):
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Repository path is invalid",
+        )
+    if isinstance(error, RepositoryCredentialNotFoundError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Connect repository credentials before running this operation",
+        )
+    if isinstance(error, RepositoryTokenError):
+        return HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Repository credential could not be decrypted",
+        )
+    if isinstance(error, RepositoryAlreadyClonedError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Repository is already cloned or the workspace directory is not empty",
+        )
+    if isinstance(error, RepositoryNotClonedError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Clone the repository before running this operation",
+        )
+    if isinstance(error, NoChangesToCommitError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="There are no changes to commit",
+        )
+    if isinstance(error, GitCommandError):
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error.message)
+    return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Request failed")
 
 
 def env_response(env_var: WorkspaceEnvVar) -> WorkspaceEnvVarResponse:
@@ -96,6 +170,189 @@ def env_response(env_var: WorkspaceEnvVar) -> WorkspaceEnvVarResponse:
         created_at=env_var.created_at,
         updated_at=env_var.updated_at,
     )
+
+
+@router.post("/{workspace_id}/repo/connect", response_model=WorkspaceResponse)
+async def connect_repository(
+    workspace_id: UUID,
+    payload: RepositoryConnectRequest,
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+) -> Workspace:
+    try:
+        return await service.connect(
+            workspace_id=workspace_id,
+            owner_id=current_user.id,
+            repo_url=payload.repo_url,
+            token=payload.token,
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+    ) as error:
+        raise repository_error(error) from None
+
+
+@router.post("/{workspace_id}/repo/clone", response_model=RepositoryOperationResponse)
+async def clone_repository(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        await service.clone(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+    ) as error:
+        raise repository_error(error) from None
+    return RepositoryOperationResponse(ok=True, message="Repository cloned.")
+
+
+@router.get("/{workspace_id}/repo/status", response_model=RepositoryStatusResponse)
+async def get_repository_status(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+) -> RepositoryStatusResponse:
+    try:
+        repo_status = await service.status(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+    ) as error:
+        raise repository_error(error) from None
+    return RepositoryStatusResponse(
+        cloned=repo_status.cloned,
+        branch=repo_status.branch,
+        is_clean=repo_status.is_clean,
+        files=[
+            RepositoryFileStatus(path=file_status.path, status=file_status.status)
+            for file_status in repo_status.files
+        ],
+    )
+
+
+@router.get("/{workspace_id}/repo/diff", response_model=RepositoryDiffResponse)
+async def get_repository_diff(
+    workspace_id: UUID,
+    path: str | None = Query(default=None, max_length=1024),
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+) -> RepositoryDiffResponse:
+    try:
+        diff = await service.diff(workspace_id, current_user.id, path)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+    ) as error:
+        raise repository_error(error) from None
+    return RepositoryDiffResponse(diff=diff)
+
+
+@router.post("/{workspace_id}/repo/pull", response_model=RepositoryOperationResponse)
+async def pull_repository(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        await service.pull(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+    ) as error:
+        raise repository_error(error) from None
+    return RepositoryOperationResponse(ok=True, message="Repository pulled.")
+
+
+@router.post("/{workspace_id}/repo/commit", response_model=RepositoryOperationResponse)
+async def commit_repository(
+    workspace_id: UUID,
+    payload: RepositoryCommitRequest,
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        await service.commit(workspace_id, current_user.id, payload.message)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+    ) as error:
+        raise repository_error(error) from None
+    return RepositoryOperationResponse(ok=True, message="Changes committed.")
+
+
+@router.post("/{workspace_id}/repo/push", response_model=RepositoryOperationResponse)
+async def push_repository(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        await service.push(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+    ) as error:
+        raise repository_error(error) from None
+    return RepositoryOperationResponse(ok=True, message="Changes pushed.")
 
 
 @router.post("", response_model=WorkspaceResponse, status_code=status.HTTP_201_CREATED)

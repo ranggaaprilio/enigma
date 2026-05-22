@@ -57,6 +57,36 @@ export type WorkspaceEnvVarPayload = {
   value: string;
 };
 
+export type RepositoryConnectPayload = {
+  repo_url: string;
+  token: string;
+};
+
+export type RepositoryFileStatus = {
+  path: string;
+  status: string;
+};
+
+export type RepositoryStatusResponse = {
+  cloned: boolean;
+  branch: string | null;
+  is_clean: boolean;
+  files: RepositoryFileStatus[];
+};
+
+export type RepositoryDiffResponse = {
+  diff: string;
+};
+
+export type RepositoryCommitPayload = {
+  message: string;
+};
+
+export type RepositoryOperationResponse = {
+  ok: boolean;
+  message: string;
+};
+
 export type LoginPayload = {
   email: string;
   password: string;
@@ -192,4 +222,62 @@ export function deleteWorkspaceEnvVar(workspaceId: string, key: string): Promise
     `/workspaces/${workspaceId}/env-vars?key=${encodeURIComponent(key)}`,
     { method: "DELETE" },
   );
+}
+
+export function connectRepository(
+  workspaceId: string,
+  payload: RepositoryConnectPayload,
+): Promise<WorkspaceResponse> {
+  return requestJson<WorkspaceResponse>(`/workspaces/${workspaceId}/repo/connect`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function cloneRepository(workspaceId: string): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/clone`, {
+    method: "POST",
+  });
+}
+
+export function getRepositoryStatus(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<RepositoryStatusResponse> {
+  return requestJson<RepositoryStatusResponse>(`/workspaces/${workspaceId}/repo/status`, {
+    signal,
+  });
+}
+
+export function getRepositoryDiff(
+  workspaceId: string,
+  path?: string,
+  signal?: AbortSignal,
+): Promise<RepositoryDiffResponse> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  return requestJson<RepositoryDiffResponse>(`/workspaces/${workspaceId}/repo/diff${query}`, {
+    signal,
+  });
+}
+
+export function pullRepository(workspaceId: string): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/pull`, {
+    method: "POST",
+  });
+}
+
+export function commitRepository(
+  workspaceId: string,
+  payload: RepositoryCommitPayload,
+): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/commit`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function pushRepository(workspaceId: string): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/push`, {
+    method: "POST",
+  });
 }

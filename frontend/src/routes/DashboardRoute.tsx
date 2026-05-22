@@ -1,17 +1,25 @@
-import { type FormEvent, useEffect, useMemo, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
 import { useAuth } from "../auth/context";
 import { DashboardShell } from "../components/DashboardShell";
 import {
   ApiError,
+  cloneRepository,
+  commitRepository,
+  connectRepository,
   createWorkspace,
   deleteWorkspaceEnvVar,
+  getRepositoryDiff,
+  getRepositoryStatus,
   getHealth,
   listWorkspaceEnvVars,
   listWorkspaces,
+  pullRepository,
+  pushRepository,
   updateWorkspace,
   upsertWorkspaceEnvVar,
   type HealthResponse,
+  type RepositoryStatusResponse,
   type WorkspaceEnvVarResponse,
   type WorkspaceResponse,
 } from "../lib/api";
@@ -151,22 +159,34 @@ export function DashboardRoute() {
       </section>
 
       {workspaceState.status === "ready" && workspaceState.workspace && (
-        <WorkspaceSettings
-          workspace={workspaceState.workspace}
-          envVars={workspaceState.envVars}
-          onWorkspaceChanged={(nextWorkspace) =>
-            setWorkspaceState((current) =>
-              current.status === "ready"
-                ? { ...current, workspace: nextWorkspace }
-                : current,
-            )
-          }
-          onEnvVarsChanged={(envVars) =>
-            setWorkspaceState((current) =>
-              current.status === "ready" ? { ...current, envVars } : current,
-            )
-          }
-        />
+        <>
+          <RepositoryPanel
+            workspace={workspaceState.workspace}
+            onWorkspaceChanged={(nextWorkspace) =>
+              setWorkspaceState((current) =>
+                current.status === "ready"
+                  ? { ...current, workspace: nextWorkspace }
+                  : current,
+              )
+            }
+          />
+          <WorkspaceSettings
+            workspace={workspaceState.workspace}
+            envVars={workspaceState.envVars}
+            onWorkspaceChanged={(nextWorkspace) =>
+              setWorkspaceState((current) =>
+                current.status === "ready"
+                  ? { ...current, workspace: nextWorkspace }
+                  : current,
+              )
+            }
+            onEnvVarsChanged={(envVars) =>
+              setWorkspaceState((current) =>
+                current.status === "ready" ? { ...current, envVars } : current,
+              )
+            }
+          />
+        </>
       )}
     </DashboardShell>
   );
@@ -284,6 +304,316 @@ function WorkspaceSettings({
       <WorkspaceMetadataForm workspace={workspace} onWorkspaceChanged={onWorkspaceChanged} />
       <EnvVarManager workspace={workspace} envVars={envVars} onEnvVarsChanged={onEnvVarsChanged} />
     </section>
+  );
+}
+
+type RepositoryState =
+  | { status: "loading" }
+  | { status: "ready"; data: RepositoryStatusResponse }
+  | { status: "error"; message: string };
+
+function RepositoryPanel({
+  workspace,
+  onWorkspaceChanged,
+}: {
+  workspace: WorkspaceResponse;
+  onWorkspaceChanged: (workspace: WorkspaceResponse) => void;
+}) {
+  const [repoUrl, setRepoUrl] = useState(workspace.repo_url);
+  const [token, setToken] = useState("");
+  const [commitMessage, setCommitMessage] = useState("");
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [diff, setDiff] = useState("");
+  const [repoState, setRepoState] = useState<RepositoryState>({ status: "loading" });
+  const [message, setMessage] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+
+  useEffect(() => {
+    setRepoUrl(workspace.repo_url);
+  }, [workspace.repo_url]);
+
+  const loadRepositoryStatus = useCallback(
+    async (signal?: AbortSignal) => {
+      setRepoState({ status: "loading" });
+      try {
+        const data = await getRepositoryStatus(workspace.id, signal);
+        setRepoState({ status: "ready", data });
+        setSelectedPath((currentPath) => {
+          if (currentPath && data.files.some((file) => file.path === currentPath)) {
+            return currentPath;
+          }
+          return data.files[0]?.path ?? null;
+        });
+      } catch (caughtError) {
+        if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
+          return;
+        }
+        setRepoState({
+          status: "error",
+          message:
+            caughtError instanceof ApiError ? caughtError.message : "Unable to load repository.",
+        });
+      }
+    },
+    [workspace.id],
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void loadRepositoryStatus(controller.signal);
+    return () => controller.abort();
+  }, [loadRepositoryStatus]);
+
+  const statusData = repoState.status === "ready" ? repoState.data : null;
+  const selectedFile =
+    selectedPath && statusData
+      ? statusData.files.find((file) => file.path === selectedPath) ?? null
+      : null;
+
+  useEffect(() => {
+    if (!selectedPath) {
+      setDiff("");
+      return;
+    }
+
+    const controller = new AbortController();
+    getRepositoryDiff(workspace.id, selectedPath, controller.signal)
+      .then((response) => setDiff(response.diff))
+      .catch((caughtError: unknown) => {
+        if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
+          return;
+        }
+        setDiff("");
+        setError(caughtError instanceof ApiError ? caughtError.message : "Unable to load diff.");
+      });
+
+    return () => controller.abort();
+  }, [selectedPath, workspace.id]);
+
+  async function runAction(actionName: string, action: () => Promise<string>) {
+    setBusyAction(actionName);
+    setError(null);
+    setMessage(null);
+    try {
+      const nextMessage = await action();
+      setMessage(nextMessage);
+      await loadRepositoryStatus();
+    } catch (caughtError) {
+      setError(caughtError instanceof ApiError ? caughtError.message : "Repository action failed.");
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function handleConnect(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!repoUrl.trim() || !token.trim()) {
+      setError("Enter a GitHub repository URL and personal access token.");
+      return;
+    }
+    await runAction("connect", async () => {
+      const updated = await connectRepository(workspace.id, {
+        repo_url: repoUrl,
+        token,
+      });
+      onWorkspaceChanged(updated);
+      setToken("");
+      return "Repository credentials saved.";
+    });
+  }
+
+  async function handleCommit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!commitMessage.trim()) {
+      setError("Enter a commit message.");
+      return;
+    }
+    await runAction("commit", async () => {
+      const response = await commitRepository(workspace.id, { message: commitMessage });
+      setCommitMessage("");
+      return response.message;
+    });
+  }
+
+  return (
+    <section className="mt-4 grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
+      <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
+              Repository
+            </p>
+            <h3 className="mt-1 text-base font-semibold">Connection</h3>
+          </div>
+          <span className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-ink/65">
+            {statusData?.cloned ? statusData.branch ?? "Detached" : "Not cloned"}
+          </span>
+        </div>
+
+        <form className="mt-4 space-y-3" onSubmit={handleConnect}>
+          <TextInput label="GitHub repository URL" value={repoUrl} onChange={setRepoUrl} />
+          <TextInput label="Personal access token" type="password" value={token} onChange={setToken} />
+          <button
+            className="rounded-md bg-ink px-4 py-2 font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+            type="submit"
+            disabled={busyAction === "connect"}
+          >
+            {busyAction === "connect" ? "Saving..." : "Connect repository"}
+          </button>
+        </form>
+
+        <div className="mt-5 grid grid-cols-3 gap-2">
+          <RepoActionButton
+            label="Clone"
+            disabled={busyAction !== null || statusData?.cloned === true}
+            onClick={() =>
+              void runAction("clone", async () => {
+                const response = await cloneRepository(workspace.id);
+                return response.message;
+              })
+            }
+          />
+          <RepoActionButton
+            label="Pull"
+            disabled={busyAction !== null || statusData?.cloned !== true}
+            onClick={() =>
+              void runAction("pull", async () => {
+                const response = await pullRepository(workspace.id);
+                return response.message;
+              })
+            }
+          />
+          <RepoActionButton
+            label="Push"
+            disabled={busyAction !== null || statusData?.cloned !== true}
+            onClick={() =>
+              void runAction("push", async () => {
+                const response = await pushRepository(workspace.id);
+                return response.message;
+              })
+            }
+          />
+        </div>
+
+        <form className="mt-5 space-y-3" onSubmit={handleCommit}>
+          <TextInput label="Commit message" value={commitMessage} onChange={setCommitMessage} />
+          <button
+            className="rounded-md bg-ink px-4 py-2 font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+            type="submit"
+            disabled={busyAction === "commit" || statusData?.cloned !== true}
+          >
+            {busyAction === "commit" ? "Committing..." : "Commit changes"}
+          </button>
+        </form>
+
+        {message && (
+          <div className="mt-4 rounded-md border border-signal/30 bg-[#f0faf5] px-3 py-2 text-sm text-signal">
+            {message}
+          </div>
+        )}
+        {error && (
+          <div className="mt-4">
+            <ErrorState message={error} />
+          </div>
+        )}
+      </div>
+
+      <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold">Changes</h3>
+            <p className="mt-1 text-sm text-ink/60">
+              {repoState.status === "ready"
+                ? statusData?.is_clean
+                  ? "Working tree clean"
+                  : `${statusData?.files.length ?? 0} changed file${
+                      statusData?.files.length === 1 ? "" : "s"
+                    }`
+                : "Checking repository"}
+            </p>
+          </div>
+          <button
+            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8]"
+            type="button"
+            onClick={() => void loadRepositoryStatus()}
+          >
+            Refresh
+          </button>
+        </div>
+
+        {repoState.status === "loading" && (
+          <div className="mt-4">
+            <LoadingState message="Loading repository status..." />
+          </div>
+        )}
+        {repoState.status === "error" && (
+          <div className="mt-4">
+            <ErrorState message={repoState.message} />
+          </div>
+        )}
+        {repoState.status === "ready" && (
+          <div className="mt-4 grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+            <div className="space-y-2">
+              {repoState.data.files.length === 0 && (
+                <div className="rounded-md border border-dashed border-line bg-white p-4 text-sm text-ink/65">
+                  No changed files.
+                </div>
+              )}
+              {repoState.data.files.map((file) => (
+                <button
+                  className={`flex w-full items-center justify-between gap-3 rounded-md border px-3 py-2 text-left transition ${
+                    file.path === selectedPath
+                      ? "border-ink bg-white"
+                      : "border-line bg-white hover:bg-[#f5f1e8]"
+                  }`}
+                  key={`${file.status}-${file.path}`}
+                  type="button"
+                  onClick={() => setSelectedPath(file.path)}
+                >
+                  <span className="min-w-0 truncate font-mono text-sm">{file.path}</span>
+                  <span className="shrink-0 rounded bg-[#e8edf2] px-2 py-1 font-mono text-xs">
+                    {file.status}
+                  </span>
+                </button>
+              ))}
+            </div>
+
+            <div className="min-w-0 rounded-md border border-line bg-white">
+              <div className="border-b border-line px-3 py-2">
+                <p className="truncate font-mono text-sm font-semibold">
+                  {selectedFile?.path ?? "No file selected"}
+                </p>
+              </div>
+              <pre className="max-h-[460px] overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-5 text-ink/80">
+                {diff || "Select a changed file to view its diff."}
+              </pre>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function RepoActionButton({
+  label,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className="rounded-md border border-line bg-white px-3 py-2 text-sm font-semibold transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+      type="button"
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {label}
+    </button>
   );
 }
 
