@@ -18,6 +18,11 @@ class Settings(BaseSettings):
     auth_login_rate_limit_window_seconds: int = 60 * 15
     workspace_root: Path = Path(".data/workspaces")
     workspace_env_encryption_key: str = "SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc="
+    agent_provider: str = "auto"
+    openai_api_key: str | None = None
+    openai_model: str = "gpt-4.1-mini"
+    agent_command_timeout_seconds: int = 20
+    agent_max_command_output_chars: int = 20_000
     backend_cors_origins: str | list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )

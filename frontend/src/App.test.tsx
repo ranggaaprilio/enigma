@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -27,6 +27,27 @@ const workspace = {
   updated_at: "2026-05-23T00:00:00Z",
 };
 
+class MockWebSocket {
+  static instances: MockWebSocket[] = [];
+
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onerror: (() => void) | null = null;
+  url: string;
+
+  constructor(url: string) {
+    this.url = url;
+    MockWebSocket.instances.push(this);
+  }
+
+  close() {
+    return undefined;
+  }
+
+  emit(payload: unknown) {
+    this.onmessage?.({ data: JSON.stringify(payload) } as MessageEvent);
+  }
+}
+
 function jsonResponse(payload: unknown, ok = true, status = 200) {
   return {
     ok,
@@ -38,6 +59,7 @@ function jsonResponse(payload: unknown, ok = true, status = 200) {
 describe("App auth routing", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    MockWebSocket.instances = [];
     window.history.pushState({}, "", "/");
   });
 
@@ -109,6 +131,9 @@ describe("App auth routing", () => {
       if (url.endsWith("/workspaces")) {
         return Promise.resolve(jsonResponse([workspace]));
       }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
       if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
         return Promise.resolve(jsonResponse([]));
       }
@@ -159,5 +184,83 @@ describe("App auth routing", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Push" }));
     expect(await screen.findByText("Changes pushed.")).toBeInTheDocument();
+  });
+
+  it("starts an agent run, renders streamed output, and stops it", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    Object.defineProperty(window, "WebSocket", {
+      configurable: true,
+      value: MockWebSocket,
+      writable: true,
+    });
+    const run = {
+      id: "68b44d9c-4c0a-4770-8c6a-a4a462d0528d",
+      workspace_id: workspace.id,
+      user_id: authUser.id,
+      prompt: "Inspect files",
+      status: "thinking",
+      provider: "mock",
+      model: "mock-agent",
+      tokens_used: null,
+      started_at: "2026-05-23T00:00:00Z",
+      completed_at: null,
+      error_message: null,
+    };
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/repo/status`)) {
+        return Promise.resolve(
+          jsonResponse({ cloned: true, branch: "main", is_clean: true, files: [] }),
+        );
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`) && init?.method === "POST") {
+        return Promise.resolve(jsonResponse(run));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([run]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs/${run.id}/stop`)) {
+        return Promise.resolve(jsonResponse({ ...run, status: "stopped" }));
+      }
+      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/");
+
+    render(<App />);
+
+    await screen.findByText("Agent Panel");
+    await userEvent.type(screen.getByLabelText("Prompt"), "Inspect files");
+    await userEvent.click(screen.getByRole("button", { name: "Run" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://localhost:8000/workspaces/${workspace.id}/agent/runs`,
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    act(() => {
+      MockWebSocket.instances[0].emit({
+        id: "9f835690-6ac1-4bbf-a53f-68cde51f21e5",
+        agent_run_id: run.id,
+        event_type: "output_text",
+        content: "Hello from agent",
+        metadata: {},
+        created_at: "2026-05-23T00:00:01Z",
+      });
+    });
+
+    expect(await screen.findByText("Hello from agent")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(await screen.findAllByText("stopped")).not.toHaveLength(0);
   });
 });

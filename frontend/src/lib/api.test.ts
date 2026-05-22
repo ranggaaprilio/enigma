@@ -4,8 +4,11 @@ import {
   cloneRepository,
   commitRepository,
   connectRepository,
+  createAgentRun,
   createWorkspace,
   deleteWorkspaceEnvVar,
+  getAgentRun,
+  getAgentStreamUrl,
   getCurrentUser,
   getHealth,
   getRepositoryDiff,
@@ -13,11 +16,13 @@ import {
   getWorkspaceStatus,
   listWorkspaceEnvVars,
   listWorkspaces,
+  listAgentRuns,
   login,
   logout,
   pullRepository,
   pushRepository,
   register,
+  stopAgentRun,
   updateWorkspace,
   upsertWorkspaceEnvVar,
 } from "./api";
@@ -234,6 +239,45 @@ describe("getHealth", () => {
       7,
       `http://localhost:8000/workspaces/${workspaceId}/repo/push`,
       expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+  });
+
+  it("sends credentialed agent requests and builds the stream URL", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const runId = "68b44d9c-4c0a-4770-8c6a-a4a462d0528d";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: runId }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createAgentRun(workspaceId, { prompt: "Inspect files" });
+    await listAgentRuns(workspaceId);
+    await getAgentRun(workspaceId, runId);
+    await stopAgentRun(workspaceId, runId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/runs`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/runs`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/runs/${runId}`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/runs/${runId}/stop`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(getAgentStreamUrl(workspaceId, runId)).toBe(
+      `ws://localhost:8000/workspaces/${workspaceId}/agent/runs/${runId}/stream`,
     );
   });
 });

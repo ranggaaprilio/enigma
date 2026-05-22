@@ -17,6 +17,8 @@ export type UserResponse = {
 };
 
 export type WorkspaceStatus = "creating" | "ready" | "busy" | "error" | "stopped";
+export type AgentRunStatus = "thinking" | "executing" | "completed" | "error" | "stopped";
+export type AgentEventType = "status" | "output_text" | "tool_call" | "tool_result" | "error";
 
 export type WorkspaceResponse = {
   id: string;
@@ -87,6 +89,37 @@ export type RepositoryOperationResponse = {
   message: string;
 };
 
+export type AgentEventResponse = {
+  id: string;
+  agent_run_id: string;
+  event_type: AgentEventType;
+  content: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
+export type AgentRunResponse = {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  prompt: string;
+  status: AgentRunStatus;
+  provider: string;
+  model: string;
+  tokens_used: number | null;
+  started_at: string;
+  completed_at: string | null;
+  error_message: string | null;
+};
+
+export type AgentRunDetailResponse = AgentRunResponse & {
+  events: AgentEventResponse[];
+};
+
+export type AgentRunCreatePayload = {
+  prompt: string;
+};
+
 export type LoginPayload = {
   email: string;
   password: string;
@@ -110,6 +143,14 @@ const fallbackApiBaseUrl = "http://localhost:8000";
 
 export function getApiBaseUrl() {
   return import.meta.env.VITE_API_BASE_URL ?? fallbackApiBaseUrl;
+}
+
+export function getAgentStreamUrl(workspaceId: string, runId: string) {
+  const baseUrl = new URL(getApiBaseUrl());
+  baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+  baseUrl.pathname = `/workspaces/${workspaceId}/agent/runs/${runId}/stream`;
+  baseUrl.search = "";
+  return baseUrl.toString();
 }
 
 export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
@@ -278,6 +319,40 @@ export function commitRepository(
 
 export function pushRepository(workspaceId: string): Promise<RepositoryOperationResponse> {
   return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/push`, {
+    method: "POST",
+  });
+}
+
+export function createAgentRun(
+  workspaceId: string,
+  payload: AgentRunCreatePayload,
+): Promise<AgentRunResponse> {
+  return requestJson<AgentRunResponse>(`/workspaces/${workspaceId}/agent/runs`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listAgentRuns(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<AgentRunResponse[]> {
+  return requestJson<AgentRunResponse[]>(`/workspaces/${workspaceId}/agent/runs`, { signal });
+}
+
+export function getAgentRun(
+  workspaceId: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<AgentRunDetailResponse> {
+  return requestJson<AgentRunDetailResponse>(
+    `/workspaces/${workspaceId}/agent/runs/${runId}`,
+    { signal },
+  );
+}
+
+export function stopAgentRun(workspaceId: string, runId: string): Promise<AgentRunResponse> {
+  return requestJson<AgentRunResponse>(`/workspaces/${workspaceId}/agent/runs/${runId}/stop`, {
     method: "POST",
   });
 }
