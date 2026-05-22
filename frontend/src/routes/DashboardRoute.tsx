@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
+import { useAuth } from "../auth/context";
 import { DashboardShell } from "../components/DashboardShell";
 import { getHealth, type HealthResponse } from "../lib/api";
 
@@ -9,6 +10,7 @@ type HealthState =
   | { status: "error"; message: string };
 
 export function DashboardRoute() {
+  const { user, logout } = useAuth();
   const [health, setHealth] = useState<HealthState>({ status: "loading" });
 
   useEffect(() => {
@@ -44,7 +46,12 @@ export function DashboardRoute() {
   }, [health]);
 
   return (
-    <DashboardShell healthLabel={shellStatus.label} healthTone={shellStatus.tone}>
+    <DashboardShell
+      healthLabel={shellStatus.label}
+      healthTone={shellStatus.tone}
+      user={user}
+      onLogout={logout}
+    >
       <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_280px]">
         <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
           <div className="mb-5 flex flex-wrap items-start justify-between gap-3">

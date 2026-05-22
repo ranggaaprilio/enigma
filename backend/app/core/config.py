@@ -9,6 +9,12 @@ class Settings(BaseSettings):
     environment: str = "local"
     database_url: str = "postgresql+asyncpg://execute:execute@localhost:5432/execute_dashboard"
     redis_url: str = "redis://localhost:6379/0"
+    auth_secret_key: str = "local-development-auth-secret-change-me"
+    auth_cookie_name: str = "execute_session"
+    auth_session_ttl_seconds: int = 60 * 60 * 24 * 7
+    auth_cookie_secure: bool = False
+    auth_login_rate_limit_attempts: int = 5
+    auth_login_rate_limit_window_seconds: int = 60 * 15
     backend_cors_origins: str | list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )

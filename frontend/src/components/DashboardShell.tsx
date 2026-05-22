@@ -1,14 +1,30 @@
 import type { ReactNode } from "react";
 
+import { navigate } from "../lib/router";
+import type { UserResponse } from "../lib/api";
+
 type DashboardShellProps = {
   healthLabel: string;
   healthTone: "loading" | "ok" | "degraded" | "error";
+  user: UserResponse | null;
+  onLogout: () => Promise<void>;
   children: ReactNode;
 };
 
 const navItems = ["Dashboard", "Workspaces", "Repositories", "Agents", "Terminal"];
 
-export function DashboardShell({ healthLabel, healthTone, children }: DashboardShellProps) {
+export function DashboardShell({
+  healthLabel,
+  healthTone,
+  user,
+  onLogout,
+  children,
+}: DashboardShellProps) {
+  async function handleLogout() {
+    await onLogout();
+    navigate("/login");
+  }
+
   return (
     <div className="min-h-screen bg-[#ece7dc] text-ink">
       <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[240px_minmax(0,1fr)_320px]">
@@ -42,7 +58,10 @@ export function DashboardShell({ healthLabel, healthTone, children }: DashboardS
               </p>
               <h2 className="text-xl font-semibold">AI Agent Control Room</h2>
             </div>
-            <StatusPill label={healthLabel} tone={healthTone} />
+            <div className="flex flex-wrap items-center gap-3">
+              <StatusPill label={healthLabel} tone={healthTone} />
+              {user && <UserMenu user={user} onLogout={handleLogout} />}
+            </div>
           </header>
 
           <main className="flex-1 px-5 py-5">{children}</main>
@@ -71,6 +90,26 @@ export function DashboardShell({ healthLabel, healthTone, children }: DashboardS
           </div>
         </aside>
       </div>
+    </div>
+  );
+}
+
+function UserMenu({ user, onLogout }: { user: UserResponse; onLogout: () => Promise<void> }) {
+  const displayName = user.name ?? user.email;
+
+  return (
+    <div className="flex items-center gap-3 rounded-md border border-line bg-white px-3 py-2">
+      <div className="min-w-0">
+        <p className="max-w-44 truncate text-sm font-semibold">{displayName}</p>
+        <p className="text-xs uppercase text-ink/55">{user.role}</p>
+      </div>
+      <button
+        className="rounded-md border border-line px-3 py-1 text-sm font-medium transition hover:bg-[#f5f1e8]"
+        type="button"
+        onClick={() => void onLogout()}
+      >
+        Logout
+      </button>
     </div>
   );
 }

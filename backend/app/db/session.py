@@ -6,3 +6,8 @@ settings = get_settings()
 
 engine = create_async_engine(settings.database_url, pool_pre_ping=True)
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+
+async def get_db_session():
+    async with async_session_maker() as session:
+        yield session
