@@ -1,0 +1,12 @@
+{
+  "name": "execute-dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "podman compose up --build",
+    "dev:docker": "docker compose up --build",
+    "test:backend": "cd backend && uv run pytest",
+    "test:frontend": "cd frontend && pnpm test",
+    "lint:frontend": "cd frontend && pnpm lint"
+  }
+}
