@@ -1,11 +1,13 @@
 import type { ReactNode } from "react";
 
 import { navigate } from "../lib/router";
-import type { UserResponse } from "../lib/api";
+import type { UserResponse, WorkspaceResponse, WorkspaceStatus } from "../lib/api";
 
 type DashboardShellProps = {
   healthLabel: string;
   healthTone: "loading" | "ok" | "degraded" | "error";
+  workspace: WorkspaceResponse | null;
+  workspaceStatus: WorkspaceStatus | "none" | "loading";
   user: UserResponse | null;
   onLogout: () => Promise<void>;
   children: ReactNode;
@@ -16,6 +18,8 @@ const navItems = ["Dashboard", "Workspaces", "Repositories", "Agents", "Terminal
 export function DashboardShell({
   healthLabel,
   healthTone,
+  workspace,
+  workspaceStatus,
   user,
   onLogout,
   children,
@@ -60,6 +64,7 @@ export function DashboardShell({
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <StatusPill label={healthLabel} tone={healthTone} />
+              <WorkspaceStatusPill status={workspaceStatus} />
               {user && <UserMenu user={user} onLogout={handleLogout} />}
             </div>
           </header>
@@ -67,7 +72,7 @@ export function DashboardShell({
           <main className="flex-1 px-5 py-5">{children}</main>
 
           <footer className="border-t border-line bg-panel px-5 py-3 text-sm text-ink/70">
-            API: {healthLabel}
+            API: {healthLabel} | Workspace: {workspaceStatus}
           </footer>
         </div>
 
@@ -81,11 +86,14 @@ export function DashboardShell({
           <div className="space-y-3 text-sm text-ink/72">
             <div className="rounded-md border border-line bg-white p-3">
               <p className="font-medium text-ink">Current workspace</p>
-              <p className="mt-1">No workspace selected</p>
+              <p className="mt-1">{workspace ? workspace.name : "No workspace selected"}</p>
+              {workspace && <p className="mt-1 text-xs text-ink/55">{workspace.slug}</p>}
             </div>
             <div className="rounded-md border border-line bg-white p-3">
               <p className="font-medium text-ink">Session output</p>
-              <p className="mt-1">Ready for the next epic.</p>
+              <p className="mt-1">
+                {workspace ? "Workspace management is ready." : "Create a workspace to continue."}
+              </p>
             </div>
           </div>
         </aside>
@@ -125,4 +133,23 @@ function StatusPill({ label, tone }: { label: string; tone: DashboardShellProps[
   return (
     <span className={`rounded-full px-3 py-1 text-sm font-semibold ${toneClass}`}>{label}</span>
   );
+}
+
+function WorkspaceStatusPill({
+  status,
+}: {
+  status: DashboardShellProps["workspaceStatus"];
+}) {
+  const toneClass = {
+    loading: "bg-[#e8edf2] text-ink",
+    none: "bg-white text-ink/60",
+    creating: "bg-[#e8edf2] text-ink",
+    ready: "bg-[#e3efe9] text-signal",
+    busy: "bg-[#f7eadc] text-warn",
+    error: "bg-[#fde7e3] text-danger",
+    stopped: "bg-white text-ink/60",
+  }[status];
+
+  const label = status === "none" ? "No workspace" : `Workspace ${status}`;
+  return <span className={`rounded-full px-3 py-1 text-sm font-semibold ${toneClass}`}>{label}</span>;
 }

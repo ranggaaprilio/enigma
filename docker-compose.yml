@@ -34,6 +34,8 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      WORKSPACE_ROOT: ${WORKSPACE_ROOT:-/app/.data/workspaces}
+      WORKSPACE_ENV_ENCRYPTION_KEY: ${WORKSPACE_ENV_ENCRYPTION_KEY:-SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc=}
     ports:
       - "8000:8000"
     depends_on:

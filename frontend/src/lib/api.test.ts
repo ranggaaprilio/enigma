@@ -1,6 +1,19 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { getCurrentUser, getHealth, login, logout, register } from "./api";
+import {
+  createWorkspace,
+  deleteWorkspaceEnvVar,
+  getCurrentUser,
+  getHealth,
+  getWorkspaceStatus,
+  listWorkspaceEnvVars,
+  listWorkspaces,
+  login,
+  logout,
+  register,
+  updateWorkspace,
+  upsertWorkspaceEnvVar,
+} from "./api";
 
 describe("getHealth", () => {
   afterEach(() => {
@@ -83,6 +96,81 @@ describe("getHealth", () => {
     expect(fetchMock).toHaveBeenCalledWith(
       "http://localhost:8000/auth/logout",
       expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+  });
+
+  it("sends credentialed workspace requests", async () => {
+    const workspace = {
+      id: "3e15be87-2551-4d70-b972-33fdf68c49eb",
+      owner_id: "fb6cd934-74f2-404b-bff1-30f964e9326c",
+      name: "Demo",
+      slug: "demo",
+      repo_url: "https://github.com/example/demo",
+      default_branch: "main",
+      local_path: "/tmp/demo",
+      status: "ready",
+      created_at: "2026-05-23T00:00:00Z",
+      updated_at: "2026-05-23T00:00:00Z",
+    };
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => workspace,
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createWorkspace({ name: "Demo", repo_url: workspace.repo_url });
+    await updateWorkspace(workspace.id, { default_branch: "develop" });
+    await getWorkspaceStatus(workspace.id);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://localhost:8000/workspaces",
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspace.id}`,
+      expect.objectContaining({ credentials: "include", method: "PATCH" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspace.id}/status`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
+  it("sends credentialed workspace collection and env var requests", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await listWorkspaces();
+    await listWorkspaceEnvVars(workspaceId);
+    await upsertWorkspaceEnvVar(workspaceId, { key: "SECRET_TOKEN", value: "raw-secret" });
+    await deleteWorkspaceEnvVar(workspaceId, "SECRET_TOKEN");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://localhost:8000/workspaces",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/env-vars`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/env-vars`,
+      expect.objectContaining({ credentials: "include", method: "PUT" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      `http://localhost:8000/workspaces/${workspaceId}/env-vars?key=SECRET_TOKEN`,
+      expect.objectContaining({ credentials: "include", method: "DELETE" }),
     );
   });
 });

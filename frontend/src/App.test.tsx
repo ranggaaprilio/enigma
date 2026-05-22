@@ -49,6 +49,9 @@ describe("App auth routing", () => {
         if (url.endsWith("/auth/me")) {
           return Promise.resolve(jsonResponse(authUser));
         }
+        if (url.endsWith("/workspaces")) {
+          return Promise.resolve(jsonResponse([]));
+        }
         return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
       }),
     );
@@ -67,6 +70,9 @@ describe("App auth routing", () => {
       }
       if (url.endsWith("/auth/logout")) {
         return Promise.resolve(jsonResponse({ ok: true }));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([]));
       }
       return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
     });

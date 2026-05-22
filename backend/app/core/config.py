@@ -1,4 +1,5 @@
 from functools import lru_cache
+from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -15,6 +16,8 @@ class Settings(BaseSettings):
     auth_cookie_secure: bool = False
     auth_login_rate_limit_attempts: int = 5
     auth_login_rate_limit_window_seconds: int = 60 * 15
+    workspace_root: Path = Path(".data/workspaces")
+    workspace_env_encryption_key: str = "SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc="
     backend_cors_origins: str | list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )

@@ -54,3 +54,5 @@ The root `.env.example` lists required values for local development:
 - `POSTGRES_USER`
 - `POSTGRES_PASSWORD`
 - `POSTGRES_DB`
+- `WORKSPACE_ROOT`
+- `WORKSPACE_ENV_ENCRYPTION_KEY`
