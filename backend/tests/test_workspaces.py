@@ -14,6 +14,7 @@ from app.models import User, Workspace, WorkspaceEnvVar
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import (
     InvalidEnvVarKeyError,
+    SqlAlchemyWorkspaceService,
     WorkspaceAlreadyExistsError,
     WorkspaceNotFoundError,
     WorkspaceSecretCipher,
@@ -280,3 +281,54 @@ async def test_env_vars_are_encrypted_masked_and_validated(workspace_context):
 def test_invalid_env_key_is_rejected():
     with pytest.raises(InvalidEnvVarKeyError):
         validate_env_key("bad-key")
+
+
+async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
+    class EmptyResult:
+        def scalar_one_or_none(self):
+            return None
+
+    class FakeSession:
+        def __init__(self) -> None:
+            self.added: list[Workspace] = []
+            self.commits = 0
+            self.refreshed: list[Workspace] = []
+
+        async def execute(self, statement):
+            return EmptyResult()
+
+        def add(self, workspace):
+            self.added.append(workspace)
+
+        async def flush(self):
+            self.added[-1].id = uuid4()
+
+        async def commit(self):
+            self.commits += 1
+
+        async def refresh(self, workspace):
+            self.refreshed.append(workspace)
+            now = datetime.now(UTC)
+            workspace.created_at = workspace.created_at or now
+            workspace.updated_at = now
+
+    settings = Settings(workspace_root=tmp_path)
+    session = FakeSession()
+    service = SqlAlchemyWorkspaceService(
+        session=session,  # type: ignore[arg-type]
+        workspace_root=tmp_path,
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+    )
+
+    workspace = await service.create(
+        owner_id=uuid4(),
+        name="Demo",
+        repo_url="https://github.com/example/demo",
+        default_branch="main",
+    )
+
+    assert workspace.status == "ready"
+    assert Path(workspace.local_path or "").is_dir()
+    assert session.commits == 2
+    assert session.refreshed == [workspace]
+    assert workspace.updated_at is not None

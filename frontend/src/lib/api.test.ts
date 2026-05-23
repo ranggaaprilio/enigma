@@ -5,7 +5,9 @@ import {
   commitRepository,
   connectRepository,
   createAgentRun,
+  createTerminalSession,
   createWorkspace,
+  deleteTerminalSession,
   deleteWorkspaceEnvVar,
   getAgentRun,
   getAgentStreamUrl,
@@ -13,7 +15,9 @@ import {
   getHealth,
   getRepositoryDiff,
   getRepositoryStatus,
+  getTerminalSessionSocketUrl,
   getWorkspaceStatus,
+  listTerminalSessions,
   listWorkspaceEnvVars,
   listWorkspaces,
   listAgentRuns,
@@ -278,6 +282,39 @@ describe("getHealth", () => {
     );
     expect(getAgentStreamUrl(workspaceId, runId)).toBe(
       `ws://localhost:8000/workspaces/${workspaceId}/agent/runs/${runId}/stream`,
+    );
+  });
+
+  it("sends credentialed terminal requests and builds the socket URL", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const sessionId = "a4b5e02f-fb93-4e0f-acf5-d7a78dc34fee";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: sessionId }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createTerminalSession(workspaceId);
+    await listTerminalSessions(workspaceId);
+    await deleteTerminalSession(workspaceId, sessionId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/terminal/sessions`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/terminal/sessions`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/terminal/sessions/${sessionId}`,
+      expect.objectContaining({ credentials: "include", method: "DELETE" }),
+    );
+    expect(getTerminalSessionSocketUrl(workspaceId, sessionId)).toBe(
+      `ws://localhost:8000/workspaces/${workspaceId}/terminal/sessions/${sessionId}`,
     );
   });
 });

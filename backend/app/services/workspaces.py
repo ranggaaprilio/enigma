@@ -122,6 +122,7 @@ class SqlAlchemyWorkspaceService:
         workspace.status = "ready"
         self.session.add(workspace)
         await self.session.commit()
+        await self.session.refresh(workspace)
 
         return workspace
 
@@ -143,6 +144,7 @@ class SqlAlchemyWorkspaceService:
             workspace.default_branch = default_branch
         self.session.add(workspace)
         await self.session.commit()
+        await self.session.refresh(workspace)
         return workspace
 
     async def delete(self, workspace_id: UUID, owner_id: UUID) -> None:
@@ -198,6 +200,7 @@ class SqlAlchemyWorkspaceService:
         self.session.add(env_var)
         await self.session.flush()
         await self.session.commit()
+        await self.session.refresh(env_var)
         return env_var
 
     async def delete_env_var(self, workspace_id: UUID, owner_id: UUID, key: str) -> None:

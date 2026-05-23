@@ -2,6 +2,49 @@ import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+vi.mock("@xterm/xterm", () => ({
+  Terminal: class {
+    cols = 100;
+    rows = 30;
+
+    loadAddon() {
+      return undefined;
+    }
+
+    open() {
+      return undefined;
+    }
+
+    focus() {
+      return undefined;
+    }
+
+    onData() {
+      return { dispose: () => undefined };
+    }
+
+    write() {
+      return undefined;
+    }
+
+    getSelection() {
+      return "selected text";
+    }
+
+    dispose() {
+      return undefined;
+    }
+  },
+}));
+
+vi.mock("@xterm/addon-fit", () => ({
+  FitAddon: class {
+    fit() {
+      return undefined;
+    }
+  },
+}));
+
 import App from "./App";
 
 const authUser = {
@@ -32,6 +75,9 @@ class MockWebSocket {
 
   onmessage: ((event: MessageEvent) => void) | null = null;
   onerror: (() => void) | null = null;
+  onopen: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  readyState = 1;
   url: string;
 
   constructor(url: string) {
@@ -40,6 +86,12 @@ class MockWebSocket {
   }
 
   close() {
+    this.readyState = 3;
+    this.onclose?.();
+    return undefined;
+  }
+
+  send() {
     return undefined;
   }
 
@@ -60,6 +112,7 @@ describe("App auth routing", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     MockWebSocket.instances = [];
+    window.localStorage?.clear();
     window.history.pushState({}, "", "/");
   });
 
@@ -170,6 +223,7 @@ describe("App auth routing", () => {
 
     render(<App />);
 
+    await userEvent.click(await screen.findByRole("button", { name: "Repository" }));
     expect(await screen.findByRole("button", { name: "Connect repository" })).toBeInTheDocument();
     expect(await screen.findAllByText("README.md")).toHaveLength(2);
     expect(await screen.findByText(/diff --git/)).toBeInTheDocument();
@@ -262,5 +316,65 @@ describe("App auth routing", () => {
     expect(await screen.findByText("Hello from agent")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Stop" }));
     expect(await screen.findAllByText("stopped")).not.toHaveLength(0);
+  });
+
+  it("opens the terminal tab and connects a websocket session", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    Object.defineProperty(window, "WebSocket", {
+      configurable: true,
+      value: MockWebSocket,
+      writable: true,
+    });
+    Object.defineProperty(window, "ResizeObserver", {
+      configurable: true,
+      value: class {
+        observe() {
+          return undefined;
+        }
+        disconnect() {
+          return undefined;
+        }
+      },
+      writable: true,
+    });
+    const session = {
+      id: "a4b5e02f-fb93-4e0f-acf5-d7a78dc34fee",
+      workspace_id: workspace.id,
+      user_id: authUser.id,
+      name: "Terminal",
+      tmux_session_name: "execute-demo",
+      status: "active",
+      created_at: "2026-05-23T00:00:00Z",
+      last_active_at: "2026-05-23T00:00:00Z",
+    };
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/terminal/sessions`)) {
+        return Promise.resolve(jsonResponse(session));
+      }
+      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/");
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Terminal" }));
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    expect(MockWebSocket.instances[0].url).toBe(
+      `ws://localhost:8000/workspaces/${workspace.id}/terminal/sessions/${session.id}`,
+    );
   });
 });

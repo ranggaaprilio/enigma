@@ -2,6 +2,7 @@ import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react
 
 import { useAuth } from "../auth/context";
 import { DashboardShell } from "../components/DashboardShell";
+import { TerminalPanel } from "../components/TerminalPanel";
 import {
   ApiError,
   cloneRepository,
@@ -22,6 +23,7 @@ import {
   type RepositoryStatusResponse,
   type WorkspaceEnvVarResponse,
   type WorkspaceResponse,
+  type WorkspaceStatus,
 } from "../lib/api";
 
 type HealthState =
@@ -34,10 +36,31 @@ type WorkspaceState =
   | { status: "ready"; workspace: WorkspaceResponse | null; envVars: WorkspaceEnvVarResponse[] }
   | { status: "error"; message: string };
 
+type DashboardTab = "overview" | "repository" | "terminal";
+const dashboardTabs: { id: DashboardTab; label: string }[] = [
+  { id: "overview", label: "Overview" },
+  { id: "repository", label: "Repository" },
+  { id: "terminal", label: "Terminal" },
+];
+
+function initialDashboardTab(): DashboardTab {
+  let stored: string | null = null;
+  try {
+    stored = window.localStorage?.getItem("execute-dashboard-active-tab") ?? null;
+  } catch {
+    stored = null;
+  }
+  if (stored === "repository" || stored === "terminal") {
+    return stored;
+  }
+  return "overview";
+}
+
 export function DashboardRoute() {
   const { user, logout } = useAuth();
   const [health, setHealth] = useState<HealthState>({ status: "loading" });
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>({ status: "loading" });
+  const [activeTab, setActiveTab] = useState<DashboardTab>(initialDashboardTab);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -62,6 +85,14 @@ export function DashboardRoute() {
     loadWorkspaceData(controller.signal);
     return () => controller.abort();
   }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem("execute-dashboard-active-tab", activeTab);
+    } catch {
+      return;
+    }
+  }, [activeTab]);
 
   async function loadWorkspaceData(signal?: AbortSignal) {
     setWorkspaceState({ status: "loading" });
@@ -109,84 +140,92 @@ export function DashboardRoute() {
       user={user}
       onLogout={logout}
     >
-      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-        <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
-          <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
-                Workspace
-              </p>
-              <h3 className="mt-1 text-2xl font-semibold">Project workspace</h3>
-            </div>
-            {workspace && (
-              <span className="rounded-md border border-line bg-white px-3 py-2 text-sm capitalize text-ink/70">
-                {workspace.status}
-              </span>
-            )}
-          </div>
-
-          {workspaceState.status === "loading" && <LoadingState message="Loading workspace..." />}
-          {workspaceState.status === "error" && <ErrorState message={workspaceState.message} />}
-          {workspaceState.status === "ready" && !workspaceState.workspace && (
-            <CreateWorkspacePanel onCreated={(created) => void loadWorkspaceAfterCreate(created)} />
-          )}
-          {workspaceState.status === "ready" && workspaceState.workspace && (
-            <WorkspaceOverview workspace={workspaceState.workspace} />
-          )}
-        </div>
-
-        <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
-          <h3 className="text-base font-semibold">Foundation checks</h3>
-          <ul className="mt-4 space-y-3 text-sm text-ink/72">
-            <li className="flex items-center justify-between gap-3 border-b border-line pb-3">
-              <span>Backend health</span>
-              <span>{health.status === "ready" ? health.data.status : "pending"}</span>
-            </li>
-            <li className="flex items-center justify-between gap-3 border-b border-line pb-3">
-              <span>Database</span>
-              <span>{health.status === "ready" ? health.data.database : "pending"}</span>
-            </li>
-            <li className="flex items-center justify-between gap-3 border-b border-line pb-3">
-              <span>Redis</span>
-              <span>{health.status === "ready" ? health.data.redis : "pending"}</span>
-            </li>
-            <li className="flex items-center justify-between gap-3">
-              <span>Workspace</span>
-              <span className="capitalize">{workspaceStatus}</span>
-            </li>
-          </ul>
-        </div>
-      </section>
-
       {workspaceState.status === "ready" && workspaceState.workspace && (
+        <div className="mb-4 flex gap-2 overflow-x-auto rounded-md border border-line bg-[#fffdf8] p-2 shadow-soft">
+          {dashboardTabs.map((tab) => (
+            <button
+              key={tab.id}
+              className={`whitespace-nowrap rounded-md px-4 py-2 text-sm font-semibold transition ${
+                activeTab === tab.id
+                  ? "bg-ink text-white"
+                  : "bg-white text-ink/70 hover:bg-[#f5f1e8] hover:text-ink"
+              }`}
+              type="button"
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {(workspaceState.status !== "ready" || !workspaceState.workspace || activeTab === "overview") && (
         <>
-          <RepositoryPanel
-            workspace={workspaceState.workspace}
-            onWorkspaceChanged={(nextWorkspace) =>
-              setWorkspaceState((current) =>
-                current.status === "ready"
-                  ? { ...current, workspace: nextWorkspace }
-                  : current,
-              )
-            }
-          />
-          <WorkspaceSettings
-            workspace={workspaceState.workspace}
-            envVars={workspaceState.envVars}
-            onWorkspaceChanged={(nextWorkspace) =>
-              setWorkspaceState((current) =>
-                current.status === "ready"
-                  ? { ...current, workspace: nextWorkspace }
-                  : current,
-              )
-            }
-            onEnvVarsChanged={(envVars) =>
-              setWorkspaceState((current) =>
-                current.status === "ready" ? { ...current, envVars } : current,
-              )
-            }
-          />
+          <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+            <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+              <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
+                    Workspace
+                  </p>
+                  <h3 className="mt-1 text-2xl font-semibold">Project workspace</h3>
+                </div>
+                {workspace && (
+                  <span className="rounded-md border border-line bg-white px-3 py-2 text-sm capitalize text-ink/70">
+                    {workspace.status}
+                  </span>
+                )}
+              </div>
+
+              {workspaceState.status === "loading" && <LoadingState message="Loading workspace..." />}
+              {workspaceState.status === "error" && <ErrorState message={workspaceState.message} />}
+              {workspaceState.status === "ready" && !workspaceState.workspace && (
+                <CreateWorkspacePanel onCreated={(created) => void loadWorkspaceAfterCreate(created)} />
+              )}
+              {workspaceState.status === "ready" && workspaceState.workspace && (
+                <WorkspaceOverview workspace={workspaceState.workspace} />
+              )}
+            </div>
+
+            <FoundationChecks health={health} workspaceStatus={workspaceStatus} />
+          </section>
+
+          {workspaceState.status === "ready" && workspaceState.workspace && (
+            <WorkspaceSettings
+              workspace={workspaceState.workspace}
+              envVars={workspaceState.envVars}
+              onWorkspaceChanged={(nextWorkspace) =>
+                setWorkspaceState((current) =>
+                  current.status === "ready"
+                    ? { ...current, workspace: nextWorkspace }
+                    : current,
+                )
+              }
+              onEnvVarsChanged={(envVars) =>
+                setWorkspaceState((current) =>
+                  current.status === "ready" ? { ...current, envVars } : current,
+                )
+              }
+            />
+          )}
         </>
+      )}
+
+      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "repository" && (
+        <RepositoryPanel
+          workspace={workspaceState.workspace}
+          onWorkspaceChanged={(nextWorkspace) =>
+            setWorkspaceState((current) =>
+              current.status === "ready"
+                ? { ...current, workspace: nextWorkspace }
+                : current,
+            )
+          }
+        />
+      )}
+
+      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "terminal" && (
+        <TerminalPanel workspace={workspaceState.workspace} />
       )}
     </DashboardShell>
   );
@@ -195,6 +234,38 @@ export function DashboardRoute() {
     const envVars = await listWorkspaceEnvVars(created.id);
     setWorkspaceState({ status: "ready", workspace: created, envVars });
   }
+}
+
+function FoundationChecks({
+  health,
+  workspaceStatus,
+}: {
+  health: HealthState;
+  workspaceStatus: WorkspaceStatus | "none" | "loading";
+}) {
+  return (
+    <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+      <h3 className="text-base font-semibold">Foundation checks</h3>
+      <ul className="mt-4 space-y-3 text-sm text-ink/72">
+        <li className="flex items-center justify-between gap-3 border-b border-line pb-3">
+          <span>Backend health</span>
+          <span>{health.status === "ready" ? health.data.status : "pending"}</span>
+        </li>
+        <li className="flex items-center justify-between gap-3 border-b border-line pb-3">
+          <span>Database</span>
+          <span>{health.status === "ready" ? health.data.database : "pending"}</span>
+        </li>
+        <li className="flex items-center justify-between gap-3 border-b border-line pb-3">
+          <span>Redis</span>
+          <span>{health.status === "ready" ? health.data.redis : "pending"}</span>
+        </li>
+        <li className="flex items-center justify-between gap-3">
+          <span>Workspace</span>
+          <span className="capitalize">{workspaceStatus}</span>
+        </li>
+      </ul>
+    </div>
+  );
 }
 
 function LoadingState({ message }: { message: string }) {

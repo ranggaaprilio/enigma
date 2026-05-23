@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-4.1-mini"
     agent_command_timeout_seconds: int = 20
     agent_max_command_output_chars: int = 20_000
+    terminal_tmux_binary: str = "tmux"
+    terminal_default_cols: int = 120
+    terminal_default_rows: int = 34
     backend_cors_origins: str | list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )

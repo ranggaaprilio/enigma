@@ -23,3 +23,11 @@ textarea,
 select {
   font: inherit;
 }
+
+.terminal-frame .xterm {
+  height: 100%;
+}
+
+.terminal-frame .xterm-viewport {
+  overflow-y: scroll !important;
+}

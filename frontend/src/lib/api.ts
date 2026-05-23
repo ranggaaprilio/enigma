@@ -19,6 +19,7 @@ export type UserResponse = {
 export type WorkspaceStatus = "creating" | "ready" | "busy" | "error" | "stopped";
 export type AgentRunStatus = "thinking" | "executing" | "completed" | "error" | "stopped";
 export type AgentEventType = "status" | "output_text" | "tool_call" | "tool_result" | "error";
+export type TerminalSessionStatus = "active" | "stopped" | "error";
 
 export type WorkspaceResponse = {
   id: string;
@@ -120,6 +121,21 @@ export type AgentRunCreatePayload = {
   prompt: string;
 };
 
+export type TerminalSessionResponse = {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  name: string;
+  tmux_session_name: string;
+  status: TerminalSessionStatus;
+  created_at: string;
+  last_active_at: string;
+};
+
+export type TerminalSessionCreatePayload = {
+  name?: string;
+};
+
 export type LoginPayload = {
   email: string;
   password: string;
@@ -149,6 +165,14 @@ export function getAgentStreamUrl(workspaceId: string, runId: string) {
   const baseUrl = new URL(getApiBaseUrl());
   baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
   baseUrl.pathname = `/workspaces/${workspaceId}/agent/runs/${runId}/stream`;
+  baseUrl.search = "";
+  return baseUrl.toString();
+}
+
+export function getTerminalSessionSocketUrl(workspaceId: string, sessionId: string) {
+  const baseUrl = new URL(getApiBaseUrl());
+  baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+  baseUrl.pathname = `/workspaces/${workspaceId}/terminal/sessions/${sessionId}`;
   baseUrl.search = "";
   return baseUrl.toString();
 }
@@ -355,4 +379,34 @@ export function stopAgentRun(workspaceId: string, runId: string): Promise<AgentR
   return requestJson<AgentRunResponse>(`/workspaces/${workspaceId}/agent/runs/${runId}/stop`, {
     method: "POST",
   });
+}
+
+export function createTerminalSession(
+  workspaceId: string,
+  payload: TerminalSessionCreatePayload = {},
+): Promise<TerminalSessionResponse> {
+  return requestJson<TerminalSessionResponse>(`/workspaces/${workspaceId}/terminal/sessions`, {
+    method: "POST",
+    body: JSON.stringify({ name: payload.name ?? "Terminal" }),
+  });
+}
+
+export function listTerminalSessions(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<TerminalSessionResponse[]> {
+  return requestJson<TerminalSessionResponse[]>(
+    `/workspaces/${workspaceId}/terminal/sessions`,
+    { signal },
+  );
+}
+
+export function deleteTerminalSession(
+  workspaceId: string,
+  sessionId: string,
+): Promise<{ ok: boolean }> {
+  return requestJson<{ ok: boolean }>(
+    `/workspaces/${workspaceId}/terminal/sessions/${sessionId}`,
+    { method: "DELETE" },
+  );
 }

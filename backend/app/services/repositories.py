@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse, urlunparse
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -240,8 +240,22 @@ class RepositoryService:
             raise RepositoryAlreadyClonedError
         if repo_path.exists() and any(repo_path.iterdir()):
             raise RepositoryAlreadyClonedError
-        repo_path.mkdir(parents=True, exist_ok=True)
-        self.git_runner.run(["clone", workspace.repo_url, str(repo_path)], token=token)
+
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        repo_path.mkdir(exist_ok=True)
+        temp_repo_path = repo_path.with_name(f".{repo_path.name}.clone-{uuid4().hex}")
+        try:
+            self.git_runner.run(["clone", workspace.repo_url, str(temp_repo_path)], token=token)
+            if repo_path.exists():
+                if any(repo_path.iterdir()):
+                    raise RepositoryAlreadyClonedError
+                repo_path.rmdir()
+            temp_repo_path.rename(repo_path)
+        except Exception:
+            shutil.rmtree(temp_repo_path, ignore_errors=True)
+            if not repo_path.exists():
+                repo_path.mkdir(parents=True, exist_ok=True)
+            raise
 
     async def status(self, workspace_id: UUID, owner_id: UUID) -> GitStatus:
         workspace = await self._get_workspace(workspace_id, owner_id)

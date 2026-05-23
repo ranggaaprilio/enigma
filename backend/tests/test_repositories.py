@@ -22,6 +22,7 @@ from app.services.repositories import (
     RepositoryAlreadyClonedError,
     RepositoryCredentialNotFoundError,
     RepositoryNotClonedError,
+    RepositoryService,
     parse_porcelain_status,
     sanitize_repository_url,
 )
@@ -315,6 +316,64 @@ def test_parse_porcelain_status_handles_modified_untracked_and_renamed_files():
         GitFileStatus(path="app/new.py", status="??"),
         GitFileStatus(path="new.py", status="R"),
     ]
+
+
+async def test_clone_uses_hidden_temp_directory_until_checkout_finishes(tmp_path):
+    user_id = uuid4()
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=user_id,
+        name="Demo",
+        slug="demo",
+        repo_url="https://github.com/example/demo.git",
+        default_branch="main",
+        local_path=str(tmp_path / "workspace"),
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    repo_path = Path(workspace.local_path)
+    repo_path.mkdir()
+    calls: list[dict[str, object]] = []
+
+    class CloneRunner:
+        def run(self, args, cwd=None, token=None, timeout=60):
+            clone_path = Path(args[2])
+            calls.append({"args": args, "cwd": cwd, "token": token, "clone_path": clone_path})
+            assert args[:2] == ["clone", workspace.repo_url]
+            assert clone_path.parent == repo_path.parent
+            assert clone_path.name.startswith(f".{repo_path.name}.clone-")
+            assert not (repo_path / ".git").exists()
+            clone_path.mkdir()
+            (clone_path / ".git").mkdir()
+            (clone_path / "README.md").write_text("ok\n", encoding="utf-8")
+            return SimpleNamespace(stdout="", stderr="")
+
+    service = RepositoryService(
+        session=None,  # type: ignore[arg-type]
+        workspace_root=tmp_path,
+        cipher=WorkspaceSecretCipher(Settings().workspace_env_encryption_key),
+        git_runner=CloneRunner(),  # type: ignore[arg-type]
+    )
+
+    async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
+        assert workspace_id == workspace.id
+        assert owner_id == user_id
+        return workspace
+
+    async def fake_get_token(workspace_id: UUID) -> str:
+        assert workspace_id == workspace.id
+        return "raw-secret-token"
+
+    service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
+    service._get_token = fake_get_token  # type: ignore[method-assign]
+
+    await service.clone(workspace.id, user_id)
+
+    assert (repo_path / ".git").is_dir()
+    assert (repo_path / "README.md").read_text(encoding="utf-8") == "ok\n"
+    assert calls[0]["token"] == "raw-secret-token"
+    assert not Path(calls[0]["clone_path"]).exists()
 
 
 def test_git_runner_uses_shell_false_and_keeps_token_out_of_args(monkeypatch, tmp_path):
