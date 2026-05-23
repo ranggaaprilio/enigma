@@ -12,6 +12,7 @@ import {
   getAgentRun,
   getAgentStreamUrl,
   getCurrentUser,
+  getEditorStatus,
   getHealth,
   getRepositoryDiff,
   getRepositoryStatus,
@@ -26,7 +27,9 @@ import {
   pullRepository,
   pushRepository,
   register,
+  startEditorSession,
   stopAgentRun,
+  stopEditorSession,
   updateWorkspace,
   upsertWorkspaceEnvVar,
 } from "./api";
@@ -315,6 +318,35 @@ describe("getHealth", () => {
     );
     expect(getTerminalSessionSocketUrl(workspaceId, sessionId)).toBe(
       `ws://localhost:8000/workspaces/${workspaceId}/terminal/sessions/${sessionId}`,
+    );
+  });
+
+  it("sends credentialed editor requests", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ status: "inactive", session: null }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startEditorSession(workspaceId);
+    await getEditorStatus(workspaceId);
+    await stopEditorSession(workspaceId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/editor/start`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/editor/status`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/editor/stop`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
     );
   });
 });

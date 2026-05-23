@@ -20,6 +20,8 @@ export type WorkspaceStatus = "creating" | "ready" | "busy" | "error" | "stopped
 export type AgentRunStatus = "thinking" | "executing" | "completed" | "error" | "stopped";
 export type AgentEventType = "status" | "output_text" | "tool_call" | "tool_result" | "error";
 export type TerminalSessionStatus = "active" | "stopped" | "error";
+export type EditorSessionStatus = "active" | "stopped" | "error";
+export type EditorAvailability = "inactive" | EditorSessionStatus;
 
 export type WorkspaceResponse = {
   id: string;
@@ -134,6 +136,21 @@ export type TerminalSessionResponse = {
 
 export type TerminalSessionCreatePayload = {
   name?: string;
+};
+
+export type EditorSessionResponse = {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  url: string;
+  status: EditorSessionStatus;
+  started_at: string;
+  last_active_at: string;
+};
+
+export type EditorStatusResponse = {
+  status: EditorAvailability;
+  session: EditorSessionResponse | null;
 };
 
 export type LoginPayload = {
@@ -409,4 +426,25 @@ export function deleteTerminalSession(
     `/workspaces/${workspaceId}/terminal/sessions/${sessionId}`,
     { method: "DELETE" },
   );
+}
+
+export function startEditorSession(workspaceId: string): Promise<EditorSessionResponse> {
+  return requestJson<EditorSessionResponse>(`/workspaces/${workspaceId}/editor/start`, {
+    method: "POST",
+  });
+}
+
+export function getEditorStatus(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<EditorStatusResponse> {
+  return requestJson<EditorStatusResponse>(`/workspaces/${workspaceId}/editor/status`, {
+    signal,
+  });
+}
+
+export function stopEditorSession(workspaceId: string): Promise<EditorSessionResponse> {
+  return requestJson<EditorSessionResponse>(`/workspaces/${workspaceId}/editor/stop`, {
+    method: "POST",
+  });
 }

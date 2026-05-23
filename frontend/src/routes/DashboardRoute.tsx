@@ -2,6 +2,7 @@ import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react
 
 import { useAuth } from "../auth/context";
 import { DashboardShell } from "../components/DashboardShell";
+import { EditorPanel } from "../components/EditorPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import {
   ApiError,
@@ -36,10 +37,11 @@ type WorkspaceState =
   | { status: "ready"; workspace: WorkspaceResponse | null; envVars: WorkspaceEnvVarResponse[] }
   | { status: "error"; message: string };
 
-type DashboardTab = "overview" | "repository" | "terminal";
+type DashboardTab = "overview" | "repository" | "editor" | "terminal";
 const dashboardTabs: { id: DashboardTab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "repository", label: "Repository" },
+  { id: "editor", label: "Editor" },
   { id: "terminal", label: "Terminal" },
 ];
 
@@ -50,7 +52,7 @@ function initialDashboardTab(): DashboardTab {
   } catch {
     stored = null;
   }
-  if (stored === "repository" || stored === "terminal") {
+  if (stored === "repository" || stored === "editor" || stored === "terminal") {
     return stored;
   }
   return "overview";
@@ -226,6 +228,10 @@ export function DashboardRoute() {
 
       {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "terminal" && (
         <TerminalPanel workspace={workspaceState.workspace} />
+      )}
+
+      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "editor" && (
+        <EditorPanel workspace={workspaceState.workspace} />
       )}
     </DashboardShell>
   );

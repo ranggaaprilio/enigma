@@ -112,7 +112,13 @@ describe("App auth routing", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     MockWebSocket.instances = [];
-    window.localStorage?.clear();
+    if (typeof window.localStorage?.clear === "function") {
+      window.localStorage.clear();
+    }
+    if (typeof window.localStorage?.removeItem === "function") {
+      window.localStorage.removeItem("execute-dashboard-left-sidebar-collapsed");
+      window.localStorage.removeItem("execute-dashboard-right-sidebar-collapsed");
+    }
     window.history.pushState({}, "", "/");
   });
 
@@ -149,6 +155,32 @@ describe("App auth routing", () => {
     expect(await screen.findByText("AI Agent Control Room")).toBeInTheDocument();
     expect(screen.getByText("Owner")).toBeInTheDocument();
     expect(screen.getByText("owner")).toBeInTheDocument();
+  });
+
+  it("collapses and expands the sidebars", async () => {
+    window.history.pushState({}, "", "/");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        if (url.endsWith("/workspaces")) {
+          return Promise.resolve(jsonResponse([]));
+        }
+        return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      }),
+    );
+
+    render(<App />);
+
+    await screen.findByText("AI Agent Control Room");
+    await userEvent.click(screen.getByRole("button", { name: "Collapse left sidebar" }));
+    await userEvent.click(screen.getByRole("button", { name: "Collapse agent panel" }));
+
+    expect(screen.getByRole("button", { name: "Expand left sidebar" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Expand agent panel" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Dashboard" })).toBeInTheDocument();
   });
 
   it("logs out and returns to the login route", async () => {
@@ -375,6 +407,105 @@ describe("App auth routing", () => {
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
     expect(MockWebSocket.instances[0].url).toBe(
       `ws://localhost:8000/workspaces/${workspace.id}/terminal/sessions/${session.id}`,
+    );
+  });
+
+  it("opens the editor tab, starts an editor, and renders the iframe", async () => {
+    const editorSession = {
+      id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
+      workspace_id: workspace.id,
+      user_id: authUser.id,
+      url: `/workspaces/${workspace.id}/editor/proxy/0ea59c8a-698c-4ec1-84c7-1c40271760e7/token/`,
+      status: "active",
+      started_at: "2026-05-23T00:00:00Z",
+      last_active_at: "2026-05-23T00:00:00Z",
+    };
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/editor/status`)) {
+        return Promise.resolve(jsonResponse({ status: "inactive", session: null }));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/editor/start`) && init?.method === "POST") {
+        return Promise.resolve(jsonResponse(editorSession));
+      }
+      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/");
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Editor" }));
+    expect(await screen.findByText("Editor is not running.")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Open" }));
+
+    const frame = await screen.findByTitle("Demo editor");
+    expect(frame).toHaveAttribute(
+      "src",
+      `http://localhost:8000${editorSession.url}`,
+    );
+  });
+
+  it("shows editor failure state and can restart", async () => {
+    const failedSession = {
+      id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
+      workspace_id: workspace.id,
+      user_id: authUser.id,
+      url: `/workspaces/${workspace.id}/editor/proxy/0ea59c8a-698c-4ec1-84c7-1c40271760e7/token/`,
+      status: "error",
+      started_at: "2026-05-23T00:00:00Z",
+      last_active_at: "2026-05-23T00:00:00Z",
+    };
+    const activeSession = { ...failedSession, status: "active" };
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/editor/status`)) {
+        return Promise.resolve(jsonResponse({ status: "error", session: failedSession }));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/editor/stop`) && init?.method === "POST") {
+        return Promise.resolve(jsonResponse({ ...failedSession, status: "stopped" }));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/editor/start`) && init?.method === "POST") {
+        return Promise.resolve(jsonResponse(activeSession));
+      }
+      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/");
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Editor" }));
+    expect(await screen.findByText("Editor session is unavailable.")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Restart" }));
+
+    expect(await screen.findByTitle("Demo editor")).toHaveAttribute(
+      "src",
+      `http://localhost:8000${activeSession.url}`,
     );
   });
 });

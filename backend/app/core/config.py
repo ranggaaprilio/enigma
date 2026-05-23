@@ -26,6 +26,12 @@ class Settings(BaseSettings):
     terminal_tmux_binary: str = "tmux"
     terminal_default_cols: int = 120
     terminal_default_rows: int = 34
+    editor_code_server_binary: str = "code-server"
+    editor_bind_host: str = "127.0.0.1"
+    editor_port_start: int = 13337
+    editor_port_end: int = 13437
+    editor_token_ttl_seconds: int = 60 * 60
+    editor_runtime_root: Path = Path(".data/editor")
     backend_cors_origins: str | list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )

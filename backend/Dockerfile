@@ -6,7 +6,8 @@ ENV UV_LINK_MODE=copy
 ENV PATH="/app/.venv/bin:${PATH}"
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends tmux \
+    && apt-get install -y --no-install-recommends ca-certificates curl tmux \
+    && curl -fsSL https://code-server.dev/install.sh | sh \
     && rm -rf /var/lib/apt/lists/*
 
 COPY pyproject.toml uv.lock README.md ./

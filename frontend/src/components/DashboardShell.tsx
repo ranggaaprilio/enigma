@@ -1,4 +1,24 @@
-import { type FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type ReactNode,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import {
+  Bot,
+  Code2,
+  Folder,
+  GitBranch,
+  LayoutDashboard,
+  PanelLeftClose,
+  PanelLeftOpen,
+  PanelRightClose,
+  PanelRightOpen,
+  Terminal,
+  Workflow,
+} from "lucide-react";
 
 import { navigate } from "../lib/router";
 import {
@@ -26,7 +46,35 @@ type DashboardShellProps = {
   children: ReactNode;
 };
 
-const navItems = ["Dashboard", "Workspaces", "Repositories", "Agents", "Terminal"];
+const navItems = [
+  { label: "Dashboard", icon: LayoutDashboard },
+  { label: "Workspaces", icon: Folder },
+  { label: "Repositories", icon: GitBranch },
+  { label: "Agents", icon: Bot },
+  { label: "Editor", icon: Code2 },
+  { label: "Terminal", icon: Terminal },
+];
+const leftSidebarStorageKey = "execute-dashboard-left-sidebar-collapsed";
+const rightSidebarStorageKey = "execute-dashboard-right-sidebar-collapsed";
+
+const gridColumnClass = {
+  "false:false":
+    "grid min-h-screen grid-cols-1 lg:grid-cols-[240px_minmax(0,1fr)_320px]",
+  "true:false":
+    "grid min-h-screen grid-cols-1 lg:grid-cols-[72px_minmax(0,1fr)_320px]",
+  "false:true":
+    "grid min-h-screen grid-cols-1 lg:grid-cols-[240px_minmax(0,1fr)_72px]",
+  "true:true":
+    "grid min-h-screen grid-cols-1 lg:grid-cols-[72px_minmax(0,1fr)_72px]",
+};
+
+function initialCollapsedState(storageKey: string) {
+  try {
+    return window.localStorage?.getItem(storageKey) === "true";
+  } catch {
+    return false;
+  }
+}
 
 export function DashboardShell({
   healthLabel,
@@ -37,31 +85,103 @@ export function DashboardShell({
   onLogout,
   children,
 }: DashboardShellProps) {
+  const [leftSidebarCollapsed, setLeftSidebarCollapsed] = useState(() =>
+    initialCollapsedState(leftSidebarStorageKey),
+  );
+  const [rightSidebarCollapsed, setRightSidebarCollapsed] = useState(() =>
+    initialCollapsedState(rightSidebarStorageKey),
+  );
+
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem(
+        leftSidebarStorageKey,
+        String(leftSidebarCollapsed),
+      );
+    } catch {
+      return;
+    }
+  }, [leftSidebarCollapsed]);
+
+  useEffect(() => {
+    try {
+      window.localStorage?.setItem(
+        rightSidebarStorageKey,
+        String(rightSidebarCollapsed),
+      );
+    } catch {
+      return;
+    }
+  }, [rightSidebarCollapsed]);
+
   async function handleLogout() {
     await onLogout();
     navigate("/login");
   }
 
+  const layoutClass =
+    gridColumnClass[
+      `${leftSidebarCollapsed}:${rightSidebarCollapsed}` as keyof typeof gridColumnClass
+    ];
+
   return (
     <div className="min-h-screen bg-[#ece7dc] text-ink">
-      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[240px_minmax(0,1fr)_320px]">
-        <aside className="border-b border-line bg-ink px-5 py-5 text-white lg:border-b-0 lg:border-r">
-          <div className="mb-8">
-            <p className="text-sm uppercase tracking-[0.18em] text-white/55">Execute</p>
-            <h1 className="mt-2 text-2xl font-semibold">Dashboard</h1>
+      <div className={layoutClass}>
+        <aside className="border-b border-line bg-ink px-4 py-5 text-white lg:border-b-0 lg:border-r">
+          <div className="mb-8 flex items-start justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-white text-ink">
+                <Workflow className="h-5 w-5" aria-hidden="true" />
+              </div>
+              {!leftSidebarCollapsed && (
+                <div className="min-w-0">
+                  <p className="text-sm uppercase tracking-[0.18em] text-white/55">
+                    Execute
+                  </p>
+                  <h1 className="mt-2 text-2xl font-semibold">Dashboard</h1>
+                </div>
+              )}
+            </div>
+            <button
+              aria-label={
+                leftSidebarCollapsed
+                  ? "Expand left sidebar"
+                  : "Collapse left sidebar"
+              }
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-white/15 text-white/75 transition hover:bg-white/10 hover:text-white"
+              type="button"
+              onClick={() => setLeftSidebarCollapsed((current) => !current)}
+            >
+              {leftSidebarCollapsed ? (
+                <PanelLeftOpen className="h-4 w-4" aria-hidden="true" />
+              ) : (
+                <PanelLeftClose className="h-4 w-4" aria-hidden="true" />
+              )}
+            </button>
           </div>
-          <nav className="flex gap-2 overflow-x-auto lg:flex-col lg:overflow-visible">
-            {navItems.map((item) => (
+          <nav
+            className={`flex gap-2 overflow-x-auto lg:flex-col lg:overflow-visible ${
+              leftSidebarCollapsed ? "items-center" : ""
+            }`}
+          >
+            {navItems.map(({ label, icon: Icon }) => (
               <a
-                key={item}
+                key={label}
+                aria-label={leftSidebarCollapsed ? label : undefined}
                 href="/"
-                className={`whitespace-nowrap rounded-md px-3 py-2 text-sm transition ${
-                  item === "Dashboard"
+                title={leftSidebarCollapsed ? label : undefined}
+                className={`flex items-center gap-3 whitespace-nowrap rounded-md text-sm transition ${
+                  leftSidebarCollapsed
+                    ? "h-10 w-10 justify-center px-0 py-0"
+                    : "px-3 py-2"
+                } ${
+                  label === "Dashboard"
                     ? "bg-white text-ink"
                     : "text-white/72 hover:bg-white/10 hover:text-white"
                 }`}
               >
-                {item}
+                <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
+                {!leftSidebarCollapsed && <span>{label}</span>}
               </a>
             ))}
           </nav>
@@ -89,8 +209,36 @@ export function DashboardShell({
           </footer>
         </div>
 
-        <aside className="border-t border-line bg-[#fffdf8] px-5 py-5 lg:border-l lg:border-t-0">
-          <AgentPanel workspace={workspace} />
+        <aside className="border-t border-line bg-[#fffdf8] px-4 py-5 lg:border-l lg:border-t-0">
+          <div className="mb-4 flex items-center justify-between gap-2">
+            <div className="flex min-w-0 items-center gap-3">
+              {!rightSidebarCollapsed && (
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-line bg-white text-ink">
+                  <Bot className="h-5 w-5" aria-hidden="true" />
+                </div>
+              )}
+              {!rightSidebarCollapsed && (
+                <h2 className="text-base font-semibold">Agent Panel</h2>
+              )}
+            </div>
+            <button
+              aria-label={
+                rightSidebarCollapsed
+                  ? "Expand agent panel"
+                  : "Collapse agent panel"
+              }
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-[#f5f1e8] hover:text-ink"
+              type="button"
+              onClick={() => setRightSidebarCollapsed((current) => !current)}
+            >
+              {rightSidebarCollapsed ? (
+                <PanelRightOpen className="h-4 w-4" aria-hidden="true" />
+              ) : (
+                <PanelRightClose className="h-4 w-4" aria-hidden="true" />
+              )}
+            </button>
+          </div>
+          {!rightSidebarCollapsed && <AgentPanel workspace={workspace} />}
         </aside>
       </div>
     </div>
@@ -122,10 +270,17 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
     listAgentRuns(workspace.id, controller.signal)
       .then((runs) => setHistory(Array.isArray(runs) ? runs : []))
       .catch((caughtError: unknown) => {
-        if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
+        if (
+          caughtError instanceof DOMException &&
+          caughtError.name === "AbortError"
+        ) {
           return;
         }
-        setError(caughtError instanceof ApiError ? caughtError.message : "Unable to load history.");
+        setError(
+          caughtError instanceof ApiError
+            ? caughtError.message
+            : "Unable to load history.",
+        );
       });
 
     return () => {
@@ -137,16 +292,21 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
   const output = useMemo(
     () =>
       events
-        .filter((event) => event.event_type === "output_text" || event.event_type === "error")
+        .filter(
+          (event) =>
+            event.event_type === "output_text" || event.event_type === "error",
+        )
         .map((event) => event.content)
         .join(""),
     [events],
   );
   const toolEvents = events.filter(
-    (event) => event.event_type === "tool_call" || event.event_type === "tool_result",
+    (event) =>
+      event.event_type === "tool_call" || event.event_type === "tool_result",
   );
   const status = activeRun?.status ?? "idle";
-  const canStop = activeRun?.status === "thinking" || activeRun?.status === "executing";
+  const canStop =
+    activeRun?.status === "thinking" || activeRun?.status === "executing";
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -160,7 +320,10 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
     try {
       const run = await createAgentRun(workspace.id, { prompt });
       setActiveRun(run);
-      setHistory((current) => [run, ...current.filter((item) => item.id !== run.id)]);
+      setHistory((current) => [
+        run,
+        ...current.filter((item) => item.id !== run.id),
+      ]);
       connectStream(workspace.id, run);
     } catch (caughtError) {
       setError(
@@ -186,7 +349,11 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
       );
       socketRef.current?.close();
     } catch (caughtError) {
-      setError(caughtError instanceof ApiError ? caughtError.message : "Unable to stop agent.");
+      setError(
+        caughtError instanceof ApiError
+          ? caughtError.message
+          : "Unable to stop agent.",
+      );
     }
   }
 
@@ -206,7 +373,11 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
         socketRef.current?.close();
       }
     } catch (caughtError) {
-      setError(caughtError instanceof ApiError ? caughtError.message : "Unable to open run.");
+      setError(
+        caughtError instanceof ApiError
+          ? caughtError.message
+          : "Unable to open run.",
+      );
     }
   }
 
@@ -221,7 +392,9 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
     socket.onmessage = (message) => {
       const event = JSON.parse(message.data) as AgentEventResponse;
       setEvents((current) =>
-        current.some((existing) => existing.id === event.id) ? current : [...current, event],
+        current.some((existing) => existing.id === event.id)
+          ? current
+          : [...current, event],
       );
       const nextStatus = event.metadata.status;
       if (
@@ -231,7 +404,9 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
         nextStatus === "error" ||
         nextStatus === "stopped"
       ) {
-        setActiveRun((current) => (current ? { ...current, status: nextStatus } : current));
+        setActiveRun((current) =>
+          current ? { ...current, status: nextStatus } : current,
+        );
       }
     };
     socket.onerror = () => setError("Agent stream disconnected.");
@@ -239,15 +414,16 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
 
   return (
     <div className="flex h-full flex-col gap-4 text-sm">
-      <div className="flex items-center justify-between gap-3">
-        <h2 className="text-base font-semibold">Agent Panel</h2>
-        <AgentStatusPill status={status} />
-      </div>
+      <AgentStatusPill status={status} />
 
       <div className="rounded-md border border-line bg-white p-3">
         <p className="font-medium text-ink">Current workspace</p>
-        <p className="mt-1 text-ink/72">{workspace ? workspace.name : "No workspace selected"}</p>
-        {workspace && <p className="mt-1 truncate text-xs text-ink/55">{workspace.slug}</p>}
+        <p className="mt-1 text-ink/72">
+          {workspace ? workspace.name : "No workspace selected"}
+        </p>
+        {workspace && (
+          <p className="mt-1 truncate text-xs text-ink/55">{workspace.slug}</p>
+        )}
       </div>
 
       <form className="space-y-3" onSubmit={handleSubmit}>
@@ -286,7 +462,9 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
       )}
 
       <div className="min-h-40 rounded-md border border-line bg-white">
-        <div className="border-b border-line px-3 py-2 font-semibold">Output</div>
+        <div className="border-b border-line px-3 py-2 font-semibold">
+          Output
+        </div>
         <pre className="max-h-64 overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-xs leading-5 text-ink/78">
           {output || "Agent output will appear here."}
         </pre>
@@ -300,9 +478,14 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
           </div>
         )}
         {toolEvents.map((event) => (
-          <details className="rounded-md border border-line bg-white p-3" key={event.id}>
+          <details
+            className="rounded-md border border-line bg-white p-3"
+            key={event.id}
+          >
             <summary className="cursor-pointer font-medium">
-              {event.metadata.tool ? String(event.metadata.tool) : event.event_type}
+              {event.metadata.tool
+                ? String(event.metadata.tool)
+                : event.event_type}
             </summary>
             <pre className="mt-2 max-h-36 overflow-auto whitespace-pre-wrap break-words font-mono text-xs text-ink/70">
               {event.content}
@@ -319,7 +502,10 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
           </div>
         )}
         {history.map((run) => (
-          <div className="rounded-md border border-line bg-white p-3" key={run.id}>
+          <div
+            className="rounded-md border border-line bg-white p-3"
+            key={run.id}
+          >
             <button
               className="line-clamp-2 w-full text-left font-medium text-ink"
               type="button"
@@ -355,13 +541,21 @@ function AgentStatusPill({ status }: { status: AgentRunStatus | "idle" }) {
   }[status];
 
   return (
-    <span className={`rounded-full px-2 py-1 text-xs font-medium capitalize ${toneClass}`}>
+    <span
+      className={`rounded-full px-2 py-1 text-xs font-medium capitalize ${toneClass}`}
+    >
       {status}
     </span>
   );
 }
 
-function UserMenu({ user, onLogout }: { user: UserResponse; onLogout: () => Promise<void> }) {
+function UserMenu({
+  user,
+  onLogout,
+}: {
+  user: UserResponse;
+  onLogout: () => Promise<void>;
+}) {
   const displayName = user.name ?? user.email;
 
   return (
@@ -381,7 +575,13 @@ function UserMenu({ user, onLogout }: { user: UserResponse; onLogout: () => Prom
   );
 }
 
-function StatusPill({ label, tone }: { label: string; tone: DashboardShellProps["healthTone"] }) {
+function StatusPill({
+  label,
+  tone,
+}: {
+  label: string;
+  tone: DashboardShellProps["healthTone"];
+}) {
   const toneClass = {
     loading: "bg-[#e8edf2] text-ink",
     ok: "bg-[#e3efe9] text-signal",
@@ -390,7 +590,11 @@ function StatusPill({ label, tone }: { label: string; tone: DashboardShellProps[
   }[tone];
 
   return (
-    <span className={`rounded-full px-3 py-1 text-sm font-semibold ${toneClass}`}>{label}</span>
+    <span
+      className={`rounded-full px-3 py-1 text-sm font-semibold ${toneClass}`}
+    >
+      {label}
+    </span>
   );
 }
 
@@ -410,5 +614,11 @@ function WorkspaceStatusPill({
   }[status];
 
   const label = status === "none" ? "No workspace" : `Workspace ${status}`;
-  return <span className={`rounded-full px-3 py-1 text-sm font-semibold ${toneClass}`}>{label}</span>;
+  return (
+    <span
+      className={`rounded-full px-3 py-1 text-sm font-semibold ${toneClass}`}
+    >
+      {label}
+    </span>
+  );
 }
