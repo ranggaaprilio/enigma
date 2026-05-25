@@ -9,6 +9,7 @@ import {
   createWorkspace,
   deleteTerminalSession,
   deleteWorkspaceEnvVar,
+  detectPreviewSession,
   getAgentRun,
   getAgentStreamUrl,
   getCurrentUser,
@@ -19,6 +20,7 @@ import {
   getTerminalSessionSocketUrl,
   getWorkspaceStatus,
   listTerminalSessions,
+  listPreviewSessions,
   listWorkspaceEnvVars,
   listWorkspaces,
   listAgentRuns,
@@ -30,6 +32,8 @@ import {
   startEditorSession,
   stopAgentRun,
   stopEditorSession,
+  refreshPreviewSession,
+  stopPreviewSession,
   updateWorkspace,
   upsertWorkspaceEnvVar,
 } from "./api";
@@ -346,6 +350,42 @@ describe("getHealth", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       3,
       `http://localhost:8000/workspaces/${workspaceId}/editor/stop`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+  });
+
+  it("sends credentialed preview requests", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const sessionId = "6f9d15db-19e2-4c04-95ad-a4e4508ef80d";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ status: "inactive", session: null }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await listPreviewSessions(workspaceId);
+    await detectPreviewSession(workspaceId);
+    await refreshPreviewSession(workspaceId, sessionId);
+    await stopPreviewSession(workspaceId, sessionId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/preview/sessions`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/preview/detect`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/preview/sessions/${sessionId}/refresh`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      `http://localhost:8000/workspaces/${workspaceId}/preview/sessions/${sessionId}/stop`,
       expect.objectContaining({ credentials: "include", method: "POST" }),
     );
   });

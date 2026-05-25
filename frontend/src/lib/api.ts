@@ -22,6 +22,8 @@ export type AgentEventType = "status" | "output_text" | "tool_call" | "tool_resu
 export type TerminalSessionStatus = "active" | "stopped" | "error";
 export type EditorSessionStatus = "active" | "stopped" | "error";
 export type EditorAvailability = "inactive" | EditorSessionStatus;
+export type PreviewSessionStatus = "active" | "stopped" | "error";
+export type PreviewAvailability = "inactive" | PreviewSessionStatus;
 
 export type WorkspaceResponse = {
   id: string;
@@ -151,6 +153,21 @@ export type EditorSessionResponse = {
 export type EditorStatusResponse = {
   status: EditorAvailability;
   session: EditorSessionResponse | null;
+};
+
+export type PreviewSessionResponse = {
+  id: string;
+  workspace_id: string;
+  port: number;
+  public_url: string;
+  status: PreviewSessionStatus;
+  created_at: string;
+  last_seen_at: string;
+};
+
+export type PreviewDetectResponse = {
+  status: PreviewAvailability;
+  session: PreviewSessionResponse | null;
 };
 
 export type LoginPayload = {
@@ -447,4 +464,40 @@ export function stopEditorSession(workspaceId: string): Promise<EditorSessionRes
   return requestJson<EditorSessionResponse>(`/workspaces/${workspaceId}/editor/stop`, {
     method: "POST",
   });
+}
+
+export function listPreviewSessions(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<PreviewSessionResponse[]> {
+  return requestJson<PreviewSessionResponse[]>(
+    `/workspaces/${workspaceId}/preview/sessions`,
+    { signal },
+  );
+}
+
+export function detectPreviewSession(workspaceId: string): Promise<PreviewDetectResponse> {
+  return requestJson<PreviewDetectResponse>(`/workspaces/${workspaceId}/preview/detect`, {
+    method: "POST",
+  });
+}
+
+export function refreshPreviewSession(
+  workspaceId: string,
+  sessionId: string,
+): Promise<PreviewSessionResponse> {
+  return requestJson<PreviewSessionResponse>(
+    `/workspaces/${workspaceId}/preview/sessions/${sessionId}/refresh`,
+    { method: "POST" },
+  );
+}
+
+export function stopPreviewSession(
+  workspaceId: string,
+  sessionId: string,
+): Promise<PreviewSessionResponse> {
+  return requestJson<PreviewSessionResponse>(
+    `/workspaces/${workspaceId}/preview/sessions/${sessionId}/stop`,
+    { method: "POST" },
+  );
 }

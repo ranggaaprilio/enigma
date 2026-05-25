@@ -508,4 +508,81 @@ describe("App auth routing", () => {
       `http://localhost:8000${activeSession.url}`,
     );
   });
+
+  it("opens the preview tab, detects a preview, and controls the iframe", async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText },
+    });
+    const previewSession = {
+      id: "6f9d15db-19e2-4c04-95ad-a4e4508ef80d",
+      workspace_id: workspace.id,
+      port: 5173,
+      public_url: `/workspaces/${workspace.id}/preview/proxy/6f9d15db-19e2-4c04-95ad-a4e4508ef80d/`,
+      status: "active",
+      created_at: "2026-05-25T00:00:00Z",
+      last_seen_at: "2026-05-25T00:00:00Z",
+    };
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/preview/sessions`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/preview/detect`) && init?.method === "POST") {
+        return Promise.resolve(jsonResponse({ status: "active", session: previewSession }));
+      }
+      if (
+        url.endsWith(`/workspaces/${workspace.id}/preview/sessions/${previewSession.id}/refresh`) &&
+        init?.method === "POST"
+      ) {
+        return Promise.resolve(jsonResponse({ ...previewSession, last_seen_at: "2026-05-25T00:00:01Z" }));
+      }
+      if (
+        url.endsWith(`/workspaces/${workspace.id}/preview/sessions/${previewSession.id}/stop`) &&
+        init?.method === "POST"
+      ) {
+        return Promise.resolve(jsonResponse({ ...previewSession, status: "stopped" }));
+      }
+      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/");
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Preview" }));
+    expect(await screen.findByText("Preview is not running.")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Detect/Open" }));
+
+    const frame = await screen.findByTitle("Demo preview");
+    expect(frame).toHaveAttribute(
+      "src",
+      `http://localhost:8000${previewSession.public_url}`,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Mobile" }));
+    expect(frame).toHaveClass("max-w-[390px]");
+
+    await userEvent.click(screen.getByRole("button", { name: "Copy URL" }));
+    expect(writeText).toHaveBeenCalledWith(`http://localhost:8000${previewSession.public_url}`);
+
+    await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
+    expect(await screen.findByTitle("Demo preview")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Stop preview" }));
+    expect(await screen.findByText(/Preview: stopped :5173/)).toBeInTheDocument();
+  });
 });

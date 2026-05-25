@@ -3,6 +3,7 @@ import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react
 import { useAuth } from "../auth/context";
 import { DashboardShell } from "../components/DashboardShell";
 import { EditorPanel } from "../components/EditorPanel";
+import { PreviewPanel } from "../components/PreviewPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import {
   ApiError,
@@ -37,12 +38,18 @@ type WorkspaceState =
   | { status: "ready"; workspace: WorkspaceResponse | null; envVars: WorkspaceEnvVarResponse[] }
   | { status: "error"; message: string };
 
-type DashboardTab = "overview" | "repository" | "editor" | "terminal";
+type DashboardTab = "overview" | "repository" | "editor" | "terminal" | "preview";
+type PreviewStatusSnapshot = {
+  status: "inactive" | "active" | "stopped" | "error";
+  port: number | null;
+};
+
 const dashboardTabs: { id: DashboardTab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "repository", label: "Repository" },
   { id: "editor", label: "Editor" },
   { id: "terminal", label: "Terminal" },
+  { id: "preview", label: "Preview" },
 ];
 
 function initialDashboardTab(): DashboardTab {
@@ -52,7 +59,12 @@ function initialDashboardTab(): DashboardTab {
   } catch {
     stored = null;
   }
-  if (stored === "repository" || stored === "editor" || stored === "terminal") {
+  if (
+    stored === "repository" ||
+    stored === "editor" ||
+    stored === "terminal" ||
+    stored === "preview"
+  ) {
     return stored;
   }
   return "overview";
@@ -63,6 +75,10 @@ export function DashboardRoute() {
   const [health, setHealth] = useState<HealthState>({ status: "loading" });
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>({ status: "loading" });
   const [activeTab, setActiveTab] = useState<DashboardTab>(initialDashboardTab);
+  const [previewStatus, setPreviewStatus] = useState<PreviewStatusSnapshot>({
+    status: "inactive",
+    port: null,
+  });
 
   useEffect(() => {
     const controller = new AbortController();
@@ -132,6 +148,14 @@ export function DashboardRoute() {
     workspaceState.status === "ready" ? workspaceState.workspace : null;
   const workspaceStatus =
     workspaceState.status === "loading" ? "loading" : workspace?.status ?? "none";
+  const previewStatusLabel =
+    previewStatus.port === null
+      ? previewStatus.status
+      : `${previewStatus.status} :${previewStatus.port}`;
+
+  const handlePreviewStatusChange = useCallback((snapshot: PreviewStatusSnapshot) => {
+    setPreviewStatus(snapshot);
+  }, []);
 
   return (
     <DashboardShell
@@ -139,6 +163,7 @@ export function DashboardRoute() {
       healthTone={shellStatus.tone}
       workspace={workspace}
       workspaceStatus={workspaceStatus}
+      previewStatusLabel={previewStatusLabel}
       user={user}
       onLogout={logout}
     >
@@ -232,6 +257,13 @@ export function DashboardRoute() {
 
       {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "editor" && (
         <EditorPanel workspace={workspaceState.workspace} />
+      )}
+
+      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "preview" && (
+        <PreviewPanel
+          workspace={workspaceState.workspace}
+          onStatusChange={handlePreviewStatusChange}
+        />
       )}
     </DashboardShell>
   );

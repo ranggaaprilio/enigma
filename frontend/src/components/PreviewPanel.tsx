@@ -1,0 +1,314 @@
+import { useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Copy,
+  Monitor,
+  RefreshCw,
+  Search,
+  Smartphone,
+  Square,
+  Tablet,
+} from "lucide-react";
+
+import {
+  ApiError,
+  detectPreviewSession,
+  getApiBaseUrl,
+  listPreviewSessions,
+  refreshPreviewSession,
+  stopPreviewSession,
+  type PreviewSessionResponse,
+  type WorkspaceResponse,
+} from "../lib/api";
+
+type PreviewPanelState =
+  | { status: "loading" }
+  | { status: "inactive"; session: null }
+  | { status: "ready"; session: PreviewSessionResponse }
+  | { status: "stopped"; session: PreviewSessionResponse | null }
+  | { status: "error"; message: string; session: PreviewSessionResponse | null };
+
+type DeviceMode = "desktop" | "tablet" | "mobile";
+
+type PreviewStatusSnapshot = {
+  status: "inactive" | "active" | "stopped" | "error";
+  port: number | null;
+};
+
+type PreviewPanelProps = {
+  workspace: WorkspaceResponse;
+  onStatusChange: (snapshot: PreviewStatusSnapshot) => void;
+};
+
+const deviceOptions: { id: DeviceMode; label: string; icon: typeof Monitor }[] = [
+  { id: "desktop", label: "Desktop", icon: Monitor },
+  { id: "tablet", label: "Tablet", icon: Tablet },
+  { id: "mobile", label: "Mobile", icon: Smartphone },
+];
+
+const deviceWidthClass: Record<DeviceMode, string> = {
+  desktop: "max-w-full",
+  tablet: "max-w-[820px]",
+  mobile: "max-w-[390px]",
+};
+
+export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
+  const [panelState, setPanelState] = useState<PreviewPanelState>({ status: "loading" });
+  const [deviceMode, setDeviceMode] = useState<DeviceMode>("desktop");
+  const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [frameVersion, setFrameVersion] = useState(0);
+  const [copyLabel, setCopyLabel] = useState("Copy URL");
+
+  const applySessionState = useCallback(
+    (nextSession: PreviewSessionResponse | null) => {
+      if (!nextSession) {
+        setPanelState({ status: "inactive", session: null });
+        onStatusChange({ status: "inactive", port: null });
+        return;
+      }
+      onStatusChange({ status: nextSession.status, port: nextSession.port });
+      if (nextSession.status === "active") {
+        setPanelState({ status: "ready", session: nextSession });
+        return;
+      }
+      if (nextSession.status === "stopped") {
+        setPanelState({ status: "stopped", session: nextSession });
+        return;
+      }
+      setPanelState({
+        status: "error",
+        message: "Preview session is unavailable.",
+        session: nextSession,
+      });
+    },
+    [onStatusChange],
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setPanelState({ status: "loading" });
+
+    listPreviewSessions(workspace.id, controller.signal)
+      .then((sessions) => {
+        const session = sessions.find((candidate) => candidate.status === "active") ?? sessions[0];
+        if (!session) {
+          setPanelState({ status: "inactive", session: null });
+          onStatusChange({ status: "inactive", port: null });
+          return;
+        }
+        applySessionState(session);
+      })
+      .catch((caughtError: unknown) => {
+        if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
+          return;
+        }
+        setPanelState({
+          status: "error",
+          message:
+            caughtError instanceof ApiError ? caughtError.message : "Unable to load preview.",
+          session: null,
+        });
+        onStatusChange({ status: "error", port: null });
+      });
+
+    return () => controller.abort();
+  }, [applySessionState, onStatusChange, workspace.id]);
+
+  const session =
+    panelState.status === "ready" ||
+    panelState.status === "stopped" ||
+    panelState.status === "error"
+      ? panelState.session
+      : null;
+
+  const iframeUrl = useMemo(() => {
+    if (!session || session.status !== "active") {
+      return null;
+    }
+    return new URL(session.public_url, getApiBaseUrl()).toString();
+  }, [session]);
+
+  async function detectPreview() {
+    setBusyAction("detect");
+    try {
+      const response = await detectPreviewSession(workspace.id);
+      applySessionState(response.session);
+      if (response.session?.status === "active") {
+        setFrameVersion((current) => current + 1);
+      }
+    } catch (caughtError) {
+      setPanelState({
+        status: "error",
+        message:
+          caughtError instanceof ApiError ? caughtError.message : "Unable to detect preview.",
+        session,
+      });
+      onStatusChange({ status: "error", port: session?.port ?? null });
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function refreshPreview() {
+    if (!session) {
+      return;
+    }
+    setBusyAction("refresh");
+    try {
+      const refreshed = await refreshPreviewSession(workspace.id, session.id);
+      applySessionState(refreshed);
+      setFrameVersion((current) => current + 1);
+    } catch (caughtError) {
+      setPanelState({
+        status: "error",
+        message:
+          caughtError instanceof ApiError ? caughtError.message : "Unable to refresh preview.",
+        session,
+      });
+      onStatusChange({ status: "error", port: session.port });
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function stopPreview() {
+    if (!session) {
+      return;
+    }
+    setBusyAction("stop");
+    try {
+      const stopped = await stopPreviewSession(workspace.id, session.id);
+      applySessionState(stopped);
+    } catch (caughtError) {
+      setPanelState({
+        status: "error",
+        message: caughtError instanceof ApiError ? caughtError.message : "Unable to stop preview.",
+        session,
+      });
+      onStatusChange({ status: "error", port: session.port });
+    } finally {
+      setBusyAction(null);
+    }
+  }
+
+  async function copyPreviewUrl() {
+    if (!iframeUrl) {
+      return;
+    }
+    await navigator.clipboard?.writeText(iframeUrl);
+    setCopyLabel("Copied");
+    window.setTimeout(() => setCopyLabel("Copy URL"), 1200);
+  }
+
+  const statusLabel = {
+    loading: "Loading",
+    inactive: "Not detected",
+    ready: "Active",
+    stopped: "Stopped",
+    error: "Error",
+  }[panelState.status];
+
+  return (
+    <section className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
+            Preview
+          </p>
+          <h3 className="mt-1 text-base font-semibold">{workspace.name}</h3>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-ink/65">
+            {statusLabel}
+            {session ? ` :${session.port}` : ""}
+          </span>
+          <button
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            type="button"
+            disabled={busyAction !== null}
+            onClick={() => void detectPreview()}
+          >
+            <Search className="h-4 w-4" aria-hidden="true" />
+            {busyAction === "detect" ? "Detecting..." : "Detect/Open"}
+          </button>
+          <button
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            type="button"
+            disabled={busyAction !== null || !session}
+            onClick={() => void refreshPreview()}
+          >
+            <RefreshCw className="h-4 w-4" aria-hidden="true" />
+            {busyAction === "refresh" ? "Refreshing..." : "Refresh"}
+          </button>
+          <button
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            type="button"
+            disabled={!iframeUrl}
+            onClick={() => void copyPreviewUrl()}
+          >
+            <Copy className="h-4 w-4" aria-hidden="true" />
+            {copyLabel}
+          </button>
+          <button
+            aria-label="Stop preview"
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            type="button"
+            disabled={busyAction !== null || session?.status !== "active"}
+            onClick={() => void stopPreview()}
+          >
+            <Square className="h-4 w-4" aria-hidden="true" />
+            {busyAction === "stop" ? "Stopping..." : "Stop"}
+          </button>
+        </div>
+      </div>
+
+      <div className="mb-4 inline-flex rounded-md border border-line bg-white p-1">
+        {deviceOptions.map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            aria-pressed={deviceMode === id}
+            className={`flex h-9 min-w-10 items-center justify-center rounded-md px-3 text-sm font-semibold transition ${
+              deviceMode === id
+                ? "bg-ink text-white"
+                : "text-ink/65 hover:bg-[#f5f1e8] hover:text-ink"
+            }`}
+            title={label}
+            type="button"
+            onClick={() => setDeviceMode(id)}
+          >
+            <Icon className="h-4 w-4" aria-hidden="true" />
+            <span className="sr-only">{label}</span>
+          </button>
+        ))}
+      </div>
+
+      {panelState.status === "error" && (
+        <div className="mb-4 rounded-md border border-danger/30 bg-[#fff5f2] p-3 text-sm text-danger">
+          {panelState.message}
+        </div>
+      )}
+
+      {panelState.status === "loading" && (
+        <div className="rounded-md border border-dashed border-line bg-white p-6 text-ink/72">
+          Loading preview...
+        </div>
+      )}
+
+      {(panelState.status === "inactive" || panelState.status === "stopped") && (
+        <div className="rounded-md border border-dashed border-line bg-white p-6 text-ink/72">
+          Preview is not running.
+        </div>
+      )}
+
+      {iframeUrl && (
+        <div className="flex justify-center overflow-auto rounded-md border border-[#0b1118] bg-[#111820] p-2">
+          <iframe
+            key={frameVersion}
+            className={`h-[680px] min-h-[420px] w-full ${deviceWidthClass[deviceMode]} rounded-sm border-0 bg-white`}
+            src={iframeUrl}
+            title={`${workspace.name} preview`}
+          />
+        </div>
+      )}
+    </section>
+  );
+}

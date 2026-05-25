@@ -12,6 +12,7 @@ import {
   Folder,
   GitBranch,
   LayoutDashboard,
+  Monitor,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
@@ -41,6 +42,7 @@ type DashboardShellProps = {
   healthTone: "loading" | "ok" | "degraded" | "error";
   workspace: WorkspaceResponse | null;
   workspaceStatus: WorkspaceStatus | "none" | "loading";
+  previewStatusLabel: string;
   user: UserResponse | null;
   onLogout: () => Promise<void>;
   children: ReactNode;
@@ -53,6 +55,7 @@ const navItems = [
   { label: "Agents", icon: Bot },
   { label: "Editor", icon: Code2 },
   { label: "Terminal", icon: Terminal },
+  { label: "Preview", icon: Monitor },
 ];
 const leftSidebarStorageKey = "execute-dashboard-left-sidebar-collapsed";
 const rightSidebarStorageKey = "execute-dashboard-right-sidebar-collapsed";
@@ -81,6 +84,7 @@ export function DashboardShell({
   healthTone,
   workspace,
   workspaceStatus,
+  previewStatusLabel,
   user,
   onLogout,
   children,
@@ -205,7 +209,7 @@ export function DashboardShell({
           <main className="flex-1 px-5 py-5">{children}</main>
 
           <footer className="border-t border-line bg-panel px-5 py-3 text-sm text-ink/70">
-            API: {healthLabel} | Workspace: {workspaceStatus}
+            API: {healthLabel} | Workspace: {workspaceStatus} | Preview: {previewStatusLabel}
           </footer>
         </div>
 
