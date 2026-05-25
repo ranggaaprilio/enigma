@@ -350,6 +350,92 @@ describe("App auth routing", () => {
     expect(await screen.findAllByText("stopped")).not.toHaveLength(0);
   });
 
+  it("creates and runs a confirmed custom command with streamed output", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    Object.defineProperty(window, "WebSocket", {
+      configurable: true,
+      value: MockWebSocket,
+      writable: true,
+    });
+    const command = {
+      id: "68b44d9c-4c0a-4770-8c6a-a4a462d0528d",
+      workspace_id: workspace.id,
+      name: "Tests",
+      command: "pnpm test",
+      description: "Run frontend tests",
+      icon: null,
+      hotkey: "T",
+      requires_confirmation: true,
+      created_at: "2026-05-25T00:00:00Z",
+      updated_at: "2026-05-25T00:00:00Z",
+    };
+    const run = {
+      id: "a4b5e02f-fb93-4e0f-acf5-d7a78dc34fee",
+      custom_command_id: command.id,
+      workspace_id: workspace.id,
+      user_id: authUser.id,
+      status: "running",
+      exit_code: null,
+      output: "",
+      started_at: "2026-05-25T00:00:00Z",
+      completed_at: null,
+    };
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/commands`) && init?.method === "POST") {
+        return Promise.resolve(jsonResponse(command, true, 201));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/commands`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/commands/${command.id}/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/commands/${command.id}/run`)) {
+        return Promise.resolve(jsonResponse(run, true, 201));
+      }
+      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/");
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Commands" }));
+    await userEvent.click(await screen.findByRole("button", { name: "New command" }));
+    await userEvent.type(screen.getByLabelText("Name"), "Tests");
+    await userEvent.type(screen.getByLabelText("Command"), "pnpm test");
+    await userEvent.type(screen.getByLabelText("Description"), "Run frontend tests");
+    await userEvent.type(screen.getByLabelText("Hotkey"), "T");
+    await userEvent.click(screen.getByLabelText("Requires confirmation"));
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    expect(await screen.findAllByText("pnpm test")).not.toHaveLength(0);
+    await userEvent.click(screen.getByRole("button", { name: "Run command" }));
+    expect(screen.getByRole("heading", { name: "Confirm command" })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Confirm run" }));
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    act(() => {
+      MockWebSocket.instances[0].emit({ type: "output", content: "ok\n" });
+      MockWebSocket.instances[0].emit({ type: "status", status: "completed", exit_code: 0 });
+    });
+
+    expect(await screen.findByText("ok")).toBeInTheDocument();
+    expect(screen.getAllByText("completed")).not.toHaveLength(0);
+  });
+
   it("opens the terminal tab and connects a websocket session", async () => {
     vi.stubGlobal("WebSocket", MockWebSocket);
     Object.defineProperty(window, "WebSocket", {

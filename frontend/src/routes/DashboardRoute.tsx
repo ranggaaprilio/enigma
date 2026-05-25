@@ -2,6 +2,7 @@ import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react
 
 import { useAuth } from "../auth/context";
 import { DashboardShell } from "../components/DashboardShell";
+import { CustomCommandsPanel } from "../components/CustomCommandsPanel";
 import { EditorPanel } from "../components/EditorPanel";
 import { PreviewPanel } from "../components/PreviewPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
@@ -38,7 +39,7 @@ type WorkspaceState =
   | { status: "ready"; workspace: WorkspaceResponse | null; envVars: WorkspaceEnvVarResponse[] }
   | { status: "error"; message: string };
 
-type DashboardTab = "overview" | "repository" | "editor" | "terminal" | "preview";
+type DashboardTab = "overview" | "repository" | "commands" | "editor" | "terminal" | "preview";
 type PreviewStatusSnapshot = {
   status: "inactive" | "active" | "stopped" | "error";
   port: number | null;
@@ -47,6 +48,7 @@ type PreviewStatusSnapshot = {
 const dashboardTabs: { id: DashboardTab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "repository", label: "Repository" },
+  { id: "commands", label: "Commands" },
   { id: "editor", label: "Editor" },
   { id: "terminal", label: "Terminal" },
   { id: "preview", label: "Preview" },
@@ -61,6 +63,7 @@ function initialDashboardTab(): DashboardTab {
   }
   if (
     stored === "repository" ||
+    stored === "commands" ||
     stored === "editor" ||
     stored === "terminal" ||
     stored === "preview"
@@ -253,6 +256,10 @@ export function DashboardRoute() {
 
       {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "terminal" && (
         <TerminalPanel workspace={workspaceState.workspace} />
+      )}
+
+      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "commands" && (
+        <CustomCommandsPanel workspace={workspaceState.workspace} />
       )}
 
       {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "editor" && (

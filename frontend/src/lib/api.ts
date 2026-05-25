@@ -19,6 +19,7 @@ export type UserResponse = {
 export type WorkspaceStatus = "creating" | "ready" | "busy" | "error" | "stopped";
 export type AgentRunStatus = "thinking" | "executing" | "completed" | "error" | "stopped";
 export type AgentEventType = "status" | "output_text" | "tool_call" | "tool_result" | "error";
+export type CommandRunStatus = "running" | "completed" | "failed" | "error";
 export type TerminalSessionStatus = "active" | "stopped" | "error";
 export type EditorSessionStatus = "active" | "stopped" | "error";
 export type EditorAvailability = "inactive" | EditorSessionStatus;
@@ -125,6 +126,50 @@ export type AgentRunCreatePayload = {
   prompt: string;
 };
 
+export type CustomCommandResponse = {
+  id: string;
+  workspace_id: string;
+  name: string;
+  command: string;
+  description: string | null;
+  icon: string | null;
+  hotkey: string | null;
+  requires_confirmation: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+export type CustomCommandPayload = {
+  name: string;
+  command: string;
+  description?: string | null;
+  icon?: string | null;
+  hotkey?: string | null;
+  requires_confirmation: boolean;
+};
+
+export type CustomCommandUpdatePayload = Partial<CustomCommandPayload>;
+
+export type CommandRunResponse = {
+  id: string;
+  custom_command_id: string;
+  workspace_id: string;
+  user_id: string;
+  status: CommandRunStatus;
+  exit_code: number | null;
+  output: string;
+  started_at: string;
+  completed_at: string | null;
+};
+
+export type CommandRunCreatePayload = {
+  confirmed?: boolean;
+};
+
+export type CommandRunStreamMessage =
+  | { type: "output"; content: string }
+  | { type: "status"; status: CommandRunStatus; exit_code: number | null };
+
 export type TerminalSessionResponse = {
   id: string;
   workspace_id: string;
@@ -207,6 +252,14 @@ export function getTerminalSessionSocketUrl(workspaceId: string, sessionId: stri
   const baseUrl = new URL(getApiBaseUrl());
   baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
   baseUrl.pathname = `/workspaces/${workspaceId}/terminal/sessions/${sessionId}`;
+  baseUrl.search = "";
+  return baseUrl.toString();
+}
+
+export function getCommandRunStreamUrl(workspaceId: string, runId: string) {
+  const baseUrl = new URL(getApiBaseUrl());
+  baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+  baseUrl.pathname = `/workspaces/${workspaceId}/command-runs/${runId}/stream`;
   baseUrl.search = "";
   return baseUrl.toString();
 }
@@ -413,6 +466,65 @@ export function stopAgentRun(workspaceId: string, runId: string): Promise<AgentR
   return requestJson<AgentRunResponse>(`/workspaces/${workspaceId}/agent/runs/${runId}/stop`, {
     method: "POST",
   });
+}
+
+export function createCustomCommand(
+  workspaceId: string,
+  payload: CustomCommandPayload,
+): Promise<CustomCommandResponse> {
+  return requestJson<CustomCommandResponse>(`/workspaces/${workspaceId}/commands`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listCustomCommands(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<CustomCommandResponse[]> {
+  return requestJson<CustomCommandResponse[]>(`/workspaces/${workspaceId}/commands`, { signal });
+}
+
+export function updateCustomCommand(
+  workspaceId: string,
+  commandId: string,
+  payload: CustomCommandUpdatePayload,
+): Promise<CustomCommandResponse> {
+  return requestJson<CustomCommandResponse>(`/workspaces/${workspaceId}/commands/${commandId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteCustomCommand(
+  workspaceId: string,
+  commandId: string,
+): Promise<{ ok: boolean }> {
+  return requestJson<{ ok: boolean }>(`/workspaces/${workspaceId}/commands/${commandId}`, {
+    method: "DELETE",
+  });
+}
+
+export function runCustomCommand(
+  workspaceId: string,
+  commandId: string,
+  payload: CommandRunCreatePayload = {},
+): Promise<CommandRunResponse> {
+  return requestJson<CommandRunResponse>(`/workspaces/${workspaceId}/commands/${commandId}/run`, {
+    method: "POST",
+    body: JSON.stringify({ confirmed: payload.confirmed ?? false }),
+  });
+}
+
+export function listCustomCommandRuns(
+  workspaceId: string,
+  commandId: string,
+  signal?: AbortSignal,
+): Promise<CommandRunResponse[]> {
+  return requestJson<CommandRunResponse[]>(
+    `/workspaces/${workspaceId}/commands/${commandId}/runs`,
+    { signal },
+  );
 }
 
 export function createTerminalSession(

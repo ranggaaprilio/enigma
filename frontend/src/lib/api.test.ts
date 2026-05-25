@@ -5,13 +5,16 @@ import {
   commitRepository,
   connectRepository,
   createAgentRun,
+  createCustomCommand,
   createTerminalSession,
   createWorkspace,
+  deleteCustomCommand,
   deleteTerminalSession,
   deleteWorkspaceEnvVar,
   detectPreviewSession,
   getAgentRun,
   getAgentStreamUrl,
+  getCommandRunStreamUrl,
   getCurrentUser,
   getEditorStatus,
   getHealth,
@@ -20,6 +23,8 @@ import {
   getTerminalSessionSocketUrl,
   getWorkspaceStatus,
   listTerminalSessions,
+  listCustomCommandRuns,
+  listCustomCommands,
   listPreviewSessions,
   listWorkspaceEnvVars,
   listWorkspaces,
@@ -29,11 +34,13 @@ import {
   pullRepository,
   pushRepository,
   register,
+  runCustomCommand,
   startEditorSession,
   stopAgentRun,
   stopEditorSession,
   refreshPreviewSession,
   stopPreviewSession,
+  updateCustomCommand,
   updateWorkspace,
   upsertWorkspaceEnvVar,
 } from "./api";
@@ -289,6 +296,62 @@ describe("getHealth", () => {
     );
     expect(getAgentStreamUrl(workspaceId, runId)).toBe(
       `ws://localhost:8000/workspaces/${workspaceId}/agent/runs/${runId}/stream`,
+    );
+  });
+
+  it("sends credentialed custom command requests and builds the stream URL", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const commandId = "68b44d9c-4c0a-4770-8c6a-a4a462d0528d";
+    const runId = "a4b5e02f-fb93-4e0f-acf5-d7a78dc34fee";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: commandId }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createCustomCommand(workspaceId, {
+      name: "Tests",
+      command: "pytest --version",
+      requires_confirmation: false,
+    });
+    await listCustomCommands(workspaceId);
+    await updateCustomCommand(workspaceId, commandId, { name: "Pytest" });
+    await runCustomCommand(workspaceId, commandId, { confirmed: true });
+    await listCustomCommandRuns(workspaceId, commandId);
+    await deleteCustomCommand(workspaceId, commandId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/commands`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/commands`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/commands/${commandId}`,
+      expect.objectContaining({ credentials: "include", method: "PATCH" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      `http://localhost:8000/workspaces/${workspaceId}/commands/${commandId}/run`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      `http://localhost:8000/workspaces/${workspaceId}/commands/${commandId}/runs`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      `http://localhost:8000/workspaces/${workspaceId}/commands/${commandId}`,
+      expect.objectContaining({ credentials: "include", method: "DELETE" }),
+    );
+    expect(getCommandRunStreamUrl(workspaceId, runId)).toBe(
+      `ws://localhost:8000/workspaces/${workspaceId}/command-runs/${runId}/stream`,
     );
   });
 
