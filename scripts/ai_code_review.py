@@ -23,7 +23,7 @@ from langgraph.graph import END, StateGraph
 
 COMMENT_MARKER = "<!-- ai-code-review:openai -->"
 MAX_FILES = 80
-MAX_PATCH_CHARS = 55_000
+MAX_PATCH_CHARS = 120_000
 GITHUB_API_URL = os.getenv("GITHUB_API_URL", "https://api.github.com")
 
 
@@ -32,6 +32,7 @@ class ReviewState(TypedDict):
     files: NotRequired[list[dict[str, Any]]]
     diff_payload: NotRequired[str]
     truncated: NotRequired[bool]
+    truncation_reasons: NotRequired[list[str]]
     review_text: NotRequired[str]
 
 
@@ -112,6 +113,7 @@ def build_diff_payload(state: ReviewState) -> ReviewState:
     files = state.get("files", [])
     patch_chars = 0
     truncated = False
+    truncation_reasons: list[str] = []
     reviewed_files: list[str] = []
 
     for file_info in files[:MAX_FILES]:
@@ -127,11 +129,13 @@ def build_diff_payload(state: ReviewState) -> ReviewState:
 
         if remaining <= 0:
             truncated = True
+            truncation_reasons.append(f"patch content exceeded {MAX_PATCH_CHARS:,} characters")
             break
 
         if len(patch) > remaining:
             selected_patch = f"{patch[:remaining]}\n[Patch truncated]"
             truncated = True
+            truncation_reasons.append(f"patch content exceeded {MAX_PATCH_CHARS:,} characters")
         else:
             selected_patch = patch
 
@@ -143,6 +147,7 @@ def build_diff_payload(state: ReviewState) -> ReviewState:
 
     if len(files) > MAX_FILES:
         truncated = True
+        truncation_reasons.append(f"changed files exceeded {MAX_FILES}")
 
     diff_payload = "\n\n".join(
         [
@@ -154,16 +159,16 @@ def build_diff_payload(state: ReviewState) -> ReviewState:
             f"Head SHA: {pull['head']['sha']}",
             f"PR Body:\n{pull.get('body') or '[No PR body provided]'}",
             f"Changed files: {len(files)}",
-            (
-                "Note: The diff was truncated. Mention that review coverage was limited if relevant."
-                if truncated
-                else "Note: The full available diff payload was included."
-            ),
             "",
             "\n\n---\n\n".join(reviewed_files),
         ]
     )
-    return {**state, "diff_payload": diff_payload, "truncated": truncated}
+    return {
+        **state,
+        "diff_payload": diff_payload,
+        "truncated": truncated,
+        "truncation_reasons": sorted(set(truncation_reasons)),
+    }
 
 
 def review_with_openai(state: ReviewState) -> ReviewState:
@@ -181,6 +186,7 @@ def review_with_openai(state: ReviewState) -> ReviewState:
                     "Avoid purely stylistic comments unless they materially affect maintainability or correctness.",
                     "If there are no actionable findings, say: No actionable issues found.",
                     "Do not invent issues that are not supported by the diff.",
+                    "Do not include meta commentary about review coverage or diff truncation.",
                 ]
             )
         ),
@@ -198,17 +204,26 @@ def upsert_comment(state: ReviewState) -> ReviewState:
     token = require_env("GITHUB_TOKEN")
     model = os.getenv("OPENAI_MODEL", "gpt-5.4")
     comments_path = f"/repos/{repo['owner']['login']}/{repo['name']}/issues/{pull['number']}/comments"
-    comment_body = "\n".join(
-        [
-            COMMENT_MARKER,
-            "## AI Code Review",
-            "",
-            f"Reviewed commit: `{pull['head']['sha']}`",
-            f"Model: `{model}`",
-            "",
-            state["review_text"],
-        ]
-    )
+    comment_parts = [
+        COMMENT_MARKER,
+        "## AI Code Review",
+        "",
+        f"Reviewed commit: `{pull['head']['sha']}`",
+        f"Model: `{model}`",
+        "",
+        state["review_text"],
+    ]
+
+    if state.get("truncated"):
+        reasons = ", ".join(state.get("truncation_reasons", [])) or "diff size limit reached"
+        comment_parts.extend(
+            [
+                "",
+                f"_Coverage note: some changes were omitted because {reasons}._",
+            ]
+        )
+
+    comment_body = "\n".join(comment_parts)
 
     comments = github_paginate(comments_path, token)
     existing_comment = next(

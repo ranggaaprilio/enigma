@@ -4,6 +4,7 @@ import { useAuth } from "../auth/context";
 import { DashboardShell } from "../components/DashboardShell";
 import { CustomCommandsPanel } from "../components/CustomCommandsPanel";
 import { EditorPanel } from "../components/EditorPanel";
+import { FileManagementPanel } from "../components/FileManagementPanel";
 import { PreviewPanel } from "../components/PreviewPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import {
@@ -39,7 +40,14 @@ type WorkspaceState =
   | { status: "ready"; workspace: WorkspaceResponse | null; envVars: WorkspaceEnvVarResponse[] }
   | { status: "error"; message: string };
 
-type DashboardTab = "overview" | "repository" | "commands" | "editor" | "terminal" | "preview";
+type DashboardTab =
+  | "overview"
+  | "repository"
+  | "files"
+  | "commands"
+  | "editor"
+  | "terminal"
+  | "preview";
 type PreviewStatusSnapshot = {
   status: "inactive" | "active" | "stopped" | "error";
   port: number | null;
@@ -48,6 +56,7 @@ type PreviewStatusSnapshot = {
 const dashboardTabs: { id: DashboardTab; label: string }[] = [
   { id: "overview", label: "Overview" },
   { id: "repository", label: "Repository" },
+  { id: "files", label: "Files" },
   { id: "commands", label: "Commands" },
   { id: "editor", label: "Editor" },
   { id: "terminal", label: "Terminal" },
@@ -63,6 +72,7 @@ function initialDashboardTab(): DashboardTab {
   }
   if (
     stored === "repository" ||
+    stored === "files" ||
     stored === "commands" ||
     stored === "editor" ||
     stored === "terminal" ||
@@ -256,6 +266,10 @@ export function DashboardRoute() {
 
       {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "terminal" && (
         <TerminalPanel workspace={workspaceState.workspace} />
+      )}
+
+      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "files" && (
+        <FileManagementPanel workspace={workspaceState.workspace} />
       )}
 
       {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "commands" && (
