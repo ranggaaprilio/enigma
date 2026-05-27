@@ -16,6 +16,7 @@ from app.schemas.files import (
     FileRenameRequest,
     FileWriteRequest,
     FolderCreateRequest,
+    normalize_path,
 )
 from app.schemas.workspaces import DeleteResponse
 from app.services.files import (
@@ -38,6 +39,8 @@ SETTINGS_DEP = Depends(get_settings)
 
 
 class FileServiceProtocol(Protocol):
+    settings: Settings
+
     async def tree(self, workspace_id: UUID, owner_id: UUID, path: str | None = None) -> FileNode:
         ...
 
@@ -87,6 +90,27 @@ async def get_file_service(
 FILE_SERVICE_DEP = Depends(get_file_service)
 
 
+def normalize_query_path(path: str) -> str:
+    return normalize_path(path)
+
+
+async def read_limited_body(request: Request, max_bytes: int) -> bytes:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > max_bytes:
+                raise FileTooLargeError
+        except ValueError as error:
+            raise FilePathError from error
+
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > max_bytes:
+            raise FileTooLargeError
+    return bytes(body)
+
+
 def translate_file_error(error: Exception) -> HTTPException:
     if isinstance(error, WorkspaceNotFoundError):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
@@ -101,12 +125,12 @@ def translate_file_error(error: Exception) -> HTTPException:
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail="File already exists")
     if isinstance(error, FileTooLargeError):
         return HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="File is too large",
         )
     if isinstance(error, FileTreeLimitExceededError):
         return HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="File tree is too large",
         )
     if isinstance(error, (FilePathError, FileIgnoredPathError)):
@@ -122,7 +146,7 @@ async def get_file_tree(
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileNode:
     try:
-        return await service.tree(workspace_id, current_user.id, path)
+        return await service.tree(workspace_id, current_user.id, normalize_query_path(path))
     except (
         WorkspaceNotFoundError,
         FileWorkspaceUnavailableError,
@@ -144,7 +168,7 @@ async def read_file(
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileReadResponse:
     try:
-        return await service.read(workspace_id, current_user.id, path)
+        return await service.read(workspace_id, current_user.id, normalize_query_path(path))
     except (
         WorkspaceNotFoundError,
         FileWorkspaceUnavailableError,
@@ -191,11 +215,12 @@ async def upload_file(
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileOperationResponse:
     try:
+        content = await read_limited_body(request, service.settings.file_max_upload_bytes)
         uploaded_path = await service.upload(
             workspace_id,
             current_user.id,
-            path,
-            await request.body(),
+            normalize_query_path(path),
+            content,
             filename,
         )
     except (
@@ -220,7 +245,11 @@ async def download_file(
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileResponse:
     try:
-        target = await service.download_path(workspace_id, current_user.id, path)
+        target = await service.download_path(
+            workspace_id,
+            current_user.id,
+            normalize_query_path(path),
+        )
     except (
         WorkspaceNotFoundError,
         FileWorkspaceUnavailableError,
@@ -294,7 +323,7 @@ async def delete_file(
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> DeleteResponse:
     try:
-        await service.delete(workspace_id, current_user.id, path)
+        await service.delete(workspace_id, current_user.id, normalize_query_path(path))
     except (
         WorkspaceNotFoundError,
         FileWorkspaceUnavailableError,

@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -223,11 +224,7 @@ class FileService:
             return []
         results: list[FileSearchResult] = []
         visited = 0
-        for item in workspace_root.rglob("*"):
-            if self._is_ignored_relative(workspace_root, item):
-                if item.is_dir():
-                    continue
-                continue
+        for item in self._walk_visible(workspace_root):
             visited += 1
             if visited > self.settings.file_tree_max_entries:
                 break
@@ -310,10 +307,30 @@ class FileService:
         return any(part in IGNORED_PATH_PARTS for part in relative.parts)
 
     def _relative_path(self, workspace_root: Path, target: Path) -> str:
+        if target == workspace_root:
+            return ""
         try:
             return target.relative_to(workspace_root).as_posix()
         except ValueError:
             return ""
+
+    def _walk_visible(self, workspace_root: Path):
+        for current_root, dirnames, filenames in os.walk(workspace_root):
+            current_path = Path(current_root)
+            dirnames[:] = sorted(
+                (
+                    dirname
+                    for dirname in dirnames
+                    if not self._is_ignored_relative(workspace_root, current_path / dirname)
+                ),
+                key=str.lower,
+            )
+            for dirname in dirnames:
+                yield current_path / dirname
+            for filename in sorted(filenames, key=str.lower):
+                item = current_path / filename
+                if not self._is_ignored_relative(workspace_root, item):
+                    yield item
 
     def _log(self, event: str, workspace_id: UUID, user_id: UUID, path: str) -> None:
         logger.info(event, workspace_id=str(workspace_id), user_id=str(user_id), path=path, ok=True)

@@ -10,7 +10,7 @@ from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
 from app.models import User, Workspace
-from app.services.files import FileService
+from app.services.files import FileService, FileTooLargeError
 from app.services.users import DuplicateUserEmailError
 
 
@@ -136,6 +136,21 @@ async def test_tree_and_search_ignore_generated_paths(file_context):
     assert search_ignored.json() == []
 
 
+async def test_query_paths_accept_slash_prefixed_workspace_paths(file_context):
+    _user, workspace, workspace_path = file_context
+    (workspace_path / "README.md").write_text("hello", encoding="utf-8")
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        tree = await client.get(f"/workspaces/{workspace.id}/files/tree?path=/")
+        read = await client.get(f"/workspaces/{workspace.id}/files/read?path=/README.md")
+
+    assert tree.status_code == 200
+    assert tree.json()["path"] == ""
+    assert read.status_code == 200
+    assert read.json()["path"] == "README.md"
+
+
 async def test_path_traversal_and_escaped_symlinks_are_rejected(file_context, tmp_path):
     _user, workspace, workspace_path = file_context
     outside_file = tmp_path / "outside.txt"
@@ -202,3 +217,67 @@ async def test_upload_create_rename_and_delete_stay_inside_workspace(file_contex
     assert deleted.status_code == 200
     assert not (workspace_path / "docs" / "renamed.txt").exists()
     assert rejected.status_code == 400
+
+
+async def test_upload_rejects_oversized_content_before_service_upload(file_context, monkeypatch):
+    _user, workspace, workspace_path = file_context
+    service = app.dependency_overrides[files_module.get_file_service]()
+    upload_called = False
+
+    async def fail_upload(*args, **kwargs):
+        nonlocal upload_called
+        upload_called = True
+        raise AssertionError("service upload should not be called")
+
+    monkeypatch.setattr(service, "upload", fail_upload)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        response = await client.post(
+            f"/workspaces/{workspace.id}/files/upload?path=big.txt",
+            content=b"x" * 65,
+            headers={"content-type": "application/octet-stream"},
+        )
+
+    assert response.status_code == 413
+    assert upload_called is False
+    assert not (workspace_path / "big.txt").exists()
+
+
+async def test_limited_body_reader_stops_streaming_after_limit():
+    class StreamingRequest:
+        headers: dict[str, str] = {}
+
+        def __init__(self) -> None:
+            self.chunks_read = 0
+
+        async def stream(self):
+            for chunk in (b"1234", b"5678", b"9", b"0"):
+                self.chunks_read += 1
+                yield chunk
+
+    request = StreamingRequest()
+
+    with pytest.raises(FileTooLargeError):
+        await files_module.read_limited_body(request, 8)
+
+    assert request.chunks_read == 3
+
+
+def test_search_walk_prunes_ignored_directories(file_context):
+    _user, _workspace, workspace_path = file_context
+    (workspace_path / "src").mkdir()
+    (workspace_path / "src" / "app.py").write_text("print('hi')", encoding="utf-8")
+    (workspace_path / "node_modules" / "package").mkdir(parents=True)
+    (workspace_path / "node_modules" / "package" / "index.js").write_text(
+        "ignored",
+        encoding="utf-8",
+    )
+    service = app.dependency_overrides[files_module.get_file_service]()
+
+    walked_paths = [
+        item.relative_to(workspace_path).as_posix()
+        for item in service._walk_visible(workspace_path)
+    ]
+
+    assert walked_paths == ["src", "src/app.py"]
