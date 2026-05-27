@@ -219,6 +219,23 @@ async def test_upload_create_rename_and_delete_stay_inside_workspace(file_contex
     assert rejected.status_code == 400
 
 
+async def test_rename_rejects_directory_moved_into_itself(file_context):
+    _user, workspace, workspace_path = file_context
+    (workspace_path / "src" / "nested").mkdir(parents=True)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        response = await client.patch(
+            f"/workspaces/{workspace.id}/files/rename",
+            json={"path": "src", "new_path": "src/nested/src"},
+        )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "File path is invalid"
+    assert (workspace_path / "src").is_dir()
+    assert not (workspace_path / "src" / "nested" / "src").exists()
+
+
 async def test_upload_rejects_oversized_content_before_service_upload(file_context, monkeypatch):
     _user, workspace, workspace_path = file_context
     service = app.dependency_overrides[files_module.get_file_service]()

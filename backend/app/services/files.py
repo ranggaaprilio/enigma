@@ -186,6 +186,8 @@ class FileService:
         target = self._resolve_target(workspace_root, new_path)
         if target.exists():
             raise FileConflictError
+        if source.is_dir() and self._is_same_or_descendant(source.resolve(), target.resolve()):
+            raise FilePathError
         target.parent.mkdir(parents=True, exist_ok=True)
         source.rename(target)
         relative_path = self._relative_path(workspace_root, target)
@@ -294,6 +296,9 @@ class FileService:
     def _ensure_inside(self, workspace_root: Path, target: Path) -> None:
         if target != workspace_root and workspace_root not in target.parents:
             raise FilePathError
+
+    def _is_same_or_descendant(self, ancestor: Path, target: Path) -> bool:
+        return target == ancestor or ancestor in target.parents
 
     def _is_ignored_relative(self, workspace_root: Path, target: Path) -> bool:
         if target.exists():
