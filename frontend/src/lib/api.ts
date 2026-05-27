@@ -25,6 +25,7 @@ export type EditorSessionStatus = "active" | "stopped" | "error";
 export type EditorAvailability = "inactive" | EditorSessionStatus;
 export type PreviewSessionStatus = "active" | "stopped" | "error";
 export type PreviewAvailability = "inactive" | PreviewSessionStatus;
+export type WorkspaceFileType = "file" | "directory";
 
 export type WorkspaceResponse = {
   id: string;
@@ -93,6 +94,43 @@ export type RepositoryCommitPayload = {
 export type RepositoryOperationResponse = {
   ok: boolean;
   message: string;
+};
+
+export type WorkspaceFileNode = {
+  path: string;
+  name: string;
+  type: WorkspaceFileType;
+  size: number | null;
+  modified_at: string;
+  children: WorkspaceFileNode[];
+};
+
+export type WorkspaceFileReadResponse = {
+  path: string;
+  name: string;
+  type: "file";
+  size: number;
+  modified_at: string;
+  content: string;
+};
+
+export type WorkspaceFileOperationResponse = {
+  ok: boolean;
+  path: string;
+};
+
+export type WorkspaceFileWritePayload = {
+  path: string;
+  content: string;
+};
+
+export type WorkspaceFolderCreatePayload = {
+  path: string;
+};
+
+export type WorkspaceFileRenamePayload = {
+  path: string;
+  new_path: string;
 };
 
 export type AgentEventResponse = {
@@ -264,6 +302,13 @@ export function getCommandRunStreamUrl(workspaceId: string, runId: string) {
   return baseUrl.toString();
 }
 
+export function getWorkspaceFileDownloadUrl(workspaceId: string, path: string) {
+  const baseUrl = new URL(getApiBaseUrl());
+  baseUrl.pathname = `/workspaces/${workspaceId}/files/download`;
+  baseUrl.search = `?path=${encodeURIComponent(path)}`;
+  return baseUrl.toString();
+}
+
 export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
   const response = await fetch(`${getApiBaseUrl()}/health`, { signal });
   const payload = (await response.json()) as HealthResponse;
@@ -432,6 +477,113 @@ export function pushRepository(workspaceId: string): Promise<RepositoryOperation
   return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/push`, {
     method: "POST",
   });
+}
+
+export function getWorkspaceFileTree(
+  workspaceId: string,
+  path = "",
+  signal?: AbortSignal,
+): Promise<WorkspaceFileNode> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  return requestJson<WorkspaceFileNode>(`/workspaces/${workspaceId}/files/tree${query}`, {
+    signal,
+  });
+}
+
+export function readWorkspaceFile(
+  workspaceId: string,
+  path: string,
+  signal?: AbortSignal,
+): Promise<WorkspaceFileReadResponse> {
+  return requestJson<WorkspaceFileReadResponse>(
+    `/workspaces/${workspaceId}/files/read?path=${encodeURIComponent(path)}`,
+    { signal },
+  );
+}
+
+export function writeWorkspaceFile(
+  workspaceId: string,
+  payload: WorkspaceFileWritePayload,
+): Promise<WorkspaceFileOperationResponse> {
+  return requestJson<WorkspaceFileOperationResponse>(`/workspaces/${workspaceId}/files/write`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function uploadWorkspaceFile(
+  workspaceId: string,
+  path: string,
+  file: File | Blob,
+  filename?: string,
+): Promise<WorkspaceFileOperationResponse> {
+  const name =
+    filename ??
+    (typeof File !== "undefined" && file instanceof File ? file.name : undefined) ??
+    "upload.bin";
+  const response = await fetch(
+    `${getApiBaseUrl()}/workspaces/${workspaceId}/files/upload?path=${encodeURIComponent(
+      path,
+    )}&filename=${encodeURIComponent(name)}`,
+    {
+      method: "POST",
+      credentials: "include",
+      headers: { "Content-Type": file.type || "application/octet-stream" },
+      body: file,
+    },
+  );
+  const payload = (await response.json().catch(() => null)) as
+    | { detail?: string }
+    | WorkspaceFileOperationResponse
+    | null;
+
+  if (!response.ok) {
+    const message =
+      payload && typeof payload === "object" && "detail" in payload && payload.detail
+        ? payload.detail
+        : "Request failed";
+    throw new ApiError(message, response.status);
+  }
+
+  return payload as WorkspaceFileOperationResponse;
+}
+
+export function createWorkspaceFolder(
+  workspaceId: string,
+  payload: WorkspaceFolderCreatePayload,
+): Promise<WorkspaceFileOperationResponse> {
+  return requestJson<WorkspaceFileOperationResponse>(`/workspaces/${workspaceId}/files/folders`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function renameWorkspaceFile(
+  workspaceId: string,
+  payload: WorkspaceFileRenamePayload,
+): Promise<WorkspaceFileOperationResponse> {
+  return requestJson<WorkspaceFileOperationResponse>(`/workspaces/${workspaceId}/files/rename`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteWorkspaceFile(workspaceId: string, path: string): Promise<{ ok: boolean }> {
+  return requestJson<{ ok: boolean }>(
+    `/workspaces/${workspaceId}/files?path=${encodeURIComponent(path)}`,
+    { method: "DELETE" },
+  );
+}
+
+export function searchWorkspaceFiles(
+  workspaceId: string,
+  query: string,
+  signal?: AbortSignal,
+): Promise<WorkspaceFileNode[]> {
+  return requestJson<WorkspaceFileNode[]>(
+    `/workspaces/${workspaceId}/files/search?q=${encodeURIComponent(query)}`,
+    { signal },
+  );
 }
 
 export function createAgentRun(

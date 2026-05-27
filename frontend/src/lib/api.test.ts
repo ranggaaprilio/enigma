@@ -7,9 +7,11 @@ import {
   createAgentRun,
   createCustomCommand,
   createTerminalSession,
+  createWorkspaceFolder,
   createWorkspace,
   deleteCustomCommand,
   deleteTerminalSession,
+  deleteWorkspaceFile,
   deleteWorkspaceEnvVar,
   detectPreviewSession,
   getAgentRun,
@@ -21,6 +23,8 @@ import {
   getRepositoryDiff,
   getRepositoryStatus,
   getTerminalSessionSocketUrl,
+  getWorkspaceFileDownloadUrl,
+  getWorkspaceFileTree,
   getWorkspaceStatus,
   listTerminalSessions,
   listCustomCommandRuns,
@@ -33,8 +37,11 @@ import {
   logout,
   pullRepository,
   pushRepository,
+  readWorkspaceFile,
   register,
+  renameWorkspaceFile,
   runCustomCommand,
+  searchWorkspaceFiles,
   startEditorSession,
   stopAgentRun,
   stopEditorSession,
@@ -42,7 +49,9 @@ import {
   stopPreviewSession,
   updateCustomCommand,
   updateWorkspace,
+  uploadWorkspaceFile,
   upsertWorkspaceEnvVar,
+  writeWorkspaceFile,
 } from "./api";
 
 describe("getHealth", () => {
@@ -257,6 +266,77 @@ describe("getHealth", () => {
       7,
       `http://localhost:8000/workspaces/${workspaceId}/repo/push`,
       expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+  });
+
+  it("sends credentialed workspace file requests", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ok: true, path: "src/app.ts" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getWorkspaceFileTree(workspaceId, "src");
+    await readWorkspaceFile(workspaceId, "src/app.ts");
+    await writeWorkspaceFile(workspaceId, { path: "src/app.ts", content: "hello" });
+    await uploadWorkspaceFile(
+      workspaceId,
+      "src",
+      new Blob(["hello"], { type: "text/plain" }),
+      "app.ts",
+    );
+    await createWorkspaceFolder(workspaceId, { path: "docs" });
+    await renameWorkspaceFile(workspaceId, { path: "docs", new_path: "guides" });
+    await deleteWorkspaceFile(workspaceId, "guides");
+    await searchWorkspaceFiles(workspaceId, "app");
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/files/tree?path=src`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/files/read?path=src%2Fapp.ts`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/files/write`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      `http://localhost:8000/workspaces/${workspaceId}/files/upload?path=src&filename=app.ts`,
+      expect.objectContaining({
+        body: expect.any(Blob),
+        credentials: "include",
+        method: "POST",
+      }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      `http://localhost:8000/workspaces/${workspaceId}/files/folders`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      `http://localhost:8000/workspaces/${workspaceId}/files/rename`,
+      expect.objectContaining({ credentials: "include", method: "PATCH" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      7,
+      `http://localhost:8000/workspaces/${workspaceId}/files?path=guides`,
+      expect.objectContaining({ credentials: "include", method: "DELETE" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      8,
+      `http://localhost:8000/workspaces/${workspaceId}/files/search?q=app`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(getWorkspaceFileDownloadUrl(workspaceId, "src/app.ts")).toBe(
+      `http://localhost:8000/workspaces/${workspaceId}/files/download?path=src%2Fapp.ts`,
     );
   });
 

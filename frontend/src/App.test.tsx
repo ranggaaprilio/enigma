@@ -70,6 +70,41 @@ const workspace = {
   updated_at: "2026-05-23T00:00:00Z",
 };
 
+const fileTree = {
+  path: "",
+  name: "workspace",
+  type: "directory",
+  size: null,
+  modified_at: "2026-05-23T00:00:00Z",
+  children: [
+    {
+      path: "src",
+      name: "src",
+      type: "directory",
+      size: null,
+      modified_at: "2026-05-23T00:00:00Z",
+      children: [
+        {
+          path: "src/app.ts",
+          name: "app.ts",
+          type: "file",
+          size: 12,
+          modified_at: "2026-05-23T00:00:00Z",
+          children: [],
+        },
+      ],
+    },
+    {
+      path: "README.md",
+      name: "README.md",
+      type: "file",
+      size: 5,
+      modified_at: "2026-05-23T00:00:00Z",
+      children: [],
+    },
+  ],
+};
+
 class MockWebSocket {
   static instances: MockWebSocket[] = [];
 
@@ -270,6 +305,73 @@ describe("App auth routing", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Push" }));
     expect(await screen.findByText("Changes pushed.")).toBeInTheDocument();
+  });
+
+  it("renders file management and handles search tree download and delete flows", async () => {
+    const openMock = vi.fn();
+    Object.defineProperty(window, "open", { value: openMock, writable: true });
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/files/tree`)) {
+        return Promise.resolve(jsonResponse(fileTree));
+      }
+      if (url.includes(`/workspaces/${workspace.id}/files/search`)) {
+        return Promise.resolve(
+          jsonResponse(url.endsWith("q=README") ? [fileTree.children[1]] : []),
+        );
+      }
+      if (
+        url.endsWith(`/workspaces/${workspace.id}/files?path=README.md`) &&
+        init?.method === "DELETE"
+      ) {
+        return Promise.resolve(jsonResponse({ ok: true }));
+      }
+      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/");
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Files" }));
+    expect(await screen.findByText("src")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Expand src" }));
+    await userEvent.click(await screen.findByText("src/app.ts"));
+    expect(screen.getByText("12 B")).toBeInTheDocument();
+
+    const search = screen.getByPlaceholderText("Search files");
+    await userEvent.type(search, "README");
+    await userEvent.click(await screen.findByText("README.md"));
+    await userEvent.click(screen.getByRole("button", { name: "Download" }));
+    expect(openMock).toHaveBeenCalledWith(
+      `http://localhost:8000/workspaces/${workspace.id}/files/download?path=README.md`,
+      "_blank",
+      "noopener",
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+    expect(screen.getByText("Confirm delete")).toBeInTheDocument();
+    const deleteButtons = screen.getAllByRole("button", { name: "Delete" });
+    await userEvent.click(deleteButtons[deleteButtons.length - 1]);
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://localhost:8000/workspaces/${workspace.id}/files?path=README.md`,
+        expect.objectContaining({ method: "DELETE" }),
+      ),
+    );
   });
 
   it("starts an agent run, renders streamed output, and stops it", async () => {
