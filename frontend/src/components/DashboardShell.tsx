@@ -7,7 +7,9 @@ import {
   useState,
 } from "react";
 import {
+  Bell,
   Bot,
+  CheckCheck,
   Code2,
   Folder,
   GitBranch,
@@ -28,11 +30,16 @@ import {
   createAgentRun,
   getAgentRun,
   getAgentStreamUrl,
+  getNotificationStreamUrl,
   listAgentRuns,
+  listNotifications,
+  markAllNotificationsRead,
+  markNotificationRead,
   stopAgentRun,
   type AgentEventResponse,
   type AgentRunResponse,
   type AgentRunStatus,
+  type NotificationResponse,
   type UserResponse,
   type WorkspaceResponse,
   type WorkspaceStatus,
@@ -79,6 +86,13 @@ function initialCollapsedState(storageKey: string) {
   } catch {
     return false;
   }
+}
+
+function formatDateTime(value: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
 }
 
 export function DashboardShell({
@@ -204,6 +218,7 @@ export function DashboardShell({
             <div className="flex flex-wrap items-center gap-3">
               <StatusPill label={healthLabel} tone={healthTone} />
               <WorkspaceStatusPill status={workspaceStatus} />
+              {user && <NotificationBell />}
               {user && <UserMenu user={user} onLogout={handleLogout} />}
             </div>
           </header>
@@ -247,6 +262,123 @@ export function DashboardShell({
           {!rightSidebarCollapsed && <AgentPanel workspace={workspace} />}
         </aside>
       </div>
+    </div>
+  );
+}
+
+function NotificationBell() {
+  const [notifications, setNotifications] = useState<NotificationResponse[]>([]);
+  const [isOpen, setIsOpen] = useState(false);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    listNotifications(controller.signal)
+      .then((data) => setNotifications(Array.isArray(data) ? data : []))
+      .catch((error: unknown) => {
+        if (error instanceof DOMException && error.name === "AbortError") {
+          return;
+        }
+        setNotifications([]);
+      });
+    return () => controller.abort();
+  }, []);
+
+  useEffect(() => {
+    if (typeof WebSocket === "undefined") {
+      return;
+    }
+    const socket = new WebSocket(getNotificationStreamUrl());
+    socket.onmessage = (event) => {
+      try {
+        const notification = JSON.parse(event.data) as NotificationResponse;
+        setNotifications((current) => [
+          notification,
+          ...current.filter((item) => item.id !== notification.id),
+        ]);
+      } catch {
+        return;
+      }
+    };
+    return () => socket.close();
+  }, []);
+
+  const unreadCount = notifications.filter((notification) => !notification.read_at).length;
+
+  async function handleMarkRead(notificationId: string) {
+    const updated = await markNotificationRead(notificationId);
+    setNotifications((current) =>
+      current.map((notification) =>
+        notification.id === updated.id ? updated : notification,
+      ),
+    );
+  }
+
+  async function handleMarkAllRead() {
+    const updated = await markAllNotificationsRead();
+    setNotifications(Array.isArray(updated) ? updated : []);
+  }
+
+  return (
+    <div className="relative">
+      <button
+        aria-label="Notifications"
+        className="relative flex h-10 w-10 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink"
+        type="button"
+        onClick={() => setIsOpen((current) => !current)}
+      >
+        <Bell className="h-4 w-4" aria-hidden="true" />
+        {unreadCount > 0 && (
+          <span className="absolute -right-1 -top-1 flex min-h-5 min-w-5 items-center justify-center rounded-full bg-danger px-1 text-xs font-semibold text-white">
+            {unreadCount > 9 ? "9+" : unreadCount}
+          </span>
+        )}
+      </button>
+
+      {isOpen && (
+        <div className="absolute right-0 top-12 z-20 w-[min(360px,calc(100vw-2rem))] rounded-md border border-line bg-white shadow-soft">
+          <div className="flex items-center justify-between gap-3 border-b border-line px-4 py-3">
+            <div>
+              <h3 className="text-sm font-semibold">Notifications</h3>
+              <p className="text-xs text-muted">{unreadCount} unread</p>
+            </div>
+            <button
+              aria-label="Mark all notifications read"
+              className="flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
+              type="button"
+              disabled={unreadCount === 0}
+              onClick={() => void handleMarkAllRead()}
+            >
+              <CheckCheck className="h-4 w-4" aria-hidden="true" />
+            </button>
+          </div>
+          <div className="max-h-96 overflow-y-auto">
+            {notifications.length === 0 && (
+              <div className="px-4 py-6 text-sm text-muted">No notifications yet.</div>
+            )}
+            {notifications.map((notification) => (
+              <button
+                key={notification.id}
+                className={`block w-full border-b border-line px-4 py-3 text-left transition last:border-b-0 hover:bg-panel ${
+                  notification.read_at ? "bg-white" : "bg-[#fff8f3]"
+                }`}
+                type="button"
+                onClick={() => void handleMarkRead(notification.id)}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <p className="text-sm font-semibold text-ink">{notification.title}</p>
+                  {!notification.read_at && (
+                    <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-primary" />
+                  )}
+                </div>
+                <p className="mt-1 text-sm text-body">{notification.message}</p>
+                <p className="mt-2 text-xs text-muted">
+                  {formatDateTime(notification.created_at)}
+                </p>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

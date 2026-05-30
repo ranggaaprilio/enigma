@@ -218,6 +218,82 @@ describe("App auth routing", () => {
     expect(screen.getByRole("link", { name: "Dashboard" })).toBeInTheDocument();
   });
 
+  it("renders notifications and workspace audit logs", async () => {
+    vi.stubGlobal("WebSocket", MockWebSocket);
+    Object.defineProperty(window, "WebSocket", {
+      configurable: true,
+      value: MockWebSocket,
+      writable: true,
+    });
+    const notification = {
+      id: "db59cbaa-c95d-4bd5-8984-16a30e4dce15",
+      user_id: authUser.id,
+      workspace_id: workspace.id,
+      type: "agent_run_completed",
+      title: "Agent run completed",
+      message: "The agent run completed successfully.",
+      read_at: null,
+      created_at: "2026-05-25T00:00:00Z",
+    };
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith("/notifications") && !init?.method) {
+        return Promise.resolve(jsonResponse([notification]));
+      }
+      if (url.endsWith(`/notifications/${notification.id}/read`)) {
+        return Promise.resolve(
+          jsonResponse({ ...notification, read_at: "2026-05-25T00:01:00Z" }),
+        );
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/audit-logs`)) {
+        return Promise.resolve(
+          jsonResponse([
+            {
+              id: "c5a17725-eef1-4542-a80a-c8f79eb7983d",
+              user_id: authUser.id,
+              workspace_id: workspace.id,
+              action: "repo_commit",
+              target_type: "repository",
+              target_id: workspace.id,
+              metadata: { message: "Update README" },
+              created_at: "2026-05-25T00:02:00Z",
+            },
+          ]),
+        );
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/");
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Notifications" }));
+    expect(await screen.findByText("Agent run completed")).toBeInTheDocument();
+    await userEvent.click(screen.getByText("Agent run completed"));
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        `http://localhost:8000/notifications/${notification.id}/read`,
+        expect.objectContaining({ method: "PATCH" }),
+      ),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Audit" }));
+    expect(await screen.findByText("repo_commit")).toBeInTheDocument();
+    expect(screen.getByText("message: Update README")).toBeInTheDocument();
+  });
+
   it("logs out and returns to the login route", async () => {
     const fetchMock = vi.fn((url: string) => {
       if (url.endsWith("/auth/me")) {
@@ -435,9 +511,18 @@ describe("App auth routing", () => {
         expect.objectContaining({ method: "POST" }),
       ),
     );
-    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    await waitFor(() =>
+      expect(
+        MockWebSocket.instances.some((socket) =>
+          socket.url.endsWith(`/workspaces/${workspace.id}/agent/runs/${run.id}/stream`),
+        ),
+      ).toBe(true),
+    );
+    const agentSocket = MockWebSocket.instances.find((socket) =>
+      socket.url.endsWith(`/workspaces/${workspace.id}/agent/runs/${run.id}/stream`),
+    );
     act(() => {
-      MockWebSocket.instances[0].emit({
+      agentSocket?.emit({
         id: "9f835690-6ac1-4bbf-a53f-68cde51f21e5",
         agent_run_id: run.id,
         event_type: "output_text",
@@ -528,10 +613,19 @@ describe("App auth routing", () => {
     expect(screen.getByRole("heading", { name: "Confirm command" })).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Confirm run" }));
 
-    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
+    await waitFor(() =>
+      expect(
+        MockWebSocket.instances.some((socket) =>
+          socket.url.endsWith(`/workspaces/${workspace.id}/command-runs/${run.id}/stream`),
+        ),
+      ).toBe(true),
+    );
+    const commandSocket = MockWebSocket.instances.find((socket) =>
+      socket.url.endsWith(`/workspaces/${workspace.id}/command-runs/${run.id}/stream`),
+    );
     act(() => {
-      MockWebSocket.instances[0].emit({ type: "output", content: "ok\n" });
-      MockWebSocket.instances[0].emit({ type: "status", status: "completed", exit_code: 0 });
+      commandSocket?.emit({ type: "output", content: "ok\n" });
+      commandSocket?.emit({ type: "status", status: "completed", exit_code: 0 });
     });
 
     expect(await screen.findByText("ok")).toBeInTheDocument();
@@ -592,10 +686,20 @@ describe("App auth routing", () => {
 
     await userEvent.click(await screen.findByRole("button", { name: "Terminal" }));
 
-    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1));
-    expect(MockWebSocket.instances[0].url).toBe(
-      `ws://localhost:8000/workspaces/${workspace.id}/terminal/sessions/${session.id}`,
+    await waitFor(() =>
+      expect(
+        MockWebSocket.instances.some((socket) =>
+          socket.url.endsWith(`/workspaces/${workspace.id}/terminal/sessions/${session.id}`),
+        ),
+      ).toBe(true),
     );
+    expect(
+      MockWebSocket.instances.some(
+        (socket) =>
+          socket.url ===
+          `ws://localhost:8000/workspaces/${workspace.id}/terminal/sessions/${session.id}`,
+      ),
+    ).toBe(true);
   });
 
   it("opens the editor tab and launches code-server in a new browser tab", async () => {

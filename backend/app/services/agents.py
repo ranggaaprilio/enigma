@@ -11,6 +11,8 @@ from app.core.config import Settings
 from app.models import AgentEvent, AgentRun, Workspace
 from app.services.agent_providers import AgentProvider, MockAgentProvider, OpenAIResponsesProvider
 from app.services.agent_tools import WorkspaceTools
+from app.services.audit import AuditLogService
+from app.services.notifications import NotificationService
 from app.services.workspaces import WorkspaceNotFoundError
 
 ACTIVE_RUN_STATUSES = ("thinking", "executing")
@@ -122,6 +124,14 @@ class AgentService:
         await self.session.flush()
         await self.session.commit()
         await self.session.refresh(run)
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace.id,
+            action="agent_run_start",
+            target_type="agent_run",
+            target_id=run.id,
+            metadata={"provider": run.provider, "model": run.model},
+        )
 
         stop_event = asyncio.Event()
         task = asyncio.create_task(self._execute_run(run.id, stop_event))
@@ -183,6 +193,7 @@ class AgentService:
             await self.session.refresh(event)
             await self.session.refresh(run)
             await self.runtime.publish(run.id, event_payload(event))
+            await self._record_run_finished(self.session, run)
         self.runtime.request_stop(run.id)
         return run
 
@@ -241,6 +252,7 @@ class AgentService:
                         run.status,
                         {"status": run.status},
                     )
+                    await self._record_run_finished(session, run)
             except asyncio.CancelledError:
                 await self._mark_stopped(run_id)
             except Exception as error:
@@ -278,6 +290,7 @@ class AgentService:
             await session.flush()
             await self._persist_event(session, run.id, "status", "stopped", {"status": "stopped"})
             await session.commit()
+            await self._record_run_finished(session, run)
 
     async def _mark_error(self, run_id: UUID, message: str) -> None:
         async with self.session_maker() as session:
@@ -291,3 +304,30 @@ class AgentService:
             await session.flush()
             await self._persist_event(session, run.id, "error", message, {})
             await session.commit()
+            await self._record_run_finished(session, run)
+
+    async def _record_run_finished(self, session: AsyncSession, run: AgentRun) -> None:
+        notification_type = (
+            "agent_run_completed" if run.status == "completed" else "agent_run_failed"
+        )
+        title = "Agent run completed" if run.status == "completed" else "Agent run needs attention"
+        message = (
+            "The agent run completed successfully."
+            if run.status == "completed"
+            else f"The agent run finished with status {run.status}."
+        )
+        await NotificationService(session).create(
+            user_id=run.user_id,
+            workspace_id=run.workspace_id,
+            notification_type=notification_type,
+            title=title,
+            message=message,
+        )
+        await AuditLogService(session).record(
+            user_id=run.user_id,
+            workspace_id=run.workspace_id,
+            action="agent_run_finish",
+            target_type="agent_run",
+            target_id=run.id,
+            metadata={"status": run.status, "tokens_used": run.tokens_used},
+        )

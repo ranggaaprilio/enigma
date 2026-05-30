@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.models import Workspace
 from app.schemas.files import FileNode, FileReadResponse
+from app.services.audit import AuditLogService
 from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
@@ -138,7 +139,9 @@ class FileService:
             raise FilePathError
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
-        self._log("file_write", workspace_id, owner_id, self._relative_path(workspace_root, target))
+        relative_path = self._relative_path(workspace_root, target)
+        self._log("file_write", workspace_id, owner_id, relative_path)
+        await self._audit(owner_id, workspace_id, "file_write", relative_path)
 
     async def upload(
         self,
@@ -159,6 +162,7 @@ class FileService:
         target.write_bytes(content)
         relative_path = self._relative_path(workspace_root, target)
         self._log("file_upload", workspace_id, owner_id, relative_path)
+        await self._audit(owner_id, workspace_id, "file_upload", relative_path)
         return relative_path
 
     async def create_folder(self, workspace_id: UUID, owner_id: UUID, path: str) -> None:
@@ -171,6 +175,12 @@ class FileService:
             "file_folder_create",
             workspace_id,
             owner_id,
+            self._relative_path(workspace_root, target),
+        )
+        await self._audit(
+            owner_id,
+            workspace_id,
+            "file_folder_create",
             self._relative_path(workspace_root, target),
         )
 
@@ -199,6 +209,13 @@ class FileService:
             new_path=relative_path,
             ok=True,
         )
+        await self._audit(
+            owner_id,
+            workspace_id,
+            "file_rename",
+            relative_path,
+            {"from_path": self._relative_path(workspace_root, source)},
+        )
         return relative_path
 
     async def delete(self, workspace_id: UUID, owner_id: UUID, path: str) -> None:
@@ -212,7 +229,9 @@ class FileService:
             shutil.rmtree(target)
         else:
             target.unlink()
-        self._log("file_delete", workspace_id, owner_id, path)
+        relative_path = self._relative_path(workspace_root, target)
+        self._log("file_delete", workspace_id, owner_id, relative_path)
+        await self._audit(owner_id, workspace_id, "file_delete", relative_path)
 
     async def search(
         self,
@@ -339,3 +358,20 @@ class FileService:
 
     def _log(self, event: str, workspace_id: UUID, user_id: UUID, path: str) -> None:
         logger.info(event, workspace_id=str(workspace_id), user_id=str(user_id), path=path, ok=True)
+
+    async def _audit(
+        self,
+        user_id: UUID,
+        workspace_id: UUID,
+        action: str,
+        path: str,
+        metadata: dict | None = None,
+    ) -> None:
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            action=action,
+            target_type="file",
+            target_id=path or "/",
+            metadata={"path": path, **(metadata or {})},
+        )

@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import TerminalSession, Workspace
+from app.services.audit import AuditLogService
 from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
@@ -60,6 +61,7 @@ class TerminalService:
             .limit(1)
         )
         terminal_session = result.scalar_one_or_none()
+        is_new_session = terminal_session is None
         if terminal_session is None:
             terminal_session = TerminalSession(
                 workspace_id=workspace.id,
@@ -85,6 +87,15 @@ class TerminalService:
         await self._ensure_tmux_session(terminal_session, workspace_path)
         await self.session.commit()
         await self.session.refresh(terminal_session)
+        if is_new_session:
+            await AuditLogService(self.session).record(
+                user_id=user_id,
+                workspace_id=workspace.id,
+                action="terminal_session_start",
+                target_type="terminal_session",
+                target_id=terminal_session.id,
+                metadata={"name": terminal_session.name},
+            )
         return terminal_session
 
     async def list_for_workspace(self, workspace_id: UUID, user_id: UUID) -> list[TerminalSession]:
@@ -123,6 +134,14 @@ class TerminalService:
         terminal_session.last_active_at = datetime.now(UTC)
         self.session.add(terminal_session)
         await self.session.commit()
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            action="terminal_session_stop",
+            target_type="terminal_session",
+            target_id=terminal_session.id,
+            metadata={"name": terminal_session.name},
+        )
         logger.info(
             "terminal_session_stop",
             terminal_session_id=str(terminal_session.id),

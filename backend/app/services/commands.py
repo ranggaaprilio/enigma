@@ -13,6 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.core.config import Settings
 from app.models import CommandRun, CustomCommand, Workspace
 from app.services.agent_tools import DANGEROUS_COMMANDS, DANGEROUS_TOKENS, DangerousCommandError
+from app.services.audit import AuditLogService
+from app.services.notifications import NotificationService
 from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
@@ -104,6 +106,14 @@ class CommandService:
         await self.session.flush()
         await self.session.commit()
         await self.session.refresh(custom_command)
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace.id,
+            action="custom_command_create",
+            target_type="custom_command",
+            target_id=custom_command.id,
+            metadata={"name": custom_command.name},
+        )
         logger.info(
             "custom_command_create",
             custom_command_id=str(custom_command.id),
@@ -135,6 +145,14 @@ class CommandService:
         await self.session.flush()
         await self.session.commit()
         await self.session.refresh(custom_command)
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            action="custom_command_update",
+            target_type="custom_command",
+            target_id=custom_command.id,
+            metadata={"name": custom_command.name},
+        )
         logger.info(
             "custom_command_update",
             custom_command_id=str(custom_command.id),
@@ -145,8 +163,17 @@ class CommandService:
 
     async def delete_command(self, workspace_id: UUID, command_id: UUID, user_id: UUID) -> None:
         custom_command = await self._get_command(workspace_id, command_id, user_id)
+        command_name = custom_command.name
         await self.session.delete(custom_command)
         await self.session.commit()
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            action="custom_command_delete",
+            target_type="custom_command",
+            target_id=command_id,
+            metadata={"name": command_name},
+        )
         logger.info(
             "custom_command_delete",
             custom_command_id=str(command_id),
@@ -176,6 +203,14 @@ class CommandService:
         await self.session.flush()
         await self.session.commit()
         await self.session.refresh(run)
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=custom_command.workspace_id,
+            action="command_run_start",
+            target_type="command_run",
+            target_id=run.id,
+            metadata={"custom_command_id": custom_command.id, "name": custom_command.name},
+        )
 
         task = asyncio.create_task(self._execute_run(run.id, confirmed))
         self.runtime.register_run(run.id, task)
@@ -350,6 +385,45 @@ class CommandService:
             user_id=str(run.user_id),
             status=run.status,
             exit_code=run.exit_code,
+        )
+        if not hasattr(session, "get"):
+            return
+        custom_command = await session.get(CustomCommand, run.custom_command_id)
+        command_name = custom_command.name if custom_command is not None else "Custom command"
+        notification_type = (
+            "command_run_completed"
+            if run.status == "completed"
+            else "command_run_failed"
+        )
+        title = (
+            "Command completed"
+            if run.status == "completed"
+            else "Command needs attention"
+        )
+        message = (
+            f"{command_name} completed successfully."
+            if run.status == "completed"
+            else f"{command_name} finished with status {run.status}."
+        )
+        await NotificationService(session).create(
+            user_id=run.user_id,
+            workspace_id=run.workspace_id,
+            notification_type=notification_type,
+            title=title,
+            message=message,
+        )
+        await AuditLogService(session).record(
+            user_id=run.user_id,
+            workspace_id=run.workspace_id,
+            action="command_run_finish",
+            target_type="command_run",
+            target_id=run.id,
+            metadata={
+                "custom_command_id": run.custom_command_id,
+                "name": command_name,
+                "status": run.status,
+                "exit_code": run.exit_code,
+            },
         )
 
     def _workspace_path(self, workspace: Workspace) -> Path:
