@@ -208,7 +208,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
   }[panelState.status];
 
   return (
-    <section className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+    <section className="rounded-md border border-line bg-white p-5 shadow-soft">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
@@ -222,7 +222,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
             {session ? ` :${session.port}` : ""}
           </span>
           <button
-            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={busyAction !== null}
             onClick={() => void detectPreview()}
@@ -231,7 +231,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
             {busyAction === "detect" ? "Detecting..." : "Detect/Open"}
           </button>
           <button
-            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={busyAction !== null || !session}
             onClick={() => void refreshPreview()}
@@ -240,7 +240,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
             {busyAction === "refresh" ? "Refreshing..." : "Refresh"}
           </button>
           <button
-            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={!iframeUrl}
             onClick={() => void copyPreviewUrl()}
@@ -250,7 +250,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
           </button>
           <button
             aria-label="Stop preview"
-            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={busyAction !== null || session?.status !== "active"}
             onClick={() => void stopPreview()}
@@ -268,8 +268,8 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
             aria-pressed={deviceMode === id}
             className={`flex h-9 min-w-10 items-center justify-center rounded-md px-3 text-sm font-semibold transition ${
               deviceMode === id
-                ? "bg-ink text-white"
-                : "text-ink/65 hover:bg-[#f5f1e8] hover:text-ink"
+                ? "bg-primary text-white"
+                : "text-ink/65 hover:bg-panel hover:text-ink"
             }`}
             title={label}
             type="button"
@@ -300,7 +300,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
       )}
 
       {iframeUrl && (
-        <div className="flex justify-center overflow-auto rounded-md border border-[#0b1118] bg-[#111820] p-2">
+        <div className="flex justify-center overflow-auto rounded-lg border border-line bg-panel p-2">
           <iframe
             key={frameVersion}
             className={`h-[680px] min-h-[420px] w-full ${deviceWidthClass[deviceMode]} rounded-sm border-0 bg-white`}

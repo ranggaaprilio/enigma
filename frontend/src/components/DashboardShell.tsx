@@ -131,20 +131,20 @@ export function DashboardShell({
     ];
 
   return (
-    <div className="min-h-screen bg-[#ece7dc] text-ink">
+    <div className="min-h-screen bg-canvas text-ink">
       <div className={layoutClass}>
-        <aside className="border-b border-line bg-ink px-4 py-5 text-white lg:border-b-0 lg:border-r">
+        <aside className="border-b border-line bg-canvas px-4 py-5 text-ink lg:border-b-0 lg:border-r">
           <div className="mb-8 flex items-start justify-between gap-2">
             <div className="flex min-w-0 items-center gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-white text-ink">
+              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-primary text-white">
                 <Workflow className="h-5 w-5" aria-hidden="true" />
               </div>
               {!leftSidebarCollapsed && (
                 <div className="min-w-0">
-                  <p className="text-sm uppercase tracking-[0.18em] text-white/55">
+                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">
                     Execute
                   </p>
-                  <h1 className="mt-2 text-2xl font-semibold">Dashboard</h1>
+                  <h1 className="mt-2 text-2xl font-normal tracking-[-0.03em]">Dashboard</h1>
                 </div>
               )}
             </div>
@@ -154,7 +154,7 @@ export function DashboardShell({
                   ? "Expand left sidebar"
                   : "Collapse left sidebar"
               }
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-white/15 text-white/75 transition hover:bg-white/10 hover:text-white"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-line-strong bg-white text-muted transition hover:bg-panel hover:text-ink"
               type="button"
               onClick={() => setLeftSidebarCollapsed((current) => !current)}
             >
@@ -182,8 +182,8 @@ export function DashboardShell({
                     : "px-3 py-2"
                 } ${
                   label === "Dashboard"
-                    ? "bg-white text-ink"
-                    : "text-white/72 hover:bg-white/10 hover:text-white"
+                    ? "bg-primary text-white"
+                    : "text-body hover:bg-white hover:text-ink"
                 }`}
               >
                 <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
@@ -194,12 +194,12 @@ export function DashboardShell({
         </aside>
 
         <div className="flex min-h-screen min-w-0 flex-col">
-          <header className="flex min-h-16 flex-wrap items-center justify-between gap-3 border-b border-line bg-panel px-5 py-3">
+          <header className="flex min-h-16 flex-wrap items-center justify-between gap-3 border-b border-line bg-canvas px-5 py-3">
             <div>
-              <p className="text-xs font-medium uppercase tracking-[0.16em] text-ink/55">
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted">
                 Local foundation
               </p>
-              <h2 className="text-xl font-semibold">AI Agent Control Room</h2>
+              <h2 className="text-2xl font-normal tracking-[-0.02em]">AI Agent Control Room</h2>
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <StatusPill label={healthLabel} tone={healthTone} />
@@ -210,16 +210,16 @@ export function DashboardShell({
 
           <main className="flex-1 px-5 py-5">{children}</main>
 
-          <footer className="border-t border-line bg-panel px-5 py-3 text-sm text-ink/70">
+          <footer className="border-t border-line bg-canvas px-5 py-3 text-sm text-body">
             API: {healthLabel} | Workspace: {workspaceStatus} | Preview: {previewStatusLabel}
           </footer>
         </div>
 
-        <aside className="border-t border-line bg-[#fffdf8] px-4 py-5 lg:border-l lg:border-t-0">
+        <aside className="border-t border-line bg-panel px-4 py-5 lg:border-l lg:border-t-0">
           <div className="mb-4 flex items-center justify-between gap-2">
             <div className="flex min-w-0 items-center gap-3">
               {!rightSidebarCollapsed && (
-                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-line bg-white text-ink">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md border border-line bg-white text-primary">
                   <Bot className="h-5 w-5" aria-hidden="true" />
                 </div>
               )}
@@ -233,7 +233,7 @@ export function DashboardShell({
                   ? "Expand agent panel"
                   : "Collapse agent panel"
               }
-              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-[#f5f1e8] hover:text-ink"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink"
               type="button"
               onClick={() => setRightSidebarCollapsed((current) => !current)}
             >
@@ -444,14 +444,14 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
         </label>
         <div className="grid grid-cols-2 gap-2">
           <button
-            className="rounded-md bg-ink px-3 py-2 font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+            className="rounded-md bg-primary px-3 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="submit"
             disabled={!workspace || isSubmitting || !prompt.trim() || canStop}
           >
             {isSubmitting ? "Starting..." : "Run"}
           </button>
           <button
-            className="rounded-md border border-line bg-white px-3 py-2 font-semibold transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-md border border-line bg-white px-3 py-2 font-semibold transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={!canStop}
             onClick={() => void handleStop()}
@@ -522,7 +522,7 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
             <div className="mt-3 flex items-center justify-between gap-2">
               <span className="capitalize text-ink/55">{run.status}</span>
               <button
-                className="rounded-md border border-line px-2 py-1 text-xs font-semibold transition hover:bg-[#f5f1e8]"
+                className="rounded-md border border-line px-2 py-1 text-xs font-semibold transition hover:bg-panel"
                 type="button"
                 onClick={() => rerun(run)}
               >
@@ -538,12 +538,12 @@ function AgentPanel({ workspace }: { workspace: WorkspaceResponse | null }) {
 
 function AgentStatusPill({ status }: { status: AgentRunStatus | "idle" }) {
   const toneClass = {
-    idle: "bg-[#e3efe9] text-signal",
-    thinking: "bg-[#e8edf2] text-ink",
-    executing: "bg-[#f7eadc] text-warn",
-    completed: "bg-[#e3efe9] text-signal",
-    error: "bg-[#fde7e3] text-danger",
-    stopped: "bg-white text-ink/60",
+    idle: "bg-white text-muted ring-1 ring-line",
+    thinking: "bg-timeline-thinking text-ink",
+    executing: "bg-timeline-edit text-ink",
+    completed: "bg-timeline-done text-white",
+    error: "bg-[#fff5f2] text-danger",
+    stopped: "bg-white text-muted ring-1 ring-line",
   }[status];
 
   return (
@@ -571,7 +571,7 @@ function UserMenu({
         <p className="text-xs uppercase text-ink/55">{user.role}</p>
       </div>
       <button
-        className="rounded-md border border-line px-3 py-1 text-sm font-medium transition hover:bg-[#f5f1e8]"
+        className="rounded-md border border-line px-3 py-1 text-sm font-medium transition hover:bg-panel"
         type="button"
         onClick={() => void onLogout()}
       >
@@ -589,10 +589,10 @@ function StatusPill({
   tone: DashboardShellProps["healthTone"];
 }) {
   const toneClass = {
-    loading: "bg-[#e8edf2] text-ink",
-    ok: "bg-[#e3efe9] text-signal",
-    degraded: "bg-[#f7eadc] text-warn",
-    error: "bg-[#fde7e3] text-danger",
+    loading: "bg-white text-muted ring-1 ring-line",
+    ok: "bg-white text-signal ring-1 ring-line",
+    degraded: "bg-white text-warn ring-1 ring-line",
+    error: "bg-[#fff5f2] text-danger",
   }[tone];
 
   return (
@@ -610,13 +610,13 @@ function WorkspaceStatusPill({
   status: DashboardShellProps["workspaceStatus"];
 }) {
   const toneClass = {
-    loading: "bg-[#e8edf2] text-ink",
-    none: "bg-white text-ink/60",
-    creating: "bg-[#e8edf2] text-ink",
-    ready: "bg-[#e3efe9] text-signal",
-    busy: "bg-[#f7eadc] text-warn",
-    error: "bg-[#fde7e3] text-danger",
-    stopped: "bg-white text-ink/60",
+    loading: "bg-white text-muted ring-1 ring-line",
+    none: "bg-white text-muted ring-1 ring-line",
+    creating: "bg-white text-ink ring-1 ring-line",
+    ready: "bg-white text-signal ring-1 ring-line",
+    busy: "bg-white text-warn ring-1 ring-line",
+    error: "bg-[#fff5f2] text-danger",
+    stopped: "bg-white text-muted ring-1 ring-line",
   }[status];
 
   const label = status === "none" ? "No workspace" : `Workspace ${status}`;

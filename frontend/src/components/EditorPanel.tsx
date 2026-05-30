@@ -1,8 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 
 import {
   ApiError,
-  getApiBaseUrl,
   getEditorStatus,
   startEditorSession,
   stopEditorSession,
@@ -20,6 +19,7 @@ type EditorPanelState =
 export function EditorPanel({ workspace }: { workspace: WorkspaceResponse }) {
   const [panelState, setPanelState] = useState<EditorPanelState>({ status: "loading" });
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  const [blockedEditorUrl, setBlockedEditorUrl] = useState<string | null>(null);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -66,18 +66,19 @@ export function EditorPanel({ workspace }: { workspace: WorkspaceResponse }) {
       ? panelState.session
       : null;
 
-  const iframeUrl = useMemo(() => {
-    if (!session || session.status !== "active") {
-      return null;
-    }
-    return new URL(session.url, getApiBaseUrl()).toString();
-  }, [session]);
+  const activeEditorUrl = session?.status === "active" ? session.url : null;
+
+  function openEditorUrl(url: string) {
+    const opened = window.open(url, "_blank", "noopener,noreferrer");
+    setBlockedEditorUrl(opened ? null : url);
+  }
 
   async function startEditor() {
     setBusyAction("start");
     try {
       const nextSession = await startEditorSession(workspace.id);
       setPanelState({ status: "ready", session: nextSession });
+      openEditorUrl(nextSession.url);
     } catch (caughtError) {
       setPanelState({
         status: "error",
@@ -95,6 +96,7 @@ export function EditorPanel({ workspace }: { workspace: WorkspaceResponse }) {
       await stopEditorSession(workspace.id).catch(() => null);
       const nextSession = await startEditorSession(workspace.id);
       setPanelState({ status: "ready", session: nextSession });
+      openEditorUrl(nextSession.url);
     } catch (caughtError) {
       setPanelState({
         status: "error",
@@ -131,7 +133,7 @@ export function EditorPanel({ workspace }: { workspace: WorkspaceResponse }) {
   }[panelState.status];
 
   return (
-    <section className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+    <section className="rounded-md border border-line bg-white p-5 shadow-soft">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
@@ -144,15 +146,15 @@ export function EditorPanel({ workspace }: { workspace: WorkspaceResponse }) {
             {statusLabel}
           </span>
           <button
-            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={busyAction !== null}
             onClick={() => void startEditor()}
           >
-            {busyAction === "start" ? "Starting..." : "Open"}
+            {busyAction === "start" ? "Opening..." : "Open new tab"}
           </button>
           <button
-            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={busyAction !== null}
             onClick={() => void restartEditor()}
@@ -160,7 +162,7 @@ export function EditorPanel({ workspace }: { workspace: WorkspaceResponse }) {
             {busyAction === "restart" ? "Restarting..." : "Restart"}
           </button>
           <button
-            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={busyAction !== null || session?.status !== "active"}
             onClick={() => void stopEditor()}
@@ -188,12 +190,33 @@ export function EditorPanel({ workspace }: { workspace: WorkspaceResponse }) {
         </div>
       )}
 
-      {iframeUrl && (
-        <iframe
-          className="h-[680px] min-h-[420px] w-full rounded-md border border-[#0b1118] bg-[#111820]"
-          src={iframeUrl}
-          title={`${workspace.name} editor`}
-        />
+      {activeEditorUrl && (
+        <div className="rounded-md border border-line bg-white p-6">
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-ink">code-server is ready</p>
+              <p className="mt-1 break-all font-mono text-xs text-ink/60">{activeEditorUrl}</p>
+            </div>
+            <button
+              className="rounded-md border border-line bg-[#26251e] px-3 py-2 text-sm font-medium text-white transition hover:bg-[#3a382f] disabled:cursor-not-allowed disabled:opacity-50"
+              type="button"
+              disabled={busyAction !== null}
+              onClick={() => openEditorUrl(activeEditorUrl)}
+            >
+              Open new tab
+            </button>
+          </div>
+          {blockedEditorUrl && (
+            <a
+              className="mt-4 inline-flex rounded-md border border-line bg-white px-3 py-2 text-sm font-medium text-ink underline-offset-4 hover:underline"
+              href={blockedEditorUrl}
+              rel="noreferrer"
+              target="_blank"
+            >
+              Continue to code-server
+            </a>
+          )}
+        </div>
       )}
     </section>
   );

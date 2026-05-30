@@ -3,8 +3,9 @@
 @tailwind utilities;
 
 :root {
-  color: #172026;
-  background: #ece7dc;
+  color: #26251e;
+  background: #f7f7f4;
+  font-family: Inter, system-ui, "Helvetica Neue", Helvetica, Arial, sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
@@ -15,6 +16,7 @@ body {
   margin: 0;
   min-width: 320px;
   min-height: 100vh;
+  background: #f7f7f4;
 }
 
 button,
@@ -22,6 +24,20 @@ input,
 textarea,
 select {
   font: inherit;
+}
+
+code,
+kbd,
+pre,
+.terminal-frame {
+  font-family:
+    "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+    "Liberation Mono", monospace;
+}
+
+::selection {
+  background: #dfa88f;
+  color: #26251e;
 }
 
 .terminal-frame .xterm {

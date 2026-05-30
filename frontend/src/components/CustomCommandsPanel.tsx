@@ -247,7 +247,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
   }
 
   return (
-    <section className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+    <section className="rounded-md border border-line bg-white p-5 shadow-soft">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
@@ -256,7 +256,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
           <h3 className="mt-1 text-base font-semibold">{workspace.name}</h3>
         </div>
         <button
-          className="flex items-center gap-2 rounded-md bg-ink px-3 py-2 text-sm font-semibold text-white transition hover:bg-ink/90"
+          className="flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-white transition hover:bg-primary-active"
           type="button"
           onClick={openCreateModal}
         >
@@ -295,7 +295,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                     <TerminalSquare className="h-4 w-4 shrink-0 text-ink/55" aria-hidden="true" />
                     <span className="truncate font-semibold">{command.name}</span>
                   </div>
-                  <code className="mt-2 block truncate rounded-md bg-[#f5f1e8] px-2 py-1 text-xs text-ink/75">
+                  <code className="mt-2 block truncate rounded-md bg-panel px-2 py-1 text-xs text-ink/75">
                     {command.command}
                   </code>
                 </div>
@@ -307,7 +307,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                 <div className="mt-3 flex items-center justify-between gap-2 text-xs text-ink/60">
                   <span className="truncate">{command.description}</span>
                   {command.hotkey && (
-                    <kbd className="rounded border border-line bg-[#fffdf8] px-2 py-1 font-mono">
+                    <kbd className="rounded border border-line bg-white px-2 py-1 font-mono">
                       {command.hotkey}
                     </kbd>
                   )}
@@ -326,14 +326,14 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
               <div className="flex flex-wrap items-start justify-between gap-3 border-b border-line p-4">
                 <div className="min-w-0">
                   <h4 className="text-lg font-semibold">{selectedCommand.name}</h4>
-                  <code className="mt-2 block break-words rounded-md bg-[#f5f1e8] px-2 py-1 text-xs text-ink/75">
+                  <code className="mt-2 block break-words rounded-md bg-panel px-2 py-1 text-xs text-ink/75">
                     {selectedCommand.command}
                   </code>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     aria-label="Run command"
-                    className="flex h-10 w-10 items-center justify-center rounded-md bg-ink text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+                    className="flex h-10 w-10 items-center justify-center rounded-md bg-primary text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
                     type="button"
                     disabled={isRunning || activeRun?.status === "running"}
                     title="Run command"
@@ -343,7 +343,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                   </button>
                   <button
                     aria-label="Edit command"
-                    className="flex h-10 w-10 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-[#f5f1e8] hover:text-ink"
+                    className="flex h-10 w-10 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink"
                     type="button"
                     title="Edit command"
                     onClick={() => openEditModal(selectedCommand)}
@@ -368,7 +368,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                     <h5 className="font-semibold">Output</h5>
                     <CommandStatusPill status={activeRun?.status ?? "idle"} />
                   </div>
-                  <pre className="min-h-[360px] max-h-[520px] overflow-auto whitespace-pre-wrap break-words rounded-md border border-[#0b1118] bg-[#111820] p-4 font-mono text-xs leading-5 text-[#f8f4ea]">
+                  <pre className="min-h-[360px] max-h-[520px] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-line bg-panel p-4 font-mono text-xs leading-5 text-ink">
                     {visibleOutput || "Run output will appear here."}
                   </pre>
                 </div>
@@ -376,7 +376,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                 <div className="space-y-2">
                   <h5 className="font-semibold">Run history</h5>
                   {runs.length === 0 && (
-                    <div className="rounded-md border border-dashed border-line bg-[#fffdf8] p-3 text-sm text-ink/60">
+                    <div className="rounded-md border border-dashed border-line bg-white p-3 text-sm text-ink/60">
                       No runs yet.
                     </div>
                   )}
@@ -385,7 +385,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                       key={run.id}
                       className={`w-full rounded-md border p-3 text-left text-sm transition ${
                         activeRun?.id === run.id
-                          ? "border-ink bg-[#fffdf8]"
+                          ? "border-ink bg-white"
                           : "border-line hover:border-ink/45"
                       }`}
                       type="button"
@@ -452,7 +452,7 @@ function CommandModal({
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/45 p-4">
       <form
-        className="w-full max-w-xl rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft"
+        className="w-full max-w-xl rounded-md border border-line bg-white p-5 shadow-soft"
         onSubmit={onSubmit}
       >
         <div className="mb-4 flex items-center justify-between gap-3">
@@ -461,7 +461,7 @@ function CommandModal({
           </h4>
           <button
             aria-label="Close command form"
-            className="flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-[#f5f1e8] hover:text-ink"
+            className="flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink"
             type="button"
             onClick={onClose}
           >
@@ -528,14 +528,14 @@ function CommandModal({
 
         <div className="mt-5 flex justify-end gap-2">
           <button
-            className="rounded-md border border-line bg-white px-4 py-2 text-sm font-semibold transition hover:bg-[#f5f1e8]"
+            className="rounded-md border border-line bg-white px-4 py-2 text-sm font-semibold transition hover:bg-panel"
             type="button"
             onClick={onClose}
           >
             Cancel
           </button>
           <button
-            className="rounded-md bg-ink px-4 py-2 text-sm font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+            className="rounded-md bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="submit"
             disabled={isSaving}
           >
@@ -558,9 +558,9 @@ function ConfirmationModal({
 }) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-ink/45 p-4">
-      <div className="w-full max-w-md rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+      <div className="w-full max-w-md rounded-md border border-line bg-white p-5 shadow-soft">
         <div className="flex items-start gap-3">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-[#f7eadc] text-warn">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-line text-warn">
             <AlertTriangle className="h-5 w-5" aria-hidden="true" />
           </div>
           <div className="min-w-0">
@@ -573,14 +573,14 @@ function ConfirmationModal({
         </div>
         <div className="mt-5 flex justify-end gap-2">
           <button
-            className="rounded-md border border-line bg-white px-4 py-2 text-sm font-semibold transition hover:bg-[#f5f1e8]"
+            className="rounded-md border border-line bg-white px-4 py-2 text-sm font-semibold transition hover:bg-panel"
             type="button"
             onClick={onCancel}
           >
             Cancel
           </button>
           <button
-            className="rounded-md bg-ink px-4 py-2 text-sm font-semibold text-white transition hover:bg-ink/90"
+            className="rounded-md bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary-active"
             type="button"
             onClick={onConfirm}
           >
@@ -594,11 +594,11 @@ function ConfirmationModal({
 
 function CommandStatusPill({ status }: { status: CommandRunStatus | "idle" }) {
   const toneClass = {
-    idle: "bg-white text-ink/60",
-    running: "bg-[#f7eadc] text-warn",
-    completed: "bg-[#e3efe9] text-signal",
-    failed: "bg-[#fde7e3] text-danger",
-    error: "bg-[#fde7e3] text-danger",
+    idle: "bg-white text-muted ring-1 ring-line",
+    running: "bg-line text-warn",
+    completed: "bg-line text-signal",
+    failed: "bg-[#fff5f2] text-danger",
+    error: "bg-[#fff5f2] text-danger",
   }[status];
   const Icon = status === "completed" ? CheckCircle2 : status === "idle" ? TerminalSquare : XCircle;
 

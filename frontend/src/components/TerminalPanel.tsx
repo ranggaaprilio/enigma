@@ -56,10 +56,10 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
           scrollback: 10_000,
           scrollOnUserInput: true,
           theme: {
-            background: "#111820",
-            foreground: "#f8f4ea",
-            cursor: "#f8f4ea",
-            selectionBackground: "#3c4a57",
+            background: "#fafaf7",
+            foreground: "#26251e",
+            cursor: "#f54e00",
+            selectionBackground: "#dfa88f",
           },
         });
         const fitAddon = new FitAddon();
@@ -206,7 +206,7 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
   }[connectionState];
 
   return (
-    <section className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+    <section className="rounded-md border border-line bg-white p-5 shadow-soft">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
         <div>
           <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
@@ -219,21 +219,21 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
             {statusLabel}
           </span>
           <button
-            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8]"
+            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel"
             type="button"
             onClick={() => void copySelection()}
           >
             Copy
           </button>
           <button
-            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8]"
+            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel"
             type="button"
             onClick={() => void pasteClipboard()}
           >
             Paste
           </button>
           <button
-            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={!session || session.status !== "active"}
             onClick={() => void stopSession()}
@@ -251,7 +251,7 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
 
       <div
         ref={containerRef}
-        className="terminal-frame h-[560px] min-h-[360px] overflow-auto rounded-md border border-[#0b1118] bg-[#111820] p-2"
+        className="terminal-frame h-[560px] min-h-[360px] overflow-auto rounded-lg border border-line bg-panel p-2"
       />
     </section>
   );

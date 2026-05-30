@@ -598,16 +598,18 @@ describe("App auth routing", () => {
     );
   });
 
-  it("opens the editor tab, starts an editor, and renders the iframe", async () => {
+  it("opens the editor tab and launches code-server in a new browser tab", async () => {
+    const editorUrl = "http://localhost:8080/?folder=/workspace/demo";
     const editorSession = {
       id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
       workspace_id: workspace.id,
       user_id: authUser.id,
-      url: `/workspaces/${workspace.id}/editor/proxy/0ea59c8a-698c-4ec1-84c7-1c40271760e7/token/`,
+      url: editorUrl,
       status: "active",
       started_at: "2026-05-23T00:00:00Z",
       last_active_at: "2026-05-23T00:00:00Z",
     };
+    const openSpy = vi.spyOn(window, "open").mockReturnValue({} as Window);
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith("/auth/me")) {
         return Promise.resolve(jsonResponse(authUser));
@@ -637,26 +639,72 @@ describe("App auth routing", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Editor" }));
     expect(await screen.findByText("Editor is not running.")).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Open" }));
+    await userEvent.click(screen.getByRole("button", { name: "Open new tab" }));
 
-    const frame = await screen.findByTitle("Demo editor");
-    expect(frame).toHaveAttribute(
-      "src",
-      `http://localhost:8000${editorSession.url}`,
+    expect(await screen.findByText("code-server is ready")).toBeInTheDocument();
+    expect(openSpy).toHaveBeenCalledWith(editorUrl, "_blank", "noopener,noreferrer");
+  });
+
+  it("shows a fallback code-server link when the popup is blocked", async () => {
+    const editorUrl = "http://localhost:8080/?folder=/workspace/demo";
+    const editorSession = {
+      id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
+      workspace_id: workspace.id,
+      user_id: authUser.id,
+      url: editorUrl,
+      status: "active",
+      started_at: "2026-05-23T00:00:00Z",
+      last_active_at: "2026-05-23T00:00:00Z",
+    };
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/editor/status`)) {
+        return Promise.resolve(jsonResponse({ status: "inactive", session: null }));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/editor/start`) && init?.method === "POST") {
+        return Promise.resolve(jsonResponse(editorSession));
+      }
+      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", "/");
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Editor" }));
+    await userEvent.click(screen.getByRole("button", { name: "Open new tab" }));
+
+    expect(await screen.findByRole("link", { name: "Continue to code-server" })).toHaveAttribute(
+      "href",
+      editorUrl,
     );
   });
 
   it("shows editor failure state and can restart", async () => {
+    const editorUrl = "http://localhost:8080/?folder=/workspace/demo";
     const failedSession = {
       id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
       workspace_id: workspace.id,
       user_id: authUser.id,
-      url: `/workspaces/${workspace.id}/editor/proxy/0ea59c8a-698c-4ec1-84c7-1c40271760e7/token/`,
+      url: editorUrl,
       status: "error",
       started_at: "2026-05-23T00:00:00Z",
       last_active_at: "2026-05-23T00:00:00Z",
     };
     const activeSession = { ...failedSession, status: "active" };
+    const openSpy = vi.spyOn(window, "open").mockReturnValue({} as Window);
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith("/auth/me")) {
         return Promise.resolve(jsonResponse(authUser));
@@ -691,10 +739,8 @@ describe("App auth routing", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Restart" }));
 
-    expect(await screen.findByTitle("Demo editor")).toHaveAttribute(
-      "src",
-      `http://localhost:8000${activeSession.url}`,
-    );
+    expect(await screen.findByText("code-server is ready")).toBeInTheDocument();
+    expect(openSpy).toHaveBeenCalledWith(editorUrl, "_blank", "noopener,noreferrer");
   });
 
   it("opens the preview tab, detects a preview, and controls the iframe", async () => {

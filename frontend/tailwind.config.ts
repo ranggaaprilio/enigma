@@ -5,15 +5,28 @@ export default {
   theme: {
     extend: {
       colors: {
-        ink: "#172026",
-        panel: "#f7f5ef",
-        line: "#d8d3c7",
-        signal: "#247c6d",
-        warn: "#a15c1b",
-        danger: "#b42318"
+        primary: "#f54e00",
+        "primary-active": "#d04200",
+        canvas: "#f7f7f4",
+        panel: "#fafaf7",
+        ink: "#26251e",
+        body: "#5a5852",
+        muted: "#807d72",
+        "muted-soft": "#a09c92",
+        line: "#e6e5e0",
+        "line-soft": "#efeee8",
+        "line-strong": "#cfcdc4",
+        "timeline-thinking": "#dfa88f",
+        "timeline-grep": "#9fc9a2",
+        "timeline-read": "#9fbbe0",
+        "timeline-edit": "#c0a8dd",
+        "timeline-done": "#c08532",
+        signal: "#1f8a65",
+        warn: "#c08532",
+        danger: "#cf2d56"
       },
       boxShadow: {
-        soft: "0 12px 36px rgba(23, 32, 38, 0.08)"
+        soft: "none"
       }
     }
   },
