@@ -63,8 +63,8 @@ function usePathname() {
 
 function FullPageMessage({ message }: { message: string }) {
   return (
-    <div className="flex min-h-screen items-center justify-center bg-[#ece7dc] px-6 text-ink">
-      <div className="rounded-md border border-line bg-[#fffdf8] px-5 py-4 shadow-soft">{message}</div>
+    <div className="flex min-h-screen items-center justify-center bg-canvas px-6 text-ink">
+      <div className="rounded-xl border border-line bg-white px-5 py-4 shadow-soft">{message}</div>
     </div>
   );
 }

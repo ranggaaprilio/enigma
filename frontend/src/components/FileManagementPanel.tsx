@@ -1,4 +1,12 @@
-import { type ChangeEvent, type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type ChangeEvent,
+  type FormEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -48,7 +56,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
     [selectedPath, tree],
   );
 
-  async function loadTree(signal?: AbortSignal) {
+  const loadTree = useCallback(async (signal?: AbortSignal) => {
     setError(null);
     setBusyAction("tree");
     try {
@@ -63,7 +71,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
     } finally {
       setBusyAction((current) => (current === "tree" ? null : current));
     }
-  }
+  }, [workspace.id]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -74,7 +82,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
     setSearchResults([]);
     void loadTree(controller.signal);
     return () => controller.abort();
-  }, [workspace.id]);
+  }, [loadTree, workspace.id]);
 
   useEffect(() => {
     const query = searchQuery.trim();
@@ -186,7 +194,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
 
   return (
     <section className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
-      <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+      <div className="rounded-md border border-line bg-white p-5 shadow-soft">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
@@ -196,7 +204,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
           </div>
           <button
             aria-label="Refresh files"
-            className="flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-[#f5f1e8] hover:text-ink"
+            className="flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink"
             type="button"
             disabled={busyAction === "tree"}
             onClick={() => void loadTree()}
@@ -218,7 +226,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
 
         <div className="mt-3 flex flex-wrap gap-2">
           <button
-            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8]"
+            className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel"
             type="button"
             onClick={() => uploadInputRef.current?.click()}
           >
@@ -237,7 +245,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
           />
           <button
             aria-label="Create folder"
-            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-ink text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+            className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-primary text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="submit"
             disabled={busyAction === "folder"}
           >
@@ -291,7 +299,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
         </div>
       </div>
 
-      <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+      <div className="rounded-md border border-line bg-white p-5 shadow-soft">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0">
             <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
@@ -303,7 +311,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
           </div>
           <div className="flex flex-wrap gap-2">
             <button
-              className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
               type="button"
               disabled={!selectedNode || selectedNode.type !== "file"}
               onClick={downloadSelected}
@@ -312,7 +320,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
               Download
             </button>
             <button
-              className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+              className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
               type="button"
               disabled={!selectedNode || selectedNode.path === ""}
               onClick={() =>
@@ -358,7 +366,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
 
       {pendingAction && (
         <div className="fixed inset-0 z-40 flex items-center justify-center bg-ink/45 p-4">
-          <div className="w-full max-w-md rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+          <div className="w-full max-w-md rounded-md border border-line bg-white p-5 shadow-soft">
             <div className="flex items-start justify-between gap-3">
               <h3 className="text-base font-semibold">
                 {pendingAction.type === "delete" ? "Confirm delete" : "Confirm rename"}
@@ -390,14 +398,14 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
             )}
             <div className="mt-5 flex justify-end gap-2">
               <button
-                className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8]"
+                className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel"
                 type="button"
                 onClick={() => setPendingAction(null)}
               >
                 Cancel
               </button>
               <button
-                className="rounded-md bg-ink px-3 py-2 text-sm font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+                className="rounded-md bg-primary px-3 py-2 text-sm font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
                 type="button"
                 disabled={
                   busyAction === pendingAction.type ||
@@ -477,7 +485,7 @@ function FileRow({
   return (
     <div
       className={`flex items-center gap-1 rounded-md px-2 py-1.5 text-left text-sm transition ${
-        selected ? "bg-[#e8edf2] text-ink" : "text-ink/72 hover:bg-[#f5f1e8] hover:text-ink"
+        selected ? "bg-line text-ink" : "text-ink/72 hover:bg-panel hover:text-ink"
       }`}
       style={{ paddingLeft: `${depth * 16 + 8}px` }}
     >

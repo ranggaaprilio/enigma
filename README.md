@@ -30,14 +30,16 @@ Server-based AI agent dashboard foundation built with FastAPI, React, PostgreSQL
    pnpm test
    ```
 
-The backend starts VS Code Web sessions with `code-server`. The provided backend
-container installs `code-server`; for non-container local development, install it
-so the `code-server` command is on `PATH`.
+The editor runs as a standalone `code-server` container. The backend returns a
+browser-openable editor URL for the selected workspace, and the frontend opens
+that URL in a new tab. The code-server container and backend both mount the same
+host workspace root at `/workspace`.
 
 ## Services
 
 - Frontend: Vite React app on port `5173`.
 - Backend: FastAPI app on port `8000`.
+- code-server: VS Code Web on port `8080`.
 - PostgreSQL: port `5432`, persisted in the `postgres_data` Docker volume.
 - Redis: port `6379`, persisted in the `redis_data` Docker volume.
 
@@ -59,10 +61,10 @@ The root `.env.example` lists required values for local development:
 - `POSTGRES_PASSWORD`
 - `POSTGRES_DB`
 - `WORKSPACE_ROOT`
+- `HOST_WORKSPACE_ROOT`
 - `WORKSPACE_ENV_ENCRYPTION_KEY`
-- `EDITOR_CODE_SERVER_BINARY`
-- `EDITOR_BIND_HOST`
-- `EDITOR_PORT_START`
-- `EDITOR_PORT_END`
+- `CODE_SERVER_PASSWORD`
+- `CODE_SERVER_PORT`
+- `EDITOR_PUBLIC_URL`
+- `EDITOR_CONTAINER_WORKSPACE_ROOT`
 - `EDITOR_TOKEN_TTL_SECONDS`
-- `EDITOR_RUNTIME_ROOT`

@@ -74,11 +74,8 @@ async def get_editor_service(
     return EditorService(
         session=session,
         workspace_root=settings.workspace_root,
-        runtime_root=settings.editor_runtime_root,
-        code_server_binary=settings.editor_code_server_binary,
-        bind_host=settings.editor_bind_host,
-        port_start=settings.editor_port_start,
-        port_end=settings.editor_port_end,
+        public_url=settings.editor_public_url,
+        container_workspace_root=settings.editor_container_workspace_root,
         token_ttl_seconds=settings.editor_token_ttl_seconds,
         secret_key=settings.auth_secret_key,
     )
@@ -228,11 +225,8 @@ async def proxy_editor_websocket(
         service = EditorService(
             session=session,
             workspace_root=settings.workspace_root,
-            runtime_root=settings.editor_runtime_root,
-            code_server_binary=settings.editor_code_server_binary,
-            bind_host=settings.editor_bind_host,
-            port_start=settings.editor_port_start,
-            port_end=settings.editor_port_end,
+            public_url=settings.editor_public_url,
+            container_workspace_root=settings.editor_container_workspace_root,
             token_ttl_seconds=settings.editor_token_ttl_seconds,
             secret_key=settings.auth_secret_key,
         )

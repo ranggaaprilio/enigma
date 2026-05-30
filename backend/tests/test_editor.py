@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import httpx
@@ -11,7 +12,6 @@ from app.core.security import hash_password
 from app.main import app
 from app.models import EditorSession, User, Workspace
 from app.services.editor import (
-    EditorRuntimeError,
     EditorService,
     EditorSessionNotFoundError,
     EditorTokenError,
@@ -98,7 +98,7 @@ class FakeEditorService:
             id=uuid4(),
             workspace_id=self.workspace.id,
             user_id=self.user.id,
-            url=f"/workspaces/{self.workspace.id}/editor/proxy/session/valid-token/",
+            url="http://localhost:8080/?folder=/workspace/demo",
             status=status,
             process_id=1234,
             bind_host="127.0.0.1",
@@ -172,7 +172,7 @@ async def test_start_status_and_stop_editor_session(editor_context):
     assert inactive.json() == {"status": "inactive", "session": None}
     assert created.status_code == 201
     assert created.json()["status"] == "active"
-    assert created.json()["url"].startswith(f"/workspaces/{workspace.id}/editor/proxy/")
+    assert created.json()["url"] == "http://localhost:8080/?folder=/workspace/demo"
     assert status_response.json()["status"] == "active"
     assert stopped.json()["status"] == "stopped"
     assert service.stopped is True
@@ -252,11 +252,8 @@ def test_editor_service_validates_workspace_path(tmp_path):
     service = EditorService(
         session=None,  # type: ignore[arg-type]
         workspace_root=tmp_path,
-        runtime_root=tmp_path / "runtime",
-        code_server_binary="code-server",
-        bind_host="127.0.0.1",
-        port_start=13337,
-        port_end=13338,
+        public_url="http://localhost:8080",
+        container_workspace_root=tmp_path,
         token_ttl_seconds=3600,
         secret_key="secret",
     )
@@ -265,98 +262,35 @@ def test_editor_service_validates_workspace_path(tmp_path):
         service._workspace_path(workspace)
 
 
-async def test_editor_service_starts_code_server_with_restricted_binding(tmp_path, monkeypatch):
+def test_editor_service_generates_standalone_code_server_url(tmp_path):
+    workspace_path = tmp_path / "owner-id" / "workspace-id"
+    workspace_path.mkdir(parents=True)
     service = EditorService(
         session=None,  # type: ignore[arg-type]
         workspace_root=tmp_path,
-        runtime_root=tmp_path / "runtime",
-        code_server_binary="code-server",
-        bind_host="127.0.0.1",
-        port_start=13337,
-        port_end=13338,
+        public_url="http://localhost:8080",
+        container_workspace_root=Path("/workspace"),
         token_ttl_seconds=3600,
         secret_key="secret",
     )
-    now = datetime.now(UTC)
-    editor_session = EditorSession(
-        id=uuid4(),
-        workspace_id=uuid4(),
-        user_id=uuid4(),
-        url="",
-        status="active",
-        process_id=None,
-        bind_host="127.0.0.1",
-        bind_port=13337,
-        token_hash="",
-        token_expires_at=now + timedelta(hours=1),
-        started_at=now,
-        last_active_at=now,
-    )
-    calls: list[tuple[str, ...]] = []
 
-    class FakeProcess:
-        pid = 4321
-        returncode = None
-
-    async def fake_create_subprocess_exec(*args, **kwargs):
-        calls.append(args)
-        return FakeProcess()
-
-    monkeypatch.setattr("app.services.editor.shutil.which", lambda binary: f"/usr/bin/{binary}")
-    monkeypatch.setattr(
-        "app.services.editor.asyncio.create_subprocess_exec",
-        fake_create_subprocess_exec,
+    assert service.editor_url(workspace_path) == (
+        "http://localhost:8080/?folder=/workspace/owner-id/workspace-id"
     )
 
-    process = await service._start_code_server(editor_session, tmp_path, "valid-token")
 
-    assert process.pid == 4321
-    assert (tmp_path / "runtime" / str(editor_session.id) / "code-server.log").exists()
-    assert calls[0][:7] == (
-        "code-server",
-        "--bind-addr",
-        "127.0.0.1:13337",
-        "--auth",
-        "none",
-        "--disable-telemetry",
-        "--disable-update-check",
-    )
-    base_path = (
-        f"--abs-proxy-base-path=/workspaces/{editor_session.workspace_id}/editor/proxy/"
-        f"{editor_session.id}/valid-token"
-    )
-    assert base_path in calls[0]
-    assert str(tmp_path) == calls[0][-1]
-
-
-async def test_editor_service_reports_missing_code_server(tmp_path, monkeypatch):
+def test_editor_service_encodes_workspace_folder_url(tmp_path):
+    workspace_path = tmp_path / "owner id" / "workspace id"
+    workspace_path.mkdir(parents=True)
     service = EditorService(
         session=None,  # type: ignore[arg-type]
         workspace_root=tmp_path,
-        runtime_root=tmp_path / "runtime",
-        code_server_binary="code-server",
-        bind_host="127.0.0.1",
-        port_start=13337,
-        port_end=13338,
+        public_url="http://localhost:8080/",
+        container_workspace_root=Path("/workspace"),
         token_ttl_seconds=3600,
         secret_key="secret",
     )
-    now = datetime.now(UTC)
-    editor_session = EditorSession(
-        id=uuid4(),
-        workspace_id=uuid4(),
-        user_id=uuid4(),
-        url="",
-        status="active",
-        process_id=None,
-        bind_host="127.0.0.1",
-        bind_port=13337,
-        token_hash="",
-        token_expires_at=now + timedelta(hours=1),
-        started_at=now,
-        last_active_at=now,
-    )
-    monkeypatch.setattr("app.services.editor.shutil.which", lambda _binary: None)
 
-    with pytest.raises(EditorRuntimeError):
-        await service._start_code_server(editor_session, tmp_path, "valid-token")
+    assert service.editor_url(workspace_path) == (
+        "http://localhost:8080/?folder=/workspace/owner%20id/workspace%20id"
+    )

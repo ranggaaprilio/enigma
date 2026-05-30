@@ -181,14 +181,14 @@ export function DashboardRoute() {
       onLogout={logout}
     >
       {workspaceState.status === "ready" && workspaceState.workspace && (
-        <div className="mb-4 flex gap-2 overflow-x-auto rounded-md border border-line bg-[#fffdf8] p-2 shadow-soft">
+        <div className="mb-4 flex gap-2 overflow-x-auto rounded-md border border-line bg-white p-2 shadow-soft">
           {dashboardTabs.map((tab) => (
             <button
               key={tab.id}
               className={`whitespace-nowrap rounded-md px-4 py-2 text-sm font-semibold transition ${
                 activeTab === tab.id
-                  ? "bg-ink text-white"
-                  : "bg-white text-ink/70 hover:bg-[#f5f1e8] hover:text-ink"
+                  ? "bg-primary text-white"
+                  : "bg-white text-ink/70 hover:bg-panel hover:text-ink"
               }`}
               type="button"
               onClick={() => setActiveTab(tab.id)}
@@ -202,7 +202,7 @@ export function DashboardRoute() {
       {(workspaceState.status !== "ready" || !workspaceState.workspace || activeTab === "overview") && (
         <>
           <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-            <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+            <div className="rounded-md border border-line bg-white p-5 shadow-soft">
               <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
                 <div>
                   <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
@@ -303,7 +303,7 @@ function FoundationChecks({
   workspaceStatus: WorkspaceStatus | "none" | "loading";
 }) {
   return (
-    <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+    <div className="rounded-md border border-line bg-white p-5 shadow-soft">
       <h3 className="text-base font-semibold">Foundation checks</h3>
       <ul className="mt-4 space-y-3 text-sm text-ink/72">
         <li className="flex items-center justify-between gap-3 border-b border-line pb-3">
@@ -391,7 +391,7 @@ function CreateWorkspacePanel({ onCreated }: { onCreated: (workspace: WorkspaceR
       {error && <ErrorState message={error} />}
 
       <button
-        className="rounded-md bg-ink px-4 py-2 font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+        className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
         type="submit"
         disabled={isSubmitting}
       >
@@ -568,7 +568,7 @@ function RepositoryPanel({
 
   return (
     <section className="mt-4 grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
-      <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+      <div className="rounded-md border border-line bg-white p-5 shadow-soft">
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div>
             <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
@@ -585,7 +585,7 @@ function RepositoryPanel({
           <TextInput label="GitHub repository URL" value={repoUrl} onChange={setRepoUrl} />
           <TextInput label="Personal access token" type="password" value={token} onChange={setToken} />
           <button
-            className="rounded-md bg-ink px-4 py-2 font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+            className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="submit"
             disabled={busyAction === "connect"}
           >
@@ -629,7 +629,7 @@ function RepositoryPanel({
         <form className="mt-5 space-y-3" onSubmit={handleCommit}>
           <TextInput label="Commit message" value={commitMessage} onChange={setCommitMessage} />
           <button
-            className="rounded-md bg-ink px-4 py-2 font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+            className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="submit"
             disabled={busyAction === "commit" || statusData?.cloned !== true}
           >
@@ -649,7 +649,7 @@ function RepositoryPanel({
         )}
       </div>
 
-      <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+      <div className="rounded-md border border-line bg-white p-5 shadow-soft">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <h3 className="text-base font-semibold">Changes</h3>
@@ -664,7 +664,7 @@ function RepositoryPanel({
             </p>
           </div>
           <button
-            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-[#f5f1e8]"
+            className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel"
             type="button"
             onClick={() => void loadRepositoryStatus()}
           >
@@ -695,14 +695,14 @@ function RepositoryPanel({
                   className={`flex w-full items-center justify-between gap-3 rounded-md border px-3 py-2 text-left transition ${
                     file.path === selectedPath
                       ? "border-ink bg-white"
-                      : "border-line bg-white hover:bg-[#f5f1e8]"
+                      : "border-line bg-white hover:bg-panel"
                   }`}
                   key={`${file.status}-${file.path}`}
                   type="button"
                   onClick={() => setSelectedPath(file.path)}
                 >
                   <span className="min-w-0 truncate font-mono text-sm">{file.path}</span>
-                  <span className="shrink-0 rounded bg-[#e8edf2] px-2 py-1 font-mono text-xs">
+                  <span className="shrink-0 rounded bg-line px-2 py-1 font-mono text-xs">
                     {file.status}
                   </span>
                 </button>
@@ -737,7 +737,7 @@ function RepoActionButton({
 }) {
   return (
     <button
-      className="rounded-md border border-line bg-white px-3 py-2 text-sm font-semibold transition hover:bg-[#f5f1e8] disabled:cursor-not-allowed disabled:opacity-50"
+      className="rounded-md border border-line bg-white px-3 py-2 text-sm font-semibold transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
       type="button"
       disabled={disabled}
       onClick={onClick}
@@ -789,7 +789,7 @@ function WorkspaceMetadataForm({
   }
 
   return (
-    <form className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft" onSubmit={handleSubmit}>
+    <form className="rounded-md border border-line bg-white p-5 shadow-soft" onSubmit={handleSubmit}>
       <h3 className="text-base font-semibold">Workspace settings</h3>
       <div className="mt-4 grid gap-4 md:grid-cols-2">
         <TextInput label="Workspace name" value={name} onChange={setName} />
@@ -811,7 +811,7 @@ function WorkspaceMetadataForm({
       )}
 
       <button
-        className="mt-4 rounded-md bg-ink px-4 py-2 font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+        className="mt-4 rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
         type="submit"
         disabled={isSubmitting}
       >
@@ -868,14 +868,14 @@ function EnvVarManager({
   }
 
   return (
-    <div className="rounded-md border border-line bg-[#fffdf8] p-5 shadow-soft">
+    <div className="rounded-md border border-line bg-white p-5 shadow-soft">
       <h3 className="text-base font-semibold">Environment variables</h3>
       <form className="mt-4 space-y-3" onSubmit={handleSubmit}>
         <TextInput label="Key" value={key} onChange={setKey} />
         <TextInput label="Value" type="password" value={value} onChange={setValue} />
         {error && <ErrorState message={error} />}
         <button
-          className="rounded-md bg-ink px-4 py-2 font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+          className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
           type="submit"
           disabled={isSubmitting}
         >
@@ -899,7 +899,7 @@ function EnvVarManager({
               <p className="mt-1 font-mono text-sm text-ink/55">{envVar.masked_value}</p>
             </div>
             <button
-              className="rounded-md border border-line px-3 py-1 text-sm font-medium transition hover:bg-[#f5f1e8]"
+              className="rounded-md border border-line px-3 py-1 text-sm font-medium transition hover:bg-panel"
               type="button"
               onClick={() => void handleDelete(envVar.key)}
             >

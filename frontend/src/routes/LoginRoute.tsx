@@ -38,10 +38,10 @@ export function LoginRoute() {
   }
 
   return (
-    <main className="flex min-h-screen items-center justify-center bg-[#ece7dc] px-5 py-8 text-ink">
-      <section className="w-full max-w-md rounded-md border border-line bg-[#fffdf8] p-6 shadow-soft">
-        <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">Execute</p>
-        <h1 className="mt-2 text-2xl font-semibold">Log in</h1>
+    <main className="flex min-h-screen items-center justify-center bg-canvas px-5 py-8 text-ink">
+      <section className="w-full max-w-md rounded-xl border border-line bg-white p-6 shadow-soft">
+        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-primary">Execute</p>
+        <h1 className="mt-2 text-3xl font-normal tracking-[-0.02em]">Log in</h1>
 
         <form className="mt-6 space-y-4" onSubmit={handleSubmit}>
           <label className="block text-sm font-medium">
@@ -73,7 +73,7 @@ export function LoginRoute() {
           )}
 
           <button
-            className="w-full rounded-md bg-ink px-4 py-2 font-semibold text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:bg-ink/45"
+            className="h-10 w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="submit"
             disabled={isSubmitting}
           >
