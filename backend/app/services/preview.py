@@ -7,6 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import PreviewSession, Workspace
+from app.services.audit import AuditLogService
 from app.services.workspaces import WorkspaceNotFoundError
 
 COMMON_PREVIEW_PORTS = (3000, 5173, 8000, 8080)
@@ -66,6 +67,7 @@ class PreviewService:
             .limit(1)
         )
         preview_session = result.scalar_one_or_none()
+        is_new_session = preview_session is None
         if preview_session is None:
             preview_session = PreviewSession(
                 workspace_id=workspace.id,
@@ -85,6 +87,15 @@ class PreviewService:
 
         await self.session.commit()
         await self.session.refresh(preview_session)
+        if is_new_session:
+            await AuditLogService(self.session).record(
+                user_id=user_id,
+                workspace_id=workspace.id,
+                action="preview_session_detect",
+                target_type="preview_session",
+                target_id=preview_session.id,
+                metadata={"port": preview_session.port},
+            )
         return preview_session
 
     async def refresh(
@@ -105,6 +116,14 @@ class PreviewService:
         self.session.add(preview_session)
         await self.session.commit()
         await self.session.refresh(preview_session)
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            action="preview_session_refresh",
+            target_type="preview_session",
+            target_id=preview_session.id,
+            metadata={"port": preview_session.port, "status": preview_session.status},
+        )
         return preview_session
 
     async def stop(
@@ -123,6 +142,14 @@ class PreviewService:
         self.session.add(preview_session)
         await self.session.commit()
         await self.session.refresh(preview_session)
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            action="preview_session_stop",
+            target_type="preview_session",
+            target_id=preview_session.id,
+            metadata={"port": preview_session.port},
+        )
         return preview_session
 
     async def get_proxy_session(

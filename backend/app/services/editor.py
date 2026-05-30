@@ -12,6 +12,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import EditorSession, Workspace
+from app.services.audit import AuditLogService
 from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
@@ -102,6 +103,14 @@ class EditorService:
             user_id=str(user_id),
             url=editor_session.url,
         )
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace.id,
+            action="editor_session_start",
+            target_type="editor_session",
+            target_id=editor_session.id,
+            metadata={},
+        )
         return editor_session
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> EditorSession | None:
@@ -129,6 +138,14 @@ class EditorService:
             editor_session_id=str(editor_session.id),
             workspace_id=str(workspace.id),
             user_id=str(user_id),
+        )
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace.id,
+            action="editor_session_stop",
+            target_type="editor_session",
+            target_id=editor_session.id,
+            metadata={},
         )
         return editor_session
 

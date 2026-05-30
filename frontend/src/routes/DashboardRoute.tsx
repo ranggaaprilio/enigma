@@ -17,12 +17,14 @@ import {
   getRepositoryDiff,
   getRepositoryStatus,
   getHealth,
+  listAuditLogs,
   listWorkspaceEnvVars,
   listWorkspaces,
   pullRepository,
   pushRepository,
   updateWorkspace,
   upsertWorkspaceEnvVar,
+  type AuditLogResponse,
   type HealthResponse,
   type RepositoryStatusResponse,
   type WorkspaceEnvVarResponse,
@@ -47,7 +49,8 @@ type DashboardTab =
   | "commands"
   | "editor"
   | "terminal"
-  | "preview";
+  | "preview"
+  | "audit";
 type PreviewStatusSnapshot = {
   status: "inactive" | "active" | "stopped" | "error";
   port: number | null;
@@ -61,6 +64,7 @@ const dashboardTabs: { id: DashboardTab; label: string }[] = [
   { id: "editor", label: "Editor" },
   { id: "terminal", label: "Terminal" },
   { id: "preview", label: "Preview" },
+  { id: "audit", label: "Audit" },
 ];
 
 function initialDashboardTab(): DashboardTab {
@@ -76,7 +80,8 @@ function initialDashboardTab(): DashboardTab {
     stored === "commands" ||
     stored === "editor" ||
     stored === "terminal" ||
-    stored === "preview"
+    stored === "preview" ||
+    stored === "audit"
   ) {
     return stored;
   }
@@ -286,6 +291,10 @@ export function DashboardRoute() {
           onStatusChange={handlePreviewStatusChange}
         />
       )}
+
+      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "audit" && (
+        <AuditLogPanel workspace={workspaceState.workspace} />
+      )}
     </DashboardShell>
   );
 
@@ -293,6 +302,98 @@ export function DashboardRoute() {
     const envVars = await listWorkspaceEnvVars(created.id);
     setWorkspaceState({ status: "ready", workspace: created, envVars });
   }
+}
+
+function AuditLogPanel({ workspace }: { workspace: WorkspaceResponse }) {
+  const [auditLogs, setAuditLogs] = useState<AuditLogResponse[]>([]);
+  const [status, setStatus] = useState<"loading" | "ready" | "error">("loading");
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setStatus("loading");
+    listAuditLogs(workspace.id, controller.signal)
+      .then((logs) => {
+        setAuditLogs(Array.isArray(logs) ? logs : []);
+        setStatus("ready");
+      })
+      .catch((unknownError: unknown) => {
+        if (unknownError instanceof DOMException && unknownError.name === "AbortError") {
+          return;
+        }
+        setError(unknownError instanceof Error ? unknownError.message : "Unable to load audit logs");
+        setStatus("error");
+      });
+    return () => controller.abort();
+  }, [workspace.id]);
+
+  return (
+    <section className="rounded-md border border-line bg-white p-5 shadow-soft">
+      <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
+            Workspace
+          </p>
+          <h3 className="mt-1 text-2xl font-semibold">Audit log</h3>
+        </div>
+      </div>
+
+      {status === "loading" && <LoadingState message="Loading audit logs..." />}
+      {status === "error" && <ErrorState message={error ?? "Unable to load audit logs"} />}
+      {status === "ready" && auditLogs.length === 0 && (
+        <div className="rounded-md border border-dashed border-line bg-white p-6 text-ink/72">
+          No audit events yet.
+        </div>
+      )}
+      {status === "ready" && auditLogs.length > 0 && (
+        <div className="overflow-hidden rounded-md border border-line">
+          <table className="min-w-full divide-y divide-line text-sm">
+            <thead className="bg-panel text-left text-xs font-semibold uppercase tracking-[0.14em] text-muted">
+              <tr>
+                <th className="px-4 py-3">Time</th>
+                <th className="px-4 py-3">Action</th>
+                <th className="px-4 py-3">Target</th>
+                <th className="px-4 py-3">Metadata</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-line bg-white">
+              {auditLogs.map((log) => (
+                <tr key={log.id}>
+                  <td className="whitespace-nowrap px-4 py-3 text-muted">
+                    {formatDateTime(log.created_at)}
+                  </td>
+                  <td className="px-4 py-3 font-semibold text-ink">{log.action}</td>
+                  <td className="px-4 py-3 text-body">
+                    {log.target_type} {log.target_id}
+                  </td>
+                  <td className="max-w-md px-4 py-3 text-body">
+                    {formatAuditMetadata(log.metadata)}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function formatDateTime(value: string) {
+  return new Intl.DateTimeFormat(undefined, {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
+function formatAuditMetadata(metadata: Record<string, unknown>) {
+  const entries = Object.entries(metadata);
+  if (entries.length === 0) {
+    return "None";
+  }
+  return entries
+    .map(([key, value]) => `${key}: ${String(value)}`)
+    .join(" | ");
 }
 
 function FoundationChecks({

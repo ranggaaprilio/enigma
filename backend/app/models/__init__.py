@@ -2,6 +2,7 @@
 from app.models.agent import AgentEvent, AgentRun
 from app.models.command import CommandRun, CustomCommand
 from app.models.editor import EditorSession
+from app.models.notification import AuditLog, Notification
 from app.models.preview import PreviewSession
 from app.models.repository import RepositoryCredential
 from app.models.terminal import TerminalSession
@@ -11,9 +12,11 @@ from app.models.workspace import Workspace, WorkspaceEnvVar
 __all__ = [
     "AgentEvent",
     "AgentRun",
+    "AuditLog",
     "CommandRun",
     "CustomCommand",
     "EditorSession",
+    "Notification",
     "PreviewSession",
     "RepositoryCredential",
     "TerminalSession",

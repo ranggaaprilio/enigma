@@ -27,6 +27,28 @@ export type PreviewSessionStatus = "active" | "stopped" | "error";
 export type PreviewAvailability = "inactive" | PreviewSessionStatus;
 export type WorkspaceFileType = "file" | "directory";
 
+export type NotificationResponse = {
+  id: string;
+  user_id: string;
+  workspace_id: string;
+  type: string;
+  title: string;
+  message: string;
+  read_at: string | null;
+  created_at: string;
+};
+
+export type AuditLogResponse = {
+  id: string;
+  user_id: string;
+  workspace_id: string | null;
+  action: string;
+  target_type: string;
+  target_id: string;
+  metadata: Record<string, unknown>;
+  created_at: string;
+};
+
 export type WorkspaceResponse = {
   id: string;
   owner_id: string;
@@ -302,6 +324,14 @@ export function getCommandRunStreamUrl(workspaceId: string, runId: string) {
   return baseUrl.toString();
 }
 
+export function getNotificationStreamUrl() {
+  const baseUrl = new URL(getApiBaseUrl());
+  baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+  baseUrl.pathname = "/notifications/stream";
+  baseUrl.search = "";
+  return baseUrl.toString();
+}
+
 export function getWorkspaceFileDownloadUrl(workspaceId: string, path: string) {
   const baseUrl = new URL(getApiBaseUrl());
   baseUrl.pathname = `/workspaces/${workspaceId}/files/download`;
@@ -365,6 +395,22 @@ export function logout(): Promise<{ ok: boolean }> {
   return requestJson<{ ok: boolean }>("/auth/logout", { method: "POST" });
 }
 
+export function listNotifications(signal?: AbortSignal): Promise<NotificationResponse[]> {
+  return requestJson<NotificationResponse[]>("/notifications", { signal });
+}
+
+export function markNotificationRead(
+  notificationId: string,
+): Promise<NotificationResponse> {
+  return requestJson<NotificationResponse>(`/notifications/${notificationId}/read`, {
+    method: "PATCH",
+  });
+}
+
+export function markAllNotificationsRead(): Promise<NotificationResponse[]> {
+  return requestJson<NotificationResponse[]>("/notifications/read-all", { method: "POST" });
+}
+
 export function listWorkspaces(signal?: AbortSignal): Promise<WorkspaceResponse[]> {
   return requestJson<WorkspaceResponse[]>("/workspaces", { signal });
 }
@@ -419,6 +465,13 @@ export function deleteWorkspaceEnvVar(workspaceId: string, key: string): Promise
     `/workspaces/${workspaceId}/env-vars?key=${encodeURIComponent(key)}`,
     { method: "DELETE" },
   );
+}
+
+export function listAuditLogs(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<AuditLogResponse[]> {
+  return requestJson<AuditLogResponse[]>(`/workspaces/${workspaceId}/audit-logs`, { signal });
 }
 
 export function connectRepository(

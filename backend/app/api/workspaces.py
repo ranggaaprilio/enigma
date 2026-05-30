@@ -25,6 +25,7 @@ from app.schemas.workspaces import (
     WorkspaceStatusResponse,
     WorkspaceUpdateRequest,
 )
+from app.services.audit import AuditLogService
 from app.services.repositories import (
     GitCommandError,
     InvalidRepositoryUrlError,
@@ -117,6 +118,20 @@ async def get_repository_service(
 REPOSITORY_SERVICE_DEP = Depends(get_repository_service)
 
 
+async def get_audit_log_service(session: AsyncSession = DB_SESSION_DEP) -> AuditLogService:
+    return AuditLogService(session)
+
+
+AUDIT_LOG_SERVICE_DEP = Depends(get_audit_log_service)
+
+
+async def record_audit_safely(audit_log_service: AuditLogService, **values) -> None:
+    try:
+        await audit_log_service.record(**values)
+    except Exception:
+        return
+
+
 def not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
 
@@ -178,9 +193,10 @@ async def connect_repository(
     payload: RepositoryConnectRequest,
     current_user: User = CURRENT_USER_DEP,
     service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> Workspace:
     try:
-        return await service.connect(
+        workspace = await service.connect(
             workspace_id=workspace_id,
             owner_id=current_user.id,
             repo_url=payload.repo_url,
@@ -199,6 +215,16 @@ async def connect_repository(
         GitCommandError,
     ) as error:
         raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace.id,
+        action="repo_connect",
+        target_type="repository",
+        target_id=workspace.id,
+        metadata={"repo_url": workspace.repo_url},
+    )
+    return workspace
 
 
 @router.post("/{workspace_id}/repo/clone", response_model=RepositoryOperationResponse)
@@ -206,6 +232,7 @@ async def clone_repository(
     workspace_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> RepositoryOperationResponse:
     try:
         await service.clone(workspace_id, current_user.id)
@@ -222,6 +249,15 @@ async def clone_repository(
         GitCommandError,
     ) as error:
         raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="repo_clone",
+        target_type="repository",
+        target_id=workspace_id,
+        metadata={},
+    )
     return RepositoryOperationResponse(ok=True, message="Repository cloned.")
 
 
@@ -287,6 +323,7 @@ async def pull_repository(
     workspace_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> RepositoryOperationResponse:
     try:
         await service.pull(workspace_id, current_user.id)
@@ -303,6 +340,15 @@ async def pull_repository(
         GitCommandError,
     ) as error:
         raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="repo_pull",
+        target_type="repository",
+        target_id=workspace_id,
+        metadata={},
+    )
     return RepositoryOperationResponse(ok=True, message="Repository pulled.")
 
 
@@ -312,6 +358,7 @@ async def commit_repository(
     payload: RepositoryCommitRequest,
     current_user: User = CURRENT_USER_DEP,
     service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> RepositoryOperationResponse:
     try:
         await service.commit(workspace_id, current_user.id, payload.message)
@@ -328,6 +375,15 @@ async def commit_repository(
         GitCommandError,
     ) as error:
         raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="repo_commit",
+        target_type="repository",
+        target_id=workspace_id,
+        metadata={"message": payload.message},
+    )
     return RepositoryOperationResponse(ok=True, message="Changes committed.")
 
 
@@ -336,6 +392,7 @@ async def push_repository(
     workspace_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> RepositoryOperationResponse:
     try:
         await service.push(workspace_id, current_user.id)
@@ -352,6 +409,15 @@ async def push_repository(
         GitCommandError,
     ) as error:
         raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="repo_push",
+        target_type="repository",
+        target_id=workspace_id,
+        metadata={},
+    )
     return RepositoryOperationResponse(ok=True, message="Changes pushed.")
 
 
@@ -360,9 +426,10 @@ async def create_workspace(
     payload: WorkspaceCreateRequest,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> Workspace:
     try:
-        return await service.create(
+        workspace = await service.create(
             owner_id=current_user.id,
             name=payload.name,
             repo_url=payload.repo_url,
@@ -378,6 +445,16 @@ async def create_workspace(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Workspace directory could not be created",
         ) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace.id,
+        action="workspace_create",
+        target_type="workspace",
+        target_id=workspace.id,
+        metadata={"name": workspace.name},
+    )
+    return workspace
 
 
 @router.get("", response_model=list[WorkspaceResponse])
@@ -406,9 +483,10 @@ async def update_workspace(
     payload: WorkspaceUpdateRequest,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> Workspace:
     try:
-        return await service.update(
+        workspace = await service.update(
             workspace_id=workspace_id,
             owner_id=current_user.id,
             name=payload.name,
@@ -417,6 +495,16 @@ async def update_workspace(
         )
     except WorkspaceNotFoundError:
         raise not_found() from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace.id,
+        action="workspace_update",
+        target_type="workspace",
+        target_id=workspace.id,
+        metadata={"name": workspace.name},
+    )
+    return workspace
 
 
 @router.delete("/{workspace_id}", response_model=DeleteResponse)
@@ -424,8 +512,19 @@ async def delete_workspace(
     workspace_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> DeleteResponse:
     try:
+        workspace = await service.get_for_owner(workspace_id, current_user.id)
+        await record_audit_safely(
+            audit_log_service,
+            user_id=current_user.id,
+            workspace_id=workspace.id,
+            action="workspace_delete",
+            target_type="workspace",
+            target_id=workspace.id,
+            metadata={},
+        )
         await service.delete(workspace_id, current_user.id)
     except WorkspaceNotFoundError:
         raise not_found() from None
@@ -463,6 +562,7 @@ async def upsert_env_var(
     payload: WorkspaceEnvVarUpsertRequest,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> WorkspaceEnvVarResponse:
     try:
         env_var = await service.upsert_env_var(
@@ -478,6 +578,15 @@ async def upsert_env_var(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Environment variable keys must use uppercase letters, numbers, and underscores",
         ) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="workspace_env_var_upsert",
+        target_type="workspace_env_var",
+        target_id=env_var.key,
+        metadata={"key": env_var.key},
+    )
     return env_response(env_var)
 
 
@@ -487,6 +596,7 @@ async def delete_env_var(
     key: str = Query(min_length=1, max_length=128),
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> DeleteResponse:
     try:
         await service.delete_env_var(workspace_id, current_user.id, key)
@@ -497,4 +607,13 @@ async def delete_env_var(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Environment variable keys must use uppercase letters, numbers, and underscores",
         ) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="workspace_env_var_delete",
+        target_type="workspace_env_var",
+        target_id=key,
+        metadata={"key": key},
+    )
     return DeleteResponse(ok=True)

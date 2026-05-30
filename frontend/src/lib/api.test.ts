@@ -20,12 +20,14 @@ import {
   getCurrentUser,
   getEditorStatus,
   getHealth,
+  getNotificationStreamUrl,
   getRepositoryDiff,
   getRepositoryStatus,
   getTerminalSessionSocketUrl,
   getWorkspaceFileDownloadUrl,
   getWorkspaceFileTree,
   getWorkspaceStatus,
+  listAuditLogs,
   listTerminalSessions,
   listCustomCommandRuns,
   listCustomCommands,
@@ -33,8 +35,11 @@ import {
   listWorkspaceEnvVars,
   listWorkspaces,
   listAgentRuns,
+  listNotifications,
   login,
   logout,
+  markAllNotificationsRead,
+  markNotificationRead,
   pullRepository,
   pushRepository,
   readWorkspaceFile,
@@ -531,5 +536,42 @@ describe("getHealth", () => {
       `http://localhost:8000/workspaces/${workspaceId}/preview/sessions/${sessionId}/stop`,
       expect.objectContaining({ credentials: "include", method: "POST" }),
     );
+  });
+
+  it("sends credentialed notification and audit requests", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const notificationId = "db59cbaa-c95d-4bd5-8984-16a30e4dce15";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await listNotifications();
+    await markNotificationRead(notificationId);
+    await markAllNotificationsRead();
+    await listAuditLogs(workspaceId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://localhost:8000/notifications",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/notifications/${notificationId}/read`,
+      expect.objectContaining({ credentials: "include", method: "PATCH" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      "http://localhost:8000/notifications/read-all",
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      `http://localhost:8000/workspaces/${workspaceId}/audit-logs`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(getNotificationStreamUrl()).toBe("ws://localhost:8000/notifications/stream");
   });
 });
