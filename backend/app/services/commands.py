@@ -1,9 +1,7 @@
 import asyncio
-import os
 import shlex
 from collections import defaultdict
 from datetime import UTC, datetime
-from pathlib import Path
 from uuid import UUID
 
 import structlog
@@ -11,11 +9,12 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
-from app.models import CommandRun, CustomCommand, Workspace
+from app.models import CommandRun, CustomCommand, Workspace, WorkspaceEnvVar
 from app.services.agent_tools import DANGEROUS_COMMANDS, DANGEROUS_TOKENS, DangerousCommandError
 from app.services.audit import AuditLogService
+from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
 from app.services.notifications import NotificationService
-from app.services.workspaces import WorkspaceNotFoundError
+from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 logger = structlog.get_logger(__name__)
 
@@ -75,11 +74,13 @@ class CommandService:
         session_maker: async_sessionmaker[AsyncSession],
         settings: Settings,
         runtime: CommandRuntime = command_runtime,
+        daytona_runtime: DaytonaRuntime | None = None,
     ) -> None:
         self.session = session
         self.session_maker = session_maker
         self.settings = settings
         self.runtime = runtime
+        self.daytona_runtime = daytona_runtime or get_daytona_runtime()
 
     async def create_command(
         self,
@@ -287,65 +288,32 @@ class CommandService:
                 return
 
             try:
-                workspace_path = self._workspace_path(workspace)
                 argv = validate_custom_command(
                     custom_command.command,
                     requires_confirmation=custom_command.requires_confirmation,
                     confirmed=confirmed,
                 )
-                process = await asyncio.create_subprocess_exec(
-                    *argv,
-                    cwd=workspace_path,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                    env=os.environ.copy(),
+                command = " ".join(shlex.quote(value) for value in argv)
+                env = await self._workspace_env(session, workspace.id)
+
+                async def on_output(content: str) -> None:
+                    await self._append_output(session, run, content)
+
+                exit_code = await self.daytona_runtime.stream_command(
+                    workspace,
+                    session_id=f"command-{run.id.hex}",
+                    command=command,
+                    cwd=workspace.workspace_path,
+                    env=env,
+                    timeout=self.settings.agent_command_timeout_seconds,
+                    on_stdout=on_output,
+                    on_stderr=on_output,
                 )
-                try:
-                    exit_code = await asyncio.wait_for(
-                        self._stream_process_output(session, run, process),
-                        timeout=self.settings.agent_command_timeout_seconds,
-                    )
-                except TimeoutError:
-                    process.kill()
-                    await process.wait()
-                    raise RuntimeError("Command timed out") from None
                 status = "completed" if exit_code == 0 else "failed"
                 await self._mark_finished(session, run, status, exit_code)
             except Exception as error:
                 await self._append_output(session, run, f"{error}\n")
                 await self._mark_finished(session, run, "error", None)
-
-    async def _stream_process_output(
-        self,
-        session: AsyncSession,
-        run: CommandRun,
-        process: asyncio.subprocess.Process,
-    ) -> int:
-        queue: asyncio.Queue[bytes] = asyncio.Queue()
-
-        async def read_stream(stream: asyncio.StreamReader | None) -> None:
-            if stream is None:
-                return
-            while chunk := await stream.read(8192):
-                await queue.put(chunk)
-
-        stdout_task = asyncio.create_task(read_stream(process.stdout))
-        stderr_task = asyncio.create_task(read_stream(process.stderr))
-        waiter = asyncio.create_task(process.wait())
-        try:
-            while True:
-                if waiter.done() and stdout_task.done() and stderr_task.done() and queue.empty():
-                    break
-                try:
-                    chunk = await asyncio.wait_for(queue.get(), timeout=0.1)
-                except TimeoutError:
-                    continue
-                text = chunk.decode("utf-8", errors="replace")
-                await self._append_output(session, run, text)
-            return process.returncode or 0
-        finally:
-            stdout_task.cancel()
-            stderr_task.cancel()
 
     async def _append_output(self, session: AsyncSession, run: CommandRun, content: str) -> None:
         if not content:
@@ -426,14 +394,21 @@ class CommandService:
             },
         )
 
-    def _workspace_path(self, workspace: Workspace) -> Path:
-        if workspace.local_path is None:
-            raise CommandWorkspacePathError("Workspace directory is not ready")
-        root = self.settings.workspace_root.resolve()
-        path = Path(workspace.local_path).resolve()
-        if path == root or root not in path.parents or not path.is_dir():
-            raise CommandWorkspacePathError("Workspace directory is not ready")
-        return path
+    async def _workspace_env(
+        self,
+        session: AsyncSession,
+        workspace_id: UUID,
+    ) -> dict[str, str]:
+        result = await session.execute(
+            select(WorkspaceEnvVar).where(WorkspaceEnvVar.workspace_id == workspace_id)
+        )
+        cipher = WorkspaceSecretCipher(self.settings.workspace_env_encryption_key)
+        values: dict[str, str] = {}
+        for item in result.scalars().all():
+            decrypted = cipher.decrypt(item.encrypted_value)
+            if decrypted is not None:
+                values[item.key] = decrypted
+        return values
 
 
 def validate_custom_command(
@@ -442,8 +417,11 @@ def validate_custom_command(
     requires_confirmation: bool,
     confirmed: bool,
 ) -> list[str]:
-    if any(token in command for token in DANGEROUS_TOKENS):
-        raise DangerousCommandError("Shell control operators are not allowed")
+    has_shell_operator = any(token in command for token in DANGEROUS_TOKENS)
+    if has_shell_operator:
+        if requires_confirmation and confirmed:
+            return ["sh", "-lc", command]
+        raise DangerousCommandError("Shell control operators require confirmation")
     try:
         argv = shlex.split(command)
     except ValueError as error:
@@ -456,5 +434,7 @@ def validate_custom_command(
     if executable in DANGEROUS_COMMANDS:
         if executable in PRACTICAL_CONFIRMED_COMMANDS and requires_confirmation and confirmed:
             return argv
+        if requires_confirmation and confirmed:
+            return ["sh", "-lc", command]
         raise DangerousCommandError("Command is not allowed")
     return argv

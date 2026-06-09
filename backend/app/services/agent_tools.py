@@ -1,9 +1,9 @@
-import asyncio
 import shlex
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import PurePosixPath
 
 from app.models import Workspace
+from app.services.daytona_runtime import DaytonaRuntime
 
 EXCLUDED_NAMES = {
     ".git",
@@ -59,74 +59,78 @@ class WorkspaceTools:
     def __init__(
         self,
         workspace: Workspace,
+        runtime: DaytonaRuntime,
         command_timeout_seconds: int,
         max_command_output_chars: int,
     ) -> None:
-        if workspace.local_path is None:
-            raise WorkspaceToolError("Workspace path is not ready")
-        self.root = Path(workspace.local_path).resolve()
+        self.workspace = workspace
+        self.runtime = runtime
         self.command_timeout_seconds = command_timeout_seconds
         self.max_command_output_chars = max_command_output_chars
 
-    def resolve_path(self, path: str | None = None) -> Path:
-        candidate = self.root if not path else (self.root / path).resolve()
-        if candidate != self.root and self.root not in candidate.parents:
+    def resolve_path(self, path: str | None = None) -> str:
+        candidate = (path or "").strip().strip("/")
+        pure = PurePosixPath(candidate)
+        if pure.is_absolute() or ".." in pure.parts:
             raise WorkspaceToolError("Path is outside the workspace")
-        if any(part in EXCLUDED_NAMES for part in candidate.relative_to(self.root).parts):
+        if any(part in EXCLUDED_NAMES for part in pure.parts):
             raise WorkspaceToolError("Path is excluded")
-        return candidate
+        return (
+            self.workspace.workspace_path
+            if not candidate
+            else f"{self.workspace.workspace_path}/{pure.as_posix()}"
+        )
 
-    def list_files(self, path: str | None = None, limit: int = 200) -> list[str]:
-        directory = self.resolve_path(path)
-        if not directory.exists():
-            raise WorkspaceToolError("Path does not exist")
-        if not directory.is_dir():
-            raise WorkspaceToolError("Path is not a directory")
-
+    async def list_files(self, path: str | None = None, limit: int = 200) -> list[str]:
+        sandbox = await self.runtime.get_sandbox(self.workspace)
+        root = self.resolve_path(path)
+        try:
+            matches = await sandbox.fs.find_files(root, "*")
+        except Exception as error:
+            raise WorkspaceToolError(str(error)) from error
         results: list[str] = []
-        for item in sorted(directory.rglob("*")):
-            relative = item.relative_to(self.root)
-            if any(part in EXCLUDED_NAMES for part in relative.parts):
+        prefix = self.workspace.workspace_path.rstrip("/") + "/"
+        for match in matches:
+            remote = str(getattr(match, "file", getattr(match, "path", "")))
+            relative = remote[len(prefix) :] if remote.startswith(prefix) else remote
+            if any(part in EXCLUDED_NAMES for part in PurePosixPath(relative).parts):
                 continue
-            results.append(str(relative) + ("/" if item.is_dir() else ""))
+            results.append(relative)
             if len(results) >= limit:
                 break
-        return results
+        return sorted(results)
 
-    def read_file(self, path: str, max_chars: int = 20_000) -> str:
-        file_path = self.resolve_path(path)
-        if not file_path.exists() or not file_path.is_file():
-            raise WorkspaceToolError("File does not exist")
-        return file_path.read_text(encoding="utf-8", errors="replace")[:max_chars]
+    async def read_file(self, path: str, max_chars: int = 20_000) -> str:
+        sandbox = await self.runtime.get_sandbox(self.workspace)
+        try:
+            content = await sandbox.fs.download_file(self.resolve_path(path))
+        except Exception as error:
+            raise WorkspaceToolError("File does not exist") from error
+        return (content or b"").decode("utf-8", errors="replace")[:max_chars]
 
-    def write_file(self, path: str, content: str) -> str:
-        file_path = self.resolve_path(path)
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        file_path.write_text(content, encoding="utf-8")
-        return str(file_path.relative_to(self.root))
+    async def write_file(self, path: str, content: str) -> str:
+        sandbox = await self.runtime.get_sandbox(self.workspace)
+        remote = self.resolve_path(path)
+        parent = str(PurePosixPath(remote).parent)
+        await sandbox.fs.create_folder(parent, "755")
+        await sandbox.fs.upload_file(content.encode("utf-8"), remote)
+        return PurePosixPath(path).as_posix()
 
     async def run_command(self, command: str) -> CommandResult:
         argv = self._validate_command(command)
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            cwd=self.root,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
         try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(),
+            response = await self.runtime.exec(
+                self.workspace,
+                " ".join(shlex.quote(value) for value in argv),
+                cwd=self.workspace.workspace_path,
                 timeout=self.command_timeout_seconds,
             )
-        except TimeoutError:
-            process.kill()
-            await process.wait()
-            raise WorkspaceToolError("Command timed out") from None
-
-        stdout, stdout_truncated = self._cap(stdout_bytes.decode("utf-8", errors="replace"))
-        stderr, stderr_truncated = self._cap(stderr_bytes.decode("utf-8", errors="replace"))
+        except Exception as error:
+            raise WorkspaceToolError(str(error)) from error
+        stdout, stdout_truncated = self._cap(response.stdout)
+        stderr, stderr_truncated = self._cap(response.stderr)
         return CommandResult(
-            exit_code=process.returncode or 0,
+            exit_code=response.exit_code,
             stdout=stdout,
             stderr=stderr,
             truncated=stdout_truncated or stderr_truncated,

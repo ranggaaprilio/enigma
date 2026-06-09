@@ -123,7 +123,9 @@ def agent_context(tmp_path):
         slug="demo",
         repo_url="https://github.com/example/demo",
         default_branch="main",
-        local_path=str(workspace_path),
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
@@ -199,7 +201,7 @@ async def test_one_active_agent_run_per_workspace(agent_context):
     assert response.json()["detail"] == "Workspace already has an active agent run"
 
 
-def test_workspace_tools_reject_path_traversal_and_dangerous_commands(tmp_path):
+async def test_workspace_tools_reject_path_traversal_and_dangerous_commands(tmp_path):
     workspace_path = tmp_path / "workspace"
     workspace_path.mkdir()
     (workspace_path / "README.md").write_text("hello", encoding="utf-8")
@@ -210,16 +212,32 @@ def test_workspace_tools_reject_path_traversal_and_dangerous_commands(tmp_path):
         slug="demo",
         repo_url="https://github.com/example/demo",
         default_branch="main",
-        local_path=str(workspace_path),
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
-    tools = WorkspaceTools(workspace, command_timeout_seconds=1, max_command_output_chars=200)
+    class FakeFs:
+        async def download_file(self, path):
+            return b"hello"
 
-    assert tools.read_file("README.md") == "hello"
+    class FakeRuntime:
+        async def get_sandbox(self, workspace):
+            return type("Sandbox", (), {"fs": FakeFs()})()
+
+    workspace.workspace_path = "/workspace"
+    tools = WorkspaceTools(
+        workspace,
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+        command_timeout_seconds=1,
+        max_command_output_chars=200,
+    )
+
+    assert await tools.read_file("README.md") == "hello"
     with pytest.raises(WorkspaceToolError):
-        tools.read_file("../outside.txt")
+        await tools.read_file("../outside.txt")
     with pytest.raises(DangerousCommandError):
         tools._validate_command("rm -rf .")
     with pytest.raises(DangerousCommandError):

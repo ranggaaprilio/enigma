@@ -2,7 +2,7 @@ from typing import Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
@@ -19,6 +19,7 @@ from app.schemas.files import (
     normalize_path,
 )
 from app.schemas.workspaces import DeleteResponse
+from app.services.daytona_runtime import get_daytona_runtime
 from app.services.files import (
     FileConflictError,
     FileIgnoredPathError,
@@ -77,14 +78,16 @@ class FileServiceProtocol(Protocol):
         query: str,
     ) -> list[FileSearchResult]: ...
 
-    async def download_path(self, workspace_id: UUID, owner_id: UUID, path: str): ...
+    async def download_path(
+        self, workspace_id: UUID, owner_id: UUID, path: str
+    ) -> tuple[str, bytes]: ...
 
 
 async def get_file_service(
     session: AsyncSession = DB_SESSION_DEP,
     settings: Settings = SETTINGS_DEP,
 ) -> FileServiceProtocol:
-    return FileService(session=session, settings=settings)
+    return FileService(session=session, settings=settings, runtime=get_daytona_runtime())
 
 
 FILE_SERVICE_DEP = Depends(get_file_service)
@@ -243,9 +246,9 @@ async def download_file(
     path: str = Query(min_length=1, max_length=4096),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
-) -> FileResponse:
+) -> Response:
     try:
-        target = await service.download_path(
+        filename, content = await service.download_path(
             workspace_id,
             current_user.id,
             normalize_query_path(path),
@@ -261,7 +264,11 @@ async def download_file(
         FileIgnoredPathError,
     ) as error:
         raise translate_file_error(error) from None
-    return FileResponse(target, filename=target.name)
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/folders", response_model=FileOperationResponse, status_code=status.HTTP_201_CREATED)

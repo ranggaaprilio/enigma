@@ -10,12 +10,18 @@ async def test_health_returns_ok_when_dependencies_are_ready(monkeypatch):
 
     monkeypatch.setattr(health_module, "check_database", ok)
     monkeypatch.setattr(health_module, "check_redis", ok)
+    monkeypatch.setattr(health_module, "check_daytona", ok)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "database": "ok", "redis": "ok"}
+    assert response.json() == {
+        "status": "ok",
+        "database": "ok",
+        "redis": "ok",
+        "daytona": "ok",
+    }
 
 
 async def test_health_returns_degraded_when_dependency_fails(monkeypatch):
@@ -27,9 +33,15 @@ async def test_health_returns_degraded_when_dependency_fails(monkeypatch):
 
     monkeypatch.setattr(health_module, "check_database", ok)
     monkeypatch.setattr(health_module, "check_redis", failing)
+    monkeypatch.setattr(health_module, "check_daytona", ok)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/health")
 
     assert response.status_code == 503
-    assert response.json() == {"status": "degraded", "database": "ok", "redis": "error"}
+    assert response.json() == {
+        "status": "degraded",
+        "database": "ok",
+        "redis": "error",
+        "daytona": "ok",
+    }

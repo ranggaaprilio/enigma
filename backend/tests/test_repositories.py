@@ -1,5 +1,4 @@
 from datetime import UTC, datetime
-from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID, uuid4
 
@@ -15,7 +14,6 @@ from app.models import User, Workspace
 from app.services.repositories import (
     GitCommandError,
     GitFileStatus,
-    GitRunner,
     GitStatus,
     InvalidRepositoryUrlError,
     NoChangesToCommitError,
@@ -148,7 +146,9 @@ def repository_context(tmp_path):
         slug="demo",
         repo_url="https://github.com/example/demo",
         default_branch="main",
-        local_path=str(tmp_path / "workspace"),
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
@@ -318,7 +318,7 @@ def test_parse_porcelain_status_handles_modified_untracked_and_renamed_files():
     ]
 
 
-async def test_clone_uses_hidden_temp_directory_until_checkout_finishes(tmp_path):
+async def test_clone_uses_daytona_git_with_branch_and_credentials(tmp_path):
     user_id = uuid4()
     workspace = Workspace(
         id=uuid4(),
@@ -327,33 +327,31 @@ async def test_clone_uses_hidden_temp_directory_until_checkout_finishes(tmp_path
         slug="demo",
         repo_url="https://github.com/example/demo.git",
         default_branch="main",
-        local_path=str(tmp_path / "workspace"),
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-1",
+        workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
     )
-    repo_path = Path(workspace.local_path)
-    repo_path.mkdir()
     calls: list[dict[str, object]] = []
 
-    class CloneRunner:
-        def run(self, args, cwd=None, token=None, timeout=60):
-            clone_path = Path(args[2])
-            calls.append({"args": args, "cwd": cwd, "token": token, "clone_path": clone_path})
-            assert args[:2] == ["clone", workspace.repo_url]
-            assert clone_path.parent == repo_path.parent
-            assert clone_path.name.startswith(f".{repo_path.name}.clone-")
-            assert not (repo_path / ".git").exists()
-            clone_path.mkdir()
-            (clone_path / ".git").mkdir()
-            (clone_path / "README.md").write_text("ok\n", encoding="utf-8")
-            return SimpleNamespace(stdout="", stderr="")
+    class FakeFs:
+        async def get_file_info(self, path):
+            raise FileNotFoundError
+
+    class FakeGit:
+        async def clone(self, url, path, **kwargs):
+            calls.append({"url": url, "path": path, **kwargs})
+
+    class FakeRuntime:
+        async def get_sandbox(self, workspace):
+            return SimpleNamespace(fs=FakeFs(), git=FakeGit())
 
     service = RepositoryService(
         session=None,  # type: ignore[arg-type]
-        workspace_root=tmp_path,
         cipher=WorkspaceSecretCipher(Settings().workspace_env_encryption_key),
-        git_runner=CloneRunner(),  # type: ignore[arg-type]
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
     )
 
     async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
@@ -370,42 +368,12 @@ async def test_clone_uses_hidden_temp_directory_until_checkout_finishes(tmp_path
 
     await service.clone(workspace.id, user_id)
 
-    assert (repo_path / ".git").is_dir()
-    assert (repo_path / "README.md").read_text(encoding="utf-8") == "ok\n"
-    assert calls[0]["token"] == "raw-secret-token"
-    assert not Path(calls[0]["clone_path"]).exists()
-
-
-def test_git_runner_uses_shell_false_and_keeps_token_out_of_args(monkeypatch, tmp_path):
-    calls: list[dict[str, object]] = []
-
-    def fake_run(args, **kwargs):
-        calls.append({"args": args, **kwargs})
-        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
-
-    monkeypatch.setattr("app.services.repositories.subprocess.run", fake_run)
-
-    result = GitRunner().run(["push"], cwd=tmp_path, token="raw-secret-token")
-
-    assert result.stdout == "ok"
-    assert calls[0]["args"] == ["git", "push"]
-    assert calls[0]["shell"] is False
-    assert "raw-secret-token" not in calls[0]["args"]
-    assert calls[0]["env"]["EXECUTE_GIT_TOKEN"] == "raw-secret-token"
-
-
-def test_git_runner_redacts_tokens_from_errors(monkeypatch, tmp_path):
-    def fake_run(args, **kwargs):
-        return SimpleNamespace(
-            returncode=1,
-            stdout="",
-            stderr="fatal https://raw-secret-token@github.com/example/demo raw-secret-token",
-        )
-
-    monkeypatch.setattr("app.services.repositories.subprocess.run", fake_run)
-
-    with pytest.raises(GitCommandError) as error:
-        GitRunner().run(["push"], cwd=Path(tmp_path), token="raw-secret-token")
-
-    assert "raw-secret-token" not in error.value.message
-    assert "[redacted]" in error.value.message
+    assert calls == [
+        {
+            "url": workspace.repo_url,
+            "path": "/workspace",
+            "branch": "main",
+            "username": "x-access-token",
+            "password": "raw-secret-token",
+        }
+    ]

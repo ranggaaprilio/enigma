@@ -419,6 +419,10 @@ function FoundationChecks({
           <span>Redis</span>
           <span>{health.status === "ready" ? health.data.redis : "pending"}</span>
         </li>
+        <li className="flex items-center justify-between gap-3 border-b border-line pb-3">
+          <span>Daytona</span>
+          <span>{health.status === "ready" ? health.data.daytona : "pending"}</span>
+        </li>
         <li className="flex items-center justify-between gap-3">
           <span>Workspace</span>
           <span className="capitalize">{workspaceStatus}</span>
@@ -448,6 +452,7 @@ function CreateWorkspacePanel({ onCreated }: { onCreated: (workspace: WorkspaceR
   const [name, setName] = useState("");
   const [repoUrl, setRepoUrl] = useState("");
   const [defaultBranch, setDefaultBranch] = useState("main");
+  const [snapshot, setSnapshot] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
 
@@ -466,6 +471,7 @@ function CreateWorkspacePanel({ onCreated }: { onCreated: (workspace: WorkspaceR
         name,
         repo_url: repoUrl,
         default_branch: defaultBranch,
+        snapshot: snapshot.trim() || null,
       });
       onCreated(workspace);
     } catch (caughtError) {
@@ -488,6 +494,11 @@ function CreateWorkspacePanel({ onCreated }: { onCreated: (workspace: WorkspaceR
         <TextInput label="Default branch" value={defaultBranch} onChange={setDefaultBranch} />
       </div>
       <TextInput label="Repository URL" value={repoUrl} onChange={setRepoUrl} />
+      <TextInput
+        label="Daytona snapshot (optional)"
+        value={snapshot}
+        onChange={setSnapshot}
+      />
 
       {error && <ErrorState message={error} />}
 
@@ -512,8 +523,10 @@ function WorkspaceOverview({ workspace }: { workspace: WorkspaceResponse }) {
       </div>
 
       <div className="rounded-md border border-line bg-white p-4">
-        <p className="text-sm text-ink/60">Local path</p>
-        <p className="mt-2 break-all font-mono text-sm">{workspace.local_path ?? "Pending"}</p>
+        <p className="text-sm text-ink/60">Daytona runtime</p>
+        <p className="mt-2 break-all font-mono text-sm">
+          {workspace.sandbox_id ?? "Provisioning"} at {workspace.workspace_path}
+        </p>
       </div>
     </div>
   );
@@ -858,6 +871,7 @@ function WorkspaceMetadataForm({
   const [name, setName] = useState(workspace.name);
   const [repoUrl, setRepoUrl] = useState(workspace.repo_url);
   const [defaultBranch, setDefaultBranch] = useState(workspace.default_branch);
+  const [snapshot, setSnapshot] = useState(workspace.snapshot ?? "");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
@@ -866,6 +880,7 @@ function WorkspaceMetadataForm({
     setName(workspace.name);
     setRepoUrl(workspace.repo_url);
     setDefaultBranch(workspace.default_branch);
+    setSnapshot(workspace.snapshot ?? "");
   }, [workspace]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
@@ -879,6 +894,7 @@ function WorkspaceMetadataForm({
         name,
         repo_url: repoUrl,
         default_branch: defaultBranch,
+        snapshot: snapshot.trim() || null,
       });
       onWorkspaceChanged(updated);
       setMessage("Workspace settings saved.");
@@ -898,6 +914,13 @@ function WorkspaceMetadataForm({
       </div>
       <div className="mt-4">
         <TextInput label="Repository URL" value={repoUrl} onChange={setRepoUrl} />
+      </div>
+      <div className="mt-4">
+        <TextInput
+          label="Daytona snapshot"
+          value={snapshot}
+          onChange={setSnapshot}
+        />
       </div>
 
       {message && (

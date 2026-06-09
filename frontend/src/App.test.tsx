@@ -64,7 +64,10 @@ const workspace = {
   slug: "demo",
   repo_url: "https://github.com/example/demo",
   default_branch: "main",
-  local_path: "/tmp/demo",
+  runtime: "daytona",
+  sandbox_id: "sandbox-demo",
+  snapshot: null,
+  workspace_path: "/workspace",
   status: "ready",
   created_at: "2026-05-23T00:00:00Z",
   updated_at: "2026-05-23T00:00:00Z",
@@ -656,7 +659,7 @@ describe("App auth routing", () => {
       workspace_id: workspace.id,
       user_id: authUser.id,
       name: "Terminal",
-      tmux_session_name: "execute-demo",
+      pty_session_id: "execute-demo",
       status: "active",
       created_at: "2026-05-23T00:00:00Z",
       last_active_at: "2026-05-23T00:00:00Z",
@@ -857,7 +860,7 @@ describe("App auth routing", () => {
       id: "6f9d15db-19e2-4c04-95ad-a4e4508ef80d",
       workspace_id: workspace.id,
       port: 5173,
-      public_url: `/workspaces/${workspace.id}/preview/proxy/6f9d15db-19e2-4c04-95ad-a4e4508ef80d/`,
+      public_url: "https://3000-sandbox.proxy.daytona.example/?token=signed",
       status: "active",
       created_at: "2026-05-25T00:00:00Z",
       last_seen_at: "2026-05-25T00:00:00Z",
@@ -908,14 +911,14 @@ describe("App auth routing", () => {
     const frame = await screen.findByTitle("Demo preview");
     expect(frame).toHaveAttribute(
       "src",
-      `http://localhost:8000${previewSession.public_url}`,
+      previewSession.public_url,
     );
 
     await userEvent.click(screen.getByRole("button", { name: "Mobile" }));
     expect(frame).toHaveClass("max-w-[390px]");
 
     await userEvent.click(screen.getByRole("button", { name: "Copy URL" }));
-    expect(writeText).toHaveBeenCalledWith(`http://localhost:8000${previewSession.public_url}`);
+    expect(writeText).toHaveBeenCalledWith(previewSession.public_url);
 
     await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
     expect(await screen.findByTitle("Demo preview")).toBeInTheDocument();

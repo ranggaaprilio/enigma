@@ -6,23 +6,24 @@ Server-based AI agent dashboard foundation built with FastAPI, React, PostgreSQL
 
 1. Install `uv`, `pnpm`, and Podman.
 2. Copy `.env.example` to `.env`.
-3. Start the full stack:
+3. Add a Daytona API key and optionally configure a self-hosted `DAYTONA_API_URL`.
+4. Start the full stack:
    ```bash
    podman compose up --build
    ```
-4. Open the frontend at `http://localhost:5173`.
-5. Check the backend health endpoint at `http://localhost:8000/health`.
-6. Run backend migrations when needed:
+5. Open the frontend at `http://localhost:5173`.
+6. Check the backend health endpoint at `http://localhost:8000/health`.
+7. Run backend migrations when needed:
    ```bash
    cd backend
    uv run alembic upgrade head
    ```
-7. Run backend tests:
+8. Run backend tests:
    ```bash
    cd backend
    uv run pytest
    ```
-8. Run frontend checks:
+9. Run frontend checks:
    ```bash
    cd frontend
    pnpm install
@@ -30,16 +31,18 @@ Server-based AI agent dashboard foundation built with FastAPI, React, PostgreSQL
    pnpm test
    ```
 
-The editor runs as a standalone `code-server` container. The backend returns a
-browser-openable editor URL for the selected workspace, and the frontend opens
-that URL in a new tab. The code-server container and backend both mount the same
-host workspace root at `/workspace`.
+Each project runs in a persistent Daytona sandbox. Git, files, commands, terminal,
+preview servers, and `code-server` all operate inside `/workspace` in that sandbox.
+The editor and preview use short-lived signed Daytona URLs.
+
+The selected Daytona snapshot must provide a Linux shell, Git, Python 3,
+`code-server`, and standard process/network utilities used for commands and port
+detection.
 
 ## Services
 
 - Frontend: Vite React app on port `5173`.
 - Backend: FastAPI app on port `8000`.
-- code-server: VS Code Web on port `8080`.
 - PostgreSQL: port `5432`, persisted in the `postgres_data` Docker volume.
 - Redis: port `6379`, persisted in the `redis_data` Docker volume.
 
@@ -60,11 +63,18 @@ The root `.env.example` lists required values for local development:
 - `POSTGRES_USER`
 - `POSTGRES_PASSWORD`
 - `POSTGRES_DB`
-- `WORKSPACE_ROOT`
-- `HOST_WORKSPACE_ROOT`
 - `WORKSPACE_ENV_ENCRYPTION_KEY`
-- `CODE_SERVER_PASSWORD`
-- `CODE_SERVER_PORT`
-- `EDITOR_PUBLIC_URL`
-- `EDITOR_CONTAINER_WORKSPACE_ROOT`
-- `EDITOR_TOKEN_TTL_SECONDS`
+- `DAYTONA_API_KEY`
+- `DAYTONA_API_URL`
+- `DAYTONA_TARGET`
+- `DAYTONA_DEFAULT_SNAPSHOT`
+- `DAYTONA_DEFAULT_LANGUAGE`
+- `DAYTONA_AUTO_STOP_MINUTES`
+
+Existing database rows can be provisioned and cloned into Daytona after the
+Alembic upgrade:
+
+```bash
+cd backend
+uv run python scripts/migrate_workspaces_to_daytona.py
+```

@@ -61,14 +61,13 @@ class FakeWorkspaceService:
         name: str,
         repo_url: str,
         default_branch: str,
+        snapshot: str | None = None,
     ) -> Workspace:
         if await self.list_for_owner(owner_id):
             raise WorkspaceAlreadyExistsError
 
         now = datetime.now(UTC)
         workspace_id = uuid4()
-        local_path = self.workspace_root / str(owner_id) / str(workspace_id)
-        local_path.mkdir(parents=True)
         workspace = Workspace(
             id=workspace_id,
             owner_id=owner_id,
@@ -76,7 +75,10 @@ class FakeWorkspaceService:
             slug=name.lower().replace(" ", "-"),
             repo_url=repo_url,
             default_branch=default_branch,
-            local_path=str(local_path),
+            runtime="daytona",
+            daytona_sandbox_id=f"sandbox-{workspace_id}",
+            snapshot=snapshot,
+            workspace_path="/workspace",
             status="ready",
             created_at=now,
             updated_at=now,
@@ -91,6 +93,7 @@ class FakeWorkspaceService:
         name: str | None = None,
         repo_url: str | None = None,
         default_branch: str | None = None,
+        snapshot: str | None = None,
     ) -> Workspace:
         workspace = await self.get_for_owner(workspace_id, owner_id)
         if name is not None:
@@ -100,6 +103,8 @@ class FakeWorkspaceService:
             workspace.repo_url = repo_url
         if default_branch is not None:
             workspace.default_branch = default_branch
+        if snapshot is not None:
+            workspace.snapshot = snapshot
         workspace.updated_at = datetime.now(UTC)
         return workspace
 
@@ -218,8 +223,9 @@ async def test_user_can_create_one_workspace_and_directory(workspace_context):
     assert first.status_code == 201
     payload = first.json()
     assert payload["status"] == "ready"
-    assert Path(payload["local_path"]).is_dir()
-    assert tmp_path in Path(payload["local_path"]).parents
+    assert payload["runtime"] == "daytona"
+    assert payload["sandbox_id"].startswith("sandbox-")
+    assert payload["workspace_path"] == "/workspace"
     assert second.status_code == 409
 
 
@@ -312,12 +318,20 @@ async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
             workspace.created_at = workspace.created_at or now
             workspace.updated_at = now
 
-    settings = Settings(workspace_root=tmp_path)
+    settings = Settings()
     session = FakeSession()
+
+    class FakeRuntime:
+        def __init__(self, runtime_settings):
+            self.settings = runtime_settings
+
+        async def provision(self, workspace_id, owner_id, snapshot):
+            return type("Sandbox", (), {"id": f"sandbox-{workspace_id}"})()
+
     service = SqlAlchemyWorkspaceService(
         session=session,  # type: ignore[arg-type]
-        workspace_root=tmp_path,
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=FakeRuntime(settings),  # type: ignore[arg-type]
     )
 
     workspace = await service.create(
@@ -328,7 +342,8 @@ async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
     )
 
     assert workspace.status == "ready"
-    assert Path(workspace.local_path or "").is_dir()
+    assert workspace.daytona_sandbox_id == f"sandbox-{workspace.id}"
+    assert workspace.workspace_path == "/workspace"
     assert session.commits == 2
     assert session.refreshed == [workspace]
     assert workspace.updated_at is not None

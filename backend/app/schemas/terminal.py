@@ -24,7 +24,7 @@ class TerminalSessionResponse(BaseModel):
     workspace_id: UUID
     user_id: UUID
     name: str
-    tmux_session_name: str
+    pty_session_id: str
     status: TerminalSessionStatus
     created_at: datetime
     last_active_at: datetime

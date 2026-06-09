@@ -1,8 +1,6 @@
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from uuid import UUID, uuid4
 
-import httpx
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -11,12 +9,7 @@ from app.api import editor as editor_module
 from app.core.security import hash_password
 from app.main import app
 from app.models import EditorSession, User, Workspace
-from app.services.editor import (
-    EditorService,
-    EditorSessionNotFoundError,
-    EditorTokenError,
-    EditorWorkspacePathError,
-)
+from app.services.editor import EditorSessionNotFoundError
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -68,26 +61,6 @@ class FakeEditorService:
         self.session.status = "stopped"
         return self.session
 
-    async def get_proxy_session(
-        self,
-        workspace_id: UUID,
-        session_id: UUID,
-        user_id: UUID,
-        token: str,
-    ) -> EditorSession:
-        self._ensure_workspace(workspace_id, user_id)
-        if self.session is None or self.session.id != session_id:
-            raise EditorSessionNotFoundError
-        if token != "valid-token":
-            raise EditorTokenError
-        return self.session
-
-    def upstream_http_url(self, editor_session: EditorSession, token: str, path: str) -> str:
-        return f"http://127.0.0.1:13337/{path}"
-
-    def upstream_ws_url(self, editor_session: EditorSession, token: str, path: str) -> str:
-        return f"ws://127.0.0.1:13337/{path}"
-
     def _ensure_workspace(self, workspace_id: UUID, user_id: UUID) -> None:
         if self.workspace.id != workspace_id or self.workspace.owner_id != user_id:
             raise WorkspaceNotFoundError
@@ -131,7 +104,9 @@ def editor_context(tmp_path):
         slug="demo",
         repo_url="https://github.com/example/demo",
         default_branch="main",
-        local_path=str(workspace_path),
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
@@ -186,111 +161,3 @@ async def test_editor_workspace_ownership_is_enforced(editor_context):
         response = await client.post(f"/workspaces/{uuid4()}/editor/start")
 
     assert response.status_code == 404
-
-
-async def test_editor_proxy_rejects_invalid_token(editor_context):
-    _user, workspace, service = editor_context
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        await login(client)
-        created = await client.post(f"/workspaces/{workspace.id}/editor/start")
-        session_id = created.json()["id"]
-        response = await client.get(
-            f"/workspaces/{workspace.id}/editor/proxy/{session_id}/invalid-token/"
-        )
-
-    assert service.session is not None
-    assert response.status_code == 404
-
-
-async def test_editor_proxy_requests_identity_encoding(editor_context, monkeypatch):
-    _user, workspace, _service = editor_context
-    captured_headers: dict[str, str] = {}
-
-    class FakeProxyClient:
-        def __init__(self, *args, **kwargs) -> None:
-            return None
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args) -> None:
-            return None
-
-        async def request(self, method, url, content, headers):
-            captured_headers.update(headers)
-            return httpx.Response(200, content=b"ok", headers={"content-type": "text/plain"})
-
-    monkeypatch.setattr(editor_module.httpx, "AsyncClient", FakeProxyClient)
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        await login(client)
-        created = await client.post(f"/workspaces/{workspace.id}/editor/start")
-        session_id = created.json()["id"]
-        response = await client.get(
-            f"/workspaces/{workspace.id}/editor/proxy/{session_id}/valid-token/",
-            headers={"accept-encoding": "br, gzip"},
-        )
-
-    assert response.text == "ok"
-    assert captured_headers["Accept-Encoding"] == "identity"
-
-
-def test_editor_service_validates_workspace_path(tmp_path):
-    workspace = Workspace(
-        id=uuid4(),
-        owner_id=uuid4(),
-        name="Demo",
-        slug="demo",
-        repo_url="https://github.com/example/demo",
-        default_branch="main",
-        local_path=str(tmp_path / "missing"),
-        status="ready",
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-    service = EditorService(
-        session=None,  # type: ignore[arg-type]
-        workspace_root=tmp_path,
-        public_url="http://localhost:8080",
-        container_workspace_root=tmp_path,
-        token_ttl_seconds=3600,
-        secret_key="secret",
-    )
-
-    with pytest.raises(EditorWorkspacePathError):
-        service._workspace_path(workspace)
-
-
-def test_editor_service_generates_standalone_code_server_url(tmp_path):
-    workspace_path = tmp_path / "owner-id" / "workspace-id"
-    workspace_path.mkdir(parents=True)
-    service = EditorService(
-        session=None,  # type: ignore[arg-type]
-        workspace_root=tmp_path,
-        public_url="http://localhost:8080",
-        container_workspace_root=Path("/workspace"),
-        token_ttl_seconds=3600,
-        secret_key="secret",
-    )
-
-    assert service.editor_url(workspace_path) == (
-        "http://localhost:8080/?folder=/workspace/owner-id/workspace-id"
-    )
-
-
-def test_editor_service_encodes_workspace_folder_url(tmp_path):
-    workspace_path = tmp_path / "owner id" / "workspace id"
-    workspace_path.mkdir(parents=True)
-    service = EditorService(
-        session=None,  # type: ignore[arg-type]
-        workspace_root=tmp_path,
-        public_url="http://localhost:8080/",
-        container_workspace_root=Path("/workspace"),
-        token_ttl_seconds=3600,
-        secret_key="secret",
-    )
-
-    assert service.editor_url(workspace_path) == (
-        "http://localhost:8080/?folder=/workspace/owner%20id/workspace%20id"
-    )

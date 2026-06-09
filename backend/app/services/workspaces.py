@@ -1,6 +1,4 @@
 import re
-import shutil
-from pathlib import Path
 from uuid import UUID
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -8,9 +6,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Workspace, WorkspaceEnvVar
+from app.services.daytona_runtime import DaytonaRuntime, DaytonaRuntimeError
 
 ENV_KEY_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
+SNAPSHOT_UNSET = object()
 
 
 class WorkspaceAlreadyExistsError(Exception):
@@ -21,7 +21,7 @@ class WorkspaceNotFoundError(Exception):
     pass
 
 
-class WorkspaceDirectoryError(Exception):
+class WorkspaceRuntimeError(Exception):
     pass
 
 
@@ -63,12 +63,12 @@ class SqlAlchemyWorkspaceService:
     def __init__(
         self,
         session: AsyncSession,
-        workspace_root: Path,
         cipher: WorkspaceSecretCipher,
+        runtime: DaytonaRuntime,
     ) -> None:
         self.session = session
-        self.workspace_root = workspace_root
         self.cipher = cipher
+        self.runtime = runtime
 
     async def list_for_owner(self, owner_id: UUID) -> list[Workspace]:
         result = await self.session.execute(
@@ -88,6 +88,7 @@ class SqlAlchemyWorkspaceService:
         name: str,
         repo_url: str,
         default_branch: str,
+        snapshot: str | None = None,
     ) -> Workspace:
         result = await self.session.execute(
             select(Workspace.id).where(Workspace.owner_id == owner_id)
@@ -101,6 +102,9 @@ class SqlAlchemyWorkspaceService:
             slug=slugify(name),
             repo_url=repo_url,
             default_branch=default_branch,
+            runtime="daytona",
+            snapshot=snapshot,
+            workspace_path=self.runtime.settings.daytona_workspace_path,
             status="creating",
         )
 
@@ -108,16 +112,14 @@ class SqlAlchemyWorkspaceService:
         await self.session.flush()
         await self.session.commit()
 
-        workspace_path = self.workspace_root / str(owner_id) / str(workspace.id)
-        workspace.local_path = str(workspace_path)
-
         try:
-            workspace_path.mkdir(parents=True, exist_ok=False)
-        except OSError as error:
+            sandbox = await self.runtime.provision(workspace.id, owner_id, snapshot)
+            workspace.daytona_sandbox_id = sandbox.id
+        except DaytonaRuntimeError as error:
             workspace.status = "error"
             self.session.add(workspace)
             await self.session.commit()
-            raise WorkspaceDirectoryError from error
+            raise WorkspaceRuntimeError(str(error)) from error
 
         workspace.status = "ready"
         self.session.add(workspace)
@@ -133,6 +135,7 @@ class SqlAlchemyWorkspaceService:
         name: str | None = None,
         repo_url: str | None = None,
         default_branch: str | None = None,
+        snapshot: str | None | object = SNAPSHOT_UNSET,
     ) -> Workspace:
         workspace = await self.get_for_owner(workspace_id, owner_id)
         if name is not None:
@@ -142,6 +145,8 @@ class SqlAlchemyWorkspaceService:
             workspace.repo_url = repo_url
         if default_branch is not None:
             workspace.default_branch = default_branch
+        if snapshot is not SNAPSHOT_UNSET:
+            workspace.snapshot = snapshot
         self.session.add(workspace)
         await self.session.commit()
         await self.session.refresh(workspace)
@@ -149,19 +154,12 @@ class SqlAlchemyWorkspaceService:
 
     async def delete(self, workspace_id: UUID, owner_id: UUID) -> None:
         workspace = await self.get_for_owner(workspace_id, owner_id)
-        local_path = workspace.local_path
+        try:
+            await self.runtime.delete(workspace)
+        except DaytonaRuntimeError as error:
+            raise WorkspaceRuntimeError(str(error)) from error
         await self.session.delete(workspace)
         await self.session.commit()
-
-        if local_path:
-            self._delete_workspace_directory(local_path)
-
-    def _delete_workspace_directory(self, local_path: str) -> None:
-        root = self.workspace_root.resolve()
-        path = Path(local_path).resolve()
-        if path == root or root not in path.parents:
-            return
-        shutil.rmtree(path, ignore_errors=True)
 
     async def list_env_vars(self, workspace_id: UUID, owner_id: UUID) -> list[WorkspaceEnvVar]:
         workspace = await self.get_for_owner(workspace_id, owner_id)

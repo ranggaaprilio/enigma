@@ -11,6 +11,7 @@ from app.db.session import async_session_maker, get_db_session
 from app.models import TerminalSession, User
 from app.schemas.terminal import TerminalSessionCreateRequest, TerminalSessionResponse
 from app.schemas.workspaces import DeleteResponse
+from app.services.daytona_runtime import get_daytona_runtime
 from app.services.terminal import (
     TerminalPtyBridge,
     TerminalRuntimeError,
@@ -46,8 +47,8 @@ async def get_terminal_service(
 ) -> TerminalServiceProtocol:
     return TerminalService(
         session=session,
-        workspace_root=settings.workspace_root,
-        tmux_binary=settings.terminal_tmux_binary,
+        settings=settings,
+        runtime=get_daytona_runtime(),
     )
 
 
@@ -138,11 +139,11 @@ async def connect_terminal_session(
 
         service = TerminalService(
             session=session,
-            workspace_root=settings.workspace_root,
-            tmux_binary=settings.terminal_tmux_binary,
+            settings=settings,
+            runtime=get_daytona_runtime(),
         )
         try:
-            _workspace, terminal_session = await service.get_for_workspace(
+            workspace, terminal_session = await service.get_for_workspace(
                 workspace_id,
                 terminal_session_id,
                 user.id,
@@ -154,14 +155,15 @@ async def connect_terminal_session(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         await service.touch(terminal_session)
+        env = await service.environment(workspace.id)
 
     await websocket.accept()
     bridge = TerminalPtyBridge(
-        tmux_binary=settings.terminal_tmux_binary,
+        runtime=get_daytona_runtime(),
         default_cols=settings.terminal_default_cols,
         default_rows=settings.terminal_default_rows,
     )
-    await bridge.bridge(websocket, terminal_session)
+    await bridge.bridge(websocket, workspace, terminal_session, env)
 
 
 async def websocket_user(
