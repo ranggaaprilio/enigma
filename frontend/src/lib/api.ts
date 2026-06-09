@@ -2,6 +2,7 @@ export type HealthResponse = {
   status: "ok" | "degraded";
   database: "ok" | "error";
   redis: "ok" | "error";
+  daytona: "ok" | "error";
 };
 
 export type UserRole = "owner" | "developer" | "viewer";
@@ -56,7 +57,10 @@ export type WorkspaceResponse = {
   slug: string;
   repo_url: string;
   default_branch: string;
-  local_path: string | null;
+  runtime: string;
+  sandbox_id: string | null;
+  snapshot: string | null;
+  workspace_path: string;
   status: WorkspaceStatus;
   created_at: string;
   updated_at: string;
@@ -64,13 +68,21 @@ export type WorkspaceResponse = {
 
 export type WorkspaceStatusResponse = Pick<
   WorkspaceResponse,
-  "id" | "status" | "local_path" | "created_at" | "updated_at"
+  | "id"
+  | "status"
+  | "runtime"
+  | "sandbox_id"
+  | "snapshot"
+  | "workspace_path"
+  | "created_at"
+  | "updated_at"
 >;
 
 export type WorkspaceCreatePayload = {
   name: string;
   repo_url: string;
   default_branch?: string;
+  snapshot?: string | null;
 };
 
 export type WorkspaceUpdatePayload = Partial<WorkspaceCreatePayload>;
@@ -235,7 +247,7 @@ export type TerminalSessionResponse = {
   workspace_id: string;
   user_id: string;
   name: string;
-  tmux_session_name: string;
+  pty_session_id: string;
   status: TerminalSessionStatus;
   created_at: string;
   last_active_at: string;

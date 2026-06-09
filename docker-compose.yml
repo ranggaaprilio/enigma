@@ -34,10 +34,13 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
-      WORKSPACE_ROOT: ${WORKSPACE_ROOT:-/workspace}
       WORKSPACE_ENV_ENCRYPTION_KEY: ${WORKSPACE_ENV_ENCRYPTION_KEY:-SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc=}
-      EDITOR_PUBLIC_URL: ${EDITOR_PUBLIC_URL:-http://localhost:8080}
-      EDITOR_CONTAINER_WORKSPACE_ROOT: ${EDITOR_CONTAINER_WORKSPACE_ROOT:-/workspace}
+      DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
+      DAYTONA_API_URL: ${DAYTONA_API_URL:-https://app.daytona.io/api}
+      DAYTONA_TARGET: ${DAYTONA_TARGET:-}
+      DAYTONA_DEFAULT_SNAPSHOT: ${DAYTONA_DEFAULT_SNAPSHOT:-}
+      DAYTONA_DEFAULT_LANGUAGE: ${DAYTONA_DEFAULT_LANGUAGE:-python}
+      DAYTONA_AUTO_STOP_MINUTES: ${DAYTONA_AUTO_STOP_MINUTES:-30}
     ports:
       - "8000:8000"
     depends_on:
@@ -47,21 +50,8 @@ services:
         condition: service_healthy
     volumes:
       - ./backend:/app
-      - ${HOST_WORKSPACE_ROOT:-/Users/rangga/workspace}:/workspace
       - backend_venv:/app/.venv
     command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
-
-  code-server:
-    image: codercom/code-server:latest
-    environment:
-      PASSWORD: ${CODE_SERVER_PASSWORD:-execute}
-    ports:
-      - "${CODE_SERVER_PORT:-8080}:8080"
-    volumes:
-      - ${HOST_WORKSPACE_ROOT:-/Users/rangga/workspace}:/workspace
-      - code_server_config:/home/coder/.config
-      - code_server_data:/home/coder/.local/share/code-server
-    command: ["--bind-addr", "0.0.0.0:8080", "/workspace"]
 
   frontend:
     build:
@@ -83,5 +73,3 @@ volumes:
   redis_data:
   backend_venv:
   frontend_node_modules:
-  code_server_config:
-  code_server_data:

@@ -42,7 +42,10 @@ class Workspace(Base):
     slug: Mapped[str] = mapped_column(String(180), nullable=False)
     repo_url: Mapped[str] = mapped_column(Text, nullable=False)
     default_branch: Mapped[str] = mapped_column(String(120), nullable=False, default="main")
-    local_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    runtime: Mapped[str] = mapped_column(String(32), nullable=False, default="daytona")
+    daytona_sandbox_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    workspace_path: Mapped[str] = mapped_column(Text, nullable=False, default="/workspace")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="creating")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -55,6 +58,10 @@ class Workspace(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
+
+    @property
+    def sandbox_id(self) -> str | None:
+        return self.daytona_sandbox_id
 
 
 class WorkspaceEnvVar(Base):

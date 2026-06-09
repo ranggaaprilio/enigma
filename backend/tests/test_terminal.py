@@ -11,7 +11,6 @@ from app.api import terminal as terminal_module
 from app.core.security import hash_password
 from app.main import app
 from app.models import TerminalSession, User, Workspace
-from app.services.terminal import TerminalRuntimeError, TerminalService, TerminalWorkspacePathError
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -65,7 +64,7 @@ class FakeTerminalService:
             workspace_id=self.workspace.id,
             user_id=self.user.id,
             name=name,
-            tmux_session_name=f"execute-{self.workspace.id.hex}",
+            pty_session_id=f"execute-{self.workspace.id.hex}",
             status="active",
             created_at=now,
             last_active_at=now,
@@ -108,7 +107,9 @@ def terminal_context(tmp_path):
         slug="demo",
         repo_url="https://github.com/example/demo",
         default_branch="main",
-        local_path=str(workspace_path),
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
@@ -153,6 +154,7 @@ async def test_create_list_and_delete_terminal_session(terminal_context):
 
     assert created.status_code == 201
     assert created.json()["name"] == "Shell"
+    assert created.json()["pty_session_id"] == f"execute-{workspace.id.hex}"
     assert reused.json()["id"] == created.json()["id"]
     assert listed.json()[0]["status"] == "active"
     assert deleted.json() == {"ok": True}
@@ -168,124 +170,6 @@ async def test_terminal_workspace_ownership_is_enforced(terminal_context):
         response = await client.post(f"/workspaces/{alien_workspace_id}/terminal/sessions")
 
     assert response.status_code == 404
-
-
-def test_terminal_service_validates_workspace_path(tmp_path):
-    workspace = Workspace(
-        id=uuid4(),
-        owner_id=uuid4(),
-        name="Demo",
-        slug="demo",
-        repo_url="https://github.com/example/demo",
-        default_branch="main",
-        local_path=str(tmp_path / "missing"),
-        status="ready",
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-    service = TerminalService(session=None, workspace_root=tmp_path, tmux_binary="tmux")  # type: ignore[arg-type]
-
-    with pytest.raises(TerminalWorkspacePathError):
-        service._workspace_path(workspace)
-
-
-def test_terminal_tmux_session_name_is_safe(tmp_path):
-    service = TerminalService(session=None, workspace_root=tmp_path, tmux_binary="tmux")  # type: ignore[arg-type]
-    workspace_id = uuid4()
-
-    assert service._tmux_session_name(workspace_id) == f"execute-{workspace_id.hex}"
-
-
-async def test_terminal_service_creates_detached_tmux_session_after_missing_check(tmp_path):
-    service = TerminalService(session=None, workspace_root=tmp_path, tmux_binary="tmux")  # type: ignore[arg-type]
-    terminal_session = TerminalSession(
-        id=uuid4(),
-        workspace_id=uuid4(),
-        user_id=uuid4(),
-        name="Terminal",
-        tmux_session_name="execute-safe",
-        status="active",
-        created_at=datetime.now(UTC),
-        last_active_at=datetime.now(UTC),
-    )
-    calls: list[tuple[str, ...]] = []
-
-    async def fake_run_tmux(*args: str) -> None:
-        calls.append(args)
-        if args[0] == "has-session":
-            raise TerminalRuntimeError("can't find session: execute-safe")
-
-    service._run_tmux = fake_run_tmux  # type: ignore[method-assign]
-
-    await service._ensure_tmux_session(terminal_session, tmp_path)
-
-    assert calls == [
-        ("has-session", "-t", "execute-safe"),
-        ("new-session", "-d", "-s", "execute-safe", "-c", str(tmp_path)),
-        ("set-option", "-t", "execute-safe", "mouse", "on"),
-        ("set-option", "-t", "execute-safe", "history-limit", "10000"),
-    ]
-
-
-async def test_terminal_service_treats_missing_tmux_socket_as_missing_session(tmp_path):
-    service = TerminalService(session=None, workspace_root=tmp_path, tmux_binary="tmux")  # type: ignore[arg-type]
-    terminal_session = TerminalSession(
-        id=uuid4(),
-        workspace_id=uuid4(),
-        user_id=uuid4(),
-        name="Terminal",
-        tmux_session_name="execute-safe",
-        status="active",
-        created_at=datetime.now(UTC),
-        last_active_at=datetime.now(UTC),
-    )
-    calls: list[tuple[str, ...]] = []
-
-    async def fake_run_tmux(*args: str) -> None:
-        calls.append(args)
-        if args[0] == "has-session":
-            raise TerminalRuntimeError(
-                "error connecting to /tmp/tmux-0/default (No such file or directory)"
-            )
-
-    service._run_tmux = fake_run_tmux  # type: ignore[method-assign]
-
-    await service._ensure_tmux_session(terminal_session, tmp_path)
-
-    assert calls == [
-        ("has-session", "-t", "execute-safe"),
-        ("new-session", "-d", "-s", "execute-safe", "-c", str(tmp_path)),
-        ("set-option", "-t", "execute-safe", "mouse", "on"),
-        ("set-option", "-t", "execute-safe", "history-limit", "10000"),
-    ]
-
-
-async def test_terminal_service_does_not_create_when_tmux_session_exists(tmp_path):
-    service = TerminalService(session=None, workspace_root=tmp_path, tmux_binary="tmux")  # type: ignore[arg-type]
-    terminal_session = TerminalSession(
-        id=uuid4(),
-        workspace_id=uuid4(),
-        user_id=uuid4(),
-        name="Terminal",
-        tmux_session_name="execute-existing",
-        status="active",
-        created_at=datetime.now(UTC),
-        last_active_at=datetime.now(UTC),
-    )
-    calls: list[tuple[str, ...]] = []
-
-    async def fake_run_tmux(*args: str) -> None:
-        calls.append(args)
-
-    service._run_tmux = fake_run_tmux  # type: ignore[method-assign]
-
-    await service._ensure_tmux_session(terminal_session, tmp_path)
-
-    assert calls == [
-        ("has-session", "-t", "execute-existing"),
-        ("set-option", "-t", "execute-existing", "mouse", "on"),
-        ("set-option", "-t", "execute-existing", "history-limit", "10000"),
-    ]
 
 
 def test_terminal_websocket_rejects_unauthenticated_connections():

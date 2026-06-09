@@ -1,7 +1,6 @@
-import os
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import PurePosixPath
 from uuid import UUID
 
 import structlog
@@ -11,6 +10,11 @@ from app.core.config import Settings
 from app.models import Workspace
 from app.schemas.files import FileNode, FileReadResponse
 from app.services.audit import AuditLogService
+from app.services.daytona_runtime import (
+    DaytonaRuntime,
+    DaytonaRuntimeError,
+    get_daytona_runtime,
+)
 from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
@@ -74,74 +78,90 @@ class FileSearchResult:
 
 
 class FileService:
-    def __init__(self, session: AsyncSession, settings: Settings) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        settings: Settings,
+        runtime: DaytonaRuntime | None = None,
+    ) -> None:
         self.session = session
         self.settings = settings
+        self.runtime = runtime or get_daytona_runtime()
 
     async def tree(self, workspace_id: UUID, owner_id: UUID, path: str | None = None) -> FileNode:
-        workspace_root = await self._workspace_root(workspace_id, owner_id)
-        target = self._resolve_existing(workspace_root, path or "")
-        if not target.is_dir():
-            raise FilePathError
-
+        workspace, sandbox = await self._workspace(workspace_id, owner_id)
+        target = self._remote_path(workspace, path or "")
         counter = 0
 
-        def build_node(item: Path) -> FileNode:
+        async def build_node(remote_path: str, relative_path: str) -> FileNode:
             nonlocal counter
             counter += 1
             if counter > self.settings.file_tree_max_entries:
                 raise FileTreeLimitExceededError
-            stat = item.stat()
+            try:
+                info = await sandbox.fs.get_file_info(remote_path)
+            except Exception as error:
+                raise FileNotFoundErrorInWorkspace from error
+            is_dir = self._is_dir(info)
             children: list[FileNode] = []
-            if item.is_dir():
-                children = [
-                    build_node(child)
-                    for child in sorted(
-                        item.iterdir(),
-                        key=lambda child_path: (not child_path.is_dir(), child_path.name.lower()),
-                    )
-                    if not self._is_ignored_relative(workspace_root, child)
+            if is_dir:
+                entries = await sandbox.fs.list_files(remote_path)
+                visible = [
+                    entry
+                    for entry in entries
+                    if not self._is_ignored(self._entry_relative(relative_path, entry))
                 ]
+                visible.sort(key=lambda entry: (not self._is_dir(entry), self._name(entry).lower()))
+                for entry in visible:
+                    child_relative = self._entry_relative(relative_path, entry)
+                    children.append(
+                        await build_node(
+                            self._remote_path(workspace, child_relative),
+                            child_relative,
+                        )
+                    )
             return FileNode(
-                path=self._relative_path(workspace_root, item),
-                name=item.name or workspace_root.name,
-                type="directory" if item.is_dir() else "file",
-                size=None if item.is_dir() else stat.st_size,
-                modified_at=datetime.fromtimestamp(stat.st_mtime, UTC),
+                path=relative_path,
+                name=self._name(info) or workspace.name,
+                type="directory" if is_dir else "file",
+                size=None if is_dir else self._size(info),
+                modified_at=self._modified_at(info),
                 children=children,
             )
 
-        return build_node(target)
+        return await build_node(target, self._normalize_relative(path or "", allow_empty=True))
 
     async def read(self, workspace_id: UUID, owner_id: UUID, path: str) -> FileReadResponse:
-        workspace_root = await self._workspace_root(workspace_id, owner_id)
-        target = self._resolve_existing(workspace_root, path)
-        if not target.is_file():
-            raise FilePathError
-        stat = target.stat()
-        if stat.st_size > self.settings.file_max_read_bytes:
-            raise FileTooLargeError
+        workspace, sandbox = await self._workspace(workspace_id, owner_id)
+        relative = self._normalize_relative(path)
+        remote = self._remote_path(workspace, relative)
+        try:
+            info = await sandbox.fs.get_file_info(remote)
+            if self._is_symlink(info):
+                raise FilePathError
+            if self._is_dir(info):
+                raise FilePathError
+            size = self._size(info)
+            if size > self.settings.file_max_read_bytes:
+                raise FileTooLargeError
+            content = await sandbox.fs.download_file(remote)
+        except (FilePathError, FileTooLargeError):
+            raise
+        except Exception as error:
+            raise FileNotFoundErrorInWorkspace from error
+        data = content or b""
         return FileReadResponse(
-            path=self._relative_path(workspace_root, target),
-            name=target.name,
+            path=relative,
+            name=PurePosixPath(relative).name,
             type="file",
-            size=stat.st_size,
-            modified_at=datetime.fromtimestamp(stat.st_mtime, UTC),
-            content=target.read_text(encoding="utf-8", errors="replace"),
+            size=len(data),
+            modified_at=self._modified_at(info),
+            content=data.decode("utf-8", errors="replace"),
         )
 
     async def write(self, workspace_id: UUID, owner_id: UUID, path: str, content: str) -> None:
-        if len(content.encode("utf-8")) > self.settings.file_max_upload_bytes:
-            raise FileTooLargeError
-        workspace_root = await self._workspace_root(workspace_id, owner_id)
-        target = self._resolve_target(workspace_root, path)
-        if target.exists() and target.is_dir():
-            raise FilePathError
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-        relative_path = self._relative_path(workspace_root, target)
-        self._log("file_write", workspace_id, owner_id, relative_path)
-        await self._audit(owner_id, workspace_id, "file_write", relative_path)
+        await self.upload(workspace_id, owner_id, path, content.encode("utf-8"))
+        await self._audit(owner_id, workspace_id, "file_write", path)
 
     async def upload(
         self,
@@ -153,36 +173,27 @@ class FileService:
     ) -> str:
         if len(content) > self.settings.file_max_upload_bytes:
             raise FileTooLargeError
-        workspace_root = await self._workspace_root(workspace_id, owner_id)
+        workspace, sandbox = await self._workspace(workspace_id, owner_id)
         upload_path = f"{path.rstrip('/')}/{filename.strip()}" if filename else path
-        target = self._resolve_target(workspace_root, upload_path)
-        if target.exists() and target.is_dir():
-            raise FilePathError
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(content)
-        relative_path = self._relative_path(workspace_root, target)
-        self._log("file_upload", workspace_id, owner_id, relative_path)
-        await self._audit(owner_id, workspace_id, "file_upload", relative_path)
-        return relative_path
+        relative = self._normalize_relative(upload_path)
+        parent = PurePosixPath(relative).parent.as_posix()
+        if parent != ".":
+            await sandbox.fs.create_folder(self._remote_path(workspace, parent), "755")
+        await sandbox.fs.upload_file(content, self._remote_path(workspace, relative))
+        self._log("file_upload", workspace_id, owner_id, relative)
+        await self._audit(owner_id, workspace_id, "file_upload", relative)
+        return relative
 
     async def create_folder(self, workspace_id: UUID, owner_id: UUID, path: str) -> None:
-        workspace_root = await self._workspace_root(workspace_id, owner_id)
-        target = self._resolve_target(workspace_root, path)
-        if target.exists():
+        workspace, sandbox = await self._workspace(workspace_id, owner_id)
+        relative = self._normalize_relative(path)
+        try:
+            await sandbox.fs.get_file_info(self._remote_path(workspace, relative))
+        except Exception:
+            await sandbox.fs.create_folder(self._remote_path(workspace, relative), "755")
+        else:
             raise FileConflictError
-        target.mkdir(parents=True)
-        self._log(
-            "file_folder_create",
-            workspace_id,
-            owner_id,
-            self._relative_path(workspace_root, target),
-        )
-        await self._audit(
-            owner_id,
-            workspace_id,
-            "file_folder_create",
-            self._relative_path(workspace_root, target),
-        )
+        await self._audit(owner_id, workspace_id, "file_folder_create", relative)
 
     async def rename(
         self,
@@ -191,47 +202,35 @@ class FileService:
         path: str,
         new_path: str,
     ) -> str:
-        workspace_root = await self._workspace_root(workspace_id, owner_id)
-        source = self._resolve_existing(workspace_root, path)
-        target = self._resolve_target(workspace_root, new_path)
-        if target.exists():
-            raise FileConflictError
-        if source.is_dir() and self._is_same_or_descendant(source.resolve(), target.resolve()):
+        workspace, sandbox = await self._workspace(workspace_id, owner_id)
+        source = self._normalize_relative(path)
+        destination = self._normalize_relative(new_path)
+        if destination == source or destination.startswith(f"{source}/"):
             raise FilePathError
-        target.parent.mkdir(parents=True, exist_ok=True)
-        source.rename(target)
-        relative_path = self._relative_path(workspace_root, target)
-        logger.info(
-            "file_rename",
-            workspace_id=str(workspace_id),
-            user_id=str(owner_id),
-            path=self._relative_path(workspace_root, source),
-            new_path=relative_path,
-            ok=True,
+        try:
+            await sandbox.fs.get_file_info(self._remote_path(workspace, destination))
+        except Exception:
+            pass
+        else:
+            raise FileConflictError
+        await sandbox.fs.move_files(
+            self._remote_path(workspace, source),
+            self._remote_path(workspace, destination),
         )
         await self._audit(
             owner_id,
             workspace_id,
             "file_rename",
-            relative_path,
-            {"from_path": self._relative_path(workspace_root, source)},
+            destination,
+            {"from_path": source},
         )
-        return relative_path
+        return destination
 
     async def delete(self, workspace_id: UUID, owner_id: UUID, path: str) -> None:
-        workspace_root = await self._workspace_root(workspace_id, owner_id)
-        target = self._resolve_existing(workspace_root, path)
-        if target == workspace_root:
-            raise FilePathError
-        if target.is_dir():
-            import shutil
-
-            shutil.rmtree(target)
-        else:
-            target.unlink()
-        relative_path = self._relative_path(workspace_root, target)
-        self._log("file_delete", workspace_id, owner_id, relative_path)
-        await self._audit(owner_id, workspace_id, "file_delete", relative_path)
+        workspace, sandbox = await self._workspace(workspace_id, owner_id)
+        relative = self._normalize_relative(path)
+        await sandbox.fs.delete_file(self._remote_path(workspace, relative), recursive=True)
+        await self._audit(owner_id, workspace_id, "file_delete", relative)
 
     async def search(
         self,
@@ -239,122 +238,113 @@ class FileService:
         owner_id: UUID,
         query: str,
     ) -> list[FileSearchResult]:
-        workspace_root = await self._workspace_root(workspace_id, owner_id)
-        normalized_query = query.strip().lower()
-        if not normalized_query:
+        workspace, sandbox = await self._workspace(workspace_id, owner_id)
+        normalized = query.strip()
+        if not normalized:
             return []
+        matches = await sandbox.fs.find_files(workspace.workspace_path, f"*{normalized}*")
         results: list[FileSearchResult] = []
-        visited = 0
-        for item in self._walk_visible(workspace_root):
-            visited += 1
-            if visited > self.settings.file_tree_max_entries:
-                break
-            if normalized_query not in item.name.lower():
+        for match in matches[: self.settings.file_tree_max_entries]:
+            path = str(getattr(match, "file", getattr(match, "path", "")))
+            relative = self._relative_from_remote(workspace, path)
+            if not relative or self._is_ignored(relative):
                 continue
-            stat = item.stat()
+            try:
+                info = await sandbox.fs.get_file_info(path)
+            except Exception:
+                continue
+            is_dir = self._is_dir(info)
             results.append(
                 FileSearchResult(
-                    path=self._relative_path(workspace_root, item),
-                    name=item.name,
-                    type="directory" if item.is_dir() else "file",
-                    size=None if item.is_dir() else stat.st_size,
-                    modified_at=datetime.fromtimestamp(stat.st_mtime, UTC),
+                    path=relative,
+                    name=PurePosixPath(relative).name,
+                    type="directory" if is_dir else "file",
+                    size=None if is_dir else self._size(info),
+                    modified_at=self._modified_at(info),
                 )
             )
         return results
 
-    async def download_path(self, workspace_id: UUID, owner_id: UUID, path: str) -> Path:
-        workspace_root = await self._workspace_root(workspace_id, owner_id)
-        target = self._resolve_existing(workspace_root, path)
-        if not target.is_file():
-            raise FilePathError
-        self._log(
-            "file_download",
-            workspace_id,
-            owner_id,
-            self._relative_path(workspace_root, target),
-        )
-        return target
+    async def download_path(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        path: str,
+    ) -> tuple[str, bytes]:
+        workspace, sandbox = await self._workspace(workspace_id, owner_id)
+        relative = self._normalize_relative(path)
+        try:
+            content = await sandbox.fs.download_file(self._remote_path(workspace, relative))
+        except Exception as error:
+            raise FileNotFoundErrorInWorkspace from error
+        return PurePosixPath(relative).name, content or b""
 
-    async def _workspace_root(self, workspace_id: UUID, owner_id: UUID) -> Path:
+    async def _workspace(self, workspace_id: UUID, owner_id: UUID):
         workspace = await self.session.get(Workspace, workspace_id)
         if workspace is None or workspace.owner_id != owner_id:
             raise WorkspaceNotFoundError
-        if workspace.local_path is None:
-            raise FileWorkspaceUnavailableError
-        root = Path(workspace.local_path).resolve()
-        if not root.is_dir():
-            raise FileWorkspaceUnavailableError
-        return root
-
-    def _resolve_existing(self, workspace_root: Path, path: str) -> Path:
-        self._validate_relative_path(path)
-        candidate = (workspace_root / path).resolve()
-        self._ensure_inside(workspace_root, candidate)
-        if self._is_ignored_relative(workspace_root, candidate):
-            raise FileIgnoredPathError
-        if not candidate.exists():
-            raise FileNotFoundErrorInWorkspace
-        return candidate
-
-    def _resolve_target(self, workspace_root: Path, path: str) -> Path:
-        self._validate_relative_path(path)
-        candidate = workspace_root / path
-        parent = candidate.parent.resolve()
-        self._ensure_inside(workspace_root, parent)
-        target = parent / candidate.name
-        if self._is_ignored_relative(workspace_root, target):
-            raise FileIgnoredPathError
-        return target
-
-    def _validate_relative_path(self, path: str) -> None:
-        candidate = Path(path)
-        if candidate.is_absolute() or any(part in {"..", ""} for part in candidate.parts):
-            raise FilePathError
-
-    def _ensure_inside(self, workspace_root: Path, target: Path) -> None:
-        if target != workspace_root and workspace_root not in target.parents:
-            raise FilePathError
-
-    def _is_same_or_descendant(self, ancestor: Path, target: Path) -> bool:
-        return target == ancestor or ancestor in target.parents
-
-    def _is_ignored_relative(self, workspace_root: Path, target: Path) -> bool:
-        if target.exists():
-            resolved = target.resolve()
-            if resolved != workspace_root and workspace_root not in resolved.parents:
-                return True
         try:
-            relative = target.relative_to(workspace_root)
-        except ValueError:
-            return True
-        return any(part in IGNORED_PATH_PARTS for part in relative.parts)
+            sandbox = await self.runtime.get_sandbox(workspace)
+        except DaytonaRuntimeError as error:
+            raise FileWorkspaceUnavailableError from error
+        return workspace, sandbox
 
-    def _relative_path(self, workspace_root: Path, target: Path) -> str:
-        if target == workspace_root:
+    def _normalize_relative(self, path: str, *, allow_empty: bool = False) -> str:
+        candidate = path.strip().strip("/")
+        if not candidate and allow_empty:
             return ""
-        try:
-            return target.relative_to(workspace_root).as_posix()
-        except ValueError:
-            return ""
+        pure = PurePosixPath(candidate)
+        if not candidate or pure.is_absolute() or ".." in pure.parts:
+            raise FilePathError
+        normalized = pure.as_posix()
+        if self._is_ignored(normalized):
+            raise FileIgnoredPathError
+        return normalized
 
-    def _walk_visible(self, workspace_root: Path):
-        for current_root, dirnames, filenames in os.walk(workspace_root):
-            current_path = Path(current_root)
-            dirnames[:] = sorted(
-                (
-                    dirname
-                    for dirname in dirnames
-                    if not self._is_ignored_relative(workspace_root, current_path / dirname)
-                ),
-                key=str.lower,
-            )
-            for dirname in dirnames:
-                yield current_path / dirname
-            for filename in sorted(filenames, key=str.lower):
-                item = current_path / filename
-                if not self._is_ignored_relative(workspace_root, item):
-                    yield item
+    def _remote_path(self, workspace: Workspace, relative: str) -> str:
+        normalized = relative.strip("/")
+        if not normalized:
+            return workspace.workspace_path
+        return f"{workspace.workspace_path}/{normalized}"
+
+    def _relative_from_remote(self, workspace: Workspace, remote: str) -> str:
+        prefix = workspace.workspace_path.rstrip("/") + "/"
+        return remote[len(prefix) :] if remote.startswith(prefix) else remote.lstrip("/")
+
+    def _entry_relative(self, parent: str, entry) -> str:
+        entry_path = str(getattr(entry, "path", ""))
+        if entry_path.startswith("/"):
+            name = PurePosixPath(entry_path).name
+        else:
+            name = self._name(entry)
+        return f"{parent}/{name}".strip("/")
+
+    def _name(self, info) -> str:
+        return str(getattr(info, "name", PurePosixPath(str(getattr(info, "path", ""))).name))
+
+    def _is_dir(self, info) -> bool:
+        return bool(getattr(info, "is_dir", getattr(info, "is_directory", False)))
+
+    def _is_symlink(self, info) -> bool:
+        return bool(getattr(info, "is_symlink", False))
+
+    def _size(self, info) -> int:
+        return int(getattr(info, "size", 0) or 0)
+
+    def _modified_at(self, info) -> datetime:
+        value = getattr(info, "modified_at", getattr(info, "mod_time", None))
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=UTC)
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+            except ValueError:
+                pass
+        return datetime.now(UTC)
+
+    def _is_ignored(self, path: str) -> bool:
+        return any(part in IGNORED_PATH_PARTS for part in PurePosixPath(path).parts)
 
     def _log(self, event: str, workspace_id: UUID, user_id: UUID, path: str) -> None:
         logger.info(event, workspace_id=str(workspace_id), user_id=str(user_id), path=path, ok=True)
@@ -372,6 +362,6 @@ class FileService:
             workspace_id=workspace_id,
             action=action,
             target_type="file",
-            target_id=path or "/",
-            metadata={"path": path, **(metadata or {})},
+            target_id=path,
+            metadata=metadata or {"path": path},
         )

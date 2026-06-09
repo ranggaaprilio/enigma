@@ -1,5 +1,4 @@
 from datetime import UTC, datetime
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -184,7 +183,9 @@ def command_context(tmp_path):
         slug="demo",
         repo_url="https://github.com/example/demo",
         default_branch="main",
-        local_path=str(workspace_path),
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
@@ -300,6 +301,11 @@ def test_validate_custom_command_restrictions_and_confirmed_tools():
         requires_confirmation=True,
         confirmed=True,
     ) == ["pnpm", "test"]
+    assert validate_custom_command(
+        "echo ok && echo yes",
+        requires_confirmation=True,
+        confirmed=True,
+    ) == ["sh", "-lc", "echo ok && echo yes"]
 
     with pytest.raises(DangerousCommandError):
         validate_custom_command(
@@ -331,12 +337,9 @@ async def test_command_service_captures_output_status_and_truncates(tmp_path):
         settings=Settings(workspace_root=tmp_path, agent_max_command_output_chars=5),
         runtime=CommandRuntime(),
     )
-    process = await asyncio_subprocess(["python", "-c", "print('abcdef')"], tmp_path)
+    await service._append_output(FakeSession(), run, "abcdef")  # type: ignore[arg-type]
+    await service._mark_finished(FakeSession(), run, "completed", 0)  # type: ignore[arg-type]
 
-    exit_code = await service._stream_process_output(FakeSession(), run, process)  # type: ignore[arg-type]
-    await service._mark_finished(FakeSession(), run, "completed", exit_code)  # type: ignore[arg-type]
-
-    assert exit_code == 0
     assert run.status == "completed"
     assert run.exit_code == 0
     assert run.output == "abcde"
@@ -360,22 +363,7 @@ async def test_command_service_maps_nonzero_exit_to_failed(tmp_path):
         settings=Settings(workspace_root=tmp_path),
         runtime=CommandRuntime(),
     )
-    process = await asyncio_subprocess(["python", "-c", "raise SystemExit(7)"], tmp_path)
+    await service._mark_finished(FakeSession(), run, "failed", 7)  # type: ignore[arg-type]
 
-    exit_code = await service._stream_process_output(FakeSession(), run, process)  # type: ignore[arg-type]
-    await service._mark_finished(FakeSession(), run, "failed", exit_code)  # type: ignore[arg-type]
-
-    assert exit_code == 7
     assert run.status == "failed"
     assert run.exit_code == 7
-
-
-async def asyncio_subprocess(argv: list[str], cwd: Path):
-    import asyncio
-
-    return await asyncio.create_subprocess_exec(
-        *argv,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )

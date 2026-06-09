@@ -50,7 +50,7 @@ class MockAgentProvider(AgentProvider):
         yield ProviderEvent("status", "executing", {"status": "executing"})
         yield ProviderEvent("tool_call", "list_files", {"tool": "list_files", "arguments": {}})
         try:
-            files = tools.list_files(limit=20)
+            files = await tools.list_files(limit=20)
             yield ProviderEvent(
                 "tool_result",
                 "\n".join(files) if files else "Workspace has no visible files.",

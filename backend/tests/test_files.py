@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+from pathlib import Path
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -45,6 +47,90 @@ class FakeSession:
             return self.workspace
         return None
 
+    def add(self, value) -> None:
+        return None
+
+    async def flush(self) -> None:
+        return None
+
+    async def commit(self) -> None:
+        return None
+
+
+class LocalFileSystem:
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def path(self, remote: str) -> Path:
+        relative = remote.removeprefix("/workspace").lstrip("/")
+        if ".." in Path(relative).parts:
+            raise ValueError("outside workspace")
+        return self.root / relative
+
+    def info(self, path: Path):
+        stat = path.stat()
+        return SimpleNamespace(
+            name=path.name or self.root.name,
+            path=f"/workspace/{path.relative_to(self.root)}",
+            is_dir=path.is_dir(),
+            is_symlink=path.is_symlink(),
+            size=stat.st_size,
+            mod_time=datetime.fromtimestamp(stat.st_mtime, UTC),
+        )
+
+    async def get_file_info(self, remote: str):
+        path = self.path(remote)
+        if not path.exists():
+            raise FileNotFoundError
+        return self.info(path)
+
+    async def list_files(self, remote: str):
+        return [self.info(path) for path in self.path(remote).iterdir()]
+
+    async def find_files(self, remote: str, pattern: str):
+        query = pattern.strip("*").lower()
+        return [
+            SimpleNamespace(file=f"/workspace/{path.relative_to(self.root).as_posix()}")
+            for path in self.root.rglob("*")
+            if query in path.name.lower()
+        ]
+
+    async def download_file(self, remote: str):
+        path = self.path(remote)
+        if path.is_symlink():
+            raise FileNotFoundError
+        return path.read_bytes()
+
+    async def upload_file(self, content: bytes, remote: str):
+        path = self.path(remote)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    async def create_folder(self, remote: str, mode: str):
+        self.path(remote).mkdir(parents=True, exist_ok=True)
+
+    async def move_files(self, source: str, destination: str):
+        target = self.path(destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self.path(source).rename(target)
+
+    async def delete_file(self, remote: str, recursive: bool = False):
+        path = self.path(remote)
+        if path.is_dir():
+            import shutil
+
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+class FakeRuntime:
+    def __init__(self, root: Path) -> None:
+        self.sandbox = SimpleNamespace(fs=LocalFileSystem(root))
+
+    async def get_sandbox(self, workspace):
+        return self.sandbox
+
 
 @pytest.fixture
 def file_context(tmp_path):
@@ -66,7 +152,9 @@ def file_context(tmp_path):
         slug="demo",
         repo_url="https://github.com/example/demo",
         default_branch="main",
-        local_path=str(workspace_path),
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-1",
+        workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
@@ -74,11 +162,11 @@ def file_context(tmp_path):
     service = FileService(
         session=FakeSession(workspace),
         settings=Settings(
-            workspace_root=tmp_path,
             file_max_read_bytes=32,
             file_max_upload_bytes=64,
             file_tree_max_entries=20,
         ),
+        runtime=FakeRuntime(workspace_path),  # type: ignore[arg-type]
     )
 
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
@@ -281,7 +369,7 @@ async def test_limited_body_reader_stops_streaming_after_limit():
     assert request.chunks_read == 3
 
 
-def test_search_walk_prunes_ignored_directories(file_context):
+async def test_search_prunes_ignored_directories(file_context):
     _user, _workspace, workspace_path = file_context
     (workspace_path / "src").mkdir()
     (workspace_path / "src" / "app.py").write_text("print('hi')", encoding="utf-8")
@@ -290,11 +378,7 @@ def test_search_walk_prunes_ignored_directories(file_context):
         "ignored",
         encoding="utf-8",
     )
+    _user, workspace, _workspace_path = file_context
     service = app.dependency_overrides[files_module.get_file_service]()
-
-    walked_paths = [
-        item.relative_to(workspace_path).as_posix()
-        for item in service._walk_visible(workspace_path)
-    ]
-
-    assert walked_paths == ["src", "src/app.py"]
+    results = await service.search(workspace.id, workspace.owner_id, "index")
+    assert results == []

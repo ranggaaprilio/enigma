@@ -12,6 +12,7 @@ from app.models import AgentEvent, AgentRun, Workspace
 from app.services.agent_providers import AgentProvider, MockAgentProvider, OpenAIResponsesProvider
 from app.services.agent_tools import WorkspaceTools
 from app.services.audit import AuditLogService
+from app.services.daytona_runtime import get_daytona_runtime
 from app.services.notifications import NotificationService
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -216,6 +217,7 @@ class AgentService:
                 provider = provider_from_settings(self.settings)
                 tools = WorkspaceTools(
                     workspace=workspace,
+                    runtime=get_daytona_runtime(),
                     command_timeout_seconds=self.settings.agent_command_timeout_seconds,
                     max_command_output_chars=self.settings.agent_max_command_output_chars,
                 )

@@ -12,7 +12,6 @@ import {
 import {
   ApiError,
   detectPreviewSession,
-  getApiBaseUrl,
   listPreviewSessions,
   refreshPreviewSession,
   stopPreviewSession,
@@ -124,7 +123,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
     if (!session || session.status !== "active") {
       return null;
     }
-    return new URL(session.public_url, getApiBaseUrl()).toString();
+    return session.public_url;
   }, [session]);
 
   async function detectPreview() {

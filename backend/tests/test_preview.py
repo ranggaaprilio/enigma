@@ -1,23 +1,15 @@
 from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
-import httpx
 import pytest
-from fastapi.testclient import TestClient
 from httpx import ASGITransport, AsyncClient
-from starlette.websockets import WebSocketDisconnect
 
 from app.api import auth as auth_module
 from app.api import preview as preview_module
 from app.core.security import hash_password
 from app.main import app
 from app.models import PreviewSession, User, Workspace
-from app.services.preview import (
-    PreviewNotFoundError,
-    PreviewService,
-    PreviewSessionNotFoundError,
-    PreviewWorkspacePathError,
-)
+from app.services.preview import PreviewNotFoundError, PreviewSessionNotFoundError
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -124,9 +116,7 @@ class FakePreviewService:
             created_at=now,
             last_seen_at=now,
         )
-        preview_session.public_url = (
-            f"/workspaces/{self.workspace.id}/preview/proxy/{preview_session.id}/"
-        )
+        preview_session.public_url = "https://5173-sandbox.proxy.daytona.example/?token=signed"
         return preview_session
 
 
@@ -150,7 +140,9 @@ def preview_context(tmp_path):
         slug="demo",
         repo_url="https://github.com/example/demo",
         default_branch="main",
-        local_path=str(workspace_path),
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
         updated_at=datetime.now(UTC),
@@ -205,6 +197,7 @@ async def test_detect_list_refresh_and_stop_preview_session(preview_context):
 
     assert detected.json()["status"] == "active"
     assert detected.json()["session"]["port"] == 5173
+    assert detected.json()["session"]["public_url"].startswith("https://")
     assert listed.json()[0]["id"] == session_id
     assert refreshed.json()["status"] == "active"
     assert stopped.json()["status"] == "stopped"
@@ -250,81 +243,3 @@ async def test_refresh_marks_unreachable_session_error(preview_context):
         )
 
     assert response.json()["status"] == "error"
-
-
-async def test_preview_proxy_requests_identity_encoding(preview_context, monkeypatch):
-    _user, workspace, service = preview_context
-    service.session = service._session("active")
-    captured_headers: dict[str, str] = {}
-    captured_url = ""
-
-    class FakeProxyClient:
-        def __init__(self, *args, **kwargs) -> None:
-            return None
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *args) -> None:
-            return None
-
-        async def request(self, method, url, content, headers):
-            nonlocal captured_url
-            captured_url = url
-            captured_headers.update(headers)
-            return httpx.Response(200, content=b"ok", headers={"content-type": "text/plain"})
-
-    monkeypatch.setattr(preview_module.httpx, "AsyncClient", FakeProxyClient)
-
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        await login(client)
-        response = await client.get(
-            f"/workspaces/{workspace.id}/preview/proxy/{service.session.id}/assets/app.js?x=1",
-            headers={"accept-encoding": "br, gzip"},
-        )
-
-    assert response.text == "ok"
-    assert captured_url == "http://127.0.0.1:5173/assets/app.js?x=1"
-    assert captured_headers["Accept-Encoding"] == "identity"
-
-
-def test_preview_service_validates_workspace_path(tmp_path):
-    workspace = Workspace(
-        id=uuid4(),
-        owner_id=uuid4(),
-        name="Demo",
-        slug="demo",
-        repo_url="https://github.com/example/demo",
-        default_branch="main",
-        local_path=str(tmp_path / "missing"),
-        status="ready",
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-    service = PreviewService(session=None, workspace_root=tmp_path)  # type: ignore[arg-type]
-
-    with pytest.raises(PreviewWorkspacePathError):
-        service._workspace_path(workspace)
-
-
-async def test_preview_service_detects_first_open_common_port(tmp_path):
-    service = PreviewService(
-        session=None,  # type: ignore[arg-type]
-        workspace_root=tmp_path,
-        common_ports=(3000, 5173, 8000, 8080),
-    )
-
-    async def fake_port_is_open(port: int) -> bool:
-        return port in {5173, 8080}
-
-    service._port_is_open = fake_port_is_open  # type: ignore[method-assign]
-
-    assert await service._first_open_port() == 5173
-
-
-def test_preview_websocket_rejects_unauthenticated_connections():
-    client = TestClient(app)
-    with pytest.raises(WebSocketDisconnect):
-        websocket_path = f"/workspaces/{uuid4()}/preview/proxy/{uuid4()}/@vite/client"
-        with client.websocket_connect(websocket_path):
-            pass

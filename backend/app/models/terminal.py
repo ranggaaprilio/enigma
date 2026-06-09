@@ -35,7 +35,7 @@ class TerminalSession(Base):
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(160), nullable=False, default="Terminal")
-    tmux_session_name: Mapped[str] = mapped_column(String(160), nullable=False)
+    pty_session_id: Mapped[str] = mapped_column(String(160), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

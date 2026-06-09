@@ -26,6 +26,7 @@ from app.schemas.workspaces import (
     WorkspaceUpdateRequest,
 )
 from app.services.audit import AuditLogService
+from app.services.daytona_runtime import DaytonaRuntimeError, get_daytona_runtime
 from app.services.repositories import (
     GitCommandError,
     InvalidRepositoryUrlError,
@@ -38,11 +39,12 @@ from app.services.repositories import (
     RepositoryTokenError,
 )
 from app.services.workspaces import (
+    SNAPSHOT_UNSET,
     InvalidEnvVarKeyError,
     SqlAlchemyWorkspaceService,
     WorkspaceAlreadyExistsError,
-    WorkspaceDirectoryError,
     WorkspaceNotFoundError,
+    WorkspaceRuntimeError,
     WorkspaceSecretCipher,
     mask_env_value,
 )
@@ -64,6 +66,7 @@ class WorkspaceService(Protocol):
         name: str,
         repo_url: str,
         default_branch: str,
+        snapshot: str | None = None,
     ) -> Workspace: ...
 
     async def update(
@@ -73,6 +76,7 @@ class WorkspaceService(Protocol):
         name: str | None = None,
         repo_url: str | None = None,
         default_branch: str | None = None,
+        snapshot: str | None | object = SNAPSHOT_UNSET,
     ) -> Workspace: ...
 
     async def delete(self, workspace_id: UUID, owner_id: UUID) -> None: ...
@@ -96,8 +100,8 @@ async def get_workspace_service(
 ) -> WorkspaceService:
     return SqlAlchemyWorkspaceService(
         session=session,
-        workspace_root=settings.workspace_root,
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=get_daytona_runtime(),
     )
 
 
@@ -110,8 +114,8 @@ async def get_repository_service(
 ) -> RepositoryService:
     return RepositoryService(
         session=session,
-        workspace_root=settings.workspace_root,
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=get_daytona_runtime(),
     )
 
 
@@ -137,6 +141,11 @@ def not_found() -> HTTPException:
 
 
 def repository_error(error: Exception) -> HTTPException:
+    if isinstance(error, DaytonaRuntimeError):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        )
     if isinstance(error, InvalidRepositoryUrlError):
         return HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -213,6 +222,7 @@ async def connect_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
+        DaytonaRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -247,6 +257,7 @@ async def clone_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
+        DaytonaRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -280,6 +291,7 @@ async def get_repository_status(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
+        DaytonaRuntimeError,
     ) as error:
         raise repository_error(error) from None
     return RepositoryStatusResponse(
@@ -313,6 +325,7 @@ async def get_repository_diff(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
+        DaytonaRuntimeError,
     ) as error:
         raise repository_error(error) from None
     return RepositoryDiffResponse(diff=diff)
@@ -338,6 +351,7 @@ async def pull_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
+        DaytonaRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -373,6 +387,7 @@ async def commit_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
+        DaytonaRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -407,6 +422,7 @@ async def push_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
+        DaytonaRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -429,21 +445,24 @@ async def create_workspace(
     audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> Workspace:
     try:
-        workspace = await service.create(
+        create_values = dict(
             owner_id=current_user.id,
             name=payload.name,
             repo_url=payload.repo_url,
             default_branch=payload.default_branch,
         )
+        if payload.snapshot is not None:
+            create_values["snapshot"] = payload.snapshot
+        workspace = await service.create(**create_values)
     except WorkspaceAlreadyExistsError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="User already has a workspace",
         ) from None
-    except WorkspaceDirectoryError:
+    except WorkspaceRuntimeError as error:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Workspace directory could not be created",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
         ) from None
     await record_audit_safely(
         audit_log_service,
@@ -486,15 +505,23 @@ async def update_workspace(
     audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> Workspace:
     try:
-        workspace = await service.update(
+        update_values = dict(
             workspace_id=workspace_id,
             owner_id=current_user.id,
             name=payload.name,
             repo_url=payload.repo_url,
             default_branch=payload.default_branch,
         )
+        if "snapshot" in payload.model_fields_set:
+            update_values["snapshot"] = payload.snapshot
+        workspace = await service.update(**update_values)
     except WorkspaceNotFoundError:
         raise not_found() from None
+    except WorkspaceRuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from None
     await record_audit_safely(
         audit_log_service,
         user_id=current_user.id,
@@ -528,6 +555,11 @@ async def delete_workspace(
         await service.delete(workspace_id, current_user.id)
     except WorkspaceNotFoundError:
         raise not_found() from None
+    except WorkspaceRuntimeError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from None
     return DeleteResponse(ok=True)
 
 
@@ -538,7 +570,16 @@ async def get_workspace_status(
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
 ) -> Workspace:
     try:
-        return await service.get_for_owner(workspace_id, current_user.id)
+        workspace = await service.get_for_owner(workspace_id, current_user.id)
+        if isinstance(service, SqlAlchemyWorkspaceService):
+            try:
+                workspace.status = await service.runtime.status(workspace)
+                service.session.add(workspace)
+                await service.session.commit()
+                await service.session.refresh(workspace)
+            except DaytonaRuntimeError:
+                workspace.status = "error"
+        return workspace
     except WorkspaceNotFoundError:
         raise not_found() from None
 

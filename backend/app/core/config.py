@@ -1,5 +1,4 @@
 from functools import lru_cache
-from pathlib import Path
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -16,24 +15,26 @@ class Settings(BaseSettings):
     auth_cookie_secure: bool = False
     auth_login_rate_limit_attempts: int = 5
     auth_login_rate_limit_window_seconds: int = 60 * 15
-    workspace_root: Path = Path(".data/workspaces")
     workspace_env_encryption_key: str = "SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc="
+    daytona_api_key: str | None = None
+    daytona_api_url: str | None = None
+    daytona_target: str | None = None
+    daytona_default_snapshot: str | None = None
+    daytona_default_language: str = "python"
+    daytona_workspace_path: str = "/workspace"
+    daytona_auto_stop_minutes: int = 30
+    daytona_provision_timeout_seconds: int = 120
+    daytona_preview_url_ttl_seconds: int = 60 * 60
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
     agent_command_timeout_seconds: int = 20
     agent_max_command_output_chars: int = 20_000
-    terminal_tmux_binary: str = "tmux"
     terminal_default_cols: int = 120
     terminal_default_rows: int = 34
     editor_code_server_binary: str = "code-server"
-    editor_bind_host: str = "127.0.0.1"
-    editor_port_start: int = 13337
-    editor_port_end: int = 13437
+    editor_port: int = 13337
     editor_token_ttl_seconds: int = 60 * 60
-    editor_runtime_root: Path = Path(".data/editor")
-    editor_public_url: str = "http://localhost:8080"
-    editor_container_workspace_root: Path = Path("/workspace")
     file_max_read_bytes: int = 1_000_000
     file_max_upload_bytes: int = 10_000_000
     file_tree_max_entries: int = 2_000

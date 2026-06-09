@@ -1,18 +1,15 @@
-import os
 import re
-import shutil
-import stat
-import subprocess
-import tempfile
+import shlex
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 from urllib.parse import urlparse, urlunparse
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import RepositoryCredential, Workspace
+from app.services.daytona_runtime import DaytonaRuntime, DaytonaRuntimeError
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 GITHUB_REPO_PATTERN = re.compile(r"^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$")
@@ -67,12 +64,6 @@ class GitStatus:
     files: list[GitFileStatus]
 
 
-@dataclass(frozen=True)
-class GitCommandResult:
-    stdout: str
-    stderr: str
-
-
 def sanitize_repository_url(repo_url: str) -> str:
     parsed = urlparse(repo_url.strip())
     if parsed.scheme != "https" or parsed.hostname != "github.com":
@@ -120,82 +111,16 @@ def validate_diff_path(path: str) -> str:
     return candidate
 
 
-class GitRunner:
-    def run(
-        self,
-        args: list[str],
-        cwd: Path | None = None,
-        token: str | None = None,
-        timeout: int = GIT_TIMEOUT_SECONDS,
-    ) -> GitCommandResult:
-        env = {
-            **os.environ,
-            "GIT_TERMINAL_PROMPT": "0",
-        }
-
-        if token is None:
-            return self._run(args=args, cwd=cwd, env=env, token=token, timeout=timeout)
-
-        with tempfile.TemporaryDirectory(prefix="execute-git-askpass-") as temp_dir:
-            askpass_path = Path(temp_dir) / "askpass.sh"
-            askpass_path.write_text(
-                "#!/bin/sh\n"
-                'case "$1" in\n'
-                '*Username*) printf "%s\\n" "x-access-token" ;;\n'
-                '*Password*) printf "%s\\n" "$EXECUTE_GIT_TOKEN" ;;\n'
-                '*) printf "%s\\n" "" ;;\n'
-                "esac\n",
-                encoding="utf-8",
-            )
-            askpass_path.chmod(stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR)
-            env["GIT_ASKPASS"] = str(askpass_path)
-            env["EXECUTE_GIT_TOKEN"] = token
-            return self._run(args=args, cwd=cwd, env=env, token=token, timeout=timeout)
-
-    def _run(
-        self,
-        args: list[str],
-        cwd: Path | None,
-        env: dict[str, str],
-        token: str | None,
-        timeout: int,
-    ) -> GitCommandResult:
-        try:
-            completed = subprocess.run(
-                ["git", *args],
-                cwd=cwd,
-                env=env,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-                check=False,
-                shell=False,
-            )
-        except (OSError, subprocess.TimeoutExpired) as error:
-            raise GitCommandError(sanitize_git_output(str(error), token)) from error
-
-        if completed.returncode != 0:
-            output = completed.stderr.strip() or completed.stdout.strip() or "Git command failed"
-            raise GitCommandError(sanitize_git_output(output, token))
-
-        return GitCommandResult(
-            stdout=sanitize_git_output(completed.stdout, token),
-            stderr=sanitize_git_output(completed.stderr, token),
-        )
-
-
 class RepositoryService:
     def __init__(
         self,
         session: AsyncSession,
-        workspace_root: Path,
         cipher: WorkspaceSecretCipher,
-        git_runner: GitRunner | None = None,
+        runtime: DaytonaRuntime,
     ) -> None:
         self.session = session
-        self.workspace_root = workspace_root
         self.cipher = cipher
-        self.git_runner = git_runner or GitRunner()
+        self.runtime = runtime
 
     async def connect(
         self,
@@ -235,79 +160,97 @@ class RepositoryService:
     async def clone(self, workspace_id: UUID, owner_id: UUID) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
         token = await self._get_token(workspace.id)
-        repo_path = self._repo_path(workspace)
-        if self._is_cloned(repo_path):
+        sandbox = await self.runtime.get_sandbox(workspace)
+        if await self._is_cloned(sandbox, workspace.workspace_path):
             raise RepositoryAlreadyClonedError
-        if repo_path.exists() and any(repo_path.iterdir()):
-            raise RepositoryAlreadyClonedError
-
-        repo_path.parent.mkdir(parents=True, exist_ok=True)
-        repo_path.mkdir(exist_ok=True)
-        temp_repo_path = repo_path.with_name(f".{repo_path.name}.clone-{uuid4().hex}")
         try:
-            self.git_runner.run(["clone", workspace.repo_url, str(temp_repo_path)], token=token)
-            if repo_path.exists():
-                if any(repo_path.iterdir()):
-                    raise RepositoryAlreadyClonedError
-                repo_path.rmdir()
-            temp_repo_path.rename(repo_path)
-        except Exception:
-            shutil.rmtree(temp_repo_path, ignore_errors=True)
-            if not repo_path.exists():
-                repo_path.mkdir(parents=True, exist_ok=True)
-            raise
+            await sandbox.git.clone(
+                workspace.repo_url,
+                workspace.workspace_path,
+                branch=workspace.default_branch,
+                username="x-access-token",
+                password=token,
+            )
+        except DaytonaRuntimeError as error:
+            raise GitCommandError(str(error)) from error
+        except Exception as error:
+            raise GitCommandError(sanitize_git_output(str(error), token)) from error
 
     async def status(self, workspace_id: UUID, owner_id: UUID) -> GitStatus:
         workspace = await self._get_workspace(workspace_id, owner_id)
-        repo_path = self._repo_path(workspace)
-        if not self._is_cloned(repo_path):
+        sandbox = await self.runtime.get_sandbox(workspace)
+        if not await self._is_cloned(sandbox, workspace.workspace_path):
             return GitStatus(cloned=False, branch=None, is_clean=True, files=[])
-
-        branch = self.git_runner.run(["branch", "--show-current"], cwd=repo_path).stdout.strip()
-        status_output = self.git_runner.run(
-            ["status", "--porcelain=v1", "-b"],
-            cwd=repo_path,
-        ).stdout
-        files = parse_porcelain_status(status_output)
+        try:
+            result = await sandbox.git.status(workspace.workspace_path)
+        except Exception as error:
+            raise GitCommandError(str(error)) from error
+        files = [
+            GitFileStatus(
+                path=str(getattr(item, "path", getattr(item, "name", ""))),
+                status=self._file_status(item),
+            )
+            for item in (getattr(result, "file_status", None) or [])
+        ]
         return GitStatus(
             cloned=True,
-            branch=branch or None,
+            branch=getattr(result, "current_branch", None),
             is_clean=len(files) == 0,
             files=files,
         )
 
     async def diff(self, workspace_id: UUID, owner_id: UUID, path: str | None = None) -> str:
         workspace = await self._get_workspace(workspace_id, owner_id)
-        repo_path = self._repo_path(workspace)
-        self._ensure_cloned(repo_path)
+        sandbox = await self.runtime.get_sandbox(workspace)
+        await self._ensure_cloned(sandbox, workspace.workspace_path)
         args = ["diff", "--"]
         if path is not None:
             args.append(validate_diff_path(path))
-        return self.git_runner.run(args, cwd=repo_path).stdout
+        result = await self.runtime.exec(
+            workspace,
+            "git " + " ".join(shlex.quote(arg) for arg in args),
+            cwd=workspace.workspace_path,
+        )
+        if result.exit_code != 0:
+            raise GitCommandError(result.stderr or result.stdout or "Git diff failed")
+        return result.stdout
 
     async def pull(self, workspace_id: UUID, owner_id: UUID) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
         token = await self._get_token(workspace.id)
-        repo_path = self._repo_path(workspace)
-        self._ensure_cloned(repo_path)
-        self.git_runner.run(["pull", "--ff-only"], cwd=repo_path, token=token)
+        sandbox = await self.runtime.get_sandbox(workspace)
+        await self._ensure_cloned(sandbox, workspace.workspace_path)
+        await sandbox.git.pull(
+            workspace.workspace_path,
+            username="x-access-token",
+            password=token,
+        )
 
     async def commit(self, workspace_id: UUID, owner_id: UUID, message: str) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
-        repo_path = self._repo_path(workspace)
-        self._ensure_cloned(repo_path)
-        status_result = self.git_runner.run(["status", "--porcelain=v1"], cwd=repo_path)
-        if not parse_porcelain_status(status_result.stdout):
+        sandbox = await self.runtime.get_sandbox(workspace)
+        await self._ensure_cloned(sandbox, workspace.workspace_path)
+        status_result = await sandbox.git.status(workspace.workspace_path)
+        if not (getattr(status_result, "file_status", None) or []):
             raise NoChangesToCommitError
-        self.git_runner.run(["add", "-A"], cwd=repo_path)
-        self.git_runner.run(["commit", "-m", message], cwd=repo_path)
+        await sandbox.git.add(workspace.workspace_path, ["."])
+        await sandbox.git.commit(
+            workspace.workspace_path,
+            message,
+            author="Execute Dashboard",
+            email="execute@localhost",
+        )
 
     async def push(self, workspace_id: UUID, owner_id: UUID) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
         token = await self._get_token(workspace.id)
-        repo_path = self._repo_path(workspace)
-        self._ensure_cloned(repo_path)
-        self.git_runner.run(["push"], cwd=repo_path, token=token)
+        sandbox = await self.runtime.get_sandbox(workspace)
+        await self._ensure_cloned(sandbox, workspace.workspace_path)
+        await sandbox.git.push(
+            workspace.workspace_path,
+            username="x-access-token",
+            password=token,
+        )
 
     async def _get_workspace(self, workspace_id: UUID, owner_id: UUID) -> Workspace:
         workspace = await self.session.get(Workspace, workspace_id)
@@ -329,22 +272,24 @@ class RepositoryService:
             raise RepositoryTokenError
         return token
 
-    def _repo_path(self, workspace: Workspace) -> Path:
-        if workspace.local_path is None:
-            raise RepositoryPathError
-        root = self.workspace_root.resolve()
-        path = Path(workspace.local_path).resolve()
-        if path == root or root not in path.parents:
-            raise RepositoryPathError
-        return path
+    async def _is_cloned(self, sandbox, repo_path: str) -> bool:
+        try:
+            info = await sandbox.fs.get_file_info(f"{repo_path}/.git")
+        except Exception:
+            return False
+        return bool(getattr(info, "is_dir", False))
 
-    def _is_cloned(self, repo_path: Path) -> bool:
-        return (repo_path / ".git").is_dir()
+    def _file_status(self, item) -> str:
+        worktree = getattr(item, "worktree", None)
+        staging = getattr(item, "staging", None)
+        selected = worktree if getattr(worktree, "value", worktree) != "Unmodified" else staging
+        return str(getattr(selected, "value", selected) or "")
 
-    def _ensure_cloned(self, repo_path: Path) -> None:
-        if not self._is_cloned(repo_path):
+    async def _ensure_cloned(self, sandbox, repo_path: str) -> None:
+        if not await self._is_cloned(sandbox, repo_path):
             raise RepositoryNotClonedError
 
-    def delete_repo_directory(self, workspace: Workspace) -> None:
-        repo_path = self._repo_path(workspace)
-        shutil.rmtree(repo_path, ignore_errors=True)
+    async def delete_repo_directory(self, workspace: Workspace) -> None:
+        sandbox = await self.runtime.get_sandbox(workspace)
+        await sandbox.fs.delete_file(workspace.workspace_path, recursive=True)
+        await sandbox.fs.create_folder(workspace.workspace_path, "755")
