@@ -156,9 +156,11 @@ export function DashboardShell({
               {!leftSidebarCollapsed && (
                 <div className="min-w-0">
                   <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">
-                    Execute
+                    ENIGMA
                   </p>
-                  <h1 className="mt-2 text-2xl font-normal tracking-[-0.03em]">Dashboard</h1>
+                  <h1 className="mt-2 text-2xl font-normal tracking-[-0.03em]">
+                    Dashboard
+                  </h1>
                 </div>
               )}
             </div>
@@ -211,9 +213,11 @@ export function DashboardShell({
           <header className="flex min-h-16 flex-wrap items-center justify-between gap-3 border-b border-line bg-canvas px-5 py-3">
             <div>
               <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted">
-                Local foundation
+                Enigma
               </p>
-              <h2 className="text-2xl font-normal tracking-[-0.02em]">AI Agent Control Room</h2>
+              <h2 className="text-2xl font-normal tracking-[-0.02em]">
+                AI Agent Control Room
+              </h2>
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <StatusPill label={healthLabel} tone={healthTone} />
@@ -226,7 +230,8 @@ export function DashboardShell({
           <main className="flex-1 px-5 py-5">{children}</main>
 
           <footer className="border-t border-line bg-canvas px-5 py-3 text-sm text-body">
-            API: {healthLabel} | Workspace: {workspaceStatus} | Preview: {previewStatusLabel}
+            API: {healthLabel} | Workspace: {workspaceStatus} | Preview:{" "}
+            {previewStatusLabel}
           </footer>
         </div>
 
@@ -267,7 +272,9 @@ export function DashboardShell({
 }
 
 function NotificationBell() {
-  const [notifications, setNotifications] = useState<NotificationResponse[]>([]);
+  const [notifications, setNotifications] = useState<NotificationResponse[]>(
+    [],
+  );
   const [isOpen, setIsOpen] = useState(false);
 
   useEffect(() => {
@@ -302,7 +309,9 @@ function NotificationBell() {
     return () => socket.close();
   }, []);
 
-  const unreadCount = notifications.filter((notification) => !notification.read_at).length;
+  const unreadCount = notifications.filter(
+    (notification) => !notification.read_at,
+  ).length;
 
   async function handleMarkRead(notificationId: string) {
     const updated = await markNotificationRead(notificationId);
@@ -353,7 +362,9 @@ function NotificationBell() {
           </div>
           <div className="max-h-96 overflow-y-auto">
             {notifications.length === 0 && (
-              <div className="px-4 py-6 text-sm text-muted">No notifications yet.</div>
+              <div className="px-4 py-6 text-sm text-muted">
+                No notifications yet.
+              </div>
             )}
             {notifications.map((notification) => (
               <button
@@ -365,7 +376,9 @@ function NotificationBell() {
                 onClick={() => void handleMarkRead(notification.id)}
               >
                 <div className="flex items-start justify-between gap-3">
-                  <p className="text-sm font-semibold text-ink">{notification.title}</p>
+                  <p className="text-sm font-semibold text-ink">
+                    {notification.title}
+                  </p>
                   {!notification.read_at && (
                     <span className="mt-1 h-2 w-2 shrink-0 rounded-full bg-primary" />
                   )}

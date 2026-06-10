@@ -46,7 +46,7 @@ export function RegisterRoute() {
   return (
     <main className="flex min-h-screen items-center justify-center bg-canvas px-5 py-8 text-ink">
       <section className="w-full max-w-md rounded-xl border border-line bg-white p-6 shadow-soft">
-        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-primary">Execute</p>
+        <p className="text-xs font-semibold uppercase tracking-[0.16em] text-primary">ENIGMA</p>
         <h1 className="mt-2 text-3xl font-normal tracking-[-0.02em]">Create account</h1>
 
         <form className="mt-6 space-y-4" onSubmit={handleSubmit}>
