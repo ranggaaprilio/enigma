@@ -287,6 +287,28 @@ export type PreviewDetectResponse = {
   session: PreviewSessionResponse | null;
 };
 
+export type DevServerStatus =
+  | "idle"
+  | "installing"
+  | "starting"
+  | "running"
+  | "stopped"
+  | "no-dev-task"
+  | "no-config"
+  | "error";
+
+export type DevServerStatusResponse = {
+  status: DevServerStatus;
+  port: number | null;
+  message: string | null;
+};
+
+export type DevServerActionResponse = {
+  ok: boolean;
+  status: DevServerStatus;
+  message: string | null;
+};
+
 export type LoginPayload = {
   email: string;
   password: string;
@@ -829,4 +851,25 @@ export function stopPreviewSession(
     `/workspaces/${workspaceId}/preview/sessions/${sessionId}/stop`,
     { method: "POST" },
   );
+}
+
+export function startDevServer(workspaceId: string): Promise<DevServerActionResponse> {
+  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/start`, {
+    method: "POST",
+  });
+}
+
+export function getDevServerStatus(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<DevServerStatusResponse> {
+  return requestJson<DevServerStatusResponse>(`/workspaces/${workspaceId}/dev/status`, {
+    signal,
+  });
+}
+
+export function stopDevServer(workspaceId: string): Promise<DevServerActionResponse> {
+  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/stop`, {
+    method: "POST",
+  });
 }

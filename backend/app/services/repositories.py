@@ -155,6 +155,7 @@ class RepositoryService:
         self.session.add(workspace)
         self.session.add(credential)
         await self.session.commit()
+        await self.session.refresh(workspace)
         return workspace
 
     async def clone(self, workspace_id: UUID, owner_id: UUID) -> None:

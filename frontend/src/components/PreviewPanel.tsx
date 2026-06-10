@@ -12,12 +12,33 @@ import {
 import {
   ApiError,
   detectPreviewSession,
+  getDevServerStatus,
   listPreviewSessions,
   refreshPreviewSession,
   stopPreviewSession,
+  type DevServerStatusResponse,
   type PreviewSessionResponse,
   type WorkspaceResponse,
 } from "../lib/api";
+
+const DEV_STATUS_POLL_MS = 4000;
+
+function devStatusLabel(status: DevServerStatusResponse): string {
+  switch (status.status) {
+    case "installing":
+      return status.message ?? "Setting up environment from mise.toml…";
+    case "starting":
+      return status.message ?? "Starting dev server…";
+    case "no-config":
+      return "No mise.toml found — start your dev server manually, then click Detect/Open.";
+    case "no-dev-task":
+      return "mise.toml has no 'dev' task — start your dev server manually, then click Detect/Open.";
+    case "error":
+      return status.message ?? "Environment setup failed.";
+    default:
+      return "";
+  }
+}
 
 type PreviewPanelState =
   | { status: "loading" }
@@ -56,6 +77,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
   const [busyAction, setBusyAction] = useState<string | null>(null);
   const [frameVersion, setFrameVersion] = useState(0);
   const [copyLabel, setCopyLabel] = useState("Copy URL");
+  const [devStatus, setDevStatus] = useState<DevServerStatusResponse | null>(null);
 
   const applySessionState = useCallback(
     (nextSession: PreviewSessionResponse | null) => {
@@ -111,6 +133,61 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
 
     return () => controller.abort();
   }, [applySessionState, onStatusChange, workspace.id]);
+
+  // Track the auto dev-server setup that kicks off after clone: surface progress
+  // and, once the dev server is up, open the preview without a manual click.
+  useEffect(() => {
+    let cancelled = false;
+    let autoDetected = false;
+    let timer: number | undefined;
+    const controller = new AbortController();
+
+    async function poll() {
+      let next: DevServerStatusResponse;
+      try {
+        next = await getDevServerStatus(workspace.id, controller.signal);
+      } catch (caughtError) {
+        if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
+          return;
+        }
+        return;
+      }
+      if (cancelled) {
+        return;
+      }
+      setDevStatus(next);
+
+      if (next.status === "running" && !autoDetected) {
+        try {
+          const response = await detectPreviewSession(workspace.id);
+          if (!cancelled && response.session?.status === "active") {
+            autoDetected = true;
+            applySessionState(response.session);
+            setFrameVersion((current) => current + 1);
+          }
+        } catch {
+          // Manual Detect/Open remains available if auto-detect races the server boot.
+        }
+      }
+
+      const keepPolling =
+        next.status === "installing" ||
+        next.status === "starting" ||
+        (next.status === "running" && !autoDetected);
+      if (!cancelled && keepPolling) {
+        timer = window.setTimeout(() => void poll(), DEV_STATUS_POLL_MS);
+      }
+    }
+
+    void poll();
+    return () => {
+      cancelled = true;
+      controller.abort();
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [applySessionState, workspace.id]);
 
   const session =
     panelState.status === "ready" ||
@@ -279,6 +356,18 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
           </button>
         ))}
       </div>
+
+      {devStatus && devStatusLabel(devStatus) && (
+        <div
+          className={`mb-4 rounded-md border p-3 text-sm ${
+            devStatus.status === "error"
+              ? "border-danger/30 bg-[#fff5f2] text-danger"
+              : "border-line bg-panel text-ink/72"
+          }`}
+        >
+          {devStatusLabel(devStatus)}
+        </div>
+      )}
 
       {panelState.status === "error" && (
         <div className="mb-4 rounded-md border border-danger/30 bg-[#fff5f2] p-3 text-sm text-danger">

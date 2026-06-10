@@ -21,7 +21,8 @@ class Settings(BaseSettings):
     daytona_target: str | None = None
     daytona_default_snapshot: str | None = None
     daytona_default_language: str = "python"
-    daytona_workspace_path: str = "/workspace"
+    daytona_workspace_path: str = "workspace"
+    daytona_sandbox_home: str = "/home/daytona"
     daytona_auto_stop_minutes: int = 30
     daytona_provision_timeout_seconds: int = 120
     daytona_preview_url_ttl_seconds: int = 60 * 60
@@ -35,9 +36,15 @@ class Settings(BaseSettings):
     editor_code_server_binary: str = "code-server"
     editor_port: int = 13337
     editor_token_ttl_seconds: int = 60 * 60
+    editor_install_timeout_seconds: int = 180
+    editor_auto_install: bool = True
+    mise_auto_install: bool = True
+    mise_install_url: str = "https://mise.run"
+    dev_server_command_timeout_seconds: int = 30
     file_max_read_bytes: int = 1_000_000
     file_max_upload_bytes: int = 10_000_000
     file_tree_max_entries: int = 2_000
+    file_tree_concurrency: int = 16
     backend_cors_origins: str | list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )

@@ -53,20 +53,23 @@ class EditorService:
             raise EditorWorkspacePathError
         existing = await self._latest_for_workspace(workspace.id, user_id)
         try:
-            await self.runtime.exec(
+            result = await self.runtime.exec(
                 workspace,
-                (
-                    f"command -v {self.settings.editor_code_server_binary} >/dev/null && "
-                    f"(pgrep -f '{self.settings.editor_code_server_binary}.*"
-                    f"{self.settings.editor_port}' >/dev/null || "
-                    f"nohup {self.settings.editor_code_server_binary} --auth none "
-                    f"--bind-addr 0.0.0.0:{self.settings.editor_port} "
-                    f"{quote(workspace.workspace_path, safe='/')} "
-                    ">/tmp/execute-code-server.log 2>&1 &)"
-                ),
+                self._ensure_command(workspace.workspace_path),
                 cwd=workspace.workspace_path,
-                timeout=20,
+                timeout=self.settings.editor_install_timeout_seconds,
             )
+            if result.exit_code != 0:
+                logger.warning(
+                    "editor_code_server_unavailable",
+                    workspace_id=str(workspace.id),
+                    exit_code=result.exit_code,
+                    output=result.stdout[-500:],
+                )
+                raise EditorRuntimeError(
+                    "code-server could not be started in the sandbox. "
+                    "Install it in the Daytona snapshot or enable editor auto-install."
+                )
             signed_url = await self.runtime.signed_preview_url(
                 workspace,
                 self.settings.editor_port,
@@ -167,6 +170,35 @@ class EditorService:
         )
         return editor_session
 
+    def _ensure_command(self, workspace_path: str) -> str:
+        binary = self.settings.editor_code_server_binary
+        port = self.settings.editor_port
+        folder = quote(self._absolute_workspace_path(workspace_path), safe="/")
+        run_log = "/tmp/execute-code-server.log"
+        install_log = "/tmp/execute-code-server-install.log"
+        # Make a user-local install discoverable without needing sudo/PATH reloads.
+        lines = ['export PATH="$HOME/.local/bin:$PATH"']
+        if self.settings.editor_auto_install:
+            lines.append(
+                f"if ! command -v {binary} >/dev/null 2>&1; then "
+                f"curl -fsSL https://code-server.dev/install.sh "
+                f"| sh -s -- --method standalone --prefix \"$HOME/.local\" "
+                f">{install_log} 2>&1; fi"
+            )
+        lines.extend(
+            [
+                # Fail loudly if the binary still isn't there so the API never hands back
+                # a preview URL that points at a port nothing is listening on.
+                f"command -v {binary} >/dev/null 2>&1 || exit 127",
+                (
+                    f"pgrep -f '{binary}.*{port}' >/dev/null 2>&1 || "
+                    f"nohup {binary} --auth none --bind-addr 0.0.0.0:{port} "
+                    f"{folder} >{run_log} 2>&1 &"
+                ),
+            ]
+        )
+        return "\n".join(lines)
+
     async def _get_workspace(self, workspace_id: UUID, user_id: UUID) -> Workspace:
         workspace = await self.session.get(Workspace, workspace_id)
         if workspace is None or workspace.owner_id != user_id:
@@ -188,4 +220,14 @@ class EditorService:
 
     def _editor_url(self, signed_url: str, workspace_path: str) -> str:
         separator = "&" if "?" in signed_url else "?"
-        return f"{signed_url}{separator}folder={quote(workspace_path, safe='/')}"
+        folder = quote(self._absolute_workspace_path(workspace_path), safe="/")
+        return f"{signed_url}{separator}folder={folder}"
+
+    def _absolute_workspace_path(self, workspace_path: str) -> str:
+        # code-server resolves the `folder=` query param as an absolute path inside the
+        # sandbox, so a relative workspace path (e.g. "workspace") must be anchored to the
+        # sandbox home (e.g. "/home/daytona/workspace").
+        if workspace_path.startswith("/"):
+            return workspace_path
+        home = self.settings.daytona_sandbox_home.rstrip("/")
+        return f"{home}/{workspace_path}"

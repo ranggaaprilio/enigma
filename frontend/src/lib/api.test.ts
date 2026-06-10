@@ -14,6 +14,9 @@ import {
   deleteWorkspaceFile,
   deleteWorkspaceEnvVar,
   detectPreviewSession,
+  getDevServerStatus,
+  startDevServer,
+  stopDevServer,
   getAgentRun,
   getAgentStreamUrl,
   getCommandRunStreamUrl,
@@ -537,6 +540,35 @@ describe("getHealth", () => {
     expect(fetchMock).toHaveBeenNthCalledWith(
       4,
       `http://localhost:8000/workspaces/${workspaceId}/preview/sessions/${sessionId}/stop`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+  });
+
+  it("sends credentialed dev-server requests", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ok: true, status: "installing", message: null, port: null }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await startDevServer(workspaceId);
+    await getDevServerStatus(workspaceId);
+    await stopDevServer(workspaceId);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/start`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/status`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/stop`,
       expect.objectContaining({ credentials: "include", method: "POST" }),
     );
   });

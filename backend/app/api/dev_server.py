@@ -1,0 +1,100 @@
+from typing import Protocol
+from uuid import UUID
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.api.auth import CURRENT_USER_DEP
+from app.core.config import Settings, get_settings
+from app.db.session import get_db_session
+from app.models import User
+from app.schemas.dev_server import DevServerActionResponse, DevServerStatusResponse
+from app.services.daytona_runtime import DaytonaRuntimeError, get_daytona_runtime
+from app.services.dev_server import (
+    DevServerNotClonedError,
+    DevServerRuntimeError,
+    DevServerService,
+    DevServerState,
+    DevServerWorkspacePathError,
+)
+from app.services.workspaces import WorkspaceNotFoundError
+
+router = APIRouter(prefix="/workspaces/{workspace_id}/dev", tags=["dev-server"])
+
+DB_SESSION_DEP = Depends(get_db_session)
+SETTINGS_DEP = Depends(get_settings)
+
+
+class DevServerServiceProtocol(Protocol):
+    async def start(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
+
+    async def status(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
+
+    async def stop(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
+
+
+async def get_dev_server_service(
+    session: AsyncSession = DB_SESSION_DEP,
+    settings: Settings = SETTINGS_DEP,
+) -> DevServerServiceProtocol:
+    return DevServerService(session, settings, get_daytona_runtime())
+
+
+DEV_SERVER_SERVICE_DEP = Depends(get_dev_server_service)
+
+
+def not_found() -> HTTPException:
+    return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+
+
+@router.post("/start", response_model=DevServerActionResponse)
+async def start_dev_server(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: DevServerServiceProtocol = DEV_SERVER_SERVICE_DEP,
+) -> DevServerActionResponse:
+    try:
+        state = await service.start(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except DevServerWorkspacePathError:
+        raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
+    except DevServerNotClonedError:
+        raise HTTPException(status_code=409, detail="Repository is not cloned yet") from None
+    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from None
+    return DevServerActionResponse(ok=True, status=state.status, message=state.message)
+
+
+@router.get("/status", response_model=DevServerStatusResponse)
+async def get_dev_server_status(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: DevServerServiceProtocol = DEV_SERVER_SERVICE_DEP,
+) -> DevServerStatusResponse:
+    try:
+        state = await service.status(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except DevServerWorkspacePathError:
+        raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
+    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from None
+    return DevServerStatusResponse(status=state.status, port=state.port, message=state.message)
+
+
+@router.post("/stop", response_model=DevServerActionResponse)
+async def stop_dev_server(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: DevServerServiceProtocol = DEV_SERVER_SERVICE_DEP,
+) -> DevServerActionResponse:
+    try:
+        state = await service.stop(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except DevServerWorkspacePathError:
+        raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
+    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from None
+    return DevServerActionResponse(ok=True, status=state.status, message=state.message)

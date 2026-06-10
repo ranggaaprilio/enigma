@@ -82,7 +82,7 @@ class WorkspaceResponse(BaseModel):
     @field_validator("workspace_path", mode="before")
     @classmethod
     def default_workspace_path(cls, value: str | None) -> str:
-        return value or "/workspace"
+        return value or "workspace"
 
 
 class WorkspaceStatusResponse(BaseModel):
@@ -105,7 +105,7 @@ class WorkspaceStatusResponse(BaseModel):
     @field_validator("workspace_path", mode="before")
     @classmethod
     def default_status_workspace_path(cls, value: str | None) -> str:
-        return value or "/workspace"
+        return value or "workspace"
 
 
 class WorkspaceEnvVarUpsertRequest(BaseModel):
