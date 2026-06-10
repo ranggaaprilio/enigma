@@ -45,7 +45,7 @@ class Workspace(Base):
     runtime: Mapped[str] = mapped_column(String(32), nullable=False, default="daytona")
     daytona_sandbox_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
     snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
-    workspace_path: Mapped[str] = mapped_column(Text, nullable=False, default="/workspace")
+    workspace_path: Mapped[str] = mapped_column(Text, nullable=False, default="workspace")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="creating")
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

@@ -6,10 +6,11 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api import auth as auth_module
 from app.api import editor as editor_module
+from app.core.config import get_settings
 from app.core.security import hash_password
 from app.main import app
 from app.models import EditorSession, User, Workspace
-from app.services.editor import EditorSessionNotFoundError
+from app.services.editor import EditorService, EditorSessionNotFoundError
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -151,6 +152,26 @@ async def test_start_status_and_stop_editor_session(editor_context):
     assert status_response.json()["status"] == "active"
     assert stopped.json()["status"] == "stopped"
     assert service.stopped is True
+
+
+def test_relative_workspace_path_resolves_to_sandbox_home():
+    service = EditorService.__new__(EditorService)
+    service.settings = get_settings()
+
+    folder = service._editor_url("https://sandbox.proxy.daytona.example", "workspace")
+    command = service._ensure_command("workspace")
+
+    assert folder.endswith("?folder=/home/daytona/workspace")
+    assert "/home/daytona/workspace" in command
+
+
+def test_absolute_workspace_path_is_left_untouched():
+    service = EditorService.__new__(EditorService)
+    service.settings = get_settings()
+
+    folder = service._editor_url("https://sandbox.proxy.daytona.example?x=1", "/srv/code")
+
+    assert folder.endswith("&folder=/srv/code")
 
 
 async def test_editor_workspace_ownership_is_enforced(editor_context):

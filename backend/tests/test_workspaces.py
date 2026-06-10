@@ -343,7 +343,7 @@ async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
 
     assert workspace.status == "ready"
     assert workspace.daytona_sandbox_id == f"sandbox-{workspace.id}"
-    assert workspace.workspace_path == "/workspace"
+    assert workspace.workspace_path == "workspace"
     assert session.commits == 2
     assert session.refreshed == [workspace]
     assert workspace.updated_at is not None

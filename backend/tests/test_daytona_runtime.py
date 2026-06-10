@@ -133,7 +133,7 @@ async def test_provision_uses_snapshot_labels_and_auto_stop() -> None:
     assert client.created_params.auto_delete_interval == -1
     assert client.created_params.public is False
     assert client.created_params.labels["execute-workspace-id"] == str(workspace_id)
-    assert sandbox.fs.created == [("/workspace", "755")]
+    assert sandbox.fs.created == [("workspace", "755")]
 
 
 async def test_existing_stopped_sandbox_is_reused_and_started() -> None:

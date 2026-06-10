@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
@@ -90,36 +91,38 @@ class FileService:
 
     async def tree(self, workspace_id: UUID, owner_id: UUID, path: str | None = None) -> FileNode:
         workspace, sandbox = await self._workspace(workspace_id, owner_id)
-        target = self._remote_path(workspace, path or "")
+        root_relative = self._normalize_relative(path or "", allow_empty=True)
+        root_remote = self._remote_path(workspace, root_relative)
+        semaphore = asyncio.Semaphore(max(1, self.settings.file_tree_concurrency))
         counter = 0
 
-        async def build_node(remote_path: str, relative_path: str) -> FileNode:
+        def count_entry() -> None:
             nonlocal counter
             counter += 1
             if counter > self.settings.file_tree_max_entries:
                 raise FileTreeLimitExceededError
-            try:
-                info = await sandbox.fs.get_file_info(remote_path)
-            except Exception as error:
-                raise FileNotFoundErrorInWorkspace from error
+
+        async def build_node(info: object, relative_path: str) -> FileNode:
+            count_entry()
             is_dir = self._is_dir(info)
             children: list[FileNode] = []
             if is_dir:
-                entries = await sandbox.fs.list_files(remote_path)
+                async with semaphore:
+                    entries = await sandbox.fs.list_files(self._remote_path(workspace, relative_path))
                 visible = [
                     entry
                     for entry in entries
                     if not self._is_ignored(self._entry_relative(relative_path, entry))
                 ]
                 visible.sort(key=lambda entry: (not self._is_dir(entry), self._name(entry).lower()))
-                for entry in visible:
-                    child_relative = self._entry_relative(relative_path, entry)
-                    children.append(
-                        await build_node(
-                            self._remote_path(workspace, child_relative),
-                            child_relative,
+                children = list(
+                    await asyncio.gather(
+                        *(
+                            build_node(entry, self._entry_relative(relative_path, entry))
+                            for entry in visible
                         )
                     )
+                )
             return FileNode(
                 path=relative_path,
                 name=self._name(info) or workspace.name,
@@ -129,7 +132,11 @@ class FileService:
                 children=children,
             )
 
-        return await build_node(target, self._normalize_relative(path or "", allow_empty=True))
+        try:
+            root_info = await sandbox.fs.get_file_info(root_remote)
+        except Exception as error:
+            raise FileNotFoundErrorInWorkspace from error
+        return await build_node(root_info, root_relative)
 
     async def read(self, workspace_id: UUID, owner_id: UUID, path: str) -> FileReadResponse:
         workspace, sandbox = await self._workspace(workspace_id, owner_id)
