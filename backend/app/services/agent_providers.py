@@ -27,6 +27,9 @@ class AgentProvider:
     ) -> AsyncIterator[ProviderEvent]:
         raise NotImplementedError
 
+    def pause(self) -> None:
+        return None
+
 
 class MockAgentProvider(AgentProvider):
     provider_name = "mock"

@@ -29,6 +29,10 @@ class Settings(BaseSettings):
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
+    openhands_llm_base_url: str | None = None
+    openhands_llm_api_key: str | None = None
+    openhands_llm_model: str | None = None
+    openhands_max_iterations: int = 30
     agent_command_timeout_seconds: int = 20
     agent_max_command_output_chars: int = 20_000
     terminal_default_cols: int = 120

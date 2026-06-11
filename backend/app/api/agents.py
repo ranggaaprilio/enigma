@@ -16,6 +16,7 @@ from app.schemas.agents import (
     AgentRunResponse,
 )
 from app.services.agents import (
+    AgentConfigurationError,
     AgentRunAlreadyActiveError,
     AgentRunNotFoundError,
     AgentService,
@@ -111,6 +112,11 @@ async def create_agent_run(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Workspace already has an active agent run",
+        ) from None
+    except AgentConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
         ) from None
 
 
