@@ -1,4 +1,4 @@
-# Custom Daytona sandbox snapshot for Enigma previews.
+# Custom Daytona sandbox snapshot for Enigma previews testing.
 #
 # Why this exists:
 #   Two runtime features bootstrap their tooling with a `curl … | sh` install:
