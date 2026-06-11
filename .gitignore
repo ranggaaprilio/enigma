@@ -18,3 +18,4 @@ frontend/.vite/
 
 postgres_data/
 redis_data/
+.venv/
