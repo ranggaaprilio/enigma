@@ -27,11 +27,16 @@ class AgentRunNotFoundError(Exception):
     pass
 
 
+class AgentConfigurationError(Exception):
+    pass
+
+
 class AgentRuntime:
     def __init__(self) -> None:
         self.stop_events: dict[UUID, asyncio.Event] = {}
         self.subscribers: dict[UUID, set[asyncio.Queue[dict]]] = defaultdict(set)
         self.tasks: dict[UUID, asyncio.Task] = {}
+        self.providers: dict[UUID, AgentProvider] = {}
 
     def register_run(self, run_id: UUID, task: asyncio.Task, stop_event: asyncio.Event) -> None:
         self.tasks[run_id] = task
@@ -41,12 +46,16 @@ class AgentRuntime:
     def forget_run(self, run_id: UUID) -> None:
         self.tasks.pop(run_id, None)
         self.stop_events.pop(run_id, None)
+        self.providers.pop(run_id, None)
+
+    def register_provider(self, run_id: UUID, provider: AgentProvider) -> None:
+        self.providers[run_id] = provider
 
     def request_stop(self, run_id: UUID) -> None:
         if stop_event := self.stop_events.get(run_id):
             stop_event.set()
-        if task := self.tasks.get(run_id):
-            task.cancel()
+        if provider := self.providers.get(run_id):
+            provider.pause()
 
     def subscribe(self, run_id: UUID) -> asyncio.Queue[dict]:
         queue: asyncio.Queue[dict] = asyncio.Queue()
@@ -82,6 +91,21 @@ def event_payload(event: AgentEvent) -> dict:
 
 def provider_from_settings(settings: Settings) -> AgentProvider:
     provider = settings.agent_provider.lower()
+    if provider == "openhands":
+        from app.services.openhands_provider import (
+            OpenHandsAgentProvider,
+            OpenHandsConfigurationError,
+        )
+
+        try:
+            return OpenHandsAgentProvider(
+                base_url=settings.openhands_llm_base_url,
+                api_key=settings.openhands_llm_api_key,
+                model=settings.openhands_llm_model,
+                max_iterations=settings.openhands_max_iterations,
+            )
+        except OpenHandsConfigurationError as error:
+            raise AgentConfigurationError(str(error)) from error
     if provider == "openai" or (provider == "auto" and settings.openai_api_key):
         if settings.openai_api_key:
             return OpenAIResponsesProvider(settings.openai_api_key, settings.openai_model)
@@ -178,6 +202,7 @@ class AgentService:
     async def stop_run(self, workspace_id: UUID, run_id: UUID, user_id: UUID) -> AgentRun:
         run = await self.get_run(workspace_id, run_id, user_id)
         if run.status in ACTIVE_RUN_STATUSES:
+            self.runtime.request_stop(run.id)
             run.status = "stopped"
             run.completed_at = datetime.now(UTC)
             self.session.add(run)
@@ -195,7 +220,6 @@ class AgentService:
             await self.session.refresh(run)
             await self.runtime.publish(run.id, event_payload(event))
             await self._record_run_finished(self.session, run)
-        self.runtime.request_stop(run.id)
         return run
 
     async def _get_workspace(self, workspace_id: UUID, user_id: UUID) -> Workspace:
@@ -215,6 +239,8 @@ class AgentService:
                     return
 
                 provider = provider_from_settings(self.settings)
+                self.runtime.register_provider(run.id, provider)
+                terminal_event_received = False
                 tools = WorkspaceTools(
                     workspace=workspace,
                     runtime=get_daytona_runtime(),
@@ -227,10 +253,13 @@ class AgentService:
                         break
                     if provider_event.event_type == "status":
                         status_value = provider_event.metadata.get("status")
-                        if status_value in ACTIVE_RUN_STATUSES:
+                        if status_value in ACTIVE_RUN_STATUSES + ("completed", "error", "stopped"):
                             run.status = status_value
+                            if status_value not in ACTIVE_RUN_STATUSES:
+                                run.completed_at = datetime.now(UTC)
+                                terminal_event_received = True
                             session.add(run)
-                    if tokens_used := provider_event.metadata.get("tokens_used"):
+                    if (tokens_used := provider_event.metadata.get("tokens_used")) is not None:
                         run.tokens_used = int(tokens_used)
                         session.add(run)
                     await self._persist_event(
@@ -242,7 +271,9 @@ class AgentService:
                     )
 
                 await session.refresh(run)
-                if run.status in ACTIVE_RUN_STATUSES:
+                if terminal_event_received:
+                    await self._record_run_finished(session, run)
+                elif run.status in ACTIVE_RUN_STATUSES:
                     run.status = "stopped" if stop_event.is_set() else "completed"
                     run.completed_at = datetime.now(UTC)
                     session.add(run)
