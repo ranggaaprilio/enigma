@@ -1,4 +1,5 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import select
@@ -11,6 +12,12 @@ from app.services.daytona_runtime import (
     DaytonaRuntime,
     DaytonaRuntimeError,
     get_daytona_runtime,
+)
+from app.services.preview_capability import (
+    InvalidPreviewCapabilityError,
+    capability_from_host,
+    create_preview_proxy_url,
+    decode_preview_capability,
 )
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -52,13 +59,7 @@ class PreviewService:
         sessions = list(result.scalars().all())
         for preview in sessions:
             if preview.status == "active":
-                try:
-                    preview.public_url = await self.runtime.signed_preview_url(
-                        workspace,
-                        preview.port,
-                    )
-                except DaytonaRuntimeError:
-                    preview.status = "error"
+                preview.public_url = self._proxy_url(preview)
                 self.session.add(preview)
         await self.session.commit()
         return sessions
@@ -80,19 +81,20 @@ class PreviewService:
         )
         preview = result.scalar_one_or_none()
         is_new = preview is None
-        public_url = await self.runtime.signed_preview_url(workspace, port)
         if preview is None:
             preview = PreviewSession(
                 workspace_id=workspace.id,
                 port=port,
-                public_url=public_url,
+                public_url="",
                 status="active",
                 created_at=now,
                 last_seen_at=now,
             )
+            self.session.add(preview)
+            await self.session.flush()
         else:
-            preview.public_url = public_url
             preview.last_seen_at = now
+        preview.public_url = self._proxy_url(preview)
         self.session.add(preview)
         await self.session.commit()
         await self.session.refresh(preview)
@@ -120,7 +122,7 @@ class PreviewService:
         )
         if await self._port_is_open(workspace, preview.port):
             preview.status = "active"
-            preview.public_url = await self.runtime.signed_preview_url(workspace, preview.port)
+            preview.public_url = self._proxy_url(preview)
         else:
             preview.status = "error"
         preview.last_seen_at = datetime.now(UTC)
@@ -128,6 +130,38 @@ class PreviewService:
         await self.session.commit()
         await self.session.refresh(preview)
         return preview
+
+    def _proxy_url(self, preview: PreviewSession) -> str:
+        ttl_seconds = min(
+            self.settings.daytona_preview_proxy_ttl_seconds,
+            self.settings.daytona_preview_url_ttl_seconds,
+        )
+        renewal_window = timedelta(seconds=min(60, max(1, ttl_seconds // 10)))
+        try:
+            parsed = urlsplit(preview.public_url)
+            capability_value = capability_from_host(
+                parsed.netloc,
+                base_url=self.settings.daytona_preview_proxy_base_url,
+            )
+            capability = decode_preview_capability(
+                capability_value,
+                secret_key=self.settings.auth_secret_key,
+            )
+            if (
+                capability.preview_session_id == preview.id
+                and capability.port == preview.port
+                and capability.expires_at - datetime.now(UTC) > renewal_window
+            ):
+                return preview.public_url
+        except (InvalidPreviewCapabilityError, ValueError):
+            pass
+        return create_preview_proxy_url(
+            preview.id,
+            preview.port,
+            base_url=self.settings.daytona_preview_proxy_base_url,
+            secret_key=self.settings.auth_secret_key,
+            ttl_seconds=ttl_seconds,
+        )
 
     async def stop(
         self,

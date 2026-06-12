@@ -25,10 +25,16 @@ class Settings(BaseSettings):
     daytona_sandbox_home: str = "/home/daytona"
     daytona_auto_stop_minutes: int = 30
     daytona_provision_timeout_seconds: int = 120
-    daytona_preview_url_ttl_seconds: int = 60 * 60
+    daytona_preview_url_ttl_seconds: int = Field(default=60 * 60, gt=0)
+    daytona_preview_proxy_base_url: str = "http://localhost:8001"
+    daytona_preview_proxy_ttl_seconds: int = Field(default=60 * 60, gt=0)
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
+    openhands_llm_base_url: str | None = None
+    openhands_llm_api_key: str | None = None
+    openhands_llm_model: str | None = None
+    openhands_max_iterations: int = 30
     agent_command_timeout_seconds: int = 20
     agent_max_command_output_chars: int = 20_000
     terminal_default_cols: int = 120

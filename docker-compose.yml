@@ -34,6 +34,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-local-development-auth-secret-change-me}
       WORKSPACE_ENV_ENCRYPTION_KEY: ${WORKSPACE_ENV_ENCRYPTION_KEY:-SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc=}
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
       DAYTONA_API_URL: ${DAYTONA_API_URL:-https://app.daytona.io/api}
@@ -41,6 +42,17 @@ services:
       DAYTONA_DEFAULT_SNAPSHOT: ${DAYTONA_DEFAULT_SNAPSHOT:-}
       DAYTONA_DEFAULT_LANGUAGE: ${DAYTONA_DEFAULT_LANGUAGE:-python}
       DAYTONA_AUTO_STOP_MINUTES: ${DAYTONA_AUTO_STOP_MINUTES:-30}
+      DAYTONA_PREVIEW_URL_TTL_SECONDS: ${DAYTONA_PREVIEW_URL_TTL_SECONDS:-3600}
+      DAYTONA_PREVIEW_PROXY_BASE_URL: ${DAYTONA_PREVIEW_PROXY_BASE_URL:-http://localhost:8001}
+      DAYTONA_PREVIEW_PROXY_TTL_SECONDS: ${DAYTONA_PREVIEW_PROXY_TTL_SECONDS:-3600}
+      AGENT_PROVIDER: ${AGENT_PROVIDER:-auto}
+      OPENHANDS_LLM_BASE_URL: ${OPENHANDS_LLM_BASE_URL:-}
+      OPENHANDS_LLM_API_KEY: ${OPENHANDS_LLM_API_KEY:-}
+      OPENHANDS_LLM_MODEL: ${OPENHANDS_LLM_MODEL:-}
+      OPENHANDS_MAX_ITERATIONS: ${OPENHANDS_MAX_ITERATIONS:-30}
+      OPENHANDS_SUPPRESS_BANNER: "1"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
     ports:
       - "8000:8000"
     depends_on:
@@ -52,6 +64,27 @@ services:
       - ./backend:/app
       - backend_venv:/app/.venv
     command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  preview-proxy:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-local-development-auth-secret-change-me}
+      DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
+      DAYTONA_API_URL: ${DAYTONA_API_URL:-https://app.daytona.io/api}
+      DAYTONA_TARGET: ${DAYTONA_TARGET:-}
+      DAYTONA_PROVISION_TIMEOUT_SECONDS: ${DAYTONA_PROVISION_TIMEOUT_SECONDS:-120}
+      DAYTONA_PREVIEW_PROXY_BASE_URL: ${DAYTONA_PREVIEW_PROXY_BASE_URL:-http://localhost:8001}
+    ports:
+      - "8001:8001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - preview_proxy_venv:/app/.venv
+    command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && uv run uvicorn app.preview_proxy:app --host 0.0.0.0 --port 8001 --reload"
 
   frontend:
     build:
@@ -66,10 +99,11 @@ services:
     volumes:
       - ./frontend:/app
       - frontend_node_modules:/app/node_modules
-    command: node ./node_modules/vite/bin/vite.js --host 0.0.0.0
+    command: sh -lc "pnpm install --frozen-lockfile && rm -rf node_modules/.vite && exec node ./node_modules/vite/bin/vite.js --host 0.0.0.0 --force"
 
 volumes:
   postgres_data:
   redis_data:
   backend_venv:
+  preview_proxy_venv:
   frontend_node_modules:

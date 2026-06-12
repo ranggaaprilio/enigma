@@ -6,6 +6,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 AgentRunStatus = Literal["thinking", "executing", "completed", "error", "stopped"]
 AgentEventType = Literal["status", "output_text", "tool_call", "tool_result", "error"]
+AgentFileChangeStatus = Literal["created", "modified", "deleted", "renamed"]
 
 
 class AgentRunCreateRequest(BaseModel):
@@ -25,6 +26,7 @@ class AgentEventResponse(BaseModel):
     agent_run_id: UUID
     event_type: AgentEventType
     content: str
+    tool_call_id: str | None = None
     metadata: dict
     created_at: datetime
 
@@ -43,6 +45,22 @@ class AgentRunResponse(BaseModel):
     error_message: str | None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class AgentFileChangeResponse(BaseModel):
+    id: UUID
+    path: str
+    status: AgentFileChangeStatus
+    tool_call_id: str | None = None
+    created_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AgentFileChangeListResponse(BaseModel):
+    items: list[AgentFileChangeResponse]
+    total: int
+    capped: bool
 
 
 class AgentRunDetailResponse(AgentRunResponse):

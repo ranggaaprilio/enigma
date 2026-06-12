@@ -73,6 +73,12 @@ class FakeSandbox:
     async def create_signed_preview_url(self, port: int, expires_in_seconds: int):
         return SimpleNamespace(url=f"https://{port}-{self.id}.example/?token=signed")
 
+    async def get_preview_link(self, port: int):
+        return SimpleNamespace(
+            url=f"https://{port}-{self.id}.proxy.daytona.example",
+            token="preview-token",
+        )
+
 
 class FakeClient:
     def __init__(self, existing: list[FakeSandbox] | None = None) -> None:
@@ -197,6 +203,17 @@ async def test_signed_preview_url_uses_configured_ttl() -> None:
     assert await runtime.signed_preview_url(workspace(), 5173) == (
         "https://5173-sandbox-1.example/?token=signed"
     )
+
+
+async def test_preview_link_returns_standard_url_and_token() -> None:
+    sandbox = FakeSandbox()
+    runtime = DaytonaRuntime(Settings(daytona_api_key="test"))
+    runtime._client = FakeClient([sandbox])  # type: ignore[assignment]
+
+    preview_link = await runtime.preview_link(workspace(), 5173)
+
+    assert preview_link.url == "https://5173-sandbox-1.proxy.daytona.example"
+    assert preview_link.token == "preview-token"
 
 
 async def _append(values: list[str], value: str) -> None:

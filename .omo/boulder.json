@@ -1,0 +1,215 @@
+{
+  "schema_version": 2,
+  "active_work_id": "agent-workspace-c41083cf",
+  "works": {
+    "agent-workspace-c41083cf": {
+      "work_id": "agent-workspace-c41083cf",
+      "active_plan": "/Users/rangga/Code/enigma/.omo/plans/agent-workspace.md",
+      "plan_name": "agent-workspace",
+      "status": "active",
+      "started_at": "2026-06-11T22:24:58.489Z",
+      "updated_at": "2026-06-11T23:24:07.283Z",
+      "session_ids": [
+        "opencode:ses_14740f04effeXtksoLkYFgfBtC"
+      ],
+      "session_origins": {
+        "opencode:ses_14740f04effeXtksoLkYFgfBtC": "direct"
+      },
+      "agent": "atlas",
+      "task_sessions": {
+        "todo:1": {
+          "task_key": "todo:1",
+          "task_label": "1",
+          "task_title": "AgentFileChange model + CRUD tests (TDD)",
+          "session_id": "opencode:ses_14735c914ffetiDhV2Rz1VBbjf",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-11T22:32:18.425Z",
+          "started_at": "2026-06-11T22:31:25.411Z",
+          "status": "completed",
+          "ended_at": "2026-06-11T22:32:18.425Z",
+          "elapsed_ms": 53014
+        },
+        "todo:4": {
+          "task_key": "todo:4",
+          "task_label": "4",
+          "task_title": "Baseline capture + file change computation service (TDD)",
+          "session_id": "opencode:ses_1472f2e6cffe8VvdJ2nd59mj2U",
+          "agent": "Sisyphus-Junior",
+          "category": "deep",
+          "updated_at": "2026-06-11T22:37:51.968Z",
+          "started_at": "2026-06-11T22:37:30.494Z",
+          "status": "completed",
+          "ended_at": "2026-06-11T22:37:51.968Z",
+          "elapsed_ms": 21474
+        },
+        "todo:5": {
+          "task_key": "todo:5",
+          "task_label": "5",
+          "task_title": "File-changes API endpoint",
+          "session_id": "opencode:ses_1472a2878ffeQjQPIa03w6NnHd",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "updated_at": "2026-06-11T22:42:40.529Z",
+          "started_at": "2026-06-11T22:42:16.395Z",
+          "status": "completed",
+          "ended_at": "2026-06-11T22:42:40.529Z",
+          "elapsed_ms": 24134
+        },
+        "todo:6": {
+          "task_key": "todo:6",
+          "task_label": "6",
+          "task_title": "File-changes schema + API tests",
+          "session_id": "opencode:ses_14725bc57ffeyFXVr3NLPMcWyX",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-11T22:59:04.102Z",
+          "started_at": "2026-06-11T22:58:45.082Z",
+          "status": "completed",
+          "ended_at": "2026-06-11T22:59:04.102Z",
+          "elapsed_ms": 19020
+        },
+        "todo:10": {
+          "task_key": "todo:10",
+          "task_label": "10",
+          "task_title": "Prompt composer + Run/Stop controls",
+          "session_id": "opencode:ses_14716ba21ffeJy63BB6b58QjpL",
+          "agent": "Sisyphus-Junior",
+          "category": "visual-engineering",
+          "updated_at": "2026-06-11T23:08:08.029Z",
+          "started_at": "2026-06-11T23:03:04.845Z",
+          "status": "completed",
+          "ended_at": "2026-06-11T23:08:08.029Z",
+          "elapsed_ms": 303184
+        },
+        "todo:15": {
+          "task_key": "todo:15",
+          "task_label": "15",
+          "task_title": "Sidebar \"Agents\" nav wiring",
+          "session_id": "opencode:ses_1470e62c0ffeyYDL9HgWUdyLY7",
+          "agent": "Sisyphus-Junior",
+          "category": "quick",
+          "updated_at": "2026-06-11T23:12:12.213Z",
+          "started_at": "2026-06-11T23:11:47.417Z",
+          "status": "completed",
+          "ended_at": "2026-06-11T23:12:12.213Z",
+          "elapsed_ms": 24796
+        },
+        "todo:17": {
+          "task_key": "todo:17",
+          "task_label": "17",
+          "task_title": "Integration tests end-to-end",
+          "session_id": "opencode:ses_1470a9560ffeZaqN3CeiFBzS5H",
+          "agent": "Sisyphus-Junior",
+          "category": "unspecified-high",
+          "updated_at": "2026-06-11T23:24:07.283Z",
+          "started_at": "2026-06-11T23:24:07.283Z",
+          "status": "running"
+        }
+      }
+    }
+  },
+  "active_plan": "/Users/rangga/Code/enigma/.omo/plans/agent-workspace.md",
+  "started_at": "2026-06-11T22:24:58.489Z",
+  "status": "active",
+  "updated_at": "2026-06-11T23:24:07.283Z",
+  "session_ids": [
+    "opencode:ses_14740f04effeXtksoLkYFgfBtC"
+  ],
+  "session_origins": {
+    "opencode:ses_14740f04effeXtksoLkYFgfBtC": "direct"
+  },
+  "plan_name": "agent-workspace",
+  "task_sessions": {
+    "todo:1": {
+      "task_key": "todo:1",
+      "task_label": "1",
+      "task_title": "AgentFileChange model + CRUD tests (TDD)",
+      "session_id": "opencode:ses_14735c914ffetiDhV2Rz1VBbjf",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-06-11T22:32:18.425Z",
+      "started_at": "2026-06-11T22:31:25.411Z",
+      "status": "completed",
+      "ended_at": "2026-06-11T22:32:18.425Z",
+      "elapsed_ms": 53014
+    },
+    "todo:4": {
+      "task_key": "todo:4",
+      "task_label": "4",
+      "task_title": "Baseline capture + file change computation service (TDD)",
+      "session_id": "opencode:ses_1472f2e6cffe8VvdJ2nd59mj2U",
+      "agent": "Sisyphus-Junior",
+      "category": "deep",
+      "updated_at": "2026-06-11T22:37:51.968Z",
+      "started_at": "2026-06-11T22:37:30.494Z",
+      "status": "completed",
+      "ended_at": "2026-06-11T22:37:51.968Z",
+      "elapsed_ms": 21474
+    },
+    "todo:5": {
+      "task_key": "todo:5",
+      "task_label": "5",
+      "task_title": "File-changes API endpoint",
+      "session_id": "opencode:ses_1472a2878ffeQjQPIa03w6NnHd",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-06-11T22:42:40.529Z",
+      "started_at": "2026-06-11T22:42:16.395Z",
+      "status": "completed",
+      "ended_at": "2026-06-11T22:42:40.529Z",
+      "elapsed_ms": 24134
+    },
+    "todo:6": {
+      "task_key": "todo:6",
+      "task_label": "6",
+      "task_title": "File-changes schema + API tests",
+      "session_id": "opencode:ses_14725bc57ffeyFXVr3NLPMcWyX",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-11T22:59:04.102Z",
+      "started_at": "2026-06-11T22:58:45.082Z",
+      "status": "completed",
+      "ended_at": "2026-06-11T22:59:04.102Z",
+      "elapsed_ms": 19020
+    },
+    "todo:10": {
+      "task_key": "todo:10",
+      "task_label": "10",
+      "task_title": "Prompt composer + Run/Stop controls",
+      "session_id": "opencode:ses_14716ba21ffeJy63BB6b58QjpL",
+      "agent": "Sisyphus-Junior",
+      "category": "visual-engineering",
+      "updated_at": "2026-06-11T23:08:08.029Z",
+      "started_at": "2026-06-11T23:03:04.845Z",
+      "status": "completed",
+      "ended_at": "2026-06-11T23:08:08.029Z",
+      "elapsed_ms": 303184
+    },
+    "todo:15": {
+      "task_key": "todo:15",
+      "task_label": "15",
+      "task_title": "Sidebar \"Agents\" nav wiring",
+      "session_id": "opencode:ses_1470e62c0ffeyYDL9HgWUdyLY7",
+      "agent": "Sisyphus-Junior",
+      "category": "quick",
+      "updated_at": "2026-06-11T23:12:12.213Z",
+      "started_at": "2026-06-11T23:11:47.417Z",
+      "status": "completed",
+      "ended_at": "2026-06-11T23:12:12.213Z",
+      "elapsed_ms": 24796
+    },
+    "todo:17": {
+      "task_key": "todo:17",
+      "task_label": "17",
+      "task_title": "Integration tests end-to-end",
+      "session_id": "opencode:ses_1470a9560ffeZaqN3CeiFBzS5H",
+      "agent": "Sisyphus-Junior",
+      "category": "unspecified-high",
+      "updated_at": "2026-06-11T23:24:07.283Z",
+      "started_at": "2026-06-11T23:24:07.283Z",
+      "status": "running"
+    }
+  },
+  "agent": "atlas"
+}

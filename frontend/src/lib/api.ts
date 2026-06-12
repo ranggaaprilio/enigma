@@ -173,6 +173,7 @@ export type AgentEventResponse = {
   event_type: AgentEventType;
   content: string;
   metadata: Record<string, unknown>;
+  tool_call_id: string | null;
   created_at: string;
 };
 
@@ -192,6 +193,20 @@ export type AgentRunResponse = {
 
 export type AgentRunDetailResponse = AgentRunResponse & {
   events: AgentEventResponse[];
+};
+
+export type AgentFileChangeResponse = {
+  id: string;
+  path: string;
+  status: "created" | "modified" | "deleted" | "renamed";
+  tool_call_id: string | null;
+  created_at: string;
+};
+
+export type AgentFileChangeListResponse = {
+  items: AgentFileChangeResponse[];
+  total: number;
+  capped: boolean;
 };
 
 export type AgentRunCreatePayload = {
@@ -686,8 +701,14 @@ export function createAgentRun(
 export function listAgentRuns(
   workspaceId: string,
   signal?: AbortSignal,
+  limit?: number,
+  offset?: number,
 ): Promise<AgentRunResponse[]> {
-  return requestJson<AgentRunResponse[]>(`/workspaces/${workspaceId}/agent/runs`, { signal });
+  const params = new URLSearchParams();
+  if (limit !== undefined) params.set("limit", String(limit));
+  if (offset !== undefined) params.set("offset", String(offset));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return requestJson<AgentRunResponse[]>(`/workspaces/${workspaceId}/agent/runs${query}`, { signal });
 }
 
 export function getAgentRun(
@@ -705,6 +726,17 @@ export function stopAgentRun(workspaceId: string, runId: string): Promise<AgentR
   return requestJson<AgentRunResponse>(`/workspaces/${workspaceId}/agent/runs/${runId}/stop`, {
     method: "POST",
   });
+}
+
+export function getAgentFileChanges(
+  workspaceId: string,
+  runId: string,
+  signal?: AbortSignal,
+): Promise<AgentFileChangeListResponse> {
+  return requestJson<AgentFileChangeListResponse>(
+    `/workspaces/${workspaceId}/agent/runs/${runId}/file-changes`,
+    { signal },
+  );
 }
 
 export function createCustomCommand(

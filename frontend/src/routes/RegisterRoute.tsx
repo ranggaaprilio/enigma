@@ -1,22 +1,17 @@
-import { type FormEvent, useEffect, useState } from "react";
+import { type FormEvent, useState } from "react";
+import { Link, useNavigate } from "react-router";
 
 import { useAuth } from "../auth/context";
 import { ApiError } from "../lib/api";
-import { navigate } from "../lib/router";
 
 export function RegisterRoute() {
-  const { status, register } = useAuth();
+  const { register } = useAuth();
+  const navigate = useNavigate();
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-
-  useEffect(() => {
-    if (status === "authenticated") {
-      navigate("/");
-    }
-  }, [status]);
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -35,7 +30,7 @@ export function RegisterRoute() {
     setIsSubmitting(true);
     try {
       await register({ email, password, name: name.trim() || undefined });
-      navigate("/");
+      navigate("/", { replace: true });
     } catch (caughtError) {
       setError(caughtError instanceof ApiError ? caughtError.message : "Unable to create account.");
     } finally {
@@ -100,9 +95,9 @@ export function RegisterRoute() {
 
         <div className="mt-5 border-t border-line pt-4 text-sm text-ink/70">
           Already registered?{" "}
-          <button className="font-semibold text-ink underline" type="button" onClick={() => navigate("/login")}>
+          <Link className="font-semibold text-ink underline" to="/login">
             Log in
-          </button>
+          </Link>
         </div>
       </section>
     </main>

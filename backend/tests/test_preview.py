@@ -6,10 +6,11 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api import auth as auth_module
 from app.api import preview as preview_module
+from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
 from app.models import PreviewSession, User, Workspace
-from app.services.preview import PreviewNotFoundError, PreviewSessionNotFoundError
+from app.services.preview import PreviewNotFoundError, PreviewService, PreviewSessionNotFoundError
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -116,7 +117,7 @@ class FakePreviewService:
             created_at=now,
             last_seen_at=now,
         )
-        preview_session.public_url = "https://5173-sandbox.proxy.daytona.example/?token=signed"
+        preview_session.public_url = "http://signed-capability.localhost:8001/"
         return preview_session
 
 
@@ -197,7 +198,7 @@ async def test_detect_list_refresh_and_stop_preview_session(preview_context):
 
     assert detected.json()["status"] == "active"
     assert detected.json()["session"]["port"] == 5173
-    assert detected.json()["session"]["public_url"].startswith("https://")
+    assert detected.json()["session"]["public_url"].endswith(".localhost:8001/")
     assert listed.json()[0]["id"] == session_id
     assert refreshed.json()["status"] == "active"
     assert stopped.json()["status"] == "stopped"
@@ -243,3 +244,21 @@ async def test_refresh_marks_unreachable_session_error(preview_context):
         )
 
     assert response.json()["status"] == "error"
+
+
+def test_preview_service_reuses_a_valid_proxy_url(preview_context):
+    _user, _workspace, fake_service = preview_context
+    preview = fake_service._session("active")
+    service = PreviewService(
+        session=None,  # type: ignore[arg-type]
+        settings=Settings(
+            auth_secret_key="preview-secret",
+            daytona_preview_proxy_base_url="http://localhost:8001",
+        ),
+        runtime=object(),  # type: ignore[arg-type]
+    )
+
+    first_url = service._proxy_url(preview)
+    preview.public_url = first_url
+
+    assert service._proxy_url(preview) == first_url

@@ -1,23 +1,27 @@
 from typing import Protocol
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
 from app.core.security import verify_session_token
 from app.db.session import async_session_maker, get_db_session
-from app.models import AgentEvent, AgentRun, User
+from app.models import AgentEvent, AgentFileChange, AgentRun, User
 from app.schemas.agents import (
     AgentEventResponse,
+    AgentFileChangeListResponse,
+    AgentFileChangeResponse,
     AgentRunCreateRequest,
     AgentRunDetailResponse,
     AgentRunResponse,
 )
 from app.services.agents import (
+    AgentConfigurationError,
     AgentRunAlreadyActiveError,
     AgentRunNotFoundError,
+    AgentRunNotInWorkspaceError,
     AgentService,
     agent_runtime,
     event_payload,
@@ -33,7 +37,13 @@ SETTINGS_DEP = Depends(get_settings)
 class AgentServiceProtocol(Protocol):
     async def create_run(self, workspace_id: UUID, user_id: UUID, prompt: str) -> AgentRun: ...
 
-    async def list_runs(self, workspace_id: UUID, user_id: UUID) -> list[AgentRun]: ...
+    async def list_runs(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[AgentRun]: ...
 
     async def get_run(self, workspace_id: UUID, run_id: UUID, user_id: UUID) -> AgentRun: ...
 
@@ -45,6 +55,14 @@ class AgentServiceProtocol(Protocol):
     ) -> list[AgentEvent]: ...
 
     async def stop_run(self, workspace_id: UUID, run_id: UUID, user_id: UUID) -> AgentRun: ...
+
+    async def list_file_changes(
+        self,
+        workspace_id: UUID,
+        run_id: UUID,
+        user_id: UUID,
+        limit: int = 50,
+    ) -> tuple[list[AgentFileChange], int, bool]: ...
 
 
 async def get_agent_service(
@@ -67,6 +85,7 @@ def agent_event_response(event: AgentEvent) -> AgentEventResponse:
         agent_run_id=event.agent_run_id,
         event_type=event.event_type,
         content=event.content,
+        tool_call_id=event.tool_call_id,
         metadata=event.event_metadata,
         created_at=event.created_at,
     )
@@ -112,16 +131,23 @@ async def create_agent_run(
             status_code=status.HTTP_409_CONFLICT,
             detail="Workspace already has an active agent run",
         ) from None
+    except AgentConfigurationError as error:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(error),
+        ) from None
 
 
 @router.get("/runs", response_model=list[AgentRunResponse])
 async def list_agent_runs(
     workspace_id: UUID,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     current_user: User = CURRENT_USER_DEP,
     service: AgentServiceProtocol = AGENT_SERVICE_DEP,
 ) -> list[AgentRun]:
     try:
-        return await service.list_runs(workspace_id, current_user.id)
+        return await service.list_runs(workspace_id, current_user.id, limit=limit, offset=offset)
     except WorkspaceNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -146,6 +172,36 @@ async def get_agent_run(
     except AgentRunNotFoundError:
         raise not_found() from None
     return agent_run_detail_response(run)
+
+
+@router.get("/runs/{run_id}/file-changes", response_model=AgentFileChangeListResponse)
+async def list_agent_run_file_changes(
+    workspace_id: UUID,
+    run_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: AgentServiceProtocol = AGENT_SERVICE_DEP,
+) -> AgentFileChangeListResponse:
+    try:
+        changes, total, capped = await service.list_file_changes(
+            workspace_id, run_id, current_user.id
+        )
+    except WorkspaceNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Workspace not found",
+        ) from None
+    except AgentRunNotFoundError:
+        raise not_found() from None
+    except AgentRunNotInWorkspaceError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Agent run does not belong to this workspace",
+        ) from None
+    return AgentFileChangeListResponse(
+        items=[AgentFileChangeResponse.model_validate(c) for c in changes],
+        total=total,
+        capped=capped,
+    )
 
 
 @router.post("/runs/{run_id}/stop", response_model=AgentRunResponse)
