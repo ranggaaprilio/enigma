@@ -1,6 +1,9 @@
+import asyncio
 import shlex
+from collections import deque
 from dataclasses import dataclass
 from pathlib import PurePosixPath
+from typing import Any
 
 from app.models import Workspace
 from app.services.daytona_runtime import DaytonaRuntime
@@ -84,21 +87,52 @@ class WorkspaceTools:
     async def list_files(self, path: str | None = None, limit: int = 200) -> list[str]:
         sandbox = await self.runtime.get_sandbox(self.workspace)
         root = self.resolve_path(path)
-        try:
-            matches = await sandbox.fs.find_files(root, "*")
-        except Exception as error:
-            raise WorkspaceToolError(str(error)) from error
+        bounded_limit = max(1, min(limit, 200))
         results: list[str] = []
         prefix = self.workspace.workspace_path.rstrip("/") + "/"
-        for match in matches:
-            remote = str(getattr(match, "file", getattr(match, "path", "")))
-            relative = remote[len(prefix) :] if remote.startswith(prefix) else remote
-            if any(part in EXCLUDED_NAMES for part in PurePosixPath(relative).parts):
-                continue
-            results.append(relative)
-            if len(results) >= limit:
-                break
-        return sorted(results)
+        directories = deque([root])
+
+        try:
+            while directories and len(results) < bounded_limit:
+                directory = directories.popleft()
+                async with asyncio.timeout(self.command_timeout_seconds):
+                    entries = await sandbox.fs.list_files(directory)
+                entries = sorted(entries, key=lambda entry: self._entry_name(entry).lower())
+                for entry in entries:
+                    remote = self._entry_path(directory, entry)
+                    relative = remote[len(prefix) :] if remote.startswith(prefix) else remote
+                    relative_path = PurePosixPath(relative)
+                    if any(part in EXCLUDED_NAMES for part in relative_path.parts):
+                        continue
+                    if self._entry_is_dir(entry):
+                        directories.append(remote)
+                    else:
+                        results.append(relative_path.as_posix())
+                        if len(results) >= bounded_limit:
+                            break
+        except Exception as error:
+            raise WorkspaceToolError(str(error)) from error
+        return results
+
+    @staticmethod
+    def _entry_name(entry: Any) -> str:
+        name = getattr(entry, "name", None)
+        if name:
+            return str(name)
+        path = str(getattr(entry, "path", getattr(entry, "file", "")))
+        return PurePosixPath(path).name
+
+    @classmethod
+    def _entry_path(cls, directory: str, entry: Any) -> str:
+        path = str(getattr(entry, "path", getattr(entry, "file", "")))
+        if path:
+            return path
+        return f"{directory.rstrip('/')}/{cls._entry_name(entry)}"
+
+    @staticmethod
+    def _entry_is_dir(entry: Any) -> bool:
+        value = getattr(entry, "is_dir", False)
+        return bool(value() if callable(value) else value)
 
     async def read_file(self, path: str, max_chars: int = 20_000) -> str:
         sandbox = await self.runtime.get_sandbox(self.workspace)

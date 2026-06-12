@@ -1,0 +1,8 @@
+Task 17 zero-tool edge case
+Date: 2026-06-12
+
+uv run pytest tests/test_agents.py -v -k "zero_tool"
+Result: PASS
+1 passed, 29 deselected
+
+The completed run returned one output_text event, no tool_call_id, and an empty file-change response.

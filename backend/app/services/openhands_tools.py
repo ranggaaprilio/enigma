@@ -87,7 +87,7 @@ def get_daytona_bridge(bridge_id: str) -> DaytonaToolBridge:
 
 class ListFilesAction(Action):
     path: str | None = Field(default=None, description="Relative directory to inspect.")
-    limit: int = Field(default=200, ge=1, le=1000)
+    limit: int = Field(default=200, ge=1, le=200)
 
 
 class ReadFileAction(Action):

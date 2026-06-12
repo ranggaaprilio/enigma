@@ -38,6 +38,15 @@ class OpenHandsConfigurationError(ValueError):
     pass
 
 
+def normalize_model_name(model: str | None) -> str:
+    model_name = (model or "").strip()
+    if model_name.startswith("opencode-go/"):
+        model_name = model_name.removeprefix("opencode-go/")
+    if model_name and "/" not in model_name:
+        return f"openai/{model_name}"
+    return model_name
+
+
 def sanitize_metadata(value: Any, key: str | None = None) -> Any:
     if key and any(sensitive in key.lower() for sensitive in SENSITIVE_KEYS):
         return "[redacted]"
@@ -65,7 +74,7 @@ class OpenHandsAgentProvider(AgentProvider):
     ) -> None:
         self.base_url = (base_url or "").strip()
         self.api_key = (api_key or "").strip() or None
-        self.model_name = (model or "").strip()
+        self.model_name = normalize_model_name(model)
         self.max_iterations = max_iterations
         self._conversation: Any | None = None
         self._bridge: DaytonaToolBridge | None = None

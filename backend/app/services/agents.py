@@ -8,13 +8,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
-from app.models import AgentEvent, AgentRun, Workspace
+from app.models import AgentEvent, AgentFileChange, AgentRun, Workspace
 from app.services.agent_providers import AgentProvider, MockAgentProvider, OpenAIResponsesProvider
 from app.services.agent_tools import WorkspaceTools
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import get_daytona_runtime
 from app.services.notifications import NotificationService
-from app.services.workspaces import WorkspaceNotFoundError
+from app.services.repositories import RepositoryService
+from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 ACTIVE_RUN_STATUSES = ("thinking", "executing")
 
@@ -24,6 +25,10 @@ class AgentRunAlreadyActiveError(Exception):
 
 
 class AgentRunNotFoundError(Exception):
+    pass
+
+
+class AgentRunNotInWorkspaceError(Exception):
     pass
 
 
@@ -84,6 +89,7 @@ def event_payload(event: AgentEvent) -> dict:
         "agent_run_id": str(event.agent_run_id),
         "event_type": event.event_type,
         "content": event.content,
+        "tool_call_id": event.tool_call_id,
         "metadata": event.event_metadata,
         "created_at": event.created_at.isoformat(),
     }
@@ -163,13 +169,20 @@ class AgentService:
         self.runtime.register_run(run.id, task, stop_event)
         return run
 
-    async def list_runs(self, workspace_id: UUID, user_id: UUID) -> list[AgentRun]:
+    async def list_runs(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[AgentRun]:
         workspace = await self._get_workspace(workspace_id, user_id)
         result = await self.session.execute(
             select(AgentRun)
             .where(AgentRun.workspace_id == workspace.id, AgentRun.user_id == user_id)
             .order_by(AgentRun.started_at.desc())
-            .limit(25)
+            .offset(offset)
+            .limit(limit)
         )
         return list(result.scalars().all())
 
@@ -222,6 +235,152 @@ class AgentService:
             await self._record_run_finished(self.session, run)
         return run
 
+    async def create_file_change(
+        self,
+        run_id: UUID,
+        path: str,
+        status: str,
+        tool_call_id: str | None = None,
+        session: AsyncSession | None = None,
+    ) -> AgentFileChange:
+        session = session or self.session
+        file_change = AgentFileChange(
+            agent_run_id=run_id,
+            path=path,
+            status=status,
+            tool_call_id=tool_call_id,
+        )
+        session.add(file_change)
+        await session.flush()
+        await session.commit()
+        await session.refresh(file_change)
+        return file_change
+
+    async def get_file_changes_for_run(self, run_id: UUID) -> list[AgentFileChange]:
+        result = await self.session.execute(
+            select(AgentFileChange)
+            .where(AgentFileChange.agent_run_id == run_id)
+            .order_by(AgentFileChange.created_at.asc())
+        )
+        return list(result.scalars().all())
+
+    async def get_file_changes_for_run_and_tool(
+        self,
+        run_id: UUID,
+        tool_call_id: str,
+    ) -> list[AgentFileChange]:
+        result = await self.session.execute(
+            select(AgentFileChange)
+            .where(
+                AgentFileChange.agent_run_id == run_id,
+                AgentFileChange.tool_call_id == tool_call_id,
+            )
+            .order_by(AgentFileChange.created_at.asc())
+        )
+        return list(result.scalars().all())
+
+    async def get_file_changes_for_run_capped(
+        self,
+        run_id: UUID,
+        limit: int = 50,
+    ) -> tuple[list[AgentFileChange], int, bool]:
+        changes = await self.get_file_changes_for_run(run_id)
+        total = len(changes)
+        return changes[:limit], total, total > limit
+
+    async def list_file_changes(
+        self,
+        workspace_id: UUID,
+        run_id: UUID,
+        user_id: UUID,
+        limit: int = 50,
+    ) -> tuple[list[AgentFileChange], int, bool]:
+        workspace = await self._get_workspace(workspace_id, user_id)
+        result = await self.session.execute(
+            select(AgentRun).where(AgentRun.id == run_id)
+        )
+        run = result.scalar_one_or_none()
+        if run is None:
+            raise AgentRunNotFoundError
+        if run.workspace_id != workspace.id:
+            raise AgentRunNotInWorkspaceError
+        return await self.get_file_changes_for_run_capped(run_id, limit)
+
+    @staticmethod
+    def _map_git_status_to_badge(status: str) -> str:
+        status_lower = status.lower()
+        if status_lower in ("added", "a", "untracked", "?"):
+            return "created"
+        if status_lower in ("modified", "m", "updated", "updated but unmerged", "u"):
+            return "modified"
+        if status_lower in ("deleted", "d", "removed"):
+            return "deleted"
+        if status_lower in ("renamed", "r", "copied", "c"):
+            return "renamed"
+        return "modified"
+
+    async def _capture_baseline(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        session: AsyncSession | None = None,
+    ) -> list:
+        session = session or self.session
+        workspace = await session.get(Workspace, workspace_id)
+        if workspace is None:
+            return []
+        cipher = WorkspaceSecretCipher(self.settings.workspace_env_encryption_key)
+        runtime = get_daytona_runtime()
+        repo_service = RepositoryService(session, cipher, runtime)
+        try:
+            git_status = await repo_service.status(workspace_id, user_id)
+        except Exception:
+            return []
+        if not git_status.cloned:
+            return []
+        return git_status.files
+
+    async def _compute_file_changes(
+        self,
+        workspace_id: UUID,
+        baseline: list,
+        user_id: UUID,
+        run_id: UUID,
+        session: AsyncSession | None = None,
+    ) -> list[AgentFileChange]:
+        session = session or self.session
+        workspace = await session.get(Workspace, workspace_id)
+        if workspace is None:
+            return []
+        cipher = WorkspaceSecretCipher(self.settings.workspace_env_encryption_key)
+        runtime = get_daytona_runtime()
+        repo_service = RepositoryService(session, cipher, runtime)
+        try:
+            current_status = await repo_service.status(workspace_id, user_id)
+        except Exception:
+            return []
+        if not current_status.cloned:
+            return []
+        baseline_dict = {f.path: f.status for f in baseline}
+        changes: list[AgentFileChange] = []
+        for file in current_status.files:
+            if file.path not in baseline_dict or baseline_dict[file.path] != file.status:
+                badge = self._map_git_status_to_badge(file.status)
+                changes.append(
+                    AgentFileChange(
+                        agent_run_id=run_id,
+                        path=file.path,
+                        status=badge,
+                        tool_call_id=None,
+                    )
+                )
+        for change in changes:
+            session.add(change)
+        if changes:
+            await session.flush()
+            await session.commit()
+        return changes
+
     async def _get_workspace(self, workspace_id: UUID, user_id: UUID) -> Workspace:
         workspace = await self.session.get(Workspace, workspace_id)
         if workspace is None or workspace.owner_id != user_id:
@@ -248,6 +407,10 @@ class AgentService:
                     max_command_output_chars=self.settings.agent_max_command_output_chars,
                 )
 
+                baseline = await self._capture_baseline(
+                    workspace.id, workspace.owner_id, session
+                )
+
                 async for provider_event in provider.stream_response(run.prompt, tools, stop_event):
                     if stop_event.is_set():
                         break
@@ -272,7 +435,7 @@ class AgentService:
 
                 await session.refresh(run)
                 if terminal_event_received:
-                    await self._record_run_finished(session, run)
+                    await self._record_run_finished(session, run, baseline)
                 elif run.status in ACTIVE_RUN_STATUSES:
                     run.status = "stopped" if stop_event.is_set() else "completed"
                     run.completed_at = datetime.now(UTC)
@@ -285,7 +448,7 @@ class AgentService:
                         run.status,
                         {"status": run.status},
                     )
-                    await self._record_run_finished(session, run)
+                    await self._record_run_finished(session, run, baseline)
             except asyncio.CancelledError:
                 await self._mark_stopped(run_id)
             except Exception as error:
@@ -299,10 +462,13 @@ class AgentService:
         content: str,
         metadata: dict,
     ) -> AgentEvent:
+        raw_tool_call_id = metadata.get("tool_call_id")
+        tool_call_id = str(raw_tool_call_id) if raw_tool_call_id is not None else None
         event = AgentEvent(
             agent_run_id=run_id,
             event_type=event_type,
             content=content,
+            tool_call_id=tool_call_id,
             event_metadata=metadata,
         )
         session.add(event)
@@ -339,7 +505,20 @@ class AgentService:
             await session.commit()
             await self._record_run_finished(session, run)
 
-    async def _record_run_finished(self, session: AsyncSession, run: AgentRun) -> None:
+    async def _record_run_finished(
+        self,
+        session: AsyncSession,
+        run: AgentRun,
+        baseline: list | None = None,
+    ) -> None:
+        if baseline is not None:
+            await self._compute_file_changes(
+                run.workspace_id,
+                baseline,
+                run.user_id,
+                run.id,
+                session,
+            )
         notification_type = (
             "agent_run_completed" if run.status == "completed" else "agent_run_failed"
         )

@@ -19,6 +19,10 @@ body {
   background: #f7f7f4;
 }
 
+html {
+  scroll-behavior: smooth;
+}
+
 button,
 input,
 textarea,
@@ -46,4 +50,60 @@ pre,
 
 .terminal-frame .xterm-viewport {
   overflow-y: scroll !important;
+}
+
+@layer components {
+  .landing-nav-link {
+    @apply flex min-h-11 items-center rounded-md px-1 text-sm font-medium text-body transition hover:text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-canvas;
+  }
+
+  .landing-text-link {
+    @apply inline-flex items-center justify-center rounded-md text-sm font-medium text-ink underline-offset-4 transition hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-canvas;
+  }
+
+  .landing-button-primary {
+    @apply inline-flex min-h-10 items-center justify-center gap-2 rounded-md bg-primary px-[18px] py-2.5 text-sm font-medium text-white transition hover:bg-primary-active focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-canvas;
+  }
+
+  .landing-button-secondary {
+    @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-md border border-line-strong bg-white px-5 py-3 text-sm font-medium text-ink transition hover:bg-panel focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-canvas;
+  }
+
+  .landing-button-dark {
+    @apply inline-flex min-h-11 items-center justify-center gap-2 rounded-md bg-ink px-5 py-3 text-sm font-medium text-canvas transition hover:bg-[#3a3931] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-canvas;
+  }
+
+  .landing-mobile-link {
+    @apply flex min-h-12 items-center justify-between border-b border-line py-3 text-base text-ink focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary;
+  }
+
+  .landing-eyebrow {
+    @apply text-xs font-semibold uppercase tracking-[0.16em] text-primary;
+  }
+}
+
+@keyframes landing-timeline-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.landing-timeline-row {
+  animation: landing-timeline-enter 420ms ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  .landing-timeline-row {
+    animation: none;
+  }
 }
