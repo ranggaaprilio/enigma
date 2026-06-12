@@ -1,0 +1,8 @@
+Task 17 no-git edge case
+Date: 2026-06-12
+
+uv run pytest tests/test_agents.py -v -k "no_git"
+Result: PASS
+1 passed, 29 deselected
+
+A workspace with cloned=false produced an empty baseline and no computed file changes.

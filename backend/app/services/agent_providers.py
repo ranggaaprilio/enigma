@@ -4,6 +4,7 @@ import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 from app.services.agent_tools import WorkspaceTools
 
@@ -27,6 +28,9 @@ class AgentProvider:
     ) -> AsyncIterator[ProviderEvent]:
         raise NotImplementedError
 
+    def pause(self) -> None:
+        return None
+
 
 class MockAgentProvider(AgentProvider):
     provider_name = "mock"
@@ -48,19 +52,24 @@ class MockAgentProvider(AgentProvider):
         if stop_event.is_set():
             return
         yield ProviderEvent("status", "executing", {"status": "executing"})
-        yield ProviderEvent("tool_call", "list_files", {"tool": "list_files", "arguments": {}})
+        tool_call_id = f"mock-tool-{uuid4().hex[:8]}"
+        yield ProviderEvent(
+            "tool_call",
+            "list_files",
+            {"tool": "list_files", "arguments": {}, "tool_call_id": tool_call_id},
+        )
         try:
             files = await tools.list_files(limit=20)
             yield ProviderEvent(
                 "tool_result",
                 "\n".join(files) if files else "Workspace has no visible files.",
-                {"tool": "list_files", "ok": True},
+                {"tool": "list_files", "ok": True, "tool_call_id": tool_call_id},
             )
         except Exception as error:
             yield ProviderEvent(
                 "tool_result",
                 str(error),
-                {"tool": "list_files", "ok": False},
+                {"tool": "list_files", "ok": False, "tool_call_id": tool_call_id},
             )
 
         if stop_event.is_set():

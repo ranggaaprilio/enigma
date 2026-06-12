@@ -50,6 +50,12 @@ class RuntimeCommandResult:
     stderr: str
 
 
+@dataclass(frozen=True)
+class RuntimePreviewLink:
+    url: str
+    token: str
+
+
 def map_daytona_error(error: Exception) -> DaytonaRuntimeError:
     if isinstance(error, DaytonaNotFoundError):
         return DaytonaSandboxNotFoundError("Daytona sandbox was not found")
@@ -290,6 +296,14 @@ class DaytonaRuntime:
                 expires_in_seconds=self.settings.daytona_preview_url_ttl_seconds,
             )
             return result.url
+        except Exception as error:
+            raise map_daytona_error(error) from error
+
+    async def preview_link(self, workspace: Workspace, port: int) -> RuntimePreviewLink:
+        sandbox = await self.get_sandbox(workspace)
+        try:
+            result = await sandbox.get_preview_link(port)
+            return RuntimePreviewLink(url=result.url, token=result.token)
         except Exception as error:
             raise map_daytona_error(error) from error
 

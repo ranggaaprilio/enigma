@@ -9,6 +9,7 @@ from app.db.base import Base
 
 AGENT_RUN_STATUSES = ("thinking", "executing", "completed", "error", "stopped")
 AGENT_EVENT_TYPES = ("status", "output_text", "tool_call", "tool_result", "error")
+AGENT_FILE_CHANGE_STATUSES = ("created", "modified", "deleted", "renamed")
 
 
 class AgentRun(Base):
@@ -53,6 +54,11 @@ class AgentRun(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    file_changes: Mapped[list["AgentFileChange"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 
 class AgentEvent(Base):
@@ -64,6 +70,7 @@ class AgentEvent(Base):
         ),
         Index("ix_agent_events_agent_run_id", "agent_run_id"),
         Index("ix_agent_events_created_at", "created_at"),
+        Index("ix_agent_events_tool_call_id", "tool_call_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -74,6 +81,7 @@ class AgentEvent(Base):
     )
     event_type: Mapped[str] = mapped_column(String(40), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
+    tool_call_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
     event_metadata: Mapped[dict] = mapped_column("metadata", JSONB, nullable=False, default=dict)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -82,3 +90,33 @@ class AgentEvent(Base):
     )
 
     run: Mapped[AgentRun] = relationship(back_populates="events")
+
+
+class AgentFileChange(Base):
+    __tablename__ = "agent_file_changes"
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('created', 'modified', 'deleted', 'renamed')",
+            name="ck_agent_file_changes_status",
+        ),
+        Index("ix_agent_file_changes_agent_run_id", "agent_run_id"),
+        Index("ix_agent_file_changes_tool_call_id", "tool_call_id"),
+        Index("ix_agent_file_changes_created_at", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    agent_run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    path: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    tool_call_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    run: Mapped[AgentRun] = relationship(back_populates="file_changes")
