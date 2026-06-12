@@ -50,7 +50,11 @@ class FakeWorkspaceTools:
 def test_openhands_provider_requires_base_url_and_model() -> None:
     with pytest.raises(AgentConfigurationError, match="OPENHANDS_LLM_BASE_URL"):
         provider_from_settings(
-            Settings(agent_provider="openhands", openhands_llm_model="openai/test")
+            Settings(
+                agent_provider="openhands",
+                openhands_llm_base_url=None,
+                openhands_llm_model="openai/test",
+            )
         )
 
     with pytest.raises(AgentConfigurationError, match="OPENHANDS_LLM_MODEL"):
@@ -58,6 +62,7 @@ def test_openhands_provider_requires_base_url_and_model() -> None:
             Settings(
                 agent_provider="openhands",
                 openhands_llm_base_url="http://llm.example/v1",
+                openhands_llm_model=None,
             )
         )
 
@@ -75,6 +80,28 @@ def test_openhands_provider_accepts_optional_api_key() -> None:
     assert isinstance(provider, OpenHandsAgentProvider)
     assert provider.api_key is None
     assert provider.model_name == "openai/local-model"
+
+
+@pytest.mark.parametrize(
+    ("configured_model", "litellm_model"),
+    [
+        ("deepseek-v4-pro", "openai/deepseek-v4-pro"),
+        ("opencode-go/deepseek-v4-pro", "openai/deepseek-v4-pro"),
+        ("openai/deepseek-v4-pro", "openai/deepseek-v4-pro"),
+    ],
+)
+def test_openhands_provider_normalizes_openai_compatible_model_names(
+    configured_model: str,
+    litellm_model: str,
+) -> None:
+    provider = OpenHandsAgentProvider(
+        base_url="https://opencode.ai/zen/go/v1",
+        api_key="test-key",
+        model=configured_model,
+        max_iterations=3,
+    )
+
+    assert provider.model_name == litellm_model
 
 
 def test_openhands_llm_calls_openai_compatible_chat_completions() -> None:

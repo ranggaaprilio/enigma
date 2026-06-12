@@ -1,6 +1,8 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
+import { Outlet, useOutletContext } from "react-router";
 
 import { useAuth } from "../auth/context";
+import { AgentTab } from "../components/AgentTab";
 import { DashboardShell } from "../components/DashboardShell";
 import { CustomCommandsPanel } from "../components/CustomCommandsPanel";
 import { EditorPanel } from "../components/EditorPanel";
@@ -43,7 +45,7 @@ type WorkspaceState =
   | { status: "ready"; workspace: WorkspaceResponse | null; envVars: WorkspaceEnvVarResponse[] }
   | { status: "error"; message: string };
 
-type DashboardTab =
+type DashboardViewId =
   | "overview"
   | "repository"
   | "files"
@@ -51,49 +53,27 @@ type DashboardTab =
   | "editor"
   | "terminal"
   | "preview"
+  | "agent"
   | "audit";
 type PreviewStatusSnapshot = {
   status: "inactive" | "active" | "stopped" | "error";
   port: number | null;
 };
 
-const dashboardTabs: { id: DashboardTab; label: string }[] = [
-  { id: "overview", label: "Overview" },
-  { id: "repository", label: "Repository" },
-  { id: "files", label: "Files" },
-  { id: "commands", label: "Commands" },
-  { id: "editor", label: "Editor" },
-  { id: "terminal", label: "Terminal" },
-  { id: "preview", label: "Preview" },
-  { id: "audit", label: "Audit" },
-];
-
-function initialDashboardTab(): DashboardTab {
-  let stored: string | null = null;
-  try {
-    stored = window.localStorage?.getItem("execute-dashboard-active-tab") ?? null;
-  } catch {
-    stored = null;
-  }
-  if (
-    stored === "repository" ||
-    stored === "files" ||
-    stored === "commands" ||
-    stored === "editor" ||
-    stored === "terminal" ||
-    stored === "preview" ||
-    stored === "audit"
-  ) {
-    return stored;
-  }
-  return "overview";
-}
+type DashboardOutletContext = {
+  health: HealthState;
+  workspaceState: WorkspaceState;
+  workspaceStatus: WorkspaceStatus | "none" | "loading";
+  onWorkspaceCreated: (workspace: WorkspaceResponse) => Promise<void>;
+  onWorkspaceChanged: (workspace: WorkspaceResponse) => void;
+  onEnvVarsChanged: (envVars: WorkspaceEnvVarResponse[]) => void;
+  onPreviewStatusChange: (snapshot: PreviewStatusSnapshot) => void;
+};
 
 export function DashboardRoute() {
   const { user, logout } = useAuth();
   const [health, setHealth] = useState<HealthState>({ status: "loading" });
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>({ status: "loading" });
-  const [activeTab, setActiveTab] = useState<DashboardTab>(initialDashboardTab);
   const [previewStatus, setPreviewStatus] = useState<PreviewStatusSnapshot>({
     status: "inactive",
     port: null,
@@ -122,14 +102,6 @@ export function DashboardRoute() {
     loadWorkspaceData(controller.signal);
     return () => controller.abort();
   }, []);
-
-  useEffect(() => {
-    try {
-      window.localStorage?.setItem("execute-dashboard-active-tab", activeTab);
-    } catch {
-      return;
-    }
-  }, [activeTab]);
 
   async function loadWorkspaceData(signal?: AbortSignal) {
     setWorkspaceState({ status: "loading" });
@@ -176,6 +148,25 @@ export function DashboardRoute() {
     setPreviewStatus(snapshot);
   }, []);
 
+  async function loadWorkspaceAfterCreate(created: WorkspaceResponse) {
+    const envVars = await listWorkspaceEnvVars(created.id);
+    setWorkspaceState({ status: "ready", workspace: created, envVars });
+  }
+
+  function handleWorkspaceChanged(nextWorkspace: WorkspaceResponse) {
+    setWorkspaceState((current) =>
+      current.status === "ready"
+        ? { ...current, workspace: nextWorkspace }
+        : current,
+    );
+  }
+
+  function handleEnvVarsChanged(envVars: WorkspaceEnvVarResponse[]) {
+    setWorkspaceState((current) =>
+      current.status === "ready" ? { ...current, envVars } : current,
+    );
+  }
+
   return (
     <DashboardShell
       healthLabel={shellStatus.label}
@@ -186,123 +177,157 @@ export function DashboardRoute() {
       user={user}
       onLogout={logout}
     >
-      {workspaceState.status === "ready" && workspaceState.workspace && (
-        <div className="mb-4 flex gap-2 overflow-x-auto rounded-md border border-line bg-white p-2 shadow-soft">
-          {dashboardTabs.map((tab) => (
-            <button
-              key={tab.id}
-              className={`whitespace-nowrap rounded-md px-4 py-2 text-sm font-semibold transition ${
-                activeTab === tab.id
-                  ? "bg-primary text-white"
-                  : "bg-white text-ink/70 hover:bg-panel hover:text-ink"
-              }`}
-              type="button"
-              onClick={() => setActiveTab(tab.id)}
-            >
-              {tab.label}
-            </button>
-          ))}
-        </div>
-      )}
-
-      {(workspaceState.status !== "ready" || !workspaceState.workspace || activeTab === "overview") && (
-        <>
-          <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
-            <div className="rounded-md border border-line bg-white p-5 shadow-soft">
-              <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
-                <div>
-                  <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
-                    Workspace
-                  </p>
-                  <h3 className="mt-1 text-2xl font-semibold">Project workspace</h3>
-                </div>
-                {workspace && (
-                  <span className="rounded-md border border-line bg-white px-3 py-2 text-sm capitalize text-ink/70">
-                    {workspace.status}
-                  </span>
-                )}
-              </div>
-
-              {workspaceState.status === "loading" && <LoadingState message="Loading workspace..." />}
-              {workspaceState.status === "error" && <ErrorState message={workspaceState.message} />}
-              {workspaceState.status === "ready" && !workspaceState.workspace && (
-                <CreateWorkspacePanel onCreated={(created) => void loadWorkspaceAfterCreate(created)} />
-              )}
-              {workspaceState.status === "ready" && workspaceState.workspace && (
-                <WorkspaceOverview workspace={workspaceState.workspace} />
-              )}
-            </div>
-
-            <FoundationChecks health={health} workspaceStatus={workspaceStatus} />
-          </section>
-
-          {workspaceState.status === "ready" && workspaceState.workspace && (
-            <WorkspaceSettings
-              workspace={workspaceState.workspace}
-              envVars={workspaceState.envVars}
-              onWorkspaceChanged={(nextWorkspace) =>
-                setWorkspaceState((current) =>
-                  current.status === "ready"
-                    ? { ...current, workspace: nextWorkspace }
-                    : current,
-                )
-              }
-              onEnvVarsChanged={(envVars) =>
-                setWorkspaceState((current) =>
-                  current.status === "ready" ? { ...current, envVars } : current,
-                )
-              }
-            />
-          )}
-        </>
-      )}
-
-      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "repository" && (
-        <RepositoryPanel
-          workspace={workspaceState.workspace}
-          onWorkspaceChanged={(nextWorkspace) =>
-            setWorkspaceState((current) =>
-              current.status === "ready"
-                ? { ...current, workspace: nextWorkspace }
-                : current,
-            )
-          }
-        />
-      )}
-
-      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "terminal" && (
-        <TerminalPanel workspace={workspaceState.workspace} />
-      )}
-
-      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "files" && (
-        <FileManagementPanel workspace={workspaceState.workspace} />
-      )}
-
-      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "commands" && (
-        <CustomCommandsPanel workspace={workspaceState.workspace} />
-      )}
-
-      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "editor" && (
-        <EditorPanel workspace={workspaceState.workspace} />
-      )}
-
-      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "preview" && (
-        <PreviewPanel
-          workspace={workspaceState.workspace}
-          onStatusChange={handlePreviewStatusChange}
-        />
-      )}
-
-      {workspaceState.status === "ready" && workspaceState.workspace && activeTab === "audit" && (
-        <AuditLogPanel workspace={workspaceState.workspace} />
-      )}
+      <Outlet
+        context={{
+          health,
+          workspaceState,
+          workspaceStatus,
+          onWorkspaceCreated: loadWorkspaceAfterCreate,
+          onWorkspaceChanged: handleWorkspaceChanged,
+          onEnvVarsChanged: handleEnvVarsChanged,
+          onPreviewStatusChange: handlePreviewStatusChange,
+        } satisfies DashboardOutletContext}
+      />
     </DashboardShell>
   );
+}
 
-  async function loadWorkspaceAfterCreate(created: WorkspaceResponse) {
-    const envVars = await listWorkspaceEnvVars(created.id);
-    setWorkspaceState({ status: "ready", workspace: created, envVars });
+export function DashboardView({ view }: { view: DashboardViewId }) {
+  const {
+    health,
+    workspaceState,
+    workspaceStatus,
+    onWorkspaceCreated,
+    onWorkspaceChanged,
+    onEnvVarsChanged,
+    onPreviewStatusChange,
+  } = useOutletContext<DashboardOutletContext>();
+
+  if (
+    view === "overview" ||
+    workspaceState.status !== "ready" ||
+    !workspaceState.workspace
+  ) {
+    return (
+      <DashboardOverview
+        health={health}
+        workspaceState={workspaceState}
+        workspaceStatus={workspaceStatus}
+        onWorkspaceCreated={onWorkspaceCreated}
+        onWorkspaceChanged={onWorkspaceChanged}
+        onEnvVarsChanged={onEnvVarsChanged}
+      />
+    );
   }
+
+  const workspace = workspaceState.workspace;
+
+  if (view === "repository") {
+    return (
+      <RepositoryPanel
+        workspace={workspace}
+        onWorkspaceChanged={onWorkspaceChanged}
+      />
+    );
+  }
+
+  if (view === "files") {
+    return <FileManagementPanel workspace={workspace} />;
+  }
+
+  if (view === "commands") {
+    return <CustomCommandsPanel workspace={workspace} />;
+  }
+
+  if (view === "editor") {
+    return <EditorPanel workspace={workspace} />;
+  }
+
+  if (view === "terminal") {
+    return <TerminalPanel workspace={workspace} />;
+  }
+
+  if (view === "preview") {
+    return (
+      <PreviewPanel
+        workspace={workspace}
+        onStatusChange={onPreviewStatusChange}
+      />
+    );
+  }
+
+  if (view === "agent") {
+    return <AgentTab workspaceId={workspace.id} />;
+  }
+
+  return <AuditLogPanel workspace={workspace} />;
+}
+
+function DashboardOverview({
+  health,
+  workspaceState,
+  workspaceStatus,
+  onWorkspaceCreated,
+  onWorkspaceChanged,
+  onEnvVarsChanged,
+}: {
+  health: HealthState;
+  workspaceState: WorkspaceState;
+  workspaceStatus: WorkspaceStatus | "none" | "loading";
+  onWorkspaceCreated: (workspace: WorkspaceResponse) => Promise<void>;
+  onWorkspaceChanged: (workspace: WorkspaceResponse) => void;
+  onEnvVarsChanged: (envVars: WorkspaceEnvVarResponse[]) => void;
+}) {
+  const workspace =
+    workspaceState.status === "ready" ? workspaceState.workspace : null;
+
+  return (
+    <>
+      <section className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+        <div className="rounded-md border border-line bg-white p-5 shadow-soft">
+          <div className="mb-5 flex flex-wrap items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
+                Workspace
+              </p>
+              <h3 className="mt-1 text-2xl font-semibold">Project workspace</h3>
+            </div>
+            {workspace && (
+              <span className="rounded-md border border-line bg-white px-3 py-2 text-sm capitalize text-ink/70">
+                {workspace.status}
+              </span>
+            )}
+          </div>
+
+          {workspaceState.status === "loading" && (
+            <LoadingState message="Loading workspace..." />
+          )}
+          {workspaceState.status === "error" && (
+            <ErrorState message={workspaceState.message} />
+          )}
+          {workspaceState.status === "ready" && !workspaceState.workspace && (
+            <CreateWorkspacePanel
+              onCreated={(created) => void onWorkspaceCreated(created)}
+            />
+          )}
+          {workspaceState.status === "ready" && workspaceState.workspace && (
+            <WorkspaceOverview workspace={workspaceState.workspace} />
+          )}
+        </div>
+
+        <FoundationChecks health={health} workspaceStatus={workspaceStatus} />
+      </section>
+
+      {workspaceState.status === "ready" && workspaceState.workspace && (
+        <WorkspaceSettings
+          workspace={workspaceState.workspace}
+          envVars={workspaceState.envVars}
+          onWorkspaceChanged={onWorkspaceChanged}
+          onEnvVarsChanged={onEnvVarsChanged}
+        />
+      )}
+    </>
+  );
 }
 
 function AuditLogPanel({ workspace }: { workspace: WorkspaceResponse }) {

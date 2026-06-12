@@ -108,7 +108,9 @@ class FileService:
             children: list[FileNode] = []
             if is_dir:
                 async with semaphore:
-                    entries = await sandbox.fs.list_files(self._remote_path(workspace, relative_path))
+                    entries = await sandbox.fs.list_files(
+                        self._remote_path(workspace, relative_path)
+                    )
                 visible = [
                     entry
                     for entry in entries

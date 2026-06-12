@@ -25,7 +25,9 @@ class Settings(BaseSettings):
     daytona_sandbox_home: str = "/home/daytona"
     daytona_auto_stop_minutes: int = 30
     daytona_provision_timeout_seconds: int = 120
-    daytona_preview_url_ttl_seconds: int = 60 * 60
+    daytona_preview_url_ttl_seconds: int = Field(default=60 * 60, gt=0)
+    daytona_preview_proxy_base_url: str = "http://localhost:8001"
+    daytona_preview_proxy_ttl_seconds: int = Field(default=60 * 60, gt=0)
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
