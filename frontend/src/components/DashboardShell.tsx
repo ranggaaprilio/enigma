@@ -3,22 +3,10 @@ import {
   useEffect,
   useState,
 } from "react";
-import {
-  Bell,
-  Bot,
-  CheckCheck,
-  Code2,
-  FileCode2,
-  FolderTree,
-  GitBranch,
-  LayoutDashboard,
-  ListChecks,
-  Monitor,
-  Terminal,
-  Workflow,
-} from "lucide-react";
+import { Bell, CheckCheck } from "lucide-react";
 import { NavLink, useNavigate } from "react-router";
 
+import { AppSidebar } from "./AppSidebar";
 import {
   getNotificationStreamUrl,
   listNotifications,
@@ -39,23 +27,9 @@ type DashboardShellProps = {
   user: UserResponse | null;
   onLogout: () => Promise<void>;
   children: ReactNode;
-};
-
-const navItems = [
-  { label: "Overview", icon: LayoutDashboard, to: "/", end: true },
-  { label: "Repository", icon: GitBranch, to: "/repository" },
-  { label: "Files", icon: FolderTree, to: "/files" },
-  { label: "Commands", icon: ListChecks, to: "/commands" },
-  { label: "Agent", icon: Bot, to: "/agents" },
-  { label: "Editor", icon: FileCode2, to: "/editor" },
-  { label: "Terminal", icon: Terminal, to: "/terminal" },
-  { label: "Preview", icon: Monitor, to: "/preview" },
-  { label: "Audit", icon: Code2, to: "/audit" },
-];
-
-const sidebarWidthClass = {
-  expanded: "lg:w-[240px]",
-  collapsed: "lg:w-[72px]",
+  basePath?: string;
+  projectId?: string;
+  teamId?: string;
 };
 
 function formatDateTime(value: string) {
@@ -74,96 +48,45 @@ export function DashboardShell({
   user,
   onLogout,
   children,
+  basePath = "/",
+  projectId,
+  teamId,
 }: DashboardShellProps) {
   const navigate = useNavigate();
-  const [leftSidebarExpanded, setLeftSidebarExpanded] = useState(false);
 
   async function handleLogout() {
     await onLogout();
     navigate("/login", { replace: true });
   }
 
-  const sidebarClass = leftSidebarExpanded
-    ? sidebarWidthClass.expanded
-    : sidebarWidthClass.collapsed;
-
   return (
     <div className="min-h-screen bg-canvas text-ink">
       <div className="flex min-h-screen flex-col lg:flex-row">
-        <aside
-          className={`relative shrink-0 border-b border-line bg-canvas px-4 py-5 text-ink transition-[width] duration-200 ease-out lg:border-b-0 lg:border-r ${sidebarClass}`}
-          onFocusCapture={() => setLeftSidebarExpanded(true)}
-          onMouseEnter={() => setLeftSidebarExpanded(true)}
-          onMouseLeave={() => setLeftSidebarExpanded(false)}
-        >
-          <div className="mb-8 flex items-start justify-between gap-2 lg:justify-center">
-            <div className="flex min-w-0 items-center gap-3">
-              <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-md bg-primary text-white">
-                <Workflow className="h-5 w-5" aria-hidden="true" />
-              </div>
-              <div
-                className={`overflow-hidden transition-[width,opacity] duration-200 ease-out ${
-                  leftSidebarExpanded
-                    ? "lg:w-[148px] lg:opacity-100"
-                    : "lg:w-0 lg:opacity-0"
-                }`}
-              >
-                <div className="min-w-0">
-                  <p className="text-xs font-semibold uppercase tracking-[0.18em] text-primary">
-                    ENIGMA
-                  </p>
-                  <h1 className="mt-2 text-2xl font-normal tracking-[-0.03em]">
-                    Dashboard
-                  </h1>
-                </div>
-              </div>
-            </div>
-          </div>
-          <nav
-            className={`flex gap-2 overflow-x-auto lg:flex-col lg:overflow-visible ${
-              leftSidebarExpanded ? "" : "lg:items-center"
-            }`}
-          >
-            {navItems.map(({ label, icon: Icon, to, end }) => (
-              <NavLink
-                key={label}
-                aria-label={!leftSidebarExpanded ? label : undefined}
-                end={end}
-                title={!leftSidebarExpanded ? label : undefined}
-                to={to}
-                className={({ isActive }) =>
-                  `flex items-center gap-3 whitespace-nowrap rounded-md text-sm transition ${
-                    leftSidebarExpanded
-                      ? "px-3 py-2"
-                      : "px-3 py-2 lg:h-10 lg:w-10 lg:justify-center lg:px-0 lg:py-0"
-                  } ${
-                    isActive
-                      ? "bg-primary text-white"
-                      : "text-body hover:bg-white hover:text-ink"
-                  }`
-                }
-              >
-                <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
-                <span
-                  className={`inline-block overflow-hidden transition-[max-width,opacity] duration-200 ease-out ${
-                    leftSidebarExpanded
-                      ? "lg:max-w-36 lg:opacity-100"
-                      : "lg:max-w-0 lg:opacity-0"
-                  }`}
-                >
-                  {label}
-                </span>
-              </NavLink>
-            ))}
-          </nav>
-        </aside>
+        <AppSidebar
+          projectId={projectId}
+          teamId={teamId}
+          workspaceBasePath={basePath}
+          showUser={false}
+        />
 
         <div className="flex min-h-screen min-w-0 flex-1 flex-col">
           <header className="flex min-h-16 flex-wrap items-center justify-between gap-3 border-b border-line bg-canvas px-5 py-3">
             <div>
-              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted">
-                Enigma
-              </p>
+              {projectId && teamId ? (
+                <nav className="flex items-center gap-1 text-xs text-muted">
+                  <NavLink to="/projects" className="hover:text-ink">Projects</NavLink>
+                  <span>/</span>
+                  <NavLink to={`/projects/${projectId}`} className="hover:text-ink">Project</NavLink>
+                  <span>/</span>
+                  <NavLink to={`/projects/${projectId}/teams/${teamId}`} className="hover:text-ink">Team</NavLink>
+                  <span>/</span>
+                  <span className="font-medium text-ink">Workspace</span>
+                </nav>
+              ) : (
+                <p className="text-xs font-semibold uppercase tracking-[0.16em] text-muted">
+                  Enigma
+                </p>
+              )}
               <h2 className="text-2xl font-normal tracking-[-0.02em]">
                 AI Agent Control Room
               </h2>
