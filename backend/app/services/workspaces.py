@@ -6,10 +6,11 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Workspace, WorkspaceEnvVar
+from app.models.project import TeamMember
 from app.services.daytona_runtime import DaytonaRuntime, DaytonaRuntimeError
+from app.services.utils import slugify
 
 ENV_KEY_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
-SLUG_PATTERN = re.compile(r"[^a-z0-9]+")
 SNAPSHOT_UNSET = object()
 
 
@@ -43,11 +44,6 @@ class WorkspaceSecretCipher:
             return None
 
 
-def slugify(value: str) -> str:
-    slug = SLUG_PATTERN.sub("-", value.strip().lower()).strip("-")
-    return slug or "workspace"
-
-
 def validate_env_key(key: str) -> str:
     normalized = key.strip().upper()
     if ENV_KEY_PATTERN.fullmatch(normalized) is None:
@@ -70,17 +66,42 @@ class SqlAlchemyWorkspaceService:
         self.cipher = cipher
         self.runtime = runtime
 
+    async def _is_team_member(self, team_id: UUID, user_id: UUID) -> bool:
+        result = await self.session.execute(
+            select(TeamMember).where(
+                TeamMember.team_id == team_id,
+                TeamMember.user_id == user_id,
+            )
+        )
+        return result.scalar_one_or_none() is not None
+
     async def list_for_owner(self, owner_id: UUID) -> list[Workspace]:
         result = await self.session.execute(
             select(Workspace).where(Workspace.owner_id == owner_id).order_by(Workspace.created_at)
         )
         return list(result.scalars().all())
 
+    async def list_for_team(self, team_id: UUID, user_id: UUID) -> list[Workspace]:
+        if not await self._is_team_member(team_id, user_id):
+            raise WorkspaceNotFoundError
+        result = await self.session.execute(
+            select(Workspace)
+            .where(Workspace.team_id == team_id)
+            .order_by(Workspace.created_at)
+        )
+        return list(result.scalars().all())
+
     async def get_for_owner(self, workspace_id: UUID, owner_id: UUID) -> Workspace:
         workspace = await self.session.get(Workspace, workspace_id)
-        if workspace is None or workspace.owner_id != owner_id:
+        if workspace is None:
             raise WorkspaceNotFoundError
-        return workspace
+        if workspace.owner_id == owner_id:
+            return workspace
+        if workspace.team_id is not None and await self._is_team_member(
+            workspace.team_id, owner_id
+        ):
+            return workspace
+        raise WorkspaceNotFoundError
 
     async def create(
         self,
@@ -89,17 +110,22 @@ class SqlAlchemyWorkspaceService:
         repo_url: str,
         default_branch: str,
         snapshot: str | None = None,
+        team_id: UUID | None = None,
     ) -> Workspace:
-        result = await self.session.execute(
-            select(Workspace.id).where(Workspace.owner_id == owner_id)
-        )
-        if result.scalar_one_or_none() is not None:
-            raise WorkspaceAlreadyExistsError
+        if team_id is None:
+            result = await self.session.execute(
+                select(Workspace.id).where(
+                    Workspace.owner_id == owner_id, Workspace.team_id.is_(None)
+                )
+            )
+            if result.scalar_one_or_none() is not None:
+                raise WorkspaceAlreadyExistsError
 
         workspace = Workspace(
             owner_id=owner_id,
+            team_id=team_id,
             name=name,
-            slug=slugify(name),
+            slug=slugify(name, fallback="workspace"),
             repo_url=repo_url,
             default_branch=default_branch,
             runtime="daytona",

@@ -4,7 +4,6 @@ import {
   Navigate,
   Route,
   Routes,
-  useLocation,
 } from "react-router";
 
 import { AuthProvider } from "./auth/AuthContext";
@@ -13,9 +12,16 @@ import {
   DashboardRoute,
   DashboardView,
 } from "./routes/DashboardRoute";
+import { DashboardOverviewRoute } from "./routes/DashboardOverviewRoute";
 import { LandingRoute } from "./routes/LandingRoute";
 import { LoginRoute } from "./routes/LoginRoute";
+import { ProjectListRoute } from "./routes/ProjectListRoute";
+import { ProjectMembersRoute } from "./routes/ProjectMembersRoute";
+import { ProjectRoute } from "./routes/ProjectRoute";
+import { ProjectSettingsRoute } from "./routes/ProjectSettingsRoute";
 import { RegisterRoute } from "./routes/RegisterRoute";
+import { TeamMembersRoute } from "./routes/TeamMembersRoute";
+import { TeamRoute } from "./routes/TeamRoute";
 
 export default function App() {
   return (
@@ -46,7 +52,60 @@ function AppRoutes() {
           </PublicOnlyRoute>
         }
       />
-      <Route path="/" element={<AdaptiveDashboardRoute />}>
+
+      {/* Project / team / workspace hierarchy */}
+      <Route
+        path="/projects"
+        element={
+          <PrivateRoute>
+            <ProjectListRoute />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/projects/:projectId"
+        element={
+          <PrivateRoute>
+            <ProjectRoute />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/projects/:projectId/settings"
+        element={
+          <PrivateRoute>
+            <ProjectSettingsRoute />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/projects/:projectId/members"
+        element={
+          <PrivateRoute>
+            <ProjectMembersRoute />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/projects/:projectId/teams/:teamId"
+        element={
+          <PrivateRoute>
+            <TeamRoute />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/projects/:projectId/teams/:teamId/members"
+        element={
+          <PrivateRoute>
+            <TeamMembersRoute />
+          </PrivateRoute>
+        }
+      />
+      <Route
+        path="/projects/:projectId/teams/:teamId/workspaces/:workspaceId"
+        element={<AdaptiveDashboardRoute />}
+      >
         <Route index element={<DashboardView view="overview" />} />
         <Route path="repository" element={<DashboardView view="repository" />} />
         <Route path="files" element={<DashboardView view="files" />} />
@@ -57,28 +116,55 @@ function AppRoutes() {
         <Route path="preview" element={<DashboardView view="preview" />} />
         <Route path="audit" element={<DashboardView view="audit" />} />
       </Route>
+
+      {/* Home: projects-first. Authenticated users land on their project list. */}
+      <Route path="/" element={<HomeRoute />} />
+
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
   );
 }
 
-function AdaptiveDashboardRoute() {
+function HomeRoute() {
   const { status } = useAuth();
-  const location = useLocation();
 
   if (status === "loading") {
     return <FullPageMessage message="Loading Enigma..." />;
   }
 
   if (status === "unauthenticated") {
-    return location.pathname === "/" ? (
-      <LandingRoute />
-    ) : (
-      <Navigate to="/login" replace />
-    );
+    return <LandingRoute />;
+  }
+
+  return <DashboardOverviewRoute />;
+}
+
+function AdaptiveDashboardRoute() {
+  const { status } = useAuth();
+
+  if (status === "loading") {
+    return <FullPageMessage message="Loading Enigma..." />;
+  }
+
+  if (status === "unauthenticated") {
+    return <Navigate to="/login" replace />;
   }
 
   return <DashboardRoute />;
+}
+
+function PrivateRoute({ children }: { children: ReactNode }) {
+  const { status } = useAuth();
+
+  if (status === "loading") {
+    return <FullPageMessage message="Loading session..." />;
+  }
+
+  if (status === "unauthenticated") {
+    return <Navigate to="/login" replace />;
+  }
+
+  return children;
 }
 
 function PublicOnlyRoute({ children }: { children: ReactNode }) {

@@ -1,80 +1,98 @@
-# Execute Dashboard
+# Enigma
 
-Server-based AI agent dashboard foundation built with FastAPI, React, PostgreSQL, and Redis.
+AI agent workspace platform built with FastAPI, React, PostgreSQL, and Redis.
 
-## Local Setup
+Organises work in a three-tier hierarchy: **Projects → Teams → Workspaces**.
+Each workspace is a persistent Daytona sandbox with a full dev environment —
+git, files, terminal, AI agent runner, `code-server` editor, and preview server.
 
-1. Install `uv`, `pnpm`, and Podman.
-2. Copy `.env.example` to `.env`.
-3. Add a Daytona API key and optionally configure a self-hosted `DAYTONA_API_URL`.
-4. Start the full stack:
+## Quick Start
+
+### Prerequisites
+
+- [Podman](https://podman.io/) (or Docker) with Compose support
+- A [Daytona](https://daytona.io/) account and API key
+
+### Steps
+
+1. Copy the example environment file and fill in your values:
    ```bash
-   podman compose up --build
+   cp .env.example .env
    ```
-5. Open the frontend at `http://localhost:5173`.
-6. Check the backend health endpoint at `http://localhost:8000/health`.
-7. Run backend migrations when needed:
+   At minimum set `DAYTONA_API_KEY`. See [Environment](#environment) for the full list.
+
+2. Start all services:
    ```bash
-   cd backend
-   uv run alembic upgrade head
-   ```
-8. Run backend tests:
-   ```bash
-   cd backend
-   uv run pytest
-   ```
-9. Run frontend checks:
-   ```bash
-   cd frontend
-   pnpm install
-   pnpm lint
-   pnpm test
+   podman compose up --build -d
+   # or: docker compose up --build -d
    ```
 
-Each project runs in a persistent Daytona sandbox. Git, files, commands, terminal,
-preview servers, and `code-server` all operate inside `/workspace` in that sandbox.
-The editor and preview use short-lived signed Daytona URLs.
+3. Run database migrations (required on first start and after any update):
+   ```bash
+   podman compose exec backend uv run alembic upgrade head
+   # or inside the backend directory without containers:
+   # cd backend && uv run alembic upgrade head
+   ```
 
-The selected Daytona snapshot must provide a Linux shell, Git, Python 3,
-`code-server`, and standard process/network utilities used for commands and port
-detection.
+4. Open the app:
+   - Frontend: http://localhost:5173
+   - Backend API: http://localhost:8000
+   - Health check: http://localhost:8000/health
+
+5. Register an account. The first user automatically becomes the platform owner.
+
+### First-time workflow
+
+1. Log in and create a **Project**.
+2. Inside the project, create one or more **Teams**.
+3. Inside a team, create a **Workspace** — this provisions a Daytona sandbox.
+4. Use the workspace dashboard to run the AI agent, browse files, open a terminal, start the editor, and preview your app.
 
 ## Services
 
-- Frontend: Vite React app on port `5173`.
-- Backend: FastAPI app on port `8000`.
-- PostgreSQL: port `5432`, persisted in the `postgres_data` Docker volume.
-- Redis: port `6379`, persisted in the `redis_data` Docker volume.
+| Service | Port | Notes |
+|---|---|---|
+| Frontend (Vite + React) | 5173 | Hot-reload in dev mode |
+| Backend (FastAPI) | 8000 | Auto-reload with `--reload` |
+| Preview proxy | 8001 | Proxies Daytona preview URLs |
+| PostgreSQL 16 | 5432 | Persisted in `postgres_data` volume |
+| Redis 7 | 6379 | Persisted in `redis_data` volume |
 
-Docker Compose also works with:
+## Development
 
+Run backend tests:
 ```bash
-docker compose up --build
+cd backend
+uv run pytest
+```
+
+Run frontend checks:
+```bash
+cd frontend
+pnpm install
+pnpm lint
+pnpm test
 ```
 
 ## Environment
 
-The root `.env.example` lists required values for local development:
+Copy `.env.example` to `.env`. Key variables:
 
-- `DATABASE_URL`
-- `REDIS_URL`
-- `BACKEND_CORS_ORIGINS`
-- `VITE_API_BASE_URL`
-- `POSTGRES_USER`
-- `POSTGRES_PASSWORD`
-- `POSTGRES_DB`
-- `WORKSPACE_ENV_ENCRYPTION_KEY`
-- `DAYTONA_API_KEY`
-- `DAYTONA_API_URL`
-- `DAYTONA_TARGET`
-- `DAYTONA_DEFAULT_SNAPSHOT`
-- `DAYTONA_DEFAULT_LANGUAGE`
-- `DAYTONA_AUTO_STOP_MINUTES`
+| Variable | Required | Description |
+|---|---|---|
+| `DAYTONA_API_KEY` | Yes | Daytona API key for sandbox provisioning |
+| `DAYTONA_API_URL` | No | Override for self-hosted Daytona (default: `https://app.daytona.io/api`) |
+| `DAYTONA_TARGET` | No | Daytona target region |
+| `DAYTONA_DEFAULT_SNAPSHOT` | No | Default sandbox snapshot ID |
+| `AUTH_SECRET_KEY` | Yes (prod) | Secret for signing session tokens — change from default in production |
+| `WORKSPACE_ENV_ENCRYPTION_KEY` | Yes (prod) | Fernet key for encrypting workspace env vars |
+| `OPENAI_API_KEY` | No | Required if `AGENT_PROVIDER=openai` |
+| `OPENHANDS_LLM_API_KEY` | No | Required if `AGENT_PROVIDER=openhands` |
 
-Existing database rows can be provisioned and cloned into Daytona after the
-Alembic upgrade:
+Full list of variables: see `.env.example` and `backend/app/core/config.py`.
 
-```bash
-cd backend
-uv run python scripts/migrate_workspaces_to_daytona.py
-```
+## Sandbox requirements
+
+The Daytona snapshot used by each workspace must provide: a Linux shell, Git,
+Python 3, `code-server`, and standard networking utilities for port detection and
+process management.

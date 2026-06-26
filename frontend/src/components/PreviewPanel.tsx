@@ -12,7 +12,7 @@ import {
 import {
   ApiError,
   detectPreviewSession,
-  getDevServerStatus,
+  ensureDevServer,
   listPreviewSessions,
   refreshPreviewSession,
   stopPreviewSession,
@@ -145,7 +145,9 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
     async function poll() {
       let next: DevServerStatusResponse;
       try {
-        next = await getDevServerStatus(workspace.id, controller.signal);
+        // ensureDevServer also auto-restarts the dev server if it was running
+        // before the sandbox slept (waking the sandbox). Same response shape.
+        next = await ensureDevServer(workspace.id, controller.signal);
       } catch (caughtError) {
         if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
           return;

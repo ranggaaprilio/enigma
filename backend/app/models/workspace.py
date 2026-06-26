@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     ForeignKey,
@@ -10,6 +11,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -26,10 +28,10 @@ class Workspace(Base):
             "status in ('creating', 'ready', 'busy', 'error', 'stopped')",
             name="ck_workspaces_status",
         ),
-        UniqueConstraint("owner_id", name="uq_workspaces_owner_id"),
         Index("ix_workspaces_owner_id", "owner_id"),
         Index("ix_workspaces_slug", "slug"),
         Index("ix_workspaces_status", "status"),
+        Index("ix_workspaces_team_id", "team_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -37,6 +39,11 @@ class Workspace(Base):
         UUID(as_uuid=True),
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    team_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("teams.id", ondelete="SET NULL"),
+        nullable=True,
     )
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     slug: Mapped[str] = mapped_column(String(180), nullable=False)
@@ -47,6 +54,12 @@ class Workspace(Base):
     snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     workspace_path: Mapped[str] = mapped_column(Text, nullable=False, default="workspace")
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="creating")
+    dev_autostart: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

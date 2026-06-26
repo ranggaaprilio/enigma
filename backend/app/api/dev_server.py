@@ -30,6 +30,8 @@ class DevServerServiceProtocol(Protocol):
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
 
+    async def ensure_running(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
+
     async def stop(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
 
 
@@ -74,6 +76,25 @@ async def get_dev_server_status(
 ) -> DevServerStatusResponse:
     try:
         state = await service.status(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except DevServerWorkspacePathError:
+        raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
+    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from None
+    return DevServerStatusResponse(status=state.status, port=state.port, message=state.message)
+
+
+@router.post("/ensure", response_model=DevServerStatusResponse)
+async def ensure_dev_server(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: DevServerServiceProtocol = DEV_SERVER_SERVICE_DEP,
+) -> DevServerStatusResponse:
+    """Auto-resume the dev server if it was running before the sandbox slept, then
+    report the current status. Safe to poll: a no-op unless a relaunch is needed."""
+    try:
+        state = await service.ensure_running(workspace_id, current_user.id)
     except WorkspaceNotFoundError:
         raise not_found() from None
     except DevServerWorkspacePathError:
