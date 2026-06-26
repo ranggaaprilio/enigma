@@ -72,10 +72,12 @@ class FakeRuntime:
         *,
         status_value: str = "none",
         open_ports: set[int] | None = None,
+        dev_process_alive: bool = False,
     ) -> None:
         self.sandbox = sandbox
         self.status_value = status_value
         self.open_ports = open_ports or set()
+        self.dev_process_alive = dev_process_alive
         self.commands: list[str] = []
 
     async def get_sandbox(self, workspace, *, start: bool = True) -> FakeSandbox:
@@ -85,6 +87,13 @@ class FakeRuntime:
         self.commands.append(command)
         if command.startswith("cat "):
             return RuntimeCommandResult(exit_code=0, stdout=f"{self.status_value}\n", stderr="")
+        if "pgrep" in command:
+            # `_dev_process_alive` reads the pgrep exit code from stdout ("0" = alive).
+            return RuntimeCommandResult(
+                exit_code=0,
+                stdout="0\n" if self.dev_process_alive else "1\n",
+                stderr="",
+            )
         if "python3 -c" in command:
             for port in self.open_ports:
                 if f"127.0.0.1',{port}" in command:
@@ -246,6 +255,115 @@ async def test_stop_issues_pkill():
     )
 
 
+# --- ensure_running (auto-resume on wake) --------------------------------
+
+
+async def test_ensure_does_not_start_when_not_desired():
+    """A workspace whose dev server was never started must not be auto-launched."""
+    user = _user()
+    workspace = _workspace(user)  # dev_autostart defaults falsy
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git", "workspace/mise.toml"}),
+        status_value="none",
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.ensure_running(workspace.id, user.id)
+
+    assert state.status == "idle"
+    assert all("nohup" not in command for command in runtime.commands)
+
+
+async def test_ensure_relaunches_when_desired_but_down():
+    """Desired + down (status gone after wake) → relaunch the dev server."""
+    user = _user()
+    workspace = _workspace(user)
+    workspace.dev_autostart = True
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git", "workspace/mise.toml"}),
+        status_value="none",
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.ensure_running(workspace.id, user.id)
+
+    assert state.status == "installing"
+    assert any("nohup" in command and "mise run dev" in command for command in runtime.commands)
+
+
+async def test_ensure_no_op_when_already_running():
+    user = _user()
+    workspace = _workspace(user)
+    workspace.dev_autostart = True
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git", "workspace/mise.toml"}),
+        status_value="running",
+        open_ports={5173},
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.ensure_running(workspace.id, user.id)
+
+    assert state.status == "running"
+    assert state.port == 5173
+    assert all("nohup" not in command for command in runtime.commands)
+
+
+async def test_ensure_waits_when_process_alive_but_port_not_bound():
+    """Stale 'running' status with no open port but a live process → don't double-launch."""
+    user = _user()
+    workspace = _workspace(user)
+    workspace.dev_autostart = True
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git", "workspace/mise.toml"}),
+        status_value="running",
+        open_ports=set(),
+        dev_process_alive=True,
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.ensure_running(workspace.id, user.id)
+
+    assert state.status == "starting"
+    assert all("nohup" not in command for command in runtime.commands)
+
+
+async def test_ensure_relaunches_when_status_stale_but_process_dead():
+    """Stale 'running' status after wake (process dead, no port) → relaunch."""
+    user = _user()
+    workspace = _workspace(user)
+    workspace.dev_autostart = True
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git", "workspace/mise.toml"}),
+        status_value="running",
+        open_ports=set(),
+        dev_process_alive=False,
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.ensure_running(workspace.id, user.id)
+
+    assert state.status == "installing"
+    assert any("nohup" in command and "mise run dev" in command for command in runtime.commands)
+
+
+async def test_ensure_does_not_relaunch_on_error_status():
+    """A surfaced setup error must not trigger a relaunch storm."""
+    user = _user()
+    workspace = _workspace(user)
+    workspace.dev_autostart = True
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git", "workspace/mise.toml"}),
+        status_value="error",
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.ensure_running(workspace.id, user.id)
+
+    assert state.status == "error"
+    assert all("nohup" not in command for command in runtime.commands)
+
+
 # --- API-level fake + tests ----------------------------------------------
 
 
@@ -261,6 +379,10 @@ class FakeDevServerService:
         return self.state
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
+        self._ensure_workspace(workspace_id, user_id)
+        return self.state
+
+    async def ensure_running(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
         self._ensure_workspace(workspace_id, user_id)
         return self.state
 
@@ -321,3 +443,15 @@ async def test_dev_start_status_stop_round_trip(dev_server_context):
     assert started.json()["status"] == "installing"
     assert status.json()["status"] == "installing"
     assert stopped.json()["status"] == "stopped"
+
+
+async def test_dev_ensure_endpoint(dev_server_context):
+    _user, workspace, _service = dev_server_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        response = await client.post(f"/workspaces/{workspace.id}/dev/ensure")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert "status" in body and "port" in body
