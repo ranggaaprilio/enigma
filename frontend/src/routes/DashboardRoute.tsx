@@ -1,5 +1,5 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Outlet, useOutletContext } from "react-router";
+import { Outlet, useOutletContext, useParams } from "react-router";
 
 import { useAuth } from "../auth/context";
 import { AgentTab } from "../components/AgentTab";
@@ -20,6 +20,7 @@ import {
   getRepositoryDiff,
   getRepositoryStatus,
   getHealth,
+  getWorkspace,
   listAuditLogs,
   listWorkspaceEnvVars,
   listWorkspaces,
@@ -72,6 +73,11 @@ type DashboardOutletContext = {
 
 export function DashboardRoute() {
   const { user, logout } = useAuth();
+  const { workspaceId, projectId, teamId } = useParams<{
+    workspaceId?: string;
+    projectId?: string;
+    teamId?: string;
+  }>();
   const [health, setHealth] = useState<HealthState>({ status: "loading" });
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>({ status: "loading" });
   const [previewStatus, setPreviewStatus] = useState<PreviewStatusSnapshot>({
@@ -101,13 +107,18 @@ export function DashboardRoute() {
     const controller = new AbortController();
     loadWorkspaceData(controller.signal);
     return () => controller.abort();
-  }, []);
+  }, [workspaceId]);
 
   async function loadWorkspaceData(signal?: AbortSignal) {
     setWorkspaceState({ status: "loading" });
     try {
-      const workspaces = await listWorkspaces(signal);
-      const workspace = workspaces[0] ?? null;
+      let workspace: WorkspaceResponse | null = null;
+      if (workspaceId) {
+        workspace = await getWorkspace(workspaceId, signal);
+      } else {
+        const workspaces = await listWorkspaces(signal);
+        workspace = workspaces[0] ?? null;
+      }
       const envVars = workspace ? await listWorkspaceEnvVars(workspace.id, signal) : [];
       setWorkspaceState({ status: "ready", workspace, envVars });
     } catch (error: unknown) {
@@ -167,6 +178,11 @@ export function DashboardRoute() {
     );
   }
 
+  const basePath =
+    projectId && teamId && workspaceId
+      ? `/projects/${projectId}/teams/${teamId}/workspaces/${workspaceId}`
+      : "/";
+
   return (
     <DashboardShell
       healthLabel={shellStatus.label}
@@ -176,6 +192,9 @@ export function DashboardRoute() {
       previewStatusLabel={previewStatusLabel}
       user={user}
       onLogout={logout}
+      basePath={basePath}
+      projectId={projectId}
+      teamId={teamId}
     >
       <Outlet
         context={{

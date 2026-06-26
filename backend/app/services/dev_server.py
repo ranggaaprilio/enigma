@@ -65,6 +65,19 @@ class DevServerService:
 
     async def start(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
         workspace = await self._get_workspace(workspace_id, user_id)
+
+        # If a setup run is already in flight (or the dev server is up), don't start
+        # a second one — the background script keeps running across requests. Still
+        # mark it as desired so it auto-resumes after the sandbox sleeps and wakes.
+        current = await self._read_status(workspace)
+        if current in {"installing", "running"}:
+            await self._mark_autostart(workspace, True)
+            return await self._resolve_state(workspace, current)
+
+        return await self._launch(workspace, user_id)
+
+    async def _launch(self, workspace: Workspace, user_id: UUID) -> DevServerState:
+        """Launch the background setup + dev-server script and mark it as desired."""
         sandbox = await self.runtime.get_sandbox(workspace)
         if not await self._is_cloned(sandbox, workspace.workspace_path):
             raise DevServerNotClonedError
@@ -73,12 +86,6 @@ class DevServerService:
                 status="no-config",
                 message="No mise.toml found in the repository.",
             )
-
-        # If a setup run is already in flight (or the dev server is up), don't start
-        # a second one — the background script keeps running across requests.
-        current = await self._read_status(workspace)
-        if current in {"installing", "running"}:
-            return await self._resolve_state(workspace, current)
 
         try:
             await self.runtime.exec(
@@ -90,6 +97,7 @@ class DevServerService:
         except DaytonaRuntimeError as error:
             raise DevServerRuntimeError(str(error)) from error
 
+        await self._mark_autostart(workspace, True)
         await AuditLogService(self.session).record(
             user_id=user_id,
             workspace_id=workspace.id,
@@ -104,6 +112,34 @@ class DevServerService:
         workspace = await self._get_workspace(workspace_id, user_id)
         raw = await self._read_status(workspace)
         return await self._resolve_state(workspace, raw)
+
+    async def ensure_running(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
+        """Idempotent auto-resume: if the dev server is *desired* (was started before)
+        but is no longer actually serving — typically because the sandbox auto-stopped
+        and woke — relaunch it. Reading status already wakes the sandbox VM."""
+        workspace = await self._get_workspace(workspace_id, user_id)
+        raw = await self._read_status(workspace)
+        resolved = await self._resolve_state(workspace, raw)
+
+        # Never auto-start a dev server the user never asked for (or explicitly stopped).
+        if not workspace.dev_autostart:
+            return resolved
+
+        # Serving / setup in progress / nothing to run / surfaced failure → leave it.
+        if resolved.status in {"running", "installing", "no-dev-task", "error"}:
+            return resolved
+
+        # Status file says "running" but no port is open yet. Only relaunch if the
+        # process is actually dead (stale status after a wake); otherwise it's just a
+        # genuinely slow startup and we must not double-launch.
+        if resolved.status == "starting" and await self._dev_process_alive(workspace):
+            return resolved
+
+        # Desired but down (stopped / idle / dead-after-wake) → relaunch.
+        try:
+            return await self._launch(workspace, user_id)
+        except DevServerNotClonedError:
+            return DevServerState(status="idle", message="Repository is not cloned yet.")
 
     async def stop(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
         workspace = await self._get_workspace(workspace_id, user_id)
@@ -121,6 +157,8 @@ class DevServerService:
             )
         except DaytonaRuntimeError as error:
             raise DevServerRuntimeError(str(error)) from error
+        # An explicit stop clears the desired flag so it is not auto-resumed on wake.
+        await self._mark_autostart(workspace, False)
         await AuditLogService(self.session).record(
             user_id=user_id,
             workspace_id=workspace.id,
@@ -130,6 +168,31 @@ class DevServerService:
             metadata={},
         )
         return DevServerState(status="stopped")
+
+    async def _mark_autostart(self, workspace: Workspace, value: bool) -> None:
+        if workspace.dev_autostart == value:
+            return
+        workspace.dev_autostart = value
+        # Persist only when backed by a real session (mirrors AuditLogService.record).
+        if not all(hasattr(self.session, method) for method in ("add", "commit")):
+            return
+        self.session.add(workspace)
+        await self.session.commit()
+
+    async def _dev_process_alive(self, workspace: Workspace) -> bool:
+        # `pgrep ...; echo $?` always exits 0, so we read the pgrep exit code from
+        # stdout ("0" = a matching process is alive). The `[m]ise` bracket keeps pgrep
+        # from matching its own command line.
+        try:
+            result = await self.runtime.exec(
+                workspace,
+                "pgrep -f '[m]ise run dev' >/dev/null 2>&1; echo $?",
+                cwd=workspace.workspace_path,
+                timeout=5,
+            )
+        except DaytonaRuntimeError:
+            return False
+        return (result.stdout or "").strip() == "0"
 
     async def _resolve_state(self, workspace: Workspace, raw: str) -> DevServerState:
         if raw == "running":

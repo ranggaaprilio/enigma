@@ -900,8 +900,280 @@ export function getDevServerStatus(
   });
 }
 
+/**
+ * Reports dev-server status and, if it was running before the sandbox slept,
+ * auto-restarts it (waking the sandbox). Safe to poll. Same shape as status.
+ */
+export function ensureDevServer(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<DevServerStatusResponse> {
+  return requestJson<DevServerStatusResponse>(`/workspaces/${workspaceId}/dev/ensure`, {
+    method: "POST",
+    signal,
+  });
+}
+
 export function stopDevServer(workspaceId: string): Promise<DevServerActionResponse> {
   return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/stop`, {
     method: "POST",
   });
+}
+
+// ── Projects & Teams ──────────────────────────────────────────────────────────
+
+export type ProjectRole = "admin" | "member" | "viewer";
+export type TeamRole = "lead" | "member" | "viewer";
+
+export type ProjectResponse = {
+  id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type ProjectMemberResponse = {
+  id: string;
+  project_id: string;
+  user_id: string;
+  role: ProjectRole;
+  joined_at: string;
+};
+
+export type TeamResponse = {
+  id: string;
+  project_id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  created_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type TeamMemberResponse = {
+  id: string;
+  team_id: string;
+  user_id: string;
+  role: TeamRole;
+  joined_at: string;
+};
+
+export type ProjectCreatePayload = { name: string; description?: string | null };
+export type ProjectUpdatePayload = Partial<ProjectCreatePayload>;
+export type AddMemberPayload = { user_id: string; role: string };
+export type UpdateMemberRolePayload = { role: string };
+export type TeamCreatePayload = { name: string; description?: string | null };
+export type TeamUpdatePayload = Partial<TeamCreatePayload>;
+
+// Projects
+
+export function listProjects(signal?: AbortSignal): Promise<ProjectResponse[]> {
+  return requestJson<ProjectResponse[]>("/projects", { signal });
+}
+
+export function createProject(payload: ProjectCreatePayload): Promise<ProjectResponse> {
+  return requestJson<ProjectResponse>("/projects", { method: "POST", body: JSON.stringify(payload) });
+}
+
+export function getProject(projectId: string, signal?: AbortSignal): Promise<ProjectResponse> {
+  return requestJson<ProjectResponse>(`/projects/${projectId}`, { signal });
+}
+
+export function updateProject(
+  projectId: string,
+  payload: ProjectUpdatePayload,
+): Promise<ProjectResponse> {
+  return requestJson<ProjectResponse>(`/projects/${projectId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteProject(projectId: string): Promise<void> {
+  return requestJson<void>(`/projects/${projectId}`, { method: "DELETE" });
+}
+
+export function listProjectMembers(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<ProjectMemberResponse[]> {
+  return requestJson<ProjectMemberResponse[]>(`/projects/${projectId}/members`, { signal });
+}
+
+export function addProjectMember(
+  projectId: string,
+  payload: AddMemberPayload,
+): Promise<ProjectMemberResponse> {
+  return requestJson<ProjectMemberResponse>(`/projects/${projectId}/members`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateProjectMemberRole(
+  projectId: string,
+  userId: string,
+  payload: UpdateMemberRolePayload,
+): Promise<ProjectMemberResponse> {
+  return requestJson<ProjectMemberResponse>(`/projects/${projectId}/members/${userId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function removeProjectMember(projectId: string, userId: string): Promise<void> {
+  return requestJson<void>(`/projects/${projectId}/members/${userId}`, { method: "DELETE" });
+}
+
+// Teams
+
+export function listTeams(projectId: string, signal?: AbortSignal): Promise<TeamResponse[]> {
+  return requestJson<TeamResponse[]>(`/projects/${projectId}/teams`, { signal });
+}
+
+export function createTeam(projectId: string, payload: TeamCreatePayload): Promise<TeamResponse> {
+  return requestJson<TeamResponse>(`/projects/${projectId}/teams`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getTeam(
+  projectId: string,
+  teamId: string,
+  signal?: AbortSignal,
+): Promise<TeamResponse> {
+  return requestJson<TeamResponse>(`/projects/${projectId}/teams/${teamId}`, { signal });
+}
+
+export function updateTeam(
+  projectId: string,
+  teamId: string,
+  payload: TeamUpdatePayload,
+): Promise<TeamResponse> {
+  return requestJson<TeamResponse>(`/projects/${projectId}/teams/${teamId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteTeam(projectId: string, teamId: string): Promise<void> {
+  return requestJson<void>(`/projects/${projectId}/teams/${teamId}`, { method: "DELETE" });
+}
+
+export function listTeamMembers(
+  projectId: string,
+  teamId: string,
+  signal?: AbortSignal,
+): Promise<TeamMemberResponse[]> {
+  return requestJson<TeamMemberResponse[]>(`/projects/${projectId}/teams/${teamId}/members`, {
+    signal,
+  });
+}
+
+export function addTeamMember(
+  projectId: string,
+  teamId: string,
+  payload: AddMemberPayload,
+): Promise<TeamMemberResponse> {
+  return requestJson<TeamMemberResponse>(`/projects/${projectId}/teams/${teamId}/members`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateTeamMemberRole(
+  projectId: string,
+  teamId: string,
+  userId: string,
+  payload: UpdateMemberRolePayload,
+): Promise<TeamMemberResponse> {
+  return requestJson<TeamMemberResponse>(
+    `/projects/${projectId}/teams/${teamId}/members/${userId}`,
+    { method: "PATCH", body: JSON.stringify(payload) },
+  );
+}
+
+export function removeTeamMember(
+  projectId: string,
+  teamId: string,
+  userId: string,
+): Promise<void> {
+  return requestJson<void>(`/projects/${projectId}/teams/${teamId}/members/${userId}`, {
+    method: "DELETE",
+  });
+}
+
+export function listTeamWorkspaces(
+  projectId: string,
+  teamId: string,
+  signal?: AbortSignal,
+): Promise<WorkspaceResponse[]> {
+  return requestJson<WorkspaceResponse[]>(
+    `/projects/${projectId}/teams/${teamId}/workspaces`,
+    { signal },
+  );
+}
+
+export function createTeamWorkspace(
+  projectId: string,
+  teamId: string,
+  payload: WorkspaceCreatePayload,
+): Promise<WorkspaceResponse> {
+  return requestJson<WorkspaceResponse>(
+    `/projects/${projectId}/teams/${teamId}/workspaces`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export function getWorkspace(workspaceId: string, signal?: AbortSignal): Promise<WorkspaceResponse> {
+  return requestJson<WorkspaceResponse>(`/workspaces/${workspaceId}`, { signal });
+}
+
+// Dashboard
+
+export type WorkspaceStatusCounts = {
+  creating: number;
+  ready: number;
+  busy: number;
+  error: number;
+  stopped: number;
+};
+
+export type DashboardProjectItem = {
+  id: string;
+  name: string;
+  slug: string;
+  description: string | null;
+  team_count: number;
+  workspace_count: number;
+  created_at: string;
+};
+
+export type DashboardWorkspaceItem = {
+  id: string;
+  name: string;
+  status: WorkspaceStatus;
+  project_id: string | null;
+  project_name: string | null;
+  team_id: string | null;
+  team_name: string | null;
+  created_at: string;
+};
+
+export type DashboardSummary = {
+  projects_total: number;
+  teams_total: number;
+  workspaces_total: number;
+  workspaces_by_status: WorkspaceStatusCounts;
+  recent_projects: DashboardProjectItem[];
+  recent_workspaces: DashboardWorkspaceItem[];
+};
+
+export function getDashboardSummary(signal?: AbortSignal): Promise<DashboardSummary> {
+  return requestJson<DashboardSummary>("/dashboard/summary", { signal });
 }
