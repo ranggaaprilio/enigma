@@ -137,6 +137,7 @@ class AgentService:
         user_id: UUID,
         prompt: str,
         working_dir: str | None = None,
+        worktree_id: UUID | None = None,
     ) -> AgentRun:
         workspace = await self._get_workspace(workspace_id, user_id)
         active = await self.session.execute(
@@ -152,6 +153,7 @@ class AgentService:
         run = AgentRun(
             workspace_id=workspace.id,
             user_id=user_id,
+            worktree_id=worktree_id,
             prompt=prompt,
             status="thinking",
             provider=provider.provider_name,

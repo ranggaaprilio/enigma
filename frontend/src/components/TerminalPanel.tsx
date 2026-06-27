@@ -11,11 +11,14 @@ import {
   type TerminalSessionResponse,
   type WorkspaceResponse,
 } from "../lib/api";
+import { useActiveWorktree } from "../lib/activeWorktree";
 
 type ConnectionState = "idle" | "connecting" | "connected" | "disconnected" | "error";
 const websocketOpen = 1;
 
 export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
+  const [activeWorktree] = useActiveWorktree(workspace.id);
+  const worktreeId = activeWorktree?.id ?? null;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -70,7 +73,7 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
         fitAddonRef.current = fitAddon;
 
         const socket = new window.WebSocket(
-          getTerminalSessionSocketUrl(workspace.id, terminalSession.id),
+          getTerminalSessionSocketUrl(workspace.id, terminalSession.id, worktreeId),
         );
         socket.binaryType = "arraybuffer";
         socketRef.current = socket;
@@ -130,7 +133,7 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
       terminalRef.current = null;
       fitAddonRef.current = null;
     };
-  }, [workspace.id]);
+  }, [workspace.id, worktreeId]);
 
   function handleTextMessage(value: string) {
     try {
@@ -213,6 +216,12 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
             Terminal
           </p>
           <h3 className="mt-1 text-base font-semibold">{workspace.name}</h3>
+          <p className="mt-0.5 text-xs text-ink/55">
+            Branch:{" "}
+            <span className="font-medium text-ink/75">
+              {activeWorktree ? activeWorktree.branch : "base"}
+            </span>
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-ink/65">

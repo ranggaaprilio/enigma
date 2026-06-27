@@ -25,8 +25,17 @@ from app.schemas.workspaces import (
     WorkspaceStatusResponse,
     WorkspaceUpdateRequest,
 )
+from app.schemas.worktrees import (
+    PullRequestCreateRequest,
+    PullRequestResponse,
+    WorktreeCommitRequest,
+    WorktreeCreateRequest,
+    WorktreeResponse,
+)
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntimeError, get_daytona_runtime
+from app.services.github_client import GitHubApiError, PullRequestService
+from app.services.notifications import NotificationService
 from app.services.repositories import (
     GitCommandError,
     InvalidRepositoryUrlError,
@@ -47,6 +56,16 @@ from app.services.workspaces import (
     WorkspaceRuntimeError,
     WorkspaceSecretCipher,
     mask_env_value,
+)
+from app.services.worktrees import (
+    CannotRemoveBaseWorktreeError,
+    GitWorktreeError,
+    InvalidBranchNameError,
+    WorktreeAlreadyExistsError,
+    WorktreeDirtyError,
+    WorktreeLimitError,
+    WorktreeNotFoundError,
+    WorktreeService,
 )
 
 router = APIRouter(prefix="/workspaces", tags=["workspaces"])
@@ -122,6 +141,34 @@ async def get_repository_service(
 REPOSITORY_SERVICE_DEP = Depends(get_repository_service)
 
 
+async def get_worktree_service(
+    session: AsyncSession = DB_SESSION_DEP,
+    settings: Settings = SETTINGS_DEP,
+) -> WorktreeService:
+    return WorktreeService(
+        session=session,
+        runtime=get_daytona_runtime(),
+        settings=settings,
+    )
+
+
+WORKTREE_SERVICE_DEP = Depends(get_worktree_service)
+
+
+async def get_pull_request_service(
+    session: AsyncSession = DB_SESSION_DEP,
+    settings: Settings = SETTINGS_DEP,
+) -> PullRequestService:
+    return PullRequestService(
+        session=session,
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        settings=settings,
+    )
+
+
+PULL_REQUEST_SERVICE_DEP = Depends(get_pull_request_service)
+
+
 async def get_audit_log_service(session: AsyncSession = DB_SESSION_DEP) -> AuditLogService:
     return AuditLogService(session)
 
@@ -129,9 +176,23 @@ async def get_audit_log_service(session: AsyncSession = DB_SESSION_DEP) -> Audit
 AUDIT_LOG_SERVICE_DEP = Depends(get_audit_log_service)
 
 
+async def get_notification_service(session: AsyncSession = DB_SESSION_DEP) -> NotificationService:
+    return NotificationService(session)
+
+
+NOTIFICATION_SERVICE_DEP = Depends(get_notification_service)
+
+
 async def record_audit_safely(audit_log_service: AuditLogService, **values) -> None:
     try:
         await audit_log_service.record(**values)
+    except Exception:
+        return
+
+
+async def notify_safely(notification_service: NotificationService, **values) -> None:
+    try:
+        await notification_service.create(**values)
     except Exception:
         return
 
@@ -183,6 +244,34 @@ def repository_error(error: Exception) -> HTTPException:
         )
     if isinstance(error, GitCommandError):
         return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error.message)
+    if isinstance(error, WorktreeNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Worktree not found")
+    if isinstance(error, InvalidBranchNameError):
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error))
+    if isinstance(error, WorktreeAlreadyExistsError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A worktree for this branch already exists",
+        )
+    if isinstance(error, WorktreeLimitError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
+    if isinstance(error, CannotRemoveBaseWorktreeError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The base worktree cannot be removed",
+        )
+    if isinstance(error, WorktreeDirtyError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Worktree has uncommitted changes; pass force to remove it",
+        )
+    if isinstance(error, GitWorktreeError):
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error.message)
+    if isinstance(error, GitHubApiError):
+        code = error.status_code if error.status_code and 400 <= error.status_code < 500 else (
+            status.HTTP_502_BAD_GATEWAY
+        )
+        return HTTPException(status_code=code, detail=error.message)
     return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Request failed")
 
 
@@ -375,7 +464,13 @@ async def commit_repository(
     audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> RepositoryOperationResponse:
     try:
-        await service.commit(workspace_id, current_user.id, payload.message)
+        await service.commit(
+            workspace_id,
+            current_user.id,
+            payload.message,
+            author_name=current_user.name,
+            author_email=current_user.email,
+        )
     except WorkspaceNotFoundError:
         raise not_found() from None
     except (
@@ -435,6 +530,332 @@ async def push_repository(
         metadata={},
     )
     return RepositoryOperationResponse(ok=True, message="Changes pushed.")
+
+
+# Errors raised by the worktree / pull-request flows, mapped to HTTP by ``repository_error``.
+WORKTREE_ERRORS = (
+    WorktreeNotFoundError,
+    WorktreeAlreadyExistsError,
+    WorktreeLimitError,
+    InvalidBranchNameError,
+    CannotRemoveBaseWorktreeError,
+    WorktreeDirtyError,
+    GitWorktreeError,
+    GitHubApiError,
+    InvalidRepositoryUrlError,
+    RepositoryPathError,
+    RepositoryCredentialNotFoundError,
+    RepositoryTokenError,
+    RepositoryNotClonedError,
+    NoChangesToCommitError,
+    GitCommandError,
+    DaytonaRuntimeError,
+)
+
+
+def worktree_response(info) -> WorktreeResponse:
+    return WorktreeResponse(
+        id=info.id,
+        branch=info.branch,
+        path=info.path,
+        base_ref=info.base_ref,
+        is_base=info.is_base,
+        status=info.status,
+        is_clean=info.is_clean,
+        ahead=info.ahead,
+        behind=info.behind,
+    )
+
+
+def pull_request_response(row) -> PullRequestResponse:
+    return PullRequestResponse(
+        id=row.id,
+        worktree_id=row.worktree_id,
+        number=row.number,
+        url=row.url,
+        state=row.state,
+        head=row.head,
+        base=row.base,
+        title=row.title,
+    )
+
+
+@router.get("/{workspace_id}/repo/worktrees", response_model=list[WorktreeResponse])
+async def list_worktrees(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: WorktreeService = WORKTREE_SERVICE_DEP,
+) -> list[WorktreeResponse]:
+    try:
+        infos = await service.list_worktrees(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    return [worktree_response(info) for info in infos]
+
+
+@router.post("/{workspace_id}/repo/worktrees", response_model=WorktreeResponse, status_code=201)
+async def create_worktree(
+    workspace_id: UUID,
+    payload: WorktreeCreateRequest,
+    current_user: User = CURRENT_USER_DEP,
+    service: WorktreeService = WORKTREE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+    notification_service: NotificationService = NOTIFICATION_SERVICE_DEP,
+) -> WorktreeResponse:
+    try:
+        row = await service.create_worktree(
+            workspace_id, current_user.id, payload.branch, payload.base
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="worktree_create",
+        target_type="worktree",
+        target_id=row.id,
+        metadata={"branch": row.branch, "base_ref": row.base_ref},
+    )
+    await notify_safely(
+        notification_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        notification_type="worktree_created",
+        title="Worktree created",
+        message=f"Worktree for branch '{row.branch}' is ready.",
+    )
+    return WorktreeResponse(
+        id=row.id,
+        branch=row.branch,
+        path=row.path,
+        base_ref=row.base_ref,
+        is_base=row.is_base,
+        status=row.status,
+        is_clean=True,
+        ahead=0,
+        behind=0,
+    )
+
+
+@router.delete(
+    "/{workspace_id}/repo/worktrees/{worktree_id}", response_model=RepositoryOperationResponse
+)
+async def remove_worktree(
+    workspace_id: UUID,
+    worktree_id: UUID,
+    force: bool = Query(default=False),
+    current_user: User = CURRENT_USER_DEP,
+    service: WorktreeService = WORKTREE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+    notification_service: NotificationService = NOTIFICATION_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        row = await service.remove_worktree(
+            workspace_id, current_user.id, worktree_id, force=force
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="worktree_remove",
+        target_type="worktree",
+        target_id=worktree_id,
+        metadata={"branch": row.branch, "force": force},
+    )
+    await notify_safely(
+        notification_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        notification_type="worktree_removed",
+        title="Worktree removed",
+        message=f"Worktree for branch '{row.branch}' was removed.",
+    )
+    return RepositoryOperationResponse(ok=True, message="Worktree removed.")
+
+
+@router.post(
+    "/{workspace_id}/repo/worktrees/{worktree_id}/commit",
+    response_model=RepositoryOperationResponse,
+)
+async def commit_worktree(
+    workspace_id: UUID,
+    worktree_id: UUID,
+    payload: WorktreeCommitRequest,
+    current_user: User = CURRENT_USER_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        worktree = await worktree_service.get_worktree(
+            workspace_id, current_user.id, worktree_id
+        )
+        await service.commit(
+            workspace_id,
+            current_user.id,
+            payload.message,
+            worktree_path=worktree.path,
+            author_name=current_user.name,
+            author_email=current_user.email,
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="worktree_commit",
+        target_type="worktree",
+        target_id=worktree_id,
+        metadata={"branch": worktree.branch, "message": payload.message},
+    )
+    return RepositoryOperationResponse(ok=True, message="Changes committed.")
+
+
+@router.post(
+    "/{workspace_id}/repo/worktrees/{worktree_id}/push",
+    response_model=RepositoryOperationResponse,
+)
+async def push_worktree(
+    workspace_id: UUID,
+    worktree_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+    notification_service: NotificationService = NOTIFICATION_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        worktree = await worktree_service.get_worktree(
+            workspace_id, current_user.id, worktree_id
+        )
+        await service.push(workspace_id, current_user.id, worktree_path=worktree.path)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="worktree_push",
+        target_type="worktree",
+        target_id=worktree_id,
+        metadata={"branch": worktree.branch},
+    )
+    await notify_safely(
+        notification_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        notification_type="worktree_pushed",
+        title="Branch pushed",
+        message=f"Branch '{worktree.branch}' was pushed to GitHub.",
+    )
+    return RepositoryOperationResponse(ok=True, message="Changes pushed.")
+
+
+@router.post(
+    "/{workspace_id}/repo/pull-requests",
+    response_model=PullRequestResponse,
+    status_code=201,
+)
+async def create_pull_request(
+    workspace_id: UUID,
+    payload: PullRequestCreateRequest,
+    current_user: User = CURRENT_USER_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
+    service: PullRequestService = PULL_REQUEST_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+    notification_service: NotificationService = NOTIFICATION_SERVICE_DEP,
+) -> PullRequestResponse:
+    try:
+        head = payload.head
+        if payload.worktree_id is not None:
+            worktree = await worktree_service.get_worktree(
+                workspace_id, current_user.id, payload.worktree_id
+            )
+            head = worktree.branch
+        if not head:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Provide a worktree_id or an explicit head branch",
+            )
+        row = await service.create(
+            workspace_id,
+            current_user.id,
+            head=head,
+            base=payload.base,
+            title=payload.title,
+            body=payload.body,
+            draft=payload.draft,
+            worktree_id=payload.worktree_id,
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="pull_request_create",
+        target_type="pull_request",
+        target_id=row.number,
+        metadata={"head": row.head, "base": row.base, "url": row.url},
+    )
+    await notify_safely(
+        notification_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        notification_type="pull_request_opened",
+        title="Pull request opened",
+        message=f"PR #{row.number} ({row.head} → {row.base}) was opened.",
+    )
+    return pull_request_response(row)
+
+
+@router.get("/{workspace_id}/repo/pull-requests", response_model=list[PullRequestResponse])
+async def list_pull_requests(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: PullRequestService = PULL_REQUEST_SERVICE_DEP,
+) -> list[PullRequestResponse]:
+    try:
+        rows = await service.list_open(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    return [pull_request_response(row) for row in rows]
+
+
+@router.get(
+    "/{workspace_id}/repo/pull-requests/{number}", response_model=PullRequestResponse
+)
+async def get_pull_request(
+    workspace_id: UUID,
+    number: int,
+    current_user: User = CURRENT_USER_DEP,
+    service: PullRequestService = PULL_REQUEST_SERVICE_DEP,
+) -> PullRequestResponse:
+    try:
+        row = await service.get(workspace_id, current_user.id, number)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    return pull_request_response(row)
 
 
 @router.post("", response_model=WorkspaceResponse, status_code=status.HTTP_201_CREATED)

@@ -263,6 +263,7 @@ class DaytonaRuntime:
         env: dict[str, str] | None,
         cols: int,
         rows: int,
+        cwd: str | None = None,
     ) -> Any:
         sandbox = await self.get_sandbox(workspace)
         try:
@@ -272,7 +273,7 @@ class DaytonaRuntime:
             return await sandbox.process.create_pty_session(
                 session_id,
                 on_data,
-                cwd=workspace.workspace_path,
+                cwd=cwd or workspace.workspace_path,
                 envs=env,
                 pty_size=PtySize(cols=cols, rows=rows),
             )

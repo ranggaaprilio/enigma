@@ -15,6 +15,11 @@ from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCiphe
 GITHUB_REPO_PATTERN = re.compile(r"^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$")
 GIT_TIMEOUT_SECONDS = 60
 
+# Fallback commit identity used when the acting user has no name/email. The signed-in user's
+# name/email is preferred; this is shared with speckit so the fallback is consistent.
+DEFAULT_COMMIT_AUTHOR = "Enigma app"
+DEFAULT_COMMIT_EMAIL = "author@enigma.ai"
+
 
 class InvalidRepositoryUrlError(Exception):
     pass
@@ -177,13 +182,20 @@ class RepositoryService:
         except Exception as error:
             raise GitCommandError(sanitize_git_output(str(error), token)) from error
 
-    async def status(self, workspace_id: UUID, owner_id: UUID) -> GitStatus:
+    async def status(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        *,
+        worktree_path: str | None = None,
+    ) -> GitStatus:
         workspace = await self._get_workspace(workspace_id, owner_id)
+        repo_path = worktree_path or workspace.workspace_path
         sandbox = await self.runtime.get_sandbox(workspace)
-        if not await self._is_cloned(sandbox, workspace.workspace_path):
+        if not await self._is_cloned(sandbox, repo_path):
             return GitStatus(cloned=False, branch=None, is_clean=True, files=[])
         try:
-            result = await sandbox.git.status(workspace.workspace_path)
+            result = await sandbox.git.status(repo_path)
         except Exception as error:
             raise GitCommandError(str(error)) from error
         files = [
@@ -200,17 +212,25 @@ class RepositoryService:
             files=files,
         )
 
-    async def diff(self, workspace_id: UUID, owner_id: UUID, path: str | None = None) -> str:
+    async def diff(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        path: str | None = None,
+        *,
+        worktree_path: str | None = None,
+    ) -> str:
         workspace = await self._get_workspace(workspace_id, owner_id)
+        repo_path = worktree_path or workspace.workspace_path
         sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, workspace.workspace_path)
+        await self._ensure_cloned(sandbox, repo_path)
         args = ["diff", "--"]
         if path is not None:
             args.append(validate_diff_path(path))
         result = await self.runtime.exec(
             workspace,
             "git " + " ".join(shlex.quote(arg) for arg in args),
-            cwd=workspace.workspace_path,
+            cwd=repo_path,
         )
         if result.exit_code != 0:
             raise GitCommandError(result.stderr or result.stdout or "Git diff failed")
@@ -227,28 +247,73 @@ class RepositoryService:
             password=token,
         )
 
-    async def commit(self, workspace_id: UUID, owner_id: UUID, message: str) -> None:
+    async def commit(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        message: str,
+        *,
+        worktree_path: str | None = None,
+        author_name: str | None = None,
+        author_email: str | None = None,
+    ) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
+        repo_path = worktree_path or workspace.workspace_path
         sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, workspace.workspace_path)
-        status_result = await sandbox.git.status(workspace.workspace_path)
-        if not (getattr(status_result, "file_status", None) or []):
-            raise NoChangesToCommitError
-        await sandbox.git.add(workspace.workspace_path, ["."])
-        await sandbox.git.commit(
-            workspace.workspace_path,
-            message,
-            author="Execute Dashboard",
-            email="execute@localhost",
+        await self._ensure_cloned(sandbox, repo_path)
+        # Stop early when there is nothing staged or unstaged to commit.
+        porcelain = await self.runtime.exec(
+            workspace,
+            "git status --porcelain",
+            cwd=repo_path,
+            timeout=GIT_TIMEOUT_SECONDS,
         )
+        if not porcelain.stdout.strip():
+            raise NoChangesToCommitError
+        name = author_name or DEFAULT_COMMIT_AUTHOR
+        email = author_email or DEFAULT_COMMIT_EMAIL
+        # Use the per-call -c identity form (mirrors speckit) so the author is explicit and we
+        # never rely on a global/hardcoded git identity.
+        add = await self.runtime.exec(
+            workspace, "git add -A", cwd=repo_path, timeout=GIT_TIMEOUT_SECONDS
+        )
+        if add.exit_code != 0:
+            raise GitCommandError(add.stderr or add.stdout or "git add failed")
+        commit_cmd = "git " + " ".join(
+            shlex.quote(arg)
+            for arg in [
+                "-c",
+                f"user.name={name}",
+                "-c",
+                f"user.email={email}",
+                "commit",
+                "-m",
+                message,
+            ]
+        )
+        commit = await self.runtime.exec(
+            workspace, commit_cmd, cwd=repo_path, timeout=GIT_TIMEOUT_SECONDS
+        )
+        if commit.exit_code != 0:
+            output = (commit.stdout + commit.stderr).lower()
+            if "nothing to commit" in output:
+                raise NoChangesToCommitError
+            raise GitCommandError(commit.stderr or commit.stdout or "git commit failed")
 
-    async def push(self, workspace_id: UUID, owner_id: UUID) -> None:
+    async def push(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        *,
+        worktree_path: str | None = None,
+    ) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
         token = await self._get_token(workspace.id)
+        repo_path = worktree_path or workspace.workspace_path
         sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, workspace.workspace_path)
+        await self._ensure_cloned(sandbox, repo_path)
         await sandbox.git.push(
-            workspace.workspace_path,
+            repo_path,
             username="x-access-token",
             password=token,
         )
@@ -274,11 +339,13 @@ class RepositoryService:
         return token
 
     async def _is_cloned(self, sandbox, repo_path: str) -> bool:
+        # In the base clone ``.git`` is a directory; inside a linked worktree it is a file that
+        # points at the shared git dir. Either means the path is a usable git working tree.
         try:
-            info = await sandbox.fs.get_file_info(f"{repo_path}/.git")
+            await sandbox.fs.get_file_info(f"{repo_path}/.git")
         except Exception:
             return False
-        return bool(getattr(info, "is_dir", False))
+        return True
 
     def _file_status(self, item) -> str:
         worktree = getattr(item, "worktree", None)

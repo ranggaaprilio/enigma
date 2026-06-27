@@ -47,6 +47,9 @@ class Settings(BaseSettings):
     mise_auto_install: bool = True
     mise_install_url: str = "https://mise.run"
     dev_server_command_timeout_seconds: int = 30
+    github_api_base_url: str = "https://api.github.com"
+    github_api_timeout_seconds: int = 30
+    max_worktrees_per_workspace: int = 5
     file_max_read_bytes: int = 1_000_000
     file_max_upload_bytes: int = 10_000_000
     file_tree_max_entries: int = 2_000

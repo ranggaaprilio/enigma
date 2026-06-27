@@ -111,7 +111,16 @@ class FakeRepositoryService:
     async def pull(self, workspace_id: UUID, owner_id: UUID) -> None:
         self._ensure_operation("pull", workspace_id, owner_id)
 
-    async def commit(self, workspace_id: UUID, owner_id: UUID, message: str) -> None:
+    async def commit(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        message: str,
+        *,
+        worktree_path: str | None = None,
+        author_name: str | None = None,
+        author_email: str | None = None,
+    ) -> None:
         self._ensure_operation(f"commit:{message}", workspace_id, owner_id)
 
     async def push(self, workspace_id: UUID, owner_id: UUID) -> None:

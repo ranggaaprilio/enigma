@@ -10,6 +10,7 @@ import { FileManagementPanel } from "../components/FileManagementPanel";
 import { PreviewPanel } from "../components/PreviewPanel";
 import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
+import { WorktreesPanel } from "../components/WorktreesPanel";
 import {
   ApiError,
   cloneRepository,
@@ -245,10 +246,13 @@ export function DashboardView({ view }: { view: DashboardViewId }) {
 
   if (view === "repository") {
     return (
-      <RepositoryPanel
-        workspace={workspace}
-        onWorkspaceChanged={onWorkspaceChanged}
-      />
+      <>
+        <RepositoryPanel
+          workspace={workspace}
+          onWorkspaceChanged={onWorkspaceChanged}
+        />
+        <WorktreesPanel workspace={workspace} />
+      </>
     );
   }
 

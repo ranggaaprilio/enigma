@@ -8,6 +8,7 @@ import {
 
 interface PromptComposerProps {
   workspaceId: string;
+  worktreeId?: string | null;
   activeRunId?: string | null;
   isRunning?: boolean;
   onRunCreated?: (run: AgentRunResponse) => void;
@@ -16,6 +17,7 @@ interface PromptComposerProps {
 
 export function PromptComposer({
   workspaceId,
+  worktreeId,
   activeRunId: externalActiveRunId,
   isRunning: externalIsRunning,
   onRunCreated,
@@ -38,7 +40,10 @@ export function PromptComposer({
     if (!isControlled) setInternalIsRunning(true);
 
     try {
-      const run = await createAgentRun(workspaceId, { prompt: trimmed });
+      const run = await createAgentRun(workspaceId, {
+        prompt: trimmed,
+        worktree_id: worktreeId ?? null,
+      });
       if (!isControlled) setInternalActiveRunId(run.id);
       setPrompt("");
       onRunCreated?.(run);
@@ -46,7 +51,7 @@ export function PromptComposer({
       if (!isControlled) setInternalIsRunning(false);
       setError(err instanceof Error ? err.message : "Failed to start run");
     }
-  }, [prompt, workspaceId, isRunning, isControlled, onRunCreated]);
+  }, [prompt, workspaceId, worktreeId, isRunning, isControlled, onRunCreated]);
 
   const handleStop = useCallback(async () => {
     if (!activeRunId) return;

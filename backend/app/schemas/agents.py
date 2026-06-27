@@ -11,6 +11,7 @@ AgentFileChangeStatus = Literal["created", "modified", "deleted", "renamed"]
 
 class AgentRunCreateRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=40_000)
+    worktree_id: UUID | None = None
 
     @field_validator("prompt")
     @classmethod

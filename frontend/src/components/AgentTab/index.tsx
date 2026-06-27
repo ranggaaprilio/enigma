@@ -15,6 +15,7 @@ import {
   type AgentRunResponse,
   type AgentRunStatus,
 } from "../../lib/api";
+import { useActiveWorktree } from "../../lib/activeWorktree";
 import { ToolCard, pairToolEvents } from "./ToolCard";
 import { PromptComposer } from "./PromptComposer";
 import { RunHistory } from "./RunHistory";
@@ -29,6 +30,7 @@ const RECONNECT_DELAYS = [1000, 2000, 4000];
 const MAX_RECONNECT_RETRIES = 3;
 
 export function AgentTab({ workspaceId }: AgentTabProps) {
+  const [activeWorktree] = useActiveWorktree(workspaceId ?? "");
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [events, setEvents] = useState<AgentEventResponse[]>([]);
   const [runStatus, setRunStatus] = useState<AgentRunStatus | null>(null);
@@ -420,8 +422,15 @@ export function AgentTab({ workspaceId }: AgentTabProps) {
           data-testid="agent-composer"
         >
           <div className="mx-auto w-full max-w-3xl">
+            <p className="mb-1.5 text-xs text-muted">
+              Target:{" "}
+              <span className="font-medium text-body">
+                {activeWorktree ? activeWorktree.branch : "base branch"}
+              </span>
+            </p>
             <PromptComposer
               workspaceId={workspaceId}
+              worktreeId={activeWorktree?.id ?? null}
               activeRunId={selectedRunId}
               isRunning={isRunActive}
               onRunCreated={handleRunCreated}

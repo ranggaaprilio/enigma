@@ -130,6 +130,43 @@ export type RepositoryOperationResponse = {
   message: string;
 };
 
+export type WorktreeResponse = {
+  id: string;
+  branch: string;
+  path: string;
+  base_ref: string;
+  is_base: boolean;
+  status: string;
+  is_clean: boolean;
+  ahead: number;
+  behind: number;
+};
+
+export type WorktreeCreatePayload = {
+  branch: string;
+  base?: string | null;
+};
+
+export type PullRequestResponse = {
+  id: string;
+  worktree_id: string | null;
+  number: number;
+  url: string;
+  state: string;
+  head: string;
+  base: string;
+  title: string;
+};
+
+export type PullRequestCreatePayload = {
+  worktree_id?: string | null;
+  head?: string | null;
+  base?: string | null;
+  title: string;
+  body?: string | null;
+  draft?: boolean;
+};
+
 export type WorkspaceFileNode = {
   path: string;
   name: string;
@@ -211,6 +248,7 @@ export type AgentFileChangeListResponse = {
 
 export type AgentRunCreatePayload = {
   prompt: string;
+  worktree_id?: string | null;
 };
 
 export type CustomCommandResponse = {
@@ -357,11 +395,15 @@ export function getAgentStreamUrl(workspaceId: string, runId: string) {
   return baseUrl.toString();
 }
 
-export function getTerminalSessionSocketUrl(workspaceId: string, sessionId: string) {
+export function getTerminalSessionSocketUrl(
+  workspaceId: string,
+  sessionId: string,
+  worktreeId?: string | null,
+) {
   const baseUrl = new URL(getApiBaseUrl());
   baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
   baseUrl.pathname = `/workspaces/${workspaceId}/terminal/sessions/${sessionId}`;
-  baseUrl.search = "";
+  baseUrl.search = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
   return baseUrl.toString();
 }
 
@@ -579,6 +621,89 @@ export function pushRepository(workspaceId: string): Promise<RepositoryOperation
   return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/push`, {
     method: "POST",
   });
+}
+
+export function listWorktrees(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<WorktreeResponse[]> {
+  return requestJson<WorktreeResponse[]>(`/workspaces/${workspaceId}/repo/worktrees`, {
+    signal,
+  });
+}
+
+export function createWorktree(
+  workspaceId: string,
+  payload: WorktreeCreatePayload,
+): Promise<WorktreeResponse> {
+  return requestJson<WorktreeResponse>(`/workspaces/${workspaceId}/repo/worktrees`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function removeWorktree(
+  workspaceId: string,
+  worktreeId: string,
+  force = false,
+): Promise<RepositoryOperationResponse> {
+  const query = force ? "?force=true" : "";
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}${query}`,
+    { method: "DELETE" },
+  );
+}
+
+export function commitWorktree(
+  workspaceId: string,
+  worktreeId: string,
+  payload: RepositoryCommitPayload,
+): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}/commit`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export function pushWorktree(
+  workspaceId: string,
+  worktreeId: string,
+): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}/push`,
+    { method: "POST" },
+  );
+}
+
+export function createPullRequest(
+  workspaceId: string,
+  payload: PullRequestCreatePayload,
+): Promise<PullRequestResponse> {
+  return requestJson<PullRequestResponse>(`/workspaces/${workspaceId}/repo/pull-requests`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listPullRequests(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<PullRequestResponse[]> {
+  return requestJson<PullRequestResponse[]>(
+    `/workspaces/${workspaceId}/repo/pull-requests`,
+    { signal },
+  );
+}
+
+export function getPullRequest(
+  workspaceId: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<PullRequestResponse> {
+  return requestJson<PullRequestResponse>(
+    `/workspaces/${workspaceId}/repo/pull-requests/${number}`,
+    { signal },
+  );
 }
 
 export function getWorkspaceFileTree(

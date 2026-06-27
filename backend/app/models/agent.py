@@ -36,6 +36,11 @@ class AgentRun(Base):
         ForeignKey("users.id", ondelete="CASCADE"),
         nullable=False,
     )
+    worktree_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspace_worktrees.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="thinking")
     provider: Mapped[str] = mapped_column(String(80), nullable=False)

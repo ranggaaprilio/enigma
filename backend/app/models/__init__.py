@@ -10,6 +10,7 @@ from app.models.speckit import SpecPhase, SpecWorkflow
 from app.models.terminal import TerminalSession
 from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceEnvVar
+from app.models.worktree import PullRequest, WorkspaceWorktree
 
 __all__ = [
     "AgentEvent",
@@ -23,6 +24,7 @@ __all__ = [
     "PreviewSession",
     "Project",
     "ProjectMember",
+    "PullRequest",
     "RepositoryCredential",
     "SpecPhase",
     "SpecWorkflow",
@@ -32,4 +34,5 @@ __all__ = [
     "User",
     "Workspace",
     "WorkspaceEnvVar",
+    "WorkspaceWorktree",
 ]

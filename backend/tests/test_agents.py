@@ -61,7 +61,14 @@ class FakeAgentService:
         self.events: dict[UUID, list[AgentEvent]] = {}
         self.has_active_run = False
 
-    async def create_run(self, workspace_id: UUID, user_id: UUID, prompt: str) -> AgentRun:
+    async def create_run(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        prompt: str,
+        working_dir: str | None = None,
+        worktree_id: UUID | None = None,
+    ) -> AgentRun:
         self._ensure_workspace(workspace_id, user_id)
         if self.has_active_run:
             raise AgentRunAlreadyActiveError

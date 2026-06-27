@@ -28,7 +28,12 @@ from app.services.agents import AgentService
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
 from app.services.notifications import NotificationService
-from app.services.repositories import NoChangesToCommitError, RepositoryService
+from app.services.repositories import (
+    DEFAULT_COMMIT_AUTHOR,
+    DEFAULT_COMMIT_EMAIL,
+    NoChangesToCommitError,
+    RepositoryService,
+)
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 # Phases, in pipeline order.
@@ -616,8 +621,10 @@ class SpecKitService:
     ) -> None:
         working_dir = self._working_dir(workspace, workflow, phase_name)
         user = await session.get(User, user_id)
-        name = (user.name if user and user.name else (user.email if user else "Enigma")) or "Enigma"
-        email = user.email if user else "enigma@localhost"
+        name = (
+            user.name if user and user.name else (user.email if user else DEFAULT_COMMIT_AUTHOR)
+        ) or DEFAULT_COMMIT_AUTHOR
+        email = user.email if user else DEFAULT_COMMIT_EMAIL
         message = f"spec({workflow.feature_slug}): {phase_name}"
 
         await self.runtime.exec(workspace, "git add -A", cwd=working_dir,
