@@ -2,6 +2,7 @@ import { type ComponentType, type ReactNode } from "react";
 import { NavLink, useNavigate } from "react-router";
 import {
   Bot,
+  ClipboardList,
   Code2,
   FileCode2,
   FolderKanban,
@@ -41,6 +42,7 @@ function workspaceNav(base: string): NavItem[] {
     { label: "Repository", icon: GitBranch, to: `${base}/repository` },
     { label: "Files", icon: FolderTree, to: `${base}/files` },
     { label: "Commands", icon: ListChecks, to: `${base}/commands` },
+    { label: "Spec", icon: ClipboardList, to: `${base}/spec` },
     { label: "Agent", icon: Bot, to: `${base}/agents` },
     { label: "Editor", icon: FileCode2, to: `${base}/editor` },
     { label: "Terminal", icon: Terminal, to: `${base}/terminal` },

@@ -131,7 +131,13 @@ class AgentService:
         self.settings = settings
         self.runtime = runtime
 
-    async def create_run(self, workspace_id: UUID, user_id: UUID, prompt: str) -> AgentRun:
+    async def create_run(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        prompt: str,
+        working_dir: str | None = None,
+    ) -> AgentRun:
         workspace = await self._get_workspace(workspace_id, user_id)
         active = await self.session.execute(
             select(AgentRun.id).where(
@@ -165,7 +171,7 @@ class AgentService:
         )
 
         stop_event = asyncio.Event()
-        task = asyncio.create_task(self._execute_run(run.id, stop_event))
+        task = asyncio.create_task(self._execute_run(run.id, stop_event, working_dir))
         self.runtime.register_run(run.id, task, stop_event)
         return run
 
@@ -387,7 +393,12 @@ class AgentService:
             raise WorkspaceNotFoundError
         return workspace
 
-    async def _execute_run(self, run_id: UUID, stop_event: asyncio.Event) -> None:
+    async def _execute_run(
+        self,
+        run_id: UUID,
+        stop_event: asyncio.Event,
+        working_dir: str | None = None,
+    ) -> None:
         async with self.session_maker() as session:
             try:
                 run = await session.get(AgentRun, run_id)
@@ -405,6 +416,7 @@ class AgentService:
                     runtime=get_daytona_runtime(),
                     command_timeout_seconds=self.settings.agent_command_timeout_seconds,
                     max_command_output_chars=self.settings.agent_max_command_output_chars,
+                    working_dir=working_dir,
                 )
 
                 baseline = await self._capture_baseline(

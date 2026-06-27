@@ -1177,3 +1177,149 @@ export type DashboardSummary = {
 export function getDashboardSummary(signal?: AbortSignal): Promise<DashboardSummary> {
   return requestJson<DashboardSummary>("/dashboard/summary", { signal });
 }
+
+// --- Spec-Driven Development (SDD) ---------------------------------------------------
+
+export type SpecPhaseName =
+  | "constitution"
+  | "specify"
+  | "clarify"
+  | "plan"
+  | "analyze"
+  | "tasks"
+  | "implement";
+
+export type SpecWorkflowStatus =
+  | "pending"
+  | "running"
+  | "awaiting_review"
+  | "completed"
+  | "error";
+
+export type SpecPhaseStatus =
+  | "pending"
+  | "running"
+  | "awaiting_review"
+  | "approved"
+  | "changes_requested"
+  | "completed"
+  | "error";
+
+export type SpecPhaseResponse = {
+  id: string;
+  workflow_id: string;
+  phase: SpecPhaseName;
+  status: SpecPhaseStatus;
+  artifact_path: string | null;
+  agent_run_id: string | null;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  review_notes: string | null;
+  attempt: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SpecWorkflowResponse = {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  feature_name: string;
+  feature_slug: string;
+  description: string;
+  branch: string;
+  spec_dir: string;
+  worktree_path: string | null;
+  status: SpecWorkflowStatus;
+  current_phase: SpecPhaseName;
+  created_at: string;
+  updated_at: string;
+  phases: SpecPhaseResponse[];
+};
+
+export type SpecArtifactResponse = {
+  phase: SpecPhaseName;
+  path: string | null;
+  content: string;
+};
+
+export type SpecWorkflowCreatePayload = {
+  feature_name: string;
+  description: string;
+};
+
+export function listSpecWorkflows(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<SpecWorkflowResponse[]> {
+  return requestJson<SpecWorkflowResponse[]>(`/workspaces/${workspaceId}/spec/workflows`, {
+    signal,
+  });
+}
+
+export function getSpecWorkflow(
+  workspaceId: string,
+  workflowId: string,
+  signal?: AbortSignal,
+): Promise<SpecWorkflowResponse> {
+  return requestJson<SpecWorkflowResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}`,
+    { signal },
+  );
+}
+
+export function createSpecWorkflow(
+  workspaceId: string,
+  payload: SpecWorkflowCreatePayload,
+): Promise<SpecWorkflowResponse> {
+  return requestJson<SpecWorkflowResponse>(`/workspaces/${workspaceId}/spec/workflows`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getSpecArtifact(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+  signal?: AbortSignal,
+): Promise<SpecArtifactResponse> {
+  return requestJson<SpecArtifactResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/artifact`,
+    { signal },
+  );
+}
+
+export function runSpecPhase(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+): Promise<SpecPhaseResponse> {
+  return requestJson<SpecPhaseResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/run`,
+    { method: "POST" },
+  );
+}
+
+export function approveSpecPhase(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+): Promise<SpecPhaseResponse> {
+  return requestJson<SpecPhaseResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/approve`,
+    { method: "POST" },
+  );
+}
+
+export function requestSpecChanges(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+  notes: string,
+): Promise<SpecPhaseResponse> {
+  return requestJson<SpecPhaseResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/request-changes`,
+    { method: "POST", body: JSON.stringify({ notes }) },
+  );
+}

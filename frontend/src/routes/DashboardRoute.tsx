@@ -8,6 +8,7 @@ import { CustomCommandsPanel } from "../components/CustomCommandsPanel";
 import { EditorPanel } from "../components/EditorPanel";
 import { FileManagementPanel } from "../components/FileManagementPanel";
 import { PreviewPanel } from "../components/PreviewPanel";
+import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import {
   ApiError,
@@ -54,6 +55,7 @@ type DashboardViewId =
   | "editor"
   | "terminal"
   | "preview"
+  | "spec"
   | "agent"
   | "audit";
 type PreviewStatusSnapshot = {
@@ -273,6 +275,10 @@ export function DashboardView({ view }: { view: DashboardViewId }) {
         onStatusChange={onPreviewStatusChange}
       />
     );
+  }
+
+  if (view === "spec") {
+    return <SpecPanel workspace={workspace} />;
   }
 
   if (view === "agent") {

@@ -11,6 +11,7 @@ from app.api.health import router as health_router
 from app.api.notifications import router as notifications_router
 from app.api.preview import router as preview_router
 from app.api.projects import router as projects_router
+from app.api.specs import router as specs_router
 from app.api.teams import router as teams_router
 from app.api.terminal import router as terminal_router
 from app.api.workspaces import router as workspaces_router
@@ -27,6 +28,7 @@ api_router.include_router(editor_router)
 api_router.include_router(files_router)
 api_router.include_router(preview_router)
 api_router.include_router(projects_router)
+api_router.include_router(specs_router)
 api_router.include_router(teams_router)
 api_router.include_router(terminal_router)
 api_router.include_router(workspaces_router)

@@ -65,11 +65,16 @@ class WorkspaceTools:
         runtime: DaytonaRuntime,
         command_timeout_seconds: int,
         max_command_output_chars: int,
+        working_dir: str | None = None,
     ) -> None:
         self.workspace = workspace
         self.runtime = runtime
         self.command_timeout_seconds = command_timeout_seconds
         self.max_command_output_chars = max_command_output_chars
+        # Root the tools at an explicit working directory (e.g. a feature
+        # worktree such as "worktrees/001-feature") when provided, otherwise the
+        # base clone. All path resolution stays confined to this root.
+        self.root = working_dir if working_dir is not None else workspace.workspace_path
 
     def resolve_path(self, path: str | None = None) -> str:
         candidate = (path or "").strip().strip("/")
@@ -78,18 +83,14 @@ class WorkspaceTools:
             raise WorkspaceToolError("Path is outside the workspace")
         if any(part in EXCLUDED_NAMES for part in pure.parts):
             raise WorkspaceToolError("Path is excluded")
-        return (
-            self.workspace.workspace_path
-            if not candidate
-            else f"{self.workspace.workspace_path}/{pure.as_posix()}"
-        )
+        return self.root if not candidate else f"{self.root}/{pure.as_posix()}"
 
     async def list_files(self, path: str | None = None, limit: int = 200) -> list[str]:
         sandbox = await self.runtime.get_sandbox(self.workspace)
         root = self.resolve_path(path)
         bounded_limit = max(1, min(limit, 200))
         results: list[str] = []
-        prefix = self.workspace.workspace_path.rstrip("/") + "/"
+        prefix = self.root.rstrip("/") + "/"
         directories = deque([root])
 
         try:
@@ -156,7 +157,7 @@ class WorkspaceTools:
             response = await self.runtime.exec(
                 self.workspace,
                 " ".join(shlex.quote(value) for value in argv),
-                cwd=self.workspace.workspace_path,
+                cwd=self.root,
                 timeout=self.command_timeout_seconds,
             )
         except Exception as error:

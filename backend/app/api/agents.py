@@ -35,7 +35,13 @@ SETTINGS_DEP = Depends(get_settings)
 
 
 class AgentServiceProtocol(Protocol):
-    async def create_run(self, workspace_id: UUID, user_id: UUID, prompt: str) -> AgentRun: ...
+    async def create_run(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        prompt: str,
+        working_dir: str | None = None,
+    ) -> AgentRun: ...
 
     async def list_runs(
         self,
