@@ -364,11 +364,21 @@ async def clone_repository(
 @router.get("/{workspace_id}/repo/status", response_model=RepositoryStatusResponse)
 async def get_repository_status(
     workspace_id: UUID,
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
 ) -> RepositoryStatusResponse:
     try:
-        repo_status = await service.status(workspace_id, current_user.id)
+        worktree_path: str | None = None
+        if worktree_id is not None:
+            worktree = await worktree_service.get_worktree(
+                workspace_id, current_user.id, worktree_id
+            )
+            worktree_path = worktree.path
+        repo_status = await service.status(
+            workspace_id, current_user.id, worktree_path=worktree_path
+        )
     except WorkspaceNotFoundError:
         raise not_found() from None
     except (
@@ -381,6 +391,7 @@ async def get_repository_status(
         NoChangesToCommitError,
         GitCommandError,
         DaytonaRuntimeError,
+        WorktreeNotFoundError,
     ) as error:
         raise repository_error(error) from None
     return RepositoryStatusResponse(
@@ -398,11 +409,21 @@ async def get_repository_status(
 async def get_repository_diff(
     workspace_id: UUID,
     path: str | None = Query(default=None, max_length=1024),
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
 ) -> RepositoryDiffResponse:
     try:
-        diff = await service.diff(workspace_id, current_user.id, path)
+        worktree_path: str | None = None
+        if worktree_id is not None:
+            worktree = await worktree_service.get_worktree(
+                workspace_id, current_user.id, worktree_id
+            )
+            worktree_path = worktree.path
+        diff = await service.diff(
+            workspace_id, current_user.id, path, worktree_path=worktree_path
+        )
     except WorkspaceNotFoundError:
         raise not_found() from None
     except (
@@ -415,6 +436,7 @@ async def get_repository_diff(
         NoChangesToCommitError,
         GitCommandError,
         DaytonaRuntimeError,
+        WorktreeNotFoundError,
     ) as error:
         raise repository_error(error) from None
     return RepositoryDiffResponse(diff=diff)

@@ -16,6 +16,7 @@ from app.main import app
 from app.models import AgentRun, AuditLog, Notification, SpecPhase, SpecWorkflow, User, Workspace
 from app.services.speckit import (
     PHASE_ORDER,
+    InvalidArtifactPathError,
     SpecGateError,
     SpecKitService,
     SpecPhaseNotReviewableError,
@@ -56,6 +57,36 @@ class FakeRuntime:
             exit_code = 0 if target in self.existing else 1
         elif command.startswith("cat "):
             exit_code = 1
+        return type("R", (), {"exit_code": exit_code, "stdout": stdout, "stderr": ""})()
+
+
+class ScriptedRuntime(FakeRuntime):
+    """FakeRuntime that can also serve ``cat`` content and ``ls -1`` directory listings."""
+
+    def __init__(self, existing=(".git", ".specify"), files=None, listings=None):
+        super().__init__(existing)
+        self.files = files or {}  # rel_path -> content (served by ``cat``)
+        self.listings = listings or {}  # rel_dir -> [names] (served by ``ls -1``)
+
+    async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
+        self.calls.append((command, cwd))
+        exit_code, stdout = 0, ""
+        if command.startswith("test -e "):
+            target = command[len("test -e ") :].strip().strip("'\"")
+            exit_code = 0 if target in self.existing else 1
+        elif command.startswith("cat "):
+            target = command[len("cat ") :].strip().strip("'\"")
+            if target in self.files:
+                stdout = self.files[target]
+            else:
+                exit_code = 1
+        elif command.startswith("ls -1 "):
+            target = command[len("ls -1 ") :].strip().strip("'\"")
+            names = self.listings.get(target)
+            if names is None:
+                exit_code = 1
+            else:
+                stdout = "\n".join(names)
         return type("R", (), {"exit_code": exit_code, "stdout": stdout, "stderr": ""})()
 
 
@@ -409,3 +440,246 @@ async def test_finalizer_sets_review_phase_to_awaiting_review(db_session, monkey
             .all()
         )
         assert len(notes) >= 1
+
+
+# --- Feature 1: plan generates the full design set --------------------------------------
+
+
+async def test_plan_prompt_requests_full_design_set(db_session):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"plan-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user)
+    await session.commit()
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    working_dir = service._working_dir(workspace, workflow, "plan")
+    prompt = await service._build_prompt(workspace, workflow, "plan", working_dir, None)
+
+    for expected in ("research.md", "data-model.md", "contracts/", "quickstart.md"):
+        assert expected in prompt
+    # The single-file restriction must NOT leak into the plan phase.
+    assert "Output only the artifact content to the file" not in prompt
+
+
+async def test_non_plan_phase_keeps_single_file_instruction(db_session):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"spec-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user)
+    await session.commit()
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    working_dir = service._working_dir(workspace, workflow, "specify")
+    prompt = await service._build_prompt(workspace, workflow, "specify", working_dir, None)
+
+    assert "Output only the artifact content to the file" in prompt
+    assert "data-model.md" not in prompt
+
+
+async def test_list_phase_artifacts_returns_existing_design_files(db_session):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"list-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user)
+    await session.commit()
+
+    base = workflow.spec_dir
+    runtime = ScriptedRuntime(
+        existing={
+            f"{base}/plan.md",
+            f"{base}/research.md",
+            f"{base}/data-model.md",
+            f"{base}/quickstart.md",
+        },
+        listings={f"{base}/contracts": ["auth-api.yaml"]},
+    )
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+    items = await service.list_phase_artifacts(workspace.id, workflow.id, "plan", user.id)
+
+    names = [name for name, _ in items]
+    assert names == [
+        "plan.md",
+        "research.md",
+        "data-model.md",
+        "contracts/auth-api.yaml",
+        "quickstart.md",
+    ]
+    # Paths are spec-dir relative.
+    assert (f"{base}/contracts/auth-api.yaml") in [path for _, path in items]
+
+
+async def test_read_artifact_rejects_path_traversal(db_session):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"trav-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user)
+    await session.commit()
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    for bad in ("../etc/passwd", "/etc/passwd", "specs/other-feature/spec.md"):
+        with pytest.raises(InvalidArtifactPathError):
+            await service.read_artifact(workspace.id, workflow.id, "plan", user.id, rel_path=bad)
+
+
+async def test_read_artifact_reads_design_file_within_spec_dir(db_session):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"read-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user)
+    await session.commit()
+
+    target = f"{workflow.spec_dir}/research.md"
+    runtime = ScriptedRuntime(files={target: "# Research\nDecision: use JWT"})
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+    path, content = await service.read_artifact(
+        workspace.id, workflow.id, "plan", user.id, rel_path=target
+    )
+    assert path == target
+    assert "use JWT" in content
+
+
+# --- Feature 2: analyze open questions + answer loop ------------------------------------
+
+
+async def _seed_running_analyze(session, workspace, workflow):
+    """Mark analyze as running with a completed agent run, ready to finalize."""
+    run = AgentRun(
+        workspace_id=workspace.id,
+        user_id=workflow.user_id,
+        prompt="analyze",
+        status="completed",
+        provider="mock",
+        model="mock-agent",
+    )
+    session.add(run)
+    await session.flush()
+    analyze = (
+        await session.execute(
+            select(SpecPhase).where(
+                SpecPhase.workflow_id == workflow.id, SpecPhase.phase == "analyze"
+            )
+        )
+    ).scalar_one()
+    analyze.status = "running"
+    analyze.agent_run_id = run.id
+    analyze.artifact_path = f"{workflow.spec_dir}/analysis.md"
+    session.add(analyze)
+    await session.commit()
+    return run
+
+
+async def test_analyze_finalizer_halts_when_open_questions_exist(db_session):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"anq-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user, phase_status={"plan": "approved"})
+    run = await _seed_running_analyze(session, workspace, workflow)
+
+    runtime = ScriptedRuntime(
+        files={
+            f"{workflow.spec_dir}/open-questions.json": (
+                '[{"id": "A1", "category": "Ambiguity", "severity": "HIGH", '
+                '"summary": "vague perf target", "recommendation": "quantify"}]'
+            )
+        }
+    )
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+    await service._finalize_phase(workflow.id, "analyze", run.id, user.id)
+
+    async with session_maker() as verify:
+        refreshed = (
+            await verify.execute(
+                select(SpecPhase).where(
+                    SpecPhase.workflow_id == workflow.id, SpecPhase.phase == "analyze"
+                )
+            )
+        ).scalar_one()
+        assert refreshed.status == "awaiting_review"
+
+
+async def test_analyze_finalizer_completes_when_no_open_questions(db_session):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"anc-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user, phase_status={"plan": "approved"})
+    run = await _seed_running_analyze(session, workspace, workflow)
+
+    runtime = ScriptedRuntime(files={f"{workflow.spec_dir}/open-questions.json": "[]"})
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+    await service._finalize_phase(workflow.id, "analyze", run.id, user.id)
+
+    async with session_maker() as verify:
+        refreshed = (
+            await verify.execute(
+                select(SpecPhase).where(
+                    SpecPhase.workflow_id == workflow.id, SpecPhase.phase == "analyze"
+                )
+            )
+        ).scalar_one()
+        assert refreshed.status == "completed"
+
+
+async def test_submit_analyze_answers_reruns_analyze(db_session, monkeypatch):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"ans-{uuid4()}@example.com")
+    workflow = await make_workflow(
+        session,
+        workspace,
+        user,
+        phase_status={"plan": "approved", "analyze": "awaiting_review"},
+    )
+    await session.commit()
+
+    captured: dict[str, str] = {}
+
+    async def fake_create_run(self, workspace_id, user_id, prompt, working_dir=None):
+        captured["prompt"] = prompt
+        run = AgentRun(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            prompt=prompt,
+            status="thinking",
+            provider="mock",
+            model="mock-agent",
+        )
+        self.session.add(run)
+        await self.session.flush()
+        return run
+
+    async def noop_finalize(self, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr("app.services.agents.AgentService.create_run", fake_create_run)
+    monkeypatch.setattr(SpecKitService, "_finalize_phase", noop_finalize)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    phase = await service.submit_analyze_answers(
+        workspace.id,
+        workflow.id,
+        user.id,
+        [{"id": "A1", "answer": "Target p95 < 200ms"}],
+    )
+
+    assert phase.status == "running"
+    assert phase.attempt == 2
+    assert "Target p95 < 200ms" in captured["prompt"]
+
+    audits = (
+        (
+            await session.execute(
+                select(AuditLog).where(AuditLog.action == "spec_analyze_answered")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(audits) >= 1
+
+
+async def test_submit_analyze_answers_rejects_when_not_awaiting_review(db_session):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"rej-{uuid4()}@example.com")
+    workflow = await make_workflow(
+        session, workspace, user, phase_status={"plan": "approved", "analyze": "completed"}
+    )
+    await session.commit()
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    with pytest.raises(SpecPhaseNotReviewableError):
+        await service.submit_analyze_answers(
+            workspace.id, workflow.id, user.id, [{"id": "A1", "answer": "x"}]
+        )

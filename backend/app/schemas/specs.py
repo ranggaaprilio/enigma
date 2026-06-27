@@ -90,3 +90,44 @@ class SpecArtifactResponse(BaseModel):
     phase: SpecPhaseName
     path: str | None
     content: str
+
+
+class SpecArtifactItem(BaseModel):
+    name: str
+    path: str
+
+
+class SpecArtifactListResponse(BaseModel):
+    phase: SpecPhaseName
+    items: list[SpecArtifactItem]
+
+
+class OpenQuestion(BaseModel):
+    id: str
+    category: str | None = None
+    severity: str | None = None
+    location: str | None = None
+    summary: str | None = None
+    recommendation: str | None = None
+
+
+class OpenQuestionsResponse(BaseModel):
+    phase: SpecPhaseName
+    items: list[OpenQuestion]
+
+
+class AnalyzeAnswer(BaseModel):
+    id: str = Field(min_length=1)
+    answer: str = Field(min_length=1, max_length=20_000)
+
+    @field_validator("id", "answer")
+    @classmethod
+    def normalize(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Value cannot be empty")
+        return stripped
+
+
+class AnalyzeAnswersRequest(BaseModel):
+    answers: list[AnalyzeAnswer] = Field(min_length=1)

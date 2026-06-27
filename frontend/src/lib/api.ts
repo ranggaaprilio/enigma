@@ -583,9 +583,11 @@ export function cloneRepository(workspaceId: string): Promise<RepositoryOperatio
 
 export function getRepositoryStatus(
   workspaceId: string,
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<RepositoryStatusResponse> {
-  return requestJson<RepositoryStatusResponse>(`/workspaces/${workspaceId}/repo/status`, {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<RepositoryStatusResponse>(`/workspaces/${workspaceId}/repo/status${query}`, {
     signal,
   });
 }
@@ -593,9 +595,13 @@ export function getRepositoryStatus(
 export function getRepositoryDiff(
   workspaceId: string,
   path?: string,
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<RepositoryDiffResponse> {
-  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  const query = params.toString() ? `?${params.toString()}` : "";
   return requestJson<RepositoryDiffResponse>(`/workspaces/${workspaceId}/repo/diff${query}`, {
     signal,
   });
@@ -1368,6 +1374,30 @@ export type SpecArtifactResponse = {
   content: string;
 };
 
+export type SpecArtifactItem = {
+  name: string;
+  path: string;
+};
+
+export type SpecArtifactListResponse = {
+  phase: SpecPhaseName;
+  items: SpecArtifactItem[];
+};
+
+export type OpenQuestion = {
+  id: string;
+  category: string | null;
+  severity: string | null;
+  location: string | null;
+  summary: string | null;
+  recommendation: string | null;
+};
+
+export type OpenQuestionsResponse = {
+  phase: SpecPhaseName;
+  items: OpenQuestion[];
+};
+
 export type SpecWorkflowCreatePayload = {
   feature_name: string;
   description: string;
@@ -1407,11 +1437,47 @@ export function getSpecArtifact(
   workspaceId: string,
   workflowId: string,
   phase: SpecPhaseName,
+  path?: string,
   signal?: AbortSignal,
 ): Promise<SpecArtifactResponse> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : "";
   return requestJson<SpecArtifactResponse>(
-    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/artifact`,
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/artifact${query}`,
     { signal },
+  );
+}
+
+export function listSpecArtifacts(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+  signal?: AbortSignal,
+): Promise<SpecArtifactListResponse> {
+  return requestJson<SpecArtifactListResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/artifacts`,
+    { signal },
+  );
+}
+
+export function getAnalyzeQuestions(
+  workspaceId: string,
+  workflowId: string,
+  signal?: AbortSignal,
+): Promise<OpenQuestionsResponse> {
+  return requestJson<OpenQuestionsResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/analyze/questions`,
+    { signal },
+  );
+}
+
+export function submitAnalyzeAnswers(
+  workspaceId: string,
+  workflowId: string,
+  answers: { id: string; answer: string }[],
+): Promise<SpecPhaseResponse> {
+  return requestJson<SpecPhaseResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/analyze/answers`,
+    { method: "POST", body: JSON.stringify({ answers }) },
   );
 }
 

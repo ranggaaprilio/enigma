@@ -98,14 +98,27 @@ class FakeRepositoryService:
     async def clone(self, workspace_id: UUID, owner_id: UUID) -> None:
         self._ensure_operation("clone", workspace_id, owner_id)
 
-    async def status(self, workspace_id: UUID, owner_id: UUID) -> GitStatus:
+    async def status(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        *,
+        worktree_path: str | None = None,
+    ) -> GitStatus:
         self._ensure_workspace(workspace_id, owner_id)
-        self.calls.append("status")
+        self.calls.append(f"status:{worktree_path}")
         return self.status_response
 
-    async def diff(self, workspace_id: UUID, owner_id: UUID, path: str | None = None) -> str:
+    async def diff(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        path: str | None = None,
+        *,
+        worktree_path: str | None = None,
+    ) -> str:
         self._ensure_workspace(workspace_id, owner_id)
-        self.calls.append(f"diff:{path}")
+        self.calls.append(f"diff:{path}:{worktree_path}")
         return self.diff_response
 
     async def pull(self, workspace_id: UUID, owner_id: UUID) -> None:
@@ -267,6 +280,37 @@ async def test_repository_status_diff_and_operations(repository_context):
     assert repo_service.calls[-4:] == ["clone", "pull", "commit:Update README", "push"]
 
 
+async def test_status_and_diff_scope_to_selected_worktree(repository_context):
+    _user, workspace, repo_service = repository_context
+    worktree_id = uuid4()
+    worktree_path = "/workspace/worktrees/feat-login"
+
+    class FakeWorktreeService:
+        async def get_worktree(self, ws_id, owner_id, wt_id):
+            assert ws_id == workspace.id
+            assert wt_id == worktree_id
+            return SimpleNamespace(path=worktree_path)
+
+    app.dependency_overrides[workspaces_module.get_worktree_service] = FakeWorktreeService
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        status_response = await client.get(
+            f"/workspaces/{workspace.id}/repo/status",
+            params={"worktree_id": str(worktree_id)},
+        )
+        diff_response = await client.get(
+            f"/workspaces/{workspace.id}/repo/diff",
+            params={"path": "README.md", "worktree_id": str(worktree_id)},
+        )
+
+    assert status_response.status_code == 200
+    assert diff_response.status_code == 200
+    # The resolved worktree path is forwarded to the repository service for both reads.
+    assert f"status:{worktree_path}" in repo_service.calls
+    assert f"diff:README.md:{worktree_path}" in repo_service.calls
+
+
 @pytest.mark.parametrize(
     ("service_error", "expected_status"),
     [
@@ -386,3 +430,66 @@ async def test_clone_uses_daytona_git_with_branch_and_credentials(tmp_path):
             "password": "raw-secret-token",
         }
     ]
+
+
+async def test_status_uses_git_cli_for_worktrees(tmp_path):
+    user_id = uuid4()
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=user_id,
+        name="Demo",
+        slug="demo",
+        repo_url="https://github.com/example/demo.git",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-1",
+        workspace_path="/workspace",
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    worktree_path = "/workspace/worktrees/feat-login"
+    commands: list[tuple[str, str | None]] = []
+
+    class FakeFs:
+        async def get_file_info(self, path):
+            return SimpleNamespace(name=path)  # exists => treated as cloned
+
+    class FakeRuntime:
+        async def get_sandbox(self, workspace):
+            # No ``git`` attribute: if status() fell back to the SDK path it would raise.
+            return SimpleNamespace(fs=FakeFs())
+
+        async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
+            commands.append((command, cwd))
+            if command == "git status --porcelain":
+                return SimpleNamespace(
+                    exit_code=0, stdout=" M README.md\n?? new.py\n", stderr=""
+                )
+            if command == "git branch --show-current":
+                return SimpleNamespace(exit_code=0, stdout="feat-login\n", stderr="")
+            return SimpleNamespace(exit_code=1, stdout="", stderr="unexpected command")
+
+    service = RepositoryService(
+        session=None,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(Settings().workspace_env_encryption_key),
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+    )
+
+    async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
+        return workspace
+
+    service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
+
+    result = await service.status(workspace.id, user_id, worktree_path=worktree_path)
+
+    assert result.cloned is True
+    assert result.branch == "feat-login"
+    assert result.is_clean is False
+    assert result.files == [
+        GitFileStatus(path="README.md", status="M"),
+        GitFileStatus(path="new.py", status="??"),
+    ]
+    # Both reads run via the git CLI against the worktree directory, not the SDK.
+    assert ("git status --porcelain", worktree_path) in commands
+    assert ("git branch --show-current", worktree_path) in commands

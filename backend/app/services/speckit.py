@@ -13,6 +13,7 @@ Scaffolding and git (``specify init``, ``git worktree``, commits) run directly t
 """
 
 import asyncio
+import json
 import re
 import shlex
 from datetime import UTC, datetime
@@ -63,7 +64,11 @@ PREREQUISITES: dict[str, tuple[str, ...]] = {
 
 # `specify init` flags. Build-time network is allowed; this runs offline from bundled
 # templates. NOTE: verify these flags against the installed specify-cli version.
-SPECIFY_INIT_COMMAND = "specify init . --ai claude --script sh --ignore-agent-tools --force"
+# The agent-selection flag was renamed `--ai` -> `--integration` in recent spec-kit
+# releases; the Daytona snapshot tracks latest (see daytona/Dockerfile SPEC_KIT_REF).
+SPECIFY_INIT_COMMAND = (
+    "specify init . --integration claude --script sh --ignore-agent-tools --force"
+)
 
 GIT_TIMEOUT_SECONDS = 120
 # Upper bound for how long a phase's agent run may take before the finalizer gives up.
@@ -93,6 +98,10 @@ class SpecPhaseNotReviewableError(SpecKitError):
     pass
 
 
+class InvalidArtifactPathError(SpecKitError):
+    """A requested artifact path escapes the workflow's spec directory."""
+
+
 class SpecGateError(SpecKitError):
     """A phase cannot run because its prerequisite phases are not approved."""
 
@@ -116,11 +125,15 @@ class PhasePlan:
         artifact: str | None,
         template: str | None,
         inputs: tuple[str, ...],
+        design_artifacts: tuple[str, ...] = (),
     ) -> None:
         self.command = command
         self.artifact = artifact
         self.template = template
         self.inputs = inputs
+        # Supporting files produced alongside ``artifact`` (relative to ``spec_dir``). A trailing
+        # slash marks a directory whose files are enumerated rather than a single file.
+        self.design_artifacts = design_artifacts
 
 
 PHASE_PLANS: dict[str, PhasePlan] = {
@@ -147,6 +160,7 @@ PHASE_PLANS: dict[str, PhasePlan] = {
         artifact="{spec_dir}/plan.md",
         template="plan-template.md",
         inputs=("spec.md",),
+        design_artifacts=("research.md", "data-model.md", "contracts/", "quickstart.md"),
     ),
     "analyze": PhasePlan(
         command="speckit.analyze",
@@ -386,6 +400,75 @@ class SpecKitService:
             workspace_id, workflow_id, phase_name, user_id, feedback=notes
         )
 
+    async def get_open_questions(
+        self,
+        workspace_id: UUID,
+        workflow_id: UUID,
+        user_id: UUID,
+    ) -> list[dict]:
+        """Read the structured open questions produced by the latest ``analyze`` run."""
+        workspace = await self._get_workspace(workspace_id, user_id)
+        workflow = await self._get_workflow_row(workspace_id, workflow_id)
+        return await self._read_open_questions(workspace, workflow)
+
+    async def submit_analyze_answers(
+        self,
+        workspace_id: UUID,
+        workflow_id: UUID,
+        user_id: UUID,
+        answers: list[dict[str, str]],
+    ) -> SpecPhase:
+        """Fold the developer's answers into a remediation re-run of ``analyze``.
+
+        The re-run edits spec.md/plan.md/tasks.md to resolve each answered finding, then
+        regenerates analysis.md + open-questions.json (advisory: it never gates ``implement``).
+        """
+        workspace = await self._get_workspace(workspace_id, user_id)
+        workflow = await self._get_workflow_row(workspace_id, workflow_id)
+        phase = await self._get_phase_row(workflow_id, "analyze")
+        if phase.status != "awaiting_review":
+            raise SpecPhaseNotReviewableError("analyze")
+
+        questions = await self._read_open_questions(workspace, workflow)
+        feedback = self._format_analyze_feedback(answers, questions)
+
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            action="spec_analyze_answered",
+            target_type="spec_phase",
+            target_id=phase.id,
+            metadata={"workflow_id": workflow_id, "answered": len(answers)},
+        )
+        await NotificationService(self.session).create(
+            user_id=user_id,
+            workspace_id=workspace_id,
+            notification_type="spec_analyze_answered",
+            title="Analyze answers submitted",
+            message="Re-running 'analyze' to apply your answers.",
+        )
+        # Re-run analyze with the answers folded into the prompt as remediation feedback.
+        return await self.run_phase(
+            workspace_id, workflow_id, "analyze", user_id, feedback=feedback
+        )
+
+    @staticmethod
+    def _format_analyze_feedback(
+        answers: list[dict[str, str]], questions: list[dict]
+    ) -> str:
+        by_id = {str(q.get("id")): q for q in questions}
+        lines = []
+        for answer in answers:
+            qid = str(answer.get("id", "")).strip()
+            text = str(answer.get("answer", "")).strip()
+            if not qid or not text:
+                continue
+            summary = str(by_id.get(qid, {}).get("summary", "")).strip()
+            prefix = f"[{qid}] {summary}".strip()
+            lines.append(f"- {prefix} → Answer: {text}")
+        header = "Developer answers to the open questions from the previous analysis:\n\n"
+        return header + "\n".join(lines)
+
     async def list_workflows(self, workspace_id: UUID, user_id: UUID) -> list[SpecWorkflow]:
         await self._get_workspace(workspace_id, user_id)
         result = await self.session.execute(
@@ -423,15 +506,57 @@ class SpecKitService:
         workflow_id: UUID,
         phase_name: str,
         user_id: UUID,
+        rel_path: str | None = None,
     ) -> tuple[str | None, str]:
         workspace = await self._get_workspace(workspace_id, user_id)
         workflow = await self._get_workflow_row(workspace_id, workflow_id)
         phase = await self._get_phase_row(workflow_id, phase_name)
+        working_dir = self._working_dir(workspace, workflow, phase_name)
+        if rel_path is not None:
+            target = self._validate_spec_path(workflow, rel_path)
+            content = await self._read_file(workspace, working_dir, target)
+            return target, content or ""
         if not phase.artifact_path:
             return None, ""
-        working_dir = self._working_dir(workspace, workflow, phase_name)
         content = await self._read_file(workspace, working_dir, phase.artifact_path)
         return phase.artifact_path, content or ""
+
+    async def list_phase_artifacts(
+        self,
+        workspace_id: UUID,
+        workflow_id: UUID,
+        phase_name: str,
+        user_id: UUID,
+    ) -> list[tuple[str, str]]:
+        """Return ``(display_name, path)`` for every artifact file a phase has produced.
+
+        For ``plan`` this includes the primary ``plan.md`` plus whichever design files exist
+        (``research.md``, ``data-model.md``, ``contracts/*``, ``quickstart.md``). Other phases
+        return their single artifact (when present).
+        """
+        if phase_name not in PHASE_PLANS:
+            raise InvalidSpecPhaseError(phase_name)
+        workspace = await self._get_workspace(workspace_id, user_id)
+        workflow = await self._get_workflow_row(workspace_id, workflow_id)
+        plan = PHASE_PLANS[phase_name]
+        working_dir = self._working_dir(workspace, workflow, phase_name)
+
+        items: list[tuple[str, str]] = []
+        primary = plan.artifact.format(spec_dir=workflow.spec_dir) if plan.artifact else None
+        if primary and await self._path_exists(workspace, working_dir, primary):
+            items.append((primary.rsplit("/", 1)[-1], primary))
+
+        for design in plan.design_artifacts:
+            if design.endswith("/"):
+                sub = design.rstrip("/")
+                rel_dir = f"{workflow.spec_dir}/{sub}"
+                for name in await self._list_dir(workspace, working_dir, rel_dir):
+                    items.append((f"{sub}/{name}", f"{rel_dir}/{name}"))
+            else:
+                rel = f"{workflow.spec_dir}/{design}"
+                if await self._path_exists(workspace, working_dir, rel):
+                    items.append((design, rel))
+        return items
 
     # ----- worktree + prompt helpers -----------------------------------------------
 
@@ -515,7 +640,13 @@ class SpecKitService:
                 f"artifact:\n\n{feedback.strip()}"
             )
 
-        if artifact_path:
+        if phase_name == "plan":
+            sections.append(self._plan_output_instructions(workflow.spec_dir))
+        elif phase_name == "analyze":
+            sections.append(
+                self._analyze_output_instructions(workflow.spec_dir, feedback is not None)
+            )
+        elif artifact_path:
             sections.append(
                 "When finished, write the COMPLETE artifact to the file "
                 f"`{artifact_path}` using the write_file tool. Do not run git or shell "
@@ -527,6 +658,56 @@ class SpecKitService:
                 "tools. Do not run git; the platform will commit your changes."
             )
         return "\n\n---\n\n".join(sections)
+
+    @staticmethod
+    def _plan_output_instructions(spec_dir: str) -> str:
+        """Mirror Spec Kit's /plan Phase 0 + Phase 1: emit the full design set, not just plan.md."""
+        return (
+            "Produce the full GitHub Spec Kit plan design set, writing each file with the "
+            "write_file tool. Do NOT run git or shell scripts; only read and write files.\n"
+            f"1. `{spec_dir}/plan.md` — the completed implementation plan (fill the template "
+            "above).\n"
+            f"2. Phase 0 — `{spec_dir}/research.md`: for every unknown or clarification in the "
+            "plan's Technical Context, record `Decision:` / `Rationale:` / `Alternatives "
+            "considered:`.\n"
+            f"3. Phase 1 — `{spec_dir}/data-model.md`: entities, fields, relationships, validation "
+            "rules, and state transitions extracted from the spec.\n"
+            f"4. Phase 1 — contract files under `{spec_dir}/contracts/` (one file per interface, "
+            "e.g. OpenAPI/JSON Schema for APIs, command schemas for CLIs). Create this directory "
+            "ONLY if the feature exposes external interfaces; skip it for purely internal "
+            "features.\n"
+            f"5. Phase 1 — `{spec_dir}/quickstart.md`: runnable validation steps that prove the "
+            "feature end-to-end (prerequisites, setup, commands, expected outcomes). Reference the "
+            "contracts and data model instead of duplicating them; do not include full "
+            "implementation code.\n"
+            "Write the complete content of each file; do not output the artifacts in chat."
+        )
+
+    @staticmethod
+    def _analyze_output_instructions(spec_dir: str, remediating: bool) -> str:
+        """Emit both the human report and a machine-readable open-questions list."""
+        base = (
+            "Cross-check spec.md, plan.md, and tasks.md for issues and write TWO files with the "
+            "write_file tool (do NOT run git or shell scripts):\n"
+            f"1. `{spec_dir}/analysis.md` — a human-readable report: a findings table with columns "
+            "ID | Category | Severity | Location(s) | Summary | Recommendation, plus a coverage "
+            "summary and metrics.\n"
+            f"2. `{spec_dir}/open-questions.json` — a JSON array (machine-readable) where each "
+            'item is `{"id": "A1", "category": "Ambiguity", "severity": "HIGH", "location": '
+            '"spec.md:L20", "summary": "...", "recommendation": "..."}`. Category is one of '
+            "Duplication, Ambiguity, Underspecification, Constitution, Coverage, Inconsistency. "
+            "Severity is one of CRITICAL, HIGH, MEDIUM, LOW. Use the SAME ids as the report table. "
+            "Write `[]` (an empty array) if there are no open questions."
+        )
+        if remediating:
+            base += (
+                "\n\nThe feedback above contains the developer's answers to specific findings. "
+                "First EDIT the relevant artifacts (spec.md, plan.md, and/or tasks.md) to resolve "
+                "each answered finding, then regenerate analysis.md and open-questions.json so the "
+                "resolved findings are removed and only remaining or newly discovered ones are "
+                "listed."
+            )
+        return base
 
     # ----- finalizer ----------------------------------------------------------------
 
@@ -569,6 +750,15 @@ class SpecKitService:
             if phase_name in REVIEW_PHASES:
                 phase.status = "awaiting_review"
                 workflow.status = "awaiting_review"
+            elif phase_name == "analyze":
+                # Advisory: halt for answers only while open questions remain; never gate
+                # ``implement`` (analyze is absent from PREREQUISITES["implement"]).
+                if await self._read_open_questions(workspace, workflow):
+                    phase.status = "awaiting_review"
+                    workflow.status = "awaiting_review"
+                else:
+                    phase.status = "completed"
+                    workflow.status = "running"
             else:
                 phase.status = "completed"
                 workflow.status = "completed" if phase_name == "implement" else "running"
@@ -669,6 +859,48 @@ class SpecKitService:
             timeout=GIT_TIMEOUT_SECONDS,
         )
         return result.exit_code == 0
+
+    async def _list_dir(self, workspace: Workspace, cwd: str, rel_dir: str) -> list[str]:
+        result = await self.runtime.exec(
+            workspace,
+            f"ls -1 {shlex.quote(rel_dir)}",
+            cwd=cwd,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            return []
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    async def _read_open_questions(
+        self, workspace: Workspace, workflow: SpecWorkflow
+    ) -> list[dict]:
+        working_dir = self._working_dir(workspace, workflow, "analyze")
+        raw = await self._read_file(
+            workspace, working_dir, f"{workflow.spec_dir}/open-questions.json"
+        )
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except (ValueError, TypeError):
+            return []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+
+    @staticmethod
+    def _validate_spec_path(workflow: SpecWorkflow, rel_path: str) -> str:
+        """Constrain an artifact request to files inside the workflow's spec directory."""
+        candidate = rel_path.strip()
+        prefix = workflow.spec_dir.rstrip("/") + "/"
+        if (
+            not candidate
+            or candidate.startswith("/")
+            or ".." in candidate.split("/")
+            or not candidate.startswith(prefix)
+        ):
+            raise InvalidArtifactPathError(rel_path)
+        return candidate
 
     async def _assert_prerequisites(self, workflow_id: UUID, phase_name: str) -> None:
         required = PREREQUISITES.get(phase_name, ())

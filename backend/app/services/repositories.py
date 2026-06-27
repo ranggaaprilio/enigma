@@ -194,6 +194,12 @@ class RepositoryService:
         sandbox = await self.runtime.get_sandbox(workspace)
         if not await self._is_cloned(sandbox, repo_path):
             return GitStatus(cloned=False, branch=None, is_clean=True, files=[])
+        # A linked worktree's ``.git`` is a pointer file that Daytona's server-side git (go-git)
+        # cannot resolve references through ("reference not found"), so read its status with the
+        # git CLI — the same way diffs and worktree stats already do. The base clone keeps the
+        # richer SDK status.
+        if worktree_path is not None:
+            return await self._status_via_cli(workspace, repo_path)
         try:
             result = await sandbox.git.status(repo_path)
         except Exception as error:
@@ -208,6 +214,26 @@ class RepositoryService:
         return GitStatus(
             cloned=True,
             branch=getattr(result, "current_branch", None),
+            is_clean=len(files) == 0,
+            files=files,
+        )
+
+    async def _status_via_cli(self, workspace: Workspace, repo_path: str) -> GitStatus:
+        porcelain = await self.runtime.exec(
+            workspace, "git status --porcelain", cwd=repo_path
+        )
+        if porcelain.exit_code != 0:
+            raise GitCommandError(
+                porcelain.stderr or porcelain.stdout or "Git status failed"
+            )
+        files = parse_porcelain_status(porcelain.stdout)
+        branch_result = await self.runtime.exec(
+            workspace, "git branch --show-current", cwd=repo_path
+        )
+        branch = branch_result.stdout.strip() if branch_result.exit_code == 0 else ""
+        return GitStatus(
+            cloned=True,
+            branch=branch or None,
             is_clean=len(files) == 0,
             files=files,
         )

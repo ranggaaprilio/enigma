@@ -50,8 +50,10 @@ RUN set -eux; \
 # SDD workflow (docs/improvement-epics/01-spec-driven-development.md) works at runtime.
 # uv tool install drops the `specify` entry point into $HOME/.local/bin, which is exactly
 # where the runtime PATH (set below) looks. Pin SPEC_KIT_REF to a tagged release for
-# reproducible snapshots; empty = latest at build time.
-ARG SPEC_KIT_REF=
+# reproducible snapshots; empty = latest at build time. Pinned so the runtime
+# `specify init --integration claude ...` (backend/app/services/speckit.py) stays in sync
+# with the installed CLI surface and doesn't drift on upstream breaking changes.
+ARG SPEC_KIT_REF=v0.11.9
 RUN set -eux; \
     curl -fsSL https://astral.sh/uv/install.sh | sh; \
     if [ -n "${SPEC_KIT_REF}" ]; then \

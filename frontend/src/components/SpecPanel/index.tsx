@@ -19,12 +19,17 @@ import {
   approveSpecPhase,
   createSpecWorkflow,
   getAgentStreamUrl,
+  getAnalyzeQuestions,
   getSpecArtifact,
   getSpecWorkflow,
+  listSpecArtifacts,
   listSpecWorkflows,
   requestSpecChanges,
   runSpecPhase,
+  submitAnalyzeAnswers,
   type AgentEventResponse,
+  type OpenQuestion,
+  type SpecArtifactItem,
   type SpecPhaseName,
   type SpecPhaseResponse,
   type SpecPhaseStatus,
@@ -66,6 +71,10 @@ const PREREQUISITES: Record<SpecPhaseName, SpecPhaseName[]> = {
 };
 
 const ACTIVE_WORKFLOW_STATUSES = new Set(["pending", "running"]);
+
+// Phases that produce more than one artifact file (Spec Kit's plan design set). These render a
+// file selector; every other phase shows its single artifact.
+const MULTI_ARTIFACT_PHASES = new Set<SpecPhaseName>(["plan"]);
 
 export function SpecPanel({ workspace }: { workspace: WorkspaceResponse }) {
   const workspaceId = workspace.id;
@@ -308,6 +317,20 @@ function WorkflowDetail({
     }
   }
 
+  async function handleSubmitAnswers(answers: { id: string; answer: string }[]) {
+    setBusyPhase("analyze");
+    setActionError(null);
+    try {
+      await submitAnalyzeAnswers(workspaceId, workflow.id, answers);
+      await refresh();
+      setActivePhase("analyze");
+    } catch (error) {
+      setActionError(error instanceof ApiError ? error.message : "Failed to submit answers");
+    } finally {
+      setBusyPhase(null);
+    }
+  }
+
   const activePhaseRow = phaseByName(activePhase);
 
   return (
@@ -366,6 +389,7 @@ function WorkflowDetail({
           onRun={() => handleRun(activePhase)}
           onApprove={() => handleApprove(activePhase)}
           onRequestChanges={(notes) => handleRequestChanges(activePhase, notes)}
+          onSubmitAnswers={handleSubmitAnswers}
         />
       )}
     </div>
@@ -382,6 +406,7 @@ function PhaseDetail({
   onRun,
   onApprove,
   onRequestChanges,
+  onSubmitAnswers,
 }: {
   workspaceId: string;
   workflow: SpecWorkflowResponse;
@@ -392,21 +417,50 @@ function PhaseDetail({
   onRun: () => void;
   onApprove: () => void;
   onRequestChanges: (notes: string) => void;
+  onSubmitAnswers: (answers: { id: string; answer: string }[]) => void;
 }) {
   const [artifact, setArtifact] = useState<string | null>(null);
   const [artifactError, setArtifactError] = useState<string | null>(null);
+  const [items, setItems] = useState<SpecArtifactItem[]>([]);
+  const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [questions, setQuestions] = useState<OpenQuestion[]>([]);
+  const [answers, setAnswers] = useState<Record<string, string>>({});
   const [notesOpen, setNotesOpen] = useState(false);
   const [notes, setNotes] = useState("");
   const [confirmImplement, setConfirmImplement] = useState(false);
 
   const hasArtifact = phase.status === "awaiting_review" || phase.status === "approved" || phase.status === "completed" || phase.status === "changes_requested";
+  const isMultiArtifact = MULTI_ARTIFACT_PHASES.has(phase.phase);
+  const isAnalyzeReview = phase.phase === "analyze" && phase.status === "awaiting_review";
 
+  // For multi-artifact phases (plan), load the file list and default the selection to the first.
+  useEffect(() => {
+    setItems([]);
+    setSelectedPath(null);
+    if (!hasArtifact || !isMultiArtifact) return;
+    let cancelled = false;
+    listSpecArtifacts(workspaceId, workflow.id, phase.phase)
+      .then((response) => {
+        if (cancelled) return;
+        setItems(response.items);
+        setSelectedPath(response.items[0]?.path ?? null);
+      })
+      .catch(() => {
+        // Fall back to the primary artifact (selectedPath stays null).
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, workflow.id, phase.phase, phase.status, phase.attempt, hasArtifact, isMultiArtifact]);
+
+  // Load the selected file's content (or the single primary artifact when no selection exists).
   useEffect(() => {
     setArtifact(null);
     setArtifactError(null);
     if (!hasArtifact) return;
+    if (isMultiArtifact && selectedPath === null && items.length > 0) return; // awaiting selection
     let cancelled = false;
-    getSpecArtifact(workspaceId, workflow.id, phase.phase)
+    getSpecArtifact(workspaceId, workflow.id, phase.phase, selectedPath ?? undefined)
       .then((response) => {
         if (!cancelled) setArtifact(response.content);
       })
@@ -417,10 +471,39 @@ function PhaseDetail({
     return () => {
       cancelled = true;
     };
-  }, [workspaceId, workflow.id, phase.phase, phase.status, phase.attempt, hasArtifact]);
+  }, [
+    workspaceId,
+    workflow.id,
+    phase.phase,
+    phase.status,
+    phase.attempt,
+    hasArtifact,
+    isMultiArtifact,
+    selectedPath,
+    items.length,
+  ]);
+
+  // Load structured open questions whenever analyze halts for answers.
+  useEffect(() => {
+    setQuestions([]);
+    setAnswers({});
+    if (!isAnalyzeReview) return;
+    let cancelled = false;
+    getAnalyzeQuestions(workspaceId, workflow.id)
+      .then((response) => {
+        if (!cancelled) setQuestions(response.items);
+      })
+      .catch(() => {
+        // No structured questions available; the analysis.md report still renders.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, workflow.id, phase.phase, phase.status, phase.attempt, isAnalyzeReview]);
 
   const isImplement = phase.phase === "implement";
   const runDisabled = busy || !canRun || (isImplement && !implementUnlocked);
+  const answeredCount = questions.filter((q) => (answers[q.id] ?? "").trim().length > 0).length;
 
   return (
     <div className="rounded-md border border-line bg-white p-5 shadow-soft">
@@ -519,6 +602,74 @@ function PhaseDetail({
         </div>
       )}
 
+      {isAnalyzeReview && questions.length > 0 && (
+        <div className="mt-4 rounded-md border border-warn/30 bg-[#fffbf0] p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h4 className="text-sm font-semibold text-ink">Open questions ({questions.length})</h4>
+            <span className="text-xs text-muted">
+              Answers edit spec/plan/tasks, then re-analyze. Advisory — never blocks implement.
+            </span>
+          </div>
+          <div className="mt-3 flex flex-col gap-3">
+            {questions.map((question) => (
+              <div key={question.id} className="rounded-md border border-line bg-white p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="font-mono text-xs text-muted">{question.id}</span>
+                  {question.severity && <SeverityBadge severity={question.severity} />}
+                  {question.category && (
+                    <span className="rounded-full bg-panel px-2 py-0.5 text-xs text-body">
+                      {question.category}
+                    </span>
+                  )}
+                  {question.location && (
+                    <span className="font-mono text-xs text-muted">{question.location}</span>
+                  )}
+                </div>
+                {question.summary && <p className="mt-2 text-sm text-ink">{question.summary}</p>}
+                {question.recommendation && (
+                  <p className="mt-1 text-xs text-muted">
+                    Recommendation: {question.recommendation}
+                  </p>
+                )}
+                <textarea
+                  className="mt-2 min-h-[64px] w-full rounded-md border border-line bg-white px-3 py-2 text-sm outline-none transition focus:border-ink"
+                  placeholder="Your answer…"
+                  value={answers[question.id] ?? ""}
+                  onChange={(event) =>
+                    setAnswers((prev) => ({ ...prev, [question.id]: event.target.value }))
+                  }
+                />
+              </div>
+            ))}
+          </div>
+          <div className="mt-3 flex justify-end">
+            <button
+              type="button"
+              disabled={busy || answeredCount === 0}
+              onClick={() =>
+                onSubmitAnswers(
+                  questions
+                    .filter((question) => (answers[question.id] ?? "").trim().length > 0)
+                    .map((question) => ({
+                      id: question.id,
+                      answer: (answers[question.id] ?? "").trim(),
+                    })),
+                )
+              }
+              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-primary-active disabled:opacity-50"
+            >
+              {busy ? (
+                <Loader2 className="h-4 w-4 animate-spin" />
+              ) : (
+                <RotateCcw className="h-4 w-4" />
+              )}
+              Submit {answeredCount > 0 ? `${answeredCount} ` : ""}
+              answer{answeredCount === 1 ? "" : "s"} & re-analyze
+            </button>
+          </div>
+        </div>
+      )}
+
       <div className="mt-4">
         {phase.status === "running" && phase.agent_run_id ? (
           <PhaseStream workspaceId={workspaceId} runId={phase.agent_run_id} />
@@ -526,22 +677,44 @@ function PhaseDetail({
           <p className="rounded-md border border-danger/30 bg-[#fff5f2] p-3 text-sm text-danger">
             This phase ended with an error. Re-run it to try again.
           </p>
-        ) : artifactError ? (
-          <p className="rounded-md border border-danger/30 bg-[#fff5f2] p-3 text-sm text-danger">
-            {artifactError}
-          </p>
-        ) : hasArtifact && artifact !== null ? (
-          artifact.trim() ? (
-            <ArtifactMarkdown content={artifact} />
-          ) : (
-            <p className="text-sm text-muted">The artifact file is empty.</p>
-          )
-        ) : hasArtifact ? (
-          <p className="text-sm text-muted">Loading artifact…</p>
         ) : (
-          <p className="text-sm text-muted">
-            This phase has not produced an artifact yet. Run it to generate one.
-          </p>
+          <>
+            {items.length > 1 && (
+              <div className="mb-3 flex flex-wrap gap-1.5">
+                {items.map((item) => (
+                  <button
+                    key={item.path}
+                    type="button"
+                    onClick={() => setSelectedPath(item.path)}
+                    className={`rounded-md border px-2.5 py-1 font-mono text-xs transition ${
+                      selectedPath === item.path
+                        ? "border-ink bg-ink text-white"
+                        : "border-line bg-white text-body hover:bg-panel"
+                    }`}
+                  >
+                    {item.name}
+                  </button>
+                ))}
+              </div>
+            )}
+            {artifactError ? (
+              <p className="rounded-md border border-danger/30 bg-[#fff5f2] p-3 text-sm text-danger">
+                {artifactError}
+              </p>
+            ) : hasArtifact && artifact !== null ? (
+              artifact.trim() ? (
+                <ArtifactMarkdown content={artifact} />
+              ) : (
+                <p className="text-sm text-muted">The artifact file is empty.</p>
+              )
+            ) : hasArtifact ? (
+              <p className="text-sm text-muted">Loading artifact…</p>
+            ) : (
+              <p className="text-sm text-muted">
+                This phase has not produced an artifact yet. Run it to generate one.
+              </p>
+            )}
+          </>
         )}
       </div>
 
@@ -561,30 +734,113 @@ function PhaseDetail({
   );
 }
 
+type StreamConnectionState = "connecting" | "live" | "reconnecting" | "disconnected";
+
+const PHASE_RECONNECT_DELAYS = [1000, 2000, 4000];
+const PHASE_MAX_RECONNECT_RETRIES = 3;
+const TERMINAL_RUN_STATUSES = ["completed", "error", "stopped"];
+
 function PhaseStream({ workspaceId, runId }: { workspaceId: string; runId: string }) {
   const [events, setEvents] = useState<AgentEventResponse[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
+  const [connectionState, setConnectionState] =
+    useState<StreamConnectionState>("connecting");
 
-  useEffect(() => {
+  const socketRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectAttemptRef = useRef(0);
+  const intentionalCloseRef = useRef(false);
+  const runDoneRef = useRef(false);
+
+  const connect = useCallback(() => {
+    if (reconnectTimeoutRef.current) {
+      clearTimeout(reconnectTimeoutRef.current);
+      reconnectTimeoutRef.current = null;
+    }
+    if (socketRef.current) {
+      intentionalCloseRef.current = true;
+      socketRef.current.close();
+    }
+
+    // The backend replays all prior events on every (re)connect, so reset to
+    // avoid duplicating them.
     setEvents([]);
-    setError(null);
+
     const socket = new WebSocket(getAgentStreamUrl(workspaceId, runId));
     socketRef.current = socket;
+    intentionalCloseRef.current = false;
+
+    socket.onopen = () => {
+      setConnectionState("live");
+      reconnectAttemptRef.current = 0;
+    };
+
     socket.onmessage = (event) => {
+      let message: AgentEventResponse & { type?: string };
       try {
-        const message = JSON.parse(event.data) as AgentEventResponse;
-        setEvents((prev) => [...prev, message]);
+        message = JSON.parse(event.data);
       } catch {
-        // ignore malformed frames
+        return; // ignore malformed frames
+      }
+      if (message.type === "ping") {
+        return; // keepalive frame, nothing to render
+      }
+      setEvents((prev) => [...prev, message]);
+      const statusValue =
+        message.event_type === "status" ? message.content : undefined;
+      const metadataStatus = message.metadata?.status as string | undefined;
+      if (
+        (statusValue && TERMINAL_RUN_STATUSES.includes(statusValue)) ||
+        (metadataStatus && TERMINAL_RUN_STATUSES.includes(metadataStatus))
+      ) {
+        // Run finished; the parent will unmount this stream shortly. Don't
+        // treat the imminent socket close as an unexpected drop.
+        runDoneRef.current = true;
       }
     };
-    socket.onerror = () => setError("Live stream disconnected.");
-    return () => {
-      socket.close();
-      socketRef.current = null;
+
+    socket.onclose = () => {
+      if (
+        intentionalCloseRef.current ||
+        runDoneRef.current ||
+        socketRef.current !== socket
+      ) {
+        return;
+      }
+
+      const attempt = reconnectAttemptRef.current + 1;
+      reconnectAttemptRef.current = attempt;
+
+      if (attempt > PHASE_MAX_RECONNECT_RETRIES) {
+        setConnectionState("disconnected");
+        return;
+      }
+
+      setConnectionState("reconnecting");
+      const delay =
+        PHASE_RECONNECT_DELAYS[
+          Math.min(attempt - 1, PHASE_RECONNECT_DELAYS.length - 1)
+        ];
+      reconnectTimeoutRef.current = setTimeout(connect, delay);
     };
   }, [workspaceId, runId]);
+
+  useEffect(() => {
+    reconnectAttemptRef.current = 0;
+    runDoneRef.current = false;
+    setConnectionState("connecting");
+    connect();
+    return () => {
+      intentionalCloseRef.current = true;
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+        reconnectTimeoutRef.current = null;
+      }
+      if (socketRef.current) {
+        socketRef.current.close();
+        socketRef.current = null;
+      }
+    };
+  }, [connect]);
 
   const paired = pairToolEvents(events);
   const outputText = events
@@ -598,7 +854,19 @@ function PhaseStream({ workspaceId, runId }: { workspaceId: string; runId: strin
         <CircleDot className="h-4 w-4 animate-pulse" />
         Agent is working on this phase…
       </div>
-      {error && <p className="text-xs text-danger">{error}</p>}
+      {connectionState === "reconnecting" && (
+        <p className="flex items-center gap-1.5 text-xs text-muted">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          Reconnecting to live stream…
+        </p>
+      )}
+      {connectionState === "disconnected" && (
+        <p className="flex items-center gap-1.5 text-xs text-danger">
+          <AlertCircle className="h-3.5 w-3.5" />
+          Live stream disconnected. The agent may still be running — reload the
+          page to reconnect.
+        </p>
+      )}
       {outputText && (
         <div className="whitespace-pre-wrap text-sm leading-6 text-body">{outputText}</div>
       )}
@@ -706,6 +974,24 @@ function PhaseStatusIcon({ status, muted }: { status: SpecPhaseStatus; muted?: b
     default:
       return <CircleDashed className={`${className} ${muted ? "text-white" : "text-muted"}`} />;
   }
+}
+
+function SeverityBadge({ severity }: { severity: string }) {
+  const key = severity.toUpperCase();
+  const tone: Record<string, string> = {
+    CRITICAL: "bg-[#fff5f2] text-danger ring-1 ring-danger/30",
+    HIGH: "bg-[#fff5f2] text-danger ring-1 ring-danger/30",
+    MEDIUM: "bg-[#fffbf0] text-warn ring-1 ring-warn/30",
+    LOW: "bg-white text-muted ring-1 ring-line",
+  };
+  const className = tone[key] ?? "bg-white text-muted ring-1 ring-line";
+  return (
+    <span
+      className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${className}`}
+    >
+      {key}
+    </span>
+  );
 }
 
 function SpecStatusBadge({ status }: { status: string }) {

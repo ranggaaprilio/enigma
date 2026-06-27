@@ -1,3 +1,4 @@
+import asyncio
 from typing import Protocol
 from uuid import UUID
 
@@ -34,6 +35,10 @@ router = APIRouter(prefix="/workspaces/{workspace_id}/agent", tags=["agents"])
 
 DB_SESSION_DEP = Depends(get_db_session)
 SETTINGS_DEP = Depends(get_settings)
+
+# Send a lightweight keepalive frame when the agent produces no events for this
+# long, so idle WebSockets are not reaped by intermediaries during long pauses.
+STREAM_PING_INTERVAL_SECONDS = 20.0
 
 
 class AgentServiceProtocol(Protocol):
@@ -295,7 +300,16 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
     queue = agent_runtime.subscribe(run_id)
     try:
         while True:
-            payload = await queue.get()
+            try:
+                payload = await asyncio.wait_for(
+                    queue.get(), timeout=STREAM_PING_INTERVAL_SECONDS
+                )
+            except TimeoutError:
+                # No agent activity in a while; send a keepalive so the socket
+                # stays open through long thinking pauses. The client ignores
+                # frames of type "ping".
+                await websocket.send_json({"type": "ping"})
+                continue
             await websocket.send_json(payload)
             status_value = payload.get("metadata", {}).get("status")
             if status_value in {"completed", "error", "stopped"}:

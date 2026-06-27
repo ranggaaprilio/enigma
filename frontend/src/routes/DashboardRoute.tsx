@@ -11,10 +11,12 @@ import { PreviewPanel } from "../components/PreviewPanel";
 import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import { WorktreesPanel } from "../components/WorktreesPanel";
+import { useActiveWorktree } from "../lib/activeWorktree";
 import {
   ApiError,
   cloneRepository,
   commitRepository,
+  commitWorktree,
   connectRepository,
   createWorkspace,
   deleteWorkspaceEnvVar,
@@ -627,6 +629,11 @@ function RepositoryPanel({
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  // The Changes view follows the worktree selected in the Worktrees panel. The selection is
+  // broadcast via useActiveWorktree, so picking a branch there refreshes this panel live.
+  // null => the base clone.
+  const [active] = useActiveWorktree(workspace.id);
+  const worktreeId = active?.id;
 
   useEffect(() => {
     setRepoUrl(workspace.repo_url);
@@ -636,7 +643,7 @@ function RepositoryPanel({
     async (signal?: AbortSignal) => {
       setRepoState({ status: "loading" });
       try {
-        const data = await getRepositoryStatus(workspace.id, signal);
+        const data = await getRepositoryStatus(workspace.id, worktreeId, signal);
         setRepoState({ status: "ready", data });
         setSelectedPath((currentPath) => {
           if (currentPath && data.files.some((file) => file.path === currentPath)) {
@@ -655,7 +662,7 @@ function RepositoryPanel({
         });
       }
     },
-    [workspace.id],
+    [workspace.id, worktreeId],
   );
 
   useEffect(() => {
@@ -677,7 +684,7 @@ function RepositoryPanel({
     }
 
     const controller = new AbortController();
-    getRepositoryDiff(workspace.id, selectedPath, controller.signal)
+    getRepositoryDiff(workspace.id, selectedPath, worktreeId, controller.signal)
       .then((response) => setDiff(response.diff))
       .catch((caughtError: unknown) => {
         if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
@@ -688,7 +695,7 @@ function RepositoryPanel({
       });
 
     return () => controller.abort();
-  }, [selectedPath, workspace.id]);
+  }, [selectedPath, workspace.id, worktreeId]);
 
   async function runAction(actionName: string, action: () => Promise<string>) {
     setBusyAction(actionName);
@@ -729,7 +736,11 @@ function RepositoryPanel({
       return;
     }
     await runAction("commit", async () => {
-      const response = await commitRepository(workspace.id, { message: commitMessage });
+      // Commit to whichever worktree the Changes view is showing, so what you see is
+      // what you commit. With no worktree selected this targets the base clone.
+      const response = active
+        ? await commitWorktree(workspace.id, active.id, { message: commitMessage })
+        : await commitRepository(workspace.id, { message: commitMessage });
       setCommitMessage("");
       return response.message;
     });
@@ -824,7 +835,13 @@ function RepositoryPanel({
       <div className="rounded-md border border-line bg-white p-5 shadow-soft">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="text-base font-semibold">Changes</h3>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="text-base font-semibold">Changes</h3>
+              <span className="rounded-full bg-line px-2 py-0.5 font-mono text-xs text-ink/65">
+                {active?.branch ?? statusData?.branch ?? workspace.default_branch}
+                {!active && <span className="ml-1 font-sans text-ink/45">base</span>}
+              </span>
+            </div>
             <p className="mt-1 text-sm text-ink/60">
               {repoState.status === "ready"
                 ? statusData?.is_clean
