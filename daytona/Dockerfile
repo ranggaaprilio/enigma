@@ -43,6 +43,25 @@ RUN set -eux; \
       | sh -s -- --method standalone --prefix "$HOME/.local" ${VERSION_FLAG}; \
     "$HOME/.local/bin/code-server" --version
 
+# Install GitHub Spec Kit (the `specify` CLI) for Spec-Driven Development.
+# Same rationale as mise/code-server above: the install needs network, but the sandbox
+# runtime egress is blocked. Bake the CLI in at build time; `specify init` afterwards
+# scaffolds .specify/ and specs/ OFFLINE from templates bundled in the package, so the
+# SDD workflow (docs/improvement-epics/01-spec-driven-development.md) works at runtime.
+# uv tool install drops the `specify` entry point into $HOME/.local/bin, which is exactly
+# where the runtime PATH (set below) looks. Pin SPEC_KIT_REF to a tagged release for
+# reproducible snapshots; empty = latest at build time.
+ARG SPEC_KIT_REF=
+RUN set -eux; \
+    curl -fsSL https://astral.sh/uv/install.sh | sh; \
+    if [ -n "${SPEC_KIT_REF}" ]; then \
+      SRC="git+https://github.com/github/spec-kit.git@${SPEC_KIT_REF}"; \
+    else \
+      SRC="git+https://github.com/github/spec-kit.git"; \
+    fi; \
+    "$HOME/.local/bin/uv" tool install specify-cli --from "${SRC}"; \
+    "$HOME/.local/bin/specify" check || true
+
 # Put mise and code-server on PATH for non-login shells too, so tools resolved by
 # `mise install` and the code-server binary are visible without sourcing a profile.
 # Home is /home/daytona (daytona_sandbox_home).
