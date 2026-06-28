@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import {
   ChevronDown,
   ChevronRight,
@@ -8,8 +8,19 @@ import {
   Loader2,
   Unplug,
   FileEdit,
+  Ban,
 } from "lucide-react";
 import type { AgentEventResponse, AgentFileChangeResponse } from "../../lib/api";
+import { DiffView } from "./DiffView";
+import { SearchResults } from "./SearchResults";
+import {
+  detectBlocked,
+  getDiff,
+  getGitStatus,
+  getSearchMatches,
+  isSearchTruncated,
+  type GitStatusShape,
+} from "./toolMetadata";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -118,6 +129,110 @@ function StatusBadge({ status }: { status: ToolStatus }) {
 }
 
 // ---------------------------------------------------------------------------
+// Tool-specific bodies
+// ---------------------------------------------------------------------------
+
+function SectionLabel({ children }: { children: ReactNode }) {
+  return (
+    <p className="mb-1 text-xs font-medium uppercase tracking-wide text-muted">
+      {children}
+    </p>
+  );
+}
+
+function GitStatusList({ status }: { status: GitStatusShape }) {
+  return (
+    <div className="rounded border border-line bg-white">
+      <div className="border-b border-line px-2 py-1 text-xs text-muted">
+        Branch:{" "}
+        <span className="font-mono text-ink">{status.branch ?? "(detached)"}</span>
+      </div>
+      {status.is_clean || status.files.length === 0 ? (
+        <p className="px-2 py-1.5 text-xs text-muted">Working tree clean.</p>
+      ) : (
+        <ul>
+          {status.files.map((file, i) => (
+            <li
+              key={i}
+              className="flex items-center gap-2 border-b border-line px-2 py-1 text-xs last:border-b-0"
+            >
+              <span className="shrink-0 rounded bg-line px-1 font-mono text-[10px] uppercase text-muted">
+                {file.status || "?"}
+              </span>
+              <span className="min-w-0 truncate font-mono text-ink">{file.path}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function BlockedCommandNotice({ message }: { message: string }) {
+  return (
+    <div className="flex gap-2 rounded border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">
+      <Ban className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+      <div className="min-w-0">
+        <p className="font-medium">Command blocked by policy</p>
+        <p className="mt-0.5 break-words text-danger/80">{message}</p>
+      </div>
+    </div>
+  );
+}
+
+/** Render the tool-specific result body, falling back to a generic <pre>. */
+function renderToolBody(
+  name: string,
+  result: AgentEventResponse | null,
+  output: string | null,
+): ReactNode {
+  if (name === "apply_patch" || name === "git_diff") {
+    const diff = getDiff(result);
+    if (diff !== null) {
+      return (
+        <div className="mb-2">
+          <SectionLabel>Diff</SectionLabel>
+          <DiffView diff={diff} />
+        </div>
+      );
+    }
+  }
+  if (name === "search_code") {
+    const matches = getSearchMatches(result);
+    if (matches !== null) {
+      return (
+        <div className="mb-2">
+          <SectionLabel>Results</SectionLabel>
+          <SearchResults matches={matches} truncated={isSearchTruncated(result)} />
+        </div>
+      );
+    }
+  }
+  if (name === "git_status") {
+    const status = getGitStatus(result);
+    if (status !== null) {
+      return (
+        <div className="mb-2">
+          <SectionLabel>Status</SectionLabel>
+          <GitStatusList status={status} />
+        </div>
+      );
+    }
+  }
+  if (output) {
+    return (
+      <div className="mb-2">
+        <SectionLabel>Output</SectionLabel>
+        <pre className="max-h-40 overflow-auto rounded border border-line bg-white p-2 text-xs text-ink">
+          {output}
+        </pre>
+      </div>
+    );
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // ToolCard component
 // ---------------------------------------------------------------------------
 
@@ -178,16 +293,15 @@ export function ToolCard({ event, fileChanges, streamError }: ToolCardProps) {
             </div>
           )}
 
-          {/* Output */}
-          {output && (
+          {/* Output / tool-specific body */}
+          {detectBlocked(event.result) ? (
             <div className="mb-2">
-              <p className="mb-1 text-xs font-medium uppercase tracking-wide text-muted">
-                Output
-              </p>
-              <pre className="max-h-40 overflow-auto rounded border border-line bg-white p-2 text-xs text-ink">
-                {output}
-              </pre>
+              <BlockedCommandNotice
+                message={output ?? "Command was blocked by policy."}
+              />
             </div>
+          ) : (
+            renderToolBody(name, event.result, output)
           )}
 
           {/* Exit code */}

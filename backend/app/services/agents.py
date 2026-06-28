@@ -419,6 +419,8 @@ class AgentService:
                     command_timeout_seconds=self.settings.agent_command_timeout_seconds,
                     max_command_output_chars=self.settings.agent_max_command_output_chars,
                     working_dir=working_dir,
+                    allowlist_enabled=self.settings.agent_command_allowlist_enabled,
+                    allowed_commands=frozenset(self.settings.agent_command_allowlist),
                 )
 
                 baseline = await self._capture_baseline(

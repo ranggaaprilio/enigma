@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     openhands_max_iterations: int = 30
     agent_command_timeout_seconds: int = 20
     agent_max_command_output_chars: int = 20_000
+    agent_command_allowlist_enabled: bool = False
+    agent_command_allowlist: str | list[str] = Field(default_factory=list)
     terminal_default_cols: int = 120
     terminal_default_rows: int = 34
     editor_code_server_binary: str = "code-server"
@@ -69,6 +71,13 @@ class Settings(BaseSettings):
     def parse_cors_origins(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
+        return value
+
+    @field_validator("agent_command_allowlist", mode="before")
+    @classmethod
+    def parse_command_allowlist(cls, value: str | list[str]) -> list[str]:
+        if isinstance(value, str):
+            return [item.strip() for item in value.split(",") if item.strip()]
         return value
 
 
