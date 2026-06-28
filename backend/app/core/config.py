@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     daytona_preview_url_ttl_seconds: int = Field(default=60 * 60, gt=0)
     daytona_preview_proxy_base_url: str = "http://localhost:8001"
     daytona_preview_proxy_ttl_seconds: int = Field(default=60 * 60, gt=0)
+    daytona_network_block_all: bool = False
+    daytona_network_allow_list: str | list[str] = Field(default_factory=list)
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
@@ -73,7 +75,7 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
 
-    @field_validator("agent_command_allowlist", mode="before")
+    @field_validator("agent_command_allowlist", "daytona_network_allow_list", mode="before")
     @classmethod
     def parse_command_allowlist(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
