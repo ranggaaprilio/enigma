@@ -26,7 +26,9 @@ SETTINGS_DEP = Depends(get_settings)
 
 
 class DevServerServiceProtocol(Protocol):
-    async def start(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
+    async def setup(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
+
+    async def run(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
 
@@ -49,14 +51,35 @@ def not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
 
 
-@router.post("/start", response_model=DevServerActionResponse)
-async def start_dev_server(
+@router.post("/setup", response_model=DevServerActionResponse)
+async def setup_dev_server(
     workspace_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     service: DevServerServiceProtocol = DEV_SERVER_SERVICE_DEP,
 ) -> DevServerActionResponse:
+    """Prepare the environment (toolchain + dependencies) without running the app."""
     try:
-        state = await service.start(workspace_id, current_user.id)
+        state = await service.setup(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except DevServerWorkspacePathError:
+        raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
+    except DevServerNotClonedError:
+        raise HTTPException(status_code=409, detail="Repository is not cloned yet") from None
+    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from None
+    return DevServerActionResponse(ok=True, status=state.status, message=state.message)
+
+
+@router.post("/run", response_model=DevServerActionResponse)
+async def run_dev_server(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: DevServerServiceProtocol = DEV_SERVER_SERVICE_DEP,
+) -> DevServerActionResponse:
+    """Run the app's `dev` task on demand. Requires the environment to be prepared."""
+    try:
+        state = await service.run(workspace_id, current_user.id)
     except WorkspaceNotFoundError:
         raise not_found() from None
     except DevServerWorkspacePathError:

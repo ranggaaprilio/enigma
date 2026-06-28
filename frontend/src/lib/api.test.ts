@@ -15,7 +15,8 @@ import {
   deleteWorkspaceEnvVar,
   detectPreviewSession,
   getDevServerStatus,
-  startDevServer,
+  setupDevServer,
+  runDevServer,
   stopDevServer,
   getAgentRun,
   getAgentStreamUrl,
@@ -552,22 +553,28 @@ describe("getHealth", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await startDevServer(workspaceId);
+    await setupDevServer(workspaceId);
+    await runDevServer(workspaceId);
     await getDevServerStatus(workspaceId);
     await stopDevServer(workspaceId);
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      `http://localhost:8000/workspaces/${workspaceId}/dev/start`,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/setup`,
       expect.objectContaining({ credentials: "include", method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/run`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
       `http://localhost:8000/workspaces/${workspaceId}/dev/status`,
       expect.objectContaining({ credentials: "include" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      3,
+      4,
       `http://localhost:8000/workspaces/${workspaceId}/dev/stop`,
       expect.objectContaining({ credentials: "include", method: "POST" }),
     );

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Copy,
   Monitor,
+  Play,
   RefreshCw,
   Search,
   Smartphone,
@@ -15,6 +16,7 @@ import {
   ensureDevServer,
   listPreviewSessions,
   refreshPreviewSession,
+  runDevServer,
   stopPreviewSession,
   type DevServerStatusResponse,
   type PreviewSessionResponse,
@@ -27,6 +29,8 @@ function devStatusLabel(status: DevServerStatusResponse): string {
   switch (status.status) {
     case "installing":
       return status.message ?? "Setting up environment from mise.toml…";
+    case "ready":
+      return "Environment ready — click Run App to start.";
     case "starting":
       return status.message ?? "Starting dev server…";
     case "no-config":
@@ -78,6 +82,8 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
   const [frameVersion, setFrameVersion] = useState(0);
   const [copyLabel, setCopyLabel] = useState("Copy URL");
   const [devStatus, setDevStatus] = useState<DevServerStatusResponse | null>(null);
+  // Bumped by Run App to re-trigger the dev-status poll loop below.
+  const [pollNonce, setPollNonce] = useState(0);
 
   const applySessionState = useCallback(
     (nextSession: PreviewSessionResponse | null) => {
@@ -134,8 +140,11 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
     return () => controller.abort();
   }, [applySessionState, onStatusChange, workspace.id]);
 
-  // Track the auto dev-server setup that kicks off after clone: surface progress
-  // and, once the dev server is up, open the preview without a manual click.
+  // Surface dev-server progress. After clone this reflects the environment-setup
+  // phase (ending at "ready" — the app is NOT auto-run). It also auto-opens the
+  // preview when the app is actually "running", which covers an app that was run
+  // earlier and auto-resumed after a sandbox sleep/wake. Run App bumps pollNonce to
+  // re-enter this loop and watch the freshly started app come up.
   useEffect(() => {
     let cancelled = false;
     let autoDetected = false;
@@ -159,6 +168,8 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
       }
       setDevStatus(next);
 
+      // Auto-open the preview only when the app is genuinely running — never for the
+      // "ready" (set-up-but-not-running) state, so cloning no longer auto-launches.
       if (next.status === "running" && !autoDetected) {
         try {
           const response = await detectPreviewSession(workspace.id);
@@ -189,7 +200,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
         window.clearTimeout(timer);
       }
     };
-  }, [applySessionState, workspace.id]);
+  }, [applySessionState, workspace.id, pollNonce]);
 
   const session =
     panelState.status === "ready" ||
@@ -204,6 +215,27 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
     }
     return session.public_url;
   }, [session]);
+
+  async function runApp() {
+    setBusyAction("run");
+    try {
+      const response = await runDevServer(workspace.id);
+      setDevStatus({ status: response.status, port: null, message: response.message });
+      // Re-enter the poll loop to surface startup progress and auto-open the preview
+      // once the dev server binds its port.
+      setPollNonce((current) => current + 1);
+    } catch (caughtError) {
+      setPanelState({
+        status: "error",
+        message:
+          caughtError instanceof ApiError ? caughtError.message : "Unable to run the app.",
+        session,
+      });
+      onStatusChange({ status: "error", port: session?.port ?? null });
+    } finally {
+      setBusyAction(null);
+    }
+  }
 
   async function detectPreview() {
     setBusyAction("detect");
@@ -299,6 +331,20 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
             {statusLabel}
             {session ? ` :${session.port}` : ""}
           </span>
+          <button
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
+            type="button"
+            disabled={
+              busyAction !== null ||
+              devStatus?.status === "installing" ||
+              devStatus?.status === "no-config" ||
+              panelState.status === "ready"
+            }
+            onClick={() => void runApp()}
+          >
+            <Play className="h-4 w-4" aria-hidden="true" />
+            {busyAction === "run" ? "Starting..." : "Run App"}
+          </button>
           <button
             className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
             type="button"

@@ -5,6 +5,7 @@ from pydantic import BaseModel
 DevServerStatus = Literal[
     "idle",
     "installing",
+    "ready",
     "starting",
     "running",
     "stopped",

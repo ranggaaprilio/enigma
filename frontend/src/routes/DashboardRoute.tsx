@@ -20,7 +20,7 @@ import {
   connectRepository,
   createWorkspace,
   deleteWorkspaceEnvVar,
-  startDevServer,
+  setupDevServer,
   getRepositoryDiff,
   getRepositoryStatus,
   getHealth,
@@ -780,10 +780,11 @@ function RepositoryPanel({
             onClick={() =>
               void runAction("clone", async () => {
                 const response = await cloneRepository(workspace.id);
-                // Auto-setup the environment from mise.toml and start dev mode.
-                // Fire-and-forget — the Preview tab polls progress and opens the preview.
-                void startDevServer(workspace.id).catch(() => undefined);
-                return `${response.message} Setting up the environment…`;
+                // Prepare the environment (toolchain + dependencies) from mise.toml.
+                // Fire-and-forget — the Preview tab polls progress. The app itself is
+                // started on demand from the Preview "Run App" button.
+                void setupDevServer(workspace.id).catch(() => undefined);
+                return `${response.message} Preparing the environment…`;
               })
             }
           />

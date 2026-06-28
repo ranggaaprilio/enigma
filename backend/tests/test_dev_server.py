@@ -145,45 +145,48 @@ def _service(runtime: FakeRuntime, workspace: Workspace) -> DevServerService:
     return DevServerService(FakeSession(workspace), get_settings(), runtime)
 
 
-async def test_start_returns_no_config_without_mise_toml():
+async def test_setup_returns_no_config_without_mise_toml():
     user = _user()
     workspace = _workspace(user)
     runtime = FakeRuntime(FakeSandbox({"workspace/.git"}))
     service = _service(runtime, workspace)
 
-    state = await service.start(workspace.id, user.id)
+    state = await service.setup(workspace.id, user.id)
 
     assert state.status == "no-config"
     assert all("nohup" not in command for command in runtime.commands)
 
 
-async def test_start_requires_cloned_repo():
+async def test_setup_requires_cloned_repo():
     user = _user()
     workspace = _workspace(user)
     runtime = FakeRuntime(FakeSandbox(set()))
     service = _service(runtime, workspace)
 
     with pytest.raises(DevServerNotClonedError):
-        await service.start(workspace.id, user.id)
+        await service.setup(workspace.id, user.id)
 
 
-async def test_start_launches_mise_setup_and_dev():
+async def test_setup_installs_deps_without_running_dev():
     user = _user()
     workspace = _workspace(user)
     runtime = FakeRuntime(FakeSandbox({"workspace/.git", "workspace/mise.toml"}))
     service = _service(runtime, workspace)
 
-    state = await service.start(workspace.id, user.id)
+    state = await service.setup(workspace.id, user.id)
 
     assert state.status == "installing"
     launch = next(command for command in runtime.commands if "nohup" in command)
     assert "mise install" in launch
-    assert "mise run install" in launch  # project deps before the dev task
-    assert "mise run dev" in launch
+    assert "mise run install" in launch  # project deps are installed during setup
     assert "mise.run" in launch  # auto-install of the mise binary
+    assert "mise run dev" not in launch  # setup must NOT run the app
+    assert "echo ready" in launch  # ends prepared-but-not-running
+    # Setup alone must not mark the dev server as desired (no auto-resume on wake).
+    assert not workspace.dev_autostart
 
 
-async def test_start_does_not_relaunch_when_already_installing():
+async def test_setup_does_not_relaunch_when_already_installing():
     user = _user()
     workspace = _workspace(user)
     runtime = FakeRuntime(
@@ -192,10 +195,59 @@ async def test_start_does_not_relaunch_when_already_installing():
     )
     service = _service(runtime, workspace)
 
-    state = await service.start(workspace.id, user.id)
+    state = await service.setup(workspace.id, user.id)
 
     assert state.status == "installing"
     assert all("nohup" not in command for command in runtime.commands)
+
+
+async def test_setup_does_not_relaunch_when_ready():
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git", "workspace/mise.toml"}),
+        status_value="ready",
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.setup(workspace.id, user.id)
+
+    assert state.status == "ready"
+    assert all("nohup" not in command for command in runtime.commands)
+
+
+async def test_run_launches_dev_task_and_marks_desired():
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git", "workspace/mise.toml"}))
+    service = _service(runtime, workspace)
+
+    state = await service.run(workspace.id, user.id)
+
+    assert state.status == "installing"  # "Starting app…" — dev server coming up
+    launch = next(command for command in runtime.commands if "nohup" in command)
+    assert "mise run dev" in launch
+    assert "mise run install" not in launch  # deps already installed by setup
+    # Running the app marks it desired so it auto-resumes after a sandbox wake.
+    assert workspace.dev_autostart
+
+
+async def test_run_no_ops_when_already_running():
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git", "workspace/mise.toml"}),
+        status_value="running",
+        open_ports={5173},
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.run(workspace.id, user.id)
+
+    assert state.status == "running"
+    assert state.port == 5173
+    assert all("nohup" not in command for command in runtime.commands)
+    assert workspace.dev_autostart
 
 
 async def test_status_running_with_open_port():
@@ -239,6 +291,18 @@ async def test_status_no_dev_task_passthrough():
     state = await service.status(workspace.id, user.id)
 
     assert state.status == "no-dev-task"
+
+
+async def test_status_ready_passthrough():
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}), status_value="ready")
+    service = _service(runtime, workspace)
+
+    state = await service.status(workspace.id, user.id)
+
+    assert state.status == "ready"
+    assert state.message and "Run App" in state.message
 
 
 async def test_stop_issues_pkill():
@@ -373,9 +437,14 @@ class FakeDevServerService:
         self.workspace = workspace
         self.state = DevServerState(status="idle")
 
-    async def start(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
+    async def setup(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
         self._ensure_workspace(workspace_id, user_id)
         self.state = DevServerState(status="installing", message="Setting up environment…")
+        return self.state
+
+    async def run(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
+        self._ensure_workspace(workspace_id, user_id)
+        self.state = DevServerState(status="installing", message="Starting app…")
         return self.state
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
@@ -418,7 +487,7 @@ async def test_dev_endpoints_require_auth(dev_server_context):
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(None)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-        response = await client.post(f"/workspaces/{workspace.id}/dev/start")
+        response = await client.post(f"/workspaces/{workspace.id}/dev/setup")
 
     assert response.status_code == 401
 
@@ -431,16 +500,18 @@ async def test_dev_workspace_ownership_is_enforced(dev_server_context):
     assert response.status_code == 404
 
 
-async def test_dev_start_status_stop_round_trip(dev_server_context):
+async def test_dev_setup_run_status_stop_round_trip(dev_server_context):
     _user, workspace, _service = dev_server_context
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         await login(client)
-        started = await client.post(f"/workspaces/{workspace.id}/dev/start")
+        prepared = await client.post(f"/workspaces/{workspace.id}/dev/setup")
+        ran = await client.post(f"/workspaces/{workspace.id}/dev/run")
         status = await client.get(f"/workspaces/{workspace.id}/dev/status")
         stopped = await client.post(f"/workspaces/{workspace.id}/dev/stop")
 
-    assert started.json()["status"] == "installing"
+    assert prepared.json()["status"] == "installing"
+    assert ran.json() == {"ok": True, "status": "installing", "message": "Starting app…"}
     assert status.json()["status"] == "installing"
     assert stopped.json()["status"] == "stopped"
 

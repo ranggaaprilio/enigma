@@ -35,7 +35,7 @@ The workspace dashboard exposes each capability as a surface (tab):
 | **Agents** | Run an AI coding agent against the sandbox; stream thinking/tool-call events live over WebSocket, review the files it changed, and stop a run mid-flight. |
 | **Editor** | Launch `code-server` (VS Code in the browser) bound to the workspace. |
 | **Terminal** | Full interactive PTY shell into the sandbox over WebSocket (`xterm.js`). |
-| **Preview** | Auto-detect the project toolchain via `mise`, install dependencies, run the `dev` task, detect the open port, and serve it through a signed preview proxy. |
+| **Preview** | After clone, auto-detect the project toolchain via `mise` and install dependencies (environment only — the app is not started). A **Run App** button then runs the `dev` task on demand; the open port is detected and served through a signed preview proxy. |
 | **Files** | Browse the workspace tree, read, upload, and manage files. |
 | **Custom Commands** | Save and run reusable shell commands, streaming output back to the UI. |
 | **Audit & Notifications** | Every workspace action is recorded to an audit log; long-running events (agent runs, pushes, PRs, spec phases) raise notifications. |
@@ -136,8 +136,10 @@ Key points:
 - **Confined agent tools.** The agent can only `list_files`, `read_file`, `write_file`, and
   `run_command` (`backend/app/services/agent_tools.py`). Commands are denylisted (no `git`, `rm`,
   `curl`, `sudo`, shell operators, …) and every path is confined to the workspace (or worktree) root.
-- **Preview** runs the project's `mise` `install`/`dev` tasks in the background, polls for the open
-  port, and exposes it through the preview proxy on port 8001 using short-lived signed URLs.
+- **Preview** prepares the environment after clone by running the project's `mise` `install` task in
+  the background (toolchain + dependencies only). The app's `dev` task is started on demand from the
+  **Run App** button; the panel then polls for the open port and exposes it through the preview proxy
+  on port 8001 using short-lived signed URLs. An app that was run auto-resumes after a sandbox sleep.
 
 ### Git strategy
 

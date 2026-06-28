@@ -343,6 +343,7 @@ export type PreviewDetectResponse = {
 export type DevServerStatus =
   | "idle"
   | "installing"
+  | "ready"
   | "starting"
   | "running"
   | "stopped"
@@ -1016,8 +1017,16 @@ export function stopPreviewSession(
   );
 }
 
-export function startDevServer(workspaceId: string): Promise<DevServerActionResponse> {
-  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/start`, {
+/** Prepare the environment (toolchain + dependencies) without running the app. */
+export function setupDevServer(workspaceId: string): Promise<DevServerActionResponse> {
+  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/setup`, {
+    method: "POST",
+  });
+}
+
+/** Run the app's dev task on demand (the Preview "Run App" button). */
+export function runDevServer(workspaceId: string): Promise<DevServerActionResponse> {
+  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/run`, {
     method: "POST",
   });
 }

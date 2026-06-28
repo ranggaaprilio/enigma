@@ -63,21 +63,39 @@ class DevServerService:
         self.runtime = runtime or get_daytona_runtime()
         self.common_ports = common_ports
 
-    async def start(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
+    async def setup(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
+        """Prepare the workspace: install the mise toolchain + project dependencies,
+        then stop at `ready`. This does NOT run the app and does NOT mark it as
+        desired — actually running the dev task is an explicit user action (`run`)."""
         workspace = await self._get_workspace(workspace_id, user_id)
 
-        # If a setup run is already in flight (or the dev server is up), don't start
-        # a second one — the background script keeps running across requests. Still
-        # mark it as desired so it auto-resumes after the sandbox sleeps and wakes.
+        # Setup already in flight, environment already prepared, or the app is
+        # already up → nothing to do (re-running would redo a minutes-long install).
         current = await self._read_status(workspace)
-        if current in {"installing", "running"}:
-            await self._mark_autostart(workspace, True)
+        if current in {"installing", "ready", "running"}:
             return await self._resolve_state(workspace, current)
 
-        return await self._launch(workspace, user_id)
+        return await self._launch_setup(workspace, user_id)
 
-    async def _launch(self, workspace: Workspace, user_id: UUID) -> DevServerState:
-        """Launch the background setup + dev-server script and mark it as desired."""
+    async def run(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
+        """Run the app's `dev` task. Marks it as desired so it auto-resumes after the
+        sandbox sleeps and wakes. Dependencies installed by `setup` persist on disk."""
+        workspace = await self._get_workspace(workspace_id, user_id)
+
+        current = await self._read_status(workspace)
+        # Already serving → just record the desire and report the current state.
+        if current == "running":
+            await self._mark_autostart(workspace, True)
+            return await self._resolve_state(workspace, current)
+        # Setup still in progress → can't run yet; surface the in-flight progress.
+        if current == "installing":
+            return await self._resolve_state(workspace, current)
+
+        return await self._launch_run(workspace, user_id)
+
+    async def _ensure_runnable(self, workspace: Workspace) -> DevServerState | None:
+        """Validate the repo is cloned and carries a mise config. Returns a `no-config`
+        state to surface, or `None` when good. Raises if the repo isn't cloned."""
         sandbox = await self.runtime.get_sandbox(workspace)
         if not await self._is_cloned(sandbox, workspace.workspace_path):
             raise DevServerNotClonedError
@@ -86,11 +104,45 @@ class DevServerService:
                 status="no-config",
                 message="No mise.toml found in the repository.",
             )
+        return None
+
+    async def _launch_setup(self, workspace: Workspace, user_id: UUID) -> DevServerState:
+        """Install the toolchain + dependencies in the background, ending at `ready`."""
+        blocked = await self._ensure_runnable(workspace)
+        if blocked is not None:
+            return blocked
 
         try:
             await self.runtime.exec(
                 workspace,
-                self._launch_command(),
+                self._setup_command(),
+                cwd=workspace.workspace_path,
+                timeout=self.settings.dev_server_command_timeout_seconds,
+            )
+        except DaytonaRuntimeError as error:
+            raise DevServerRuntimeError(str(error)) from error
+
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace.id,
+            action="dev_server_setup",
+            target_type="dev_server",
+            target_id=workspace.id,
+            metadata={},
+        )
+        return DevServerState(status="installing", message="Setting up environment…")
+
+    async def _launch_run(self, workspace: Workspace, user_id: UUID) -> DevServerState:
+        """Run the `dev` task in the background and mark it as desired so it
+        auto-resumes after a sandbox sleep/wake."""
+        blocked = await self._ensure_runnable(workspace)
+        if blocked is not None:
+            return blocked
+
+        try:
+            await self.runtime.exec(
+                workspace,
+                self._run_command(),
                 cwd=workspace.workspace_path,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
@@ -101,12 +153,12 @@ class DevServerService:
         await AuditLogService(self.session).record(
             user_id=user_id,
             workspace_id=workspace.id,
-            action="dev_server_start",
+            action="dev_server_run",
             target_type="dev_server",
             target_id=workspace.id,
             metadata={},
         )
-        return DevServerState(status="installing", message="Setting up environment…")
+        return DevServerState(status="installing", message="Starting app…")
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
         workspace = await self._get_workspace(workspace_id, user_id)
@@ -135,9 +187,10 @@ class DevServerService:
         if resolved.status == "starting" and await self._dev_process_alive(workspace):
             return resolved
 
-        # Desired but down (stopped / idle / dead-after-wake) → relaunch.
+        # Desired but down (stopped / idle / ready / dead-after-wake) → relaunch the
+        # dev task only; dependencies installed by `setup` persist on the sandbox disk.
         try:
-            return await self._launch(workspace, user_id)
+            return await self._launch_run(workspace, user_id)
         except DevServerNotClonedError:
             return DevServerState(status="idle", message="Repository is not cloned yet.")
 
@@ -202,6 +255,16 @@ class DevServerService:
             return DevServerState(status="starting", message="Starting dev server…")
         if raw == "installing":
             return DevServerState(status="installing", message="Setting up environment…")
+        # `launching` is the brief window after Run App while the run script re-checks
+        # the toolchain, before the dev server is up. Reported as `installing` so the
+        # auto-resume poller treats it as in-flight and never double-launches.
+        if raw == "launching":
+            return DevServerState(status="installing", message="Starting app…")
+        if raw == "ready":
+            return DevServerState(
+                status="ready",
+                message="Environment ready. Click Run App to start.",
+            )
         if raw == "no-dev-task":
             return DevServerState(
                 status="no-dev-task",
@@ -217,7 +280,10 @@ class DevServerService:
             return DevServerState(status="stopped")
         return DevServerState(status="idle")
 
-    def _launch_command(self) -> str:
+    def _setup_command(self) -> str:
+        """Background script that prepares the environment — installs the mise
+        toolchain and project dependencies — then stops at `ready`. It deliberately
+        does NOT run the `dev` task; that is the separate `run` phase."""
         install_line = ""
         if self.settings.mise_auto_install:
             install_line = (
@@ -245,18 +311,42 @@ class DevServerService:
             f"{{ echo '[setup] mise install failed'; echo error > {STATUS_PATH}; exit 1; }}\n"
             # mise installs language *tools* (node, pnpm, …) but not project
             # dependencies. If the repo defines an `install` task (e.g. `pnpm install`),
-            # run it first — otherwise `mise run dev` fails with errors like
-            # `next: not found` because node_modules was never populated.
+            # run it now so the app is ready to start — otherwise `mise run dev` would
+            # later fail with errors like `next: not found` (empty node_modules).
             "if mise task ls 2>/dev/null | grep -qw install; then "
             "echo '[setup] installing project dependencies'; "
             "mise run install || "
             f"{{ echo '[setup] dependency install failed'; echo error > {STATUS_PATH}; exit 1; }}; "
             "fi\n"
+            # Environment prepared — stop here. The app is started on demand via `run`.
+            f"echo '[setup] environment ready'; echo ready > {STATUS_PATH}\n"
+        )
+        return f"nohup sh -c {self._shell_quote(script)} >/dev/null 2>&1 &"
+
+    def _run_command(self) -> str:
+        """Background script that runs the app's `dev` task. The toolchain and
+        dependencies are installed by `setup` and persist on the sandbox disk; a bare
+        `mise install` here is a cheap no-op when tools are cached and re-provisions
+        them on a cold/woken sandbox before the dev task starts."""
+        # `launching` mirrors `installing` semantics for the auto-resume poller (so it
+        # never double-launches) while the toolchain check runs; `mise run dev` then
+        # flips the status to `running` and serves until stopped.
+        script = (
+            f"exec >{LOG_PATH} 2>&1\n"
+            "set -x\n"
+            'export PATH="$HOME/.local/bin:$PATH"\n'
+            'export MISE_INSTALL_PATH="$HOME/.local/bin/mise"\n'
+            f"echo launching > {STATUS_PATH}\n"
+            "command -v mise || "
+            f"{{ echo '[run] mise not found on PATH'; echo error > {STATUS_PATH}; exit 127; }}\n"
+            "mise trust || echo '[run] mise trust failed (continuing)'\n"
+            "mise install || "
+            f"{{ echo '[run] mise install failed'; echo error > {STATUS_PATH}; exit 1; }}\n"
             "if mise task ls 2>/dev/null | grep -qw dev; then "
             f"echo running > {STATUS_PATH}; "
             "mise run dev; "
             f"echo stopped > {STATUS_PATH}; "
-            f"else echo '[setup] no dev task found'; echo no-dev-task > {STATUS_PATH}; fi\n"
+            f"else echo '[run] no dev task found'; echo no-dev-task > {STATUS_PATH}; fi\n"
         )
         return f"nohup sh -c {self._shell_quote(script)} >/dev/null 2>&1 &"
 
