@@ -318,6 +318,11 @@ class WorkspaceTools:
             rg += ["-g", f"!{name}"]
         if path_glob:
             rg += ["-g", path_glob]
+        # Explicit search path is required. With no path, ripgrep searches the
+        # current directory only when stdin is a TTY; under a non-interactive
+        # exec (stdin is not a TTY) it reads from the empty stdin instead and
+        # silently matches nothing. Passing "." forces a directory search.
+        rg.append(".")
         result = await self._exec_search(rg)
 
         if self._is_command_missing(result):

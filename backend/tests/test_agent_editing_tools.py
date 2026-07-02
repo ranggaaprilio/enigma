@@ -226,6 +226,21 @@ async def test_search_code_parses_rg_output_and_strips_prefix():
     assert runtime.exec_calls[0]["cwd"] == "workspace"
 
 
+async def test_search_code_passes_explicit_path_to_rg():
+    # Regression: without a path argument ripgrep reads from stdin (empty)
+    # under a non-interactive exec and matches nothing, so searches always
+    # come back empty. The command must end with an explicit "." search path.
+    def handler(command: str) -> FakeExecResult:
+        return FakeExecResult(exit_code=0, stdout="app.py:1:hit\n")
+
+    tools, runtime = make_tools(exec_handler=handler)
+    await tools.search_code("hit")
+
+    command = runtime.exec_calls[0]["command"]
+    assert command.startswith("rg ")
+    assert command.split()[-1] == "."
+
+
 async def test_search_code_falls_back_to_grep_when_rg_missing():
     calls: list[str] = []
 
