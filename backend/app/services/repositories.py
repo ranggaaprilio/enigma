@@ -1,3 +1,4 @@
+import base64
 import re
 import shlex
 from dataclasses import dataclass
@@ -267,11 +268,15 @@ class RepositoryService:
         token = await self._get_token(workspace.id)
         sandbox = await self.runtime.get_sandbox(workspace)
         await self._ensure_cloned(sandbox, workspace.workspace_path)
-        await sandbox.git.pull(
-            workspace.workspace_path,
-            username="x-access-token",
-            password=token,
+        result = await self._run_authenticated_git(
+            workspace, ["pull"], token, cwd=workspace.workspace_path
         )
+        if result.exit_code != 0:
+            raise GitCommandError(
+                sanitize_git_output(
+                    result.stdout or result.stderr or "git pull failed", token
+                )
+            )
 
     async def commit(
         self,
@@ -338,17 +343,57 @@ class RepositoryService:
         repo_path = worktree_path or workspace.workspace_path
         sandbox = await self.runtime.get_sandbox(workspace)
         await self._ensure_cloned(sandbox, repo_path)
-        await sandbox.git.push(
-            repo_path,
-            username="x-access-token",
-            password=token,
+        # Push via the git CLI (not the Daytona SDK's server-side go-git). go-git cannot resolve
+        # references through a linked worktree's ``.git`` pointer file — the same limitation that
+        # forces ``status`` onto the CLI — so a new feature branch created in a worktree never
+        # reaches the remote. ``push --set-upstream origin HEAD`` pushes the current branch to a
+        # like-named remote branch (creating it if absent) and records the upstream, and behaves
+        # identically in the base clone and inside worktrees.
+        result = await self._run_authenticated_git(
+            workspace,
+            ["push", "--set-upstream", "origin", "HEAD"],
+            token,
+            cwd=repo_path,
         )
+        if result.exit_code != 0:
+            raise GitCommandError(
+                sanitize_git_output(
+                    result.stdout or result.stderr or "git push failed", token
+                )
+            )
 
     async def _get_workspace(self, workspace_id: UUID, owner_id: UUID) -> Workspace:
         workspace = await self.session.get(Workspace, workspace_id)
         if workspace is None or workspace.owner_id != owner_id:
             raise WorkspaceNotFoundError
         return workspace
+
+    async def _run_authenticated_git(
+        self,
+        workspace: Workspace,
+        args: list[str],
+        token: str,
+        *,
+        cwd: str,
+    ):
+        """Run a git CLI command against the GitHub ``origin`` with a PAT.
+
+        Authentication rides on a per-command HTTP Basic ``Authorization`` header
+        (``http.extraHeader``) — the mechanism GitHub documents for token auth over
+        HTTPS. The username half is a fixed placeholder (``x-access-token``); GitHub
+        only checks the token in the password half, so this covers classic and
+        fine-grained personal access tokens (and app installation tokens) alike.
+        Passing the credential as a per-invocation ``-c`` value keeps it out of
+        ``.git/config`` and out of the remote URL, and it is never persisted.
+        """
+        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        command = "git " + " ".join(
+            shlex.quote(part)
+            for part in ("-c", f"http.extraHeader=AUTHORIZATION: basic {basic}", *args)
+        )
+        return await self.runtime.exec(
+            workspace, command, cwd=cwd, timeout=GIT_TIMEOUT_SECONDS
+        )
 
     async def _get_token(self, workspace_id: UUID) -> str:
         result = await self.session.execute(

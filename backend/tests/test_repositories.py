@@ -432,6 +432,122 @@ async def test_clone_uses_daytona_git_with_branch_and_credentials(tmp_path):
     ]
 
 
+async def test_push_uses_authenticated_git_cli_in_worktree(tmp_path):
+    import base64
+
+    user_id = uuid4()
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=user_id,
+        name="Demo",
+        slug="demo",
+        repo_url="https://github.com/example/demo.git",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-1",
+        workspace_path="/workspace",
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    worktree_path = "/workspace/worktrees/feat-login"
+    commands: list[tuple[str, str | None]] = []
+
+    class FakeFs:
+        async def get_file_info(self, path):
+            return SimpleNamespace(name=path)  # exists => treated as cloned
+
+    class FakeRuntime:
+        async def get_sandbox(self, workspace):
+            # No ``git`` attribute: falling back to the SDK's go-git push would raise here,
+            # so a passing test proves the push runs through the git CLI instead.
+            return SimpleNamespace(fs=FakeFs())
+
+        async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
+            commands.append((command, cwd))
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    service = RepositoryService(
+        session=None,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(Settings().workspace_env_encryption_key),
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+    )
+
+    async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
+        return workspace
+
+    async def fake_get_token(workspace_id: UUID) -> str:
+        return "raw-secret-token"
+
+    service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
+    service._get_token = fake_get_token  # type: ignore[method-assign]
+
+    await service.push(workspace.id, user_id, worktree_path=worktree_path)
+
+    command, cwd = commands[-1]
+    # Pushes the current branch, creating + tracking the remote branch — works in a worktree.
+    assert "push --set-upstream origin HEAD" in command
+    assert cwd == worktree_path
+    # Auth rides on an HTTP Basic header carrying the token; the raw token never appears verbatim.
+    expected = base64.b64encode(b"x-access-token:raw-secret-token").decode()
+    assert f"http.extraHeader=AUTHORIZATION: basic {expected}" in command
+    assert "raw-secret-token" not in command
+
+
+async def test_push_surfaces_sanitized_git_error(tmp_path):
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=uuid4(),
+        name="Demo",
+        slug="demo",
+        repo_url="https://github.com/example/demo.git",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-1",
+        workspace_path="/workspace",
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+    class FakeFs:
+        async def get_file_info(self, path):
+            return SimpleNamespace(name=path)
+
+    class FakeRuntime:
+        async def get_sandbox(self, workspace):
+            return SimpleNamespace(fs=FakeFs())
+
+        async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
+            return SimpleNamespace(
+                exit_code=1,
+                stdout="remote: Permission to example/demo.git denied to raw-secret-token.",
+                stderr="",
+            )
+
+    service = RepositoryService(
+        session=None,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(Settings().workspace_env_encryption_key),
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+    )
+
+    async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
+        return workspace
+
+    async def fake_get_token(workspace_id: UUID) -> str:
+        return "raw-secret-token"
+
+    service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
+    service._get_token = fake_get_token  # type: ignore[method-assign]
+
+    with pytest.raises(GitCommandError) as excinfo:
+        await service.push(workspace.id, workspace.owner_id)
+
+    # A failed push surfaces git's message (e.g. a real permission error) with the token redacted.
+    assert "Permission to example/demo.git denied" in excinfo.value.message
+    assert "raw-secret-token" not in excinfo.value.message
+
+
 async def test_status_uses_git_cli_for_worktrees(tmp_path):
     user_id = uuid4()
     workspace = Workspace(
