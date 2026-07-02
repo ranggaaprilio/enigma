@@ -2,6 +2,7 @@ from fastapi import APIRouter
 
 from app.api.agents import router as agents_router
 from app.api.auth import router as auth_router
+from app.api.budgets import router as budgets_router
 from app.api.commands import router as commands_router
 from app.api.dashboard import router as dashboard_router
 from app.api.dev_server import router as dev_server_router
@@ -24,6 +25,7 @@ api_router.include_router(dashboard_router)
 api_router.include_router(notifications_router)
 api_router.include_router(agents_router)
 api_router.include_router(sessions_router)
+api_router.include_router(budgets_router)
 api_router.include_router(commands_router)
 api_router.include_router(dev_server_router)
 api_router.include_router(editor_router)

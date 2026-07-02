@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "../components/AppShell";
+import { UsagePanel } from "../components/usage/UsagePanel";
 import {
   getDashboardSummary,
   getHealth,
@@ -194,6 +195,11 @@ export function DashboardOverviewRoute() {
               {summary ? "No workspaces yet." : "Loading…"}
             </p>
           )}
+        </section>
+
+        {/* Usage & cost across everything the user can access */}
+        <section className="mb-8">
+          <UsagePanel title="Usage & cost" />
         </section>
 
         <div className="grid gap-6 lg:grid-cols-2">

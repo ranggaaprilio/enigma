@@ -13,6 +13,8 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "../components/AppShell";
+import { BudgetConfig } from "../components/usage/BudgetConfig";
+import { UsagePanel } from "../components/usage/UsagePanel";
 import {
   createTeamWorkspace,
   getProject,
@@ -350,6 +352,13 @@ export function TeamRoute() {
                 </div>
               </Link>
             ))}
+          </div>
+        )}
+
+        {teamId && (
+          <div className="mt-10 flex flex-col gap-4">
+            <UsagePanel scope="team" scopeId={teamId} title="Team usage" />
+            <BudgetConfig scope="team" scopeId={teamId} canManage />
           </div>
         )}
       </main>

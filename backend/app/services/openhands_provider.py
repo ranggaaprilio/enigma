@@ -199,6 +199,8 @@ class OpenHandsAgentProvider(AgentProvider):
                             {
                                 "status": "completed",
                                 "tokens_used": tokens_used,
+                                "input_tokens": usage.prompt_tokens,
+                                "output_tokens": usage.completion_tokens,
                                 "openhands_status": status,
                             },
                         )

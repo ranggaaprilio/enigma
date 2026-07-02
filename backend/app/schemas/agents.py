@@ -2,7 +2,9 @@ from datetime import datetime
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from app.core.pricing import estimate_cost
 
 AgentRunStatus = Literal["thinking", "executing", "completed", "error", "stopped"]
 AgentEventType = Literal["status", "output_text", "tool_call", "tool_result", "error"]
@@ -43,11 +45,34 @@ class AgentRunResponse(BaseModel):
     provider: str
     model: str
     tokens_used: int | None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    estimated_cost: float | None = None
     started_at: datetime
     completed_at: datetime | None
     error_message: str | None
 
     model_config = ConfigDict(from_attributes=True)
+
+    @model_validator(mode="after")
+    def _fill_estimated_cost(self) -> "AgentRunResponse":
+        # Compute-on-read fallback so runs recorded before cost tracking (or whose provider
+        # was priced later) still surface a cost. Uses default pricing (no env overrides).
+        if self.estimated_cost is None and (
+            self.tokens_used is not None
+            or self.input_tokens is not None
+            or self.output_tokens is not None
+        ):
+            cost = estimate_cost(
+                self.provider,
+                self.model,
+                input_tokens=self.input_tokens,
+                output_tokens=self.output_tokens,
+                total_tokens=self.tokens_used,
+            )
+            if cost is not None:
+                self.estimated_cost = float(cost)
+        return self
 
 
 class AgentFileChangeResponse(BaseModel):

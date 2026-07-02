@@ -11,6 +11,8 @@ import { PreviewPanel } from "../components/PreviewPanel";
 import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import { WorktreesPanel } from "../components/WorktreesPanel";
+import { BudgetConfig } from "../components/usage/BudgetConfig";
+import { UsagePanel } from "../components/usage/UsagePanel";
 import { useActiveWorktree } from "../lib/activeWorktree";
 import {
   ApiError,
@@ -60,6 +62,7 @@ type DashboardViewId =
   | "preview"
   | "spec"
   | "agent"
+  | "usage"
   | "audit";
 type PreviewStatusSnapshot = {
   status: "inactive" | "active" | "stopped" | "error";
@@ -291,7 +294,22 @@ export function DashboardView({ view }: { view: DashboardViewId }) {
     return <AgentTab workspaceId={workspace.id} />;
   }
 
+  if (view === "usage") {
+    return <WorkspaceUsageView workspace={workspace} />;
+  }
+
   return <AuditLogPanel workspace={workspace} />;
+}
+
+function WorkspaceUsageView({ workspace }: { workspace: WorkspaceResponse }) {
+  const { user } = useAuth();
+  const canManage = user?.id === workspace.owner_id;
+  return (
+    <div className="flex flex-col gap-4">
+      <UsagePanel scope="workspace" scopeId={workspace.id} title="Workspace usage" />
+      <BudgetConfig scope="workspace" scopeId={workspace.id} canManage={canManage} />
+    </div>
+  );
 }
 
 function DashboardOverview({

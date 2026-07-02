@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import PurePosixPath
 from uuid import UUID, uuid4
 
@@ -2658,3 +2659,102 @@ class TestAgentSessions:
             assert "OLDEST_TURN_PROMPT" not in context
         finally:
             self._teardown()
+
+
+class TestAgentRunCostFields:
+    """AgentRunResponse surfaces input/output tokens and estimated cost."""
+
+    async def _setup(self, session, session_maker, label):
+        uid = uuid4()
+        user = User(
+            id=uuid4(),
+            email=f"{label}-{uid}@example.com",
+            password_hash=hash_password("password"),
+            role="owner",
+            is_active=True,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        workspace = Workspace(
+            id=uuid4(),
+            owner_id=user.id,
+            name=f"{label}-{uid}",
+            slug=f"{label}-{uid}",
+            repo_url="https://github.com/example/cost",
+            default_branch="main",
+            runtime="daytona",
+            workspace_path="/workspace",
+            status="ready",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        session.add_all([user, workspace])
+        await session.flush()
+        app.dependency_overrides[auth_module.get_current_user] = await override_get_current_user(
+            user
+        )
+        app.dependency_overrides[get_db_session] = override_get_db_session(session)
+        app.dependency_overrides[agents_module.get_agent_service] = override_get_agent_service(
+            session, session_maker
+        )
+        return user, workspace
+
+    async def test_detail_includes_stored_cost_fields(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "cost-stored")
+        try:
+            run = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                prompt="do the thing",
+                status="completed",
+                provider="openai",
+                model="gpt-4.1-mini",
+                tokens_used=300,
+                input_tokens=100,
+                output_tokens=200,
+                estimated_cost=Decimal("0.00034"),
+                completed_at=datetime.now(UTC),
+            )
+            session.add(run)
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get(f"/workspaces/{workspace.id}/agent/runs/{run.id}")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["input_tokens"] == 100
+            assert body["output_tokens"] == 200
+            assert body["estimated_cost"] == pytest.approx(0.00034)
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_estimated_cost_fallback_computed_on_read(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "cost-fallback")
+        try:
+            # No stored estimated_cost, but tokens are present -> computed on read.
+            run = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                prompt="legacy run",
+                status="completed",
+                provider="openai",
+                model="gpt-4.1-mini",
+                tokens_used=1_000_000,
+                completed_at=datetime.now(UTC),
+            )
+            session.add(run)
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get(f"/workspaces/{workspace.id}/agent/runs/{run.id}")
+            assert resp.status_code == 200
+            # Total-only fallback applies the output rate (1.60 / 1M tokens).
+            assert resp.json()["estimated_cost"] == pytest.approx(1.60)
+        finally:
+            app.dependency_overrides.clear()

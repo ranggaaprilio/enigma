@@ -224,6 +224,9 @@ export type AgentRunResponse = {
   provider: string;
   model: string;
   tokens_used: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  estimated_cost: number | null;
   started_at: string;
   completed_at: string | null;
   error_message: string | null;
@@ -1426,6 +1429,129 @@ export type DashboardSummary = {
 
 export function getDashboardSummary(signal?: AbortSignal): Promise<DashboardSummary> {
   return requestJson<DashboardSummary>("/dashboard/summary", { signal });
+}
+
+// Cost & usage analytics
+
+export type UsageScope = "workspace" | "team" | "project";
+export type UsageBreakdownDimension = "project" | "team" | "workspace" | "user";
+
+export type UsageTotals = {
+  run_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  tokens_used: number;
+  estimated_cost: number;
+};
+
+export type UsageSeriesPoint = {
+  date: string;
+  run_count: number;
+  tokens_used: number;
+  estimated_cost: number;
+};
+
+export type UsageBreakdownItem = {
+  id: string | null;
+  name: string;
+  run_count: number;
+  tokens_used: number;
+  estimated_cost: number;
+};
+
+export type UsageSummary = {
+  scope: UsageScope | null;
+  scope_id: string | null;
+  date_from: string;
+  date_to: string;
+  totals: UsageTotals;
+  series: UsageSeriesPoint[];
+  breakdown_dimension: UsageBreakdownDimension;
+  breakdown: UsageBreakdownItem[];
+  top_spenders: UsageBreakdownItem[];
+};
+
+export type UsageQuery = {
+  scope?: UsageScope;
+  id?: string;
+  from?: string;
+  to?: string;
+};
+
+export function getUsageSummary(query: UsageQuery = {}, signal?: AbortSignal): Promise<UsageSummary> {
+  const params = new URLSearchParams();
+  if (query.scope) params.set("scope", query.scope);
+  if (query.id) params.set("id", query.id);
+  if (query.from) params.set("from", query.from);
+  if (query.to) params.set("to", query.to);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return requestJson<UsageSummary>(`/dashboard/usage${suffix}`, { signal });
+}
+
+// Usage budgets
+
+export type BudgetPeriod = "daily" | "weekly" | "monthly" | "total";
+export type BudgetStatus = "ok" | "warning" | "over";
+
+export type Budget = {
+  id: string;
+  scope: UsageScope;
+  scope_id: string;
+  period: BudgetPeriod;
+  limit_cost: number | null;
+  limit_tokens: number | null;
+  threshold_percent: number;
+  enforce: boolean;
+  created_at: string;
+  updated_at: string;
+  current_cost: number;
+  current_tokens: number;
+  status: BudgetStatus;
+};
+
+export type BudgetCreatePayload = {
+  scope: UsageScope;
+  scope_id: string;
+  period?: BudgetPeriod;
+  limit_cost?: number | null;
+  limit_tokens?: number | null;
+  threshold_percent?: number;
+  enforce?: boolean;
+};
+
+export type BudgetUpdatePayload = {
+  period?: BudgetPeriod;
+  limit_cost?: number | null;
+  limit_tokens?: number | null;
+  threshold_percent?: number;
+  enforce?: boolean;
+};
+
+export function listBudgets(
+  scope: UsageScope,
+  id: string,
+  signal?: AbortSignal,
+): Promise<Budget[]> {
+  const params = new URLSearchParams({ scope, id });
+  return requestJson<Budget[]>(`/budgets?${params.toString()}`, { signal });
+}
+
+export function createBudget(payload: BudgetCreatePayload): Promise<Budget> {
+  return requestJson<Budget>("/budgets", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateBudget(budgetId: string, payload: BudgetUpdatePayload): Promise<Budget> {
+  return requestJson<Budget>(`/budgets/${budgetId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteBudget(budgetId: string): Promise<void> {
+  return requestJson<void>(`/budgets/${budgetId}`, { method: "DELETE" });
 }
 
 // --- Spec-Driven Development (SDD) ---------------------------------------------------

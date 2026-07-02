@@ -8,10 +8,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
+from app.core.pricing import estimate_cost
 from app.models import AgentEvent, AgentFileChange, AgentRun, AgentSession, Workspace
 from app.services.agent_providers import AgentProvider, MockAgentProvider, OpenAIResponsesProvider
 from app.services.agent_tools import WorkspaceTools
 from app.services.audit import AuditLogService
+from app.services.budgets import BudgetService
 from app.services.daytona_runtime import get_daytona_runtime
 from app.services.notifications import NotificationService
 from app.services.repositories import RepositoryService
@@ -158,6 +160,9 @@ class AgentService:
         )
         if active.scalar_one_or_none() is not None:
             raise AgentRunAlreadyActiveError
+
+        # Block/warn before spending: an enforcing budget over its limit stops the run here.
+        await BudgetService(self.session).assert_within_budget(workspace, user_id)
 
         provider = provider_from_settings(self.settings)
         run = AgentRun(
@@ -662,6 +667,12 @@ class AgentService:
                     if (tokens_used := provider_event.metadata.get("tokens_used")) is not None:
                         run.tokens_used = int(tokens_used)
                         session.add(run)
+                    if (input_tokens := provider_event.metadata.get("input_tokens")) is not None:
+                        run.input_tokens = int(input_tokens)
+                        session.add(run)
+                    if (output_tokens := provider_event.metadata.get("output_tokens")) is not None:
+                        run.output_tokens = int(output_tokens)
+                        session.add(run)
                     await self._persist_event(
                         session,
                         run.id,
@@ -756,6 +767,8 @@ class AgentService:
                 run.id,
                 session,
             )
+        self._apply_estimated_cost(run)
+        session.add(run)
         notification_type = (
             "agent_run_completed" if run.status == "completed" else "agent_run_failed"
         )
@@ -778,5 +791,24 @@ class AgentService:
             action="agent_run_finish",
             target_type="agent_run",
             target_id=run.id,
-            metadata={"status": run.status, "tokens_used": run.tokens_used},
+            metadata={
+                "status": run.status,
+                "tokens_used": run.tokens_used,
+                "input_tokens": run.input_tokens,
+                "output_tokens": run.output_tokens,
+                "estimated_cost": (
+                    float(run.estimated_cost) if run.estimated_cost is not None else None
+                ),
+            },
+        )
+
+    def _apply_estimated_cost(self, run: AgentRun) -> None:
+        """Derive and store run.estimated_cost from the captured token counts + pricing map."""
+        run.estimated_cost = estimate_cost(
+            run.provider,
+            run.model,
+            input_tokens=run.input_tokens,
+            output_tokens=run.output_tokens,
+            total_tokens=run.tokens_used,
+            overrides=self.settings.model_pricing_overrides,
         )

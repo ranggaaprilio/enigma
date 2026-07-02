@@ -27,6 +27,7 @@ from app.services.agents import (
     agent_runtime,
     event_payload,
 )
+from app.services.budgets import BudgetExceededError
 from app.services.daytona_runtime import get_daytona_runtime
 from app.services.workspaces import WorkspaceNotFoundError
 from app.services.worktrees import WorktreeNotFoundError, WorktreeService
@@ -130,6 +131,9 @@ def agent_run_detail_response(run: AgentRun) -> AgentRunDetailResponse:
         provider=run.provider,
         model=run.model,
         tokens_used=run.tokens_used,
+        input_tokens=run.input_tokens,
+        output_tokens=run.output_tokens,
+        estimated_cost=float(run.estimated_cost) if run.estimated_cost is not None else None,
         started_at=run.started_at,
         completed_at=run.completed_at,
         error_message=run.error_message,
@@ -177,6 +181,11 @@ async def create_agent_run(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Workspace already has an active agent run",
+        ) from None
+    except BudgetExceededError as error:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=str(error),
         ) from None
     except AgentConfigurationError as error:
         raise HTTPException(

@@ -46,6 +46,10 @@ class Settings(BaseSettings):
     # is kept. ~4 chars/token, so 24k chars ≈ 6k tokens.
     agent_session_context_char_budget: int = 24_000
     agent_session_context_per_turn_char_cap: int = 8_000
+    # Optional per-provider/model pricing overrides (USD per 1M tokens), merged over the
+    # defaults in app.core.pricing. Accepts a JSON string via the MODEL_PRICING_OVERRIDES env
+    # var, e.g. {"openai": {"gpt-4.1-mini": {"input_per_1m": 0.4, "output_per_1m": 1.6}}}.
+    model_pricing_overrides: str | dict = Field(default_factory=dict)
     terminal_default_cols: int = 120
     terminal_default_rows: int = 34
     editor_code_server_binary: str = "code-server"
@@ -85,6 +89,18 @@ class Settings(BaseSettings):
     def parse_command_allowlist(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
             return [item.strip() for item in value.split(",") if item.strip()]
+        return value
+
+    @field_validator("model_pricing_overrides", mode="before")
+    @classmethod
+    def parse_model_pricing_overrides(cls, value: str | dict) -> dict:
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return {}
+            import json
+
+            return json.loads(stripped)
         return value
 
 
