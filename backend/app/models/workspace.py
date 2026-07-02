@@ -60,6 +60,12 @@ class Workspace(Base):
         default=False,
         server_default=text("false"),
     )
+    # Which worktree the current dev server was launched in (NULL = base clone).
+    dev_worktree_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspace_worktrees.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

@@ -369,6 +369,9 @@ export type PreviewSessionResponse = {
   status: PreviewSessionStatus;
   created_at: string;
   last_seen_at: string;
+  // The worktree this preview belongs to (null = base clone) and its branch.
+  worktree_id: string | null;
+  branch: string | null;
 };
 
 export type PreviewDetectResponse = {
@@ -391,6 +394,9 @@ export type DevServerStatusResponse = {
   status: DevServerStatus;
   port: number | null;
   message: string | null;
+  // The worktree the dev server is running in (null = base clone) and its branch.
+  worktree_id: string | null;
+  branch: string | null;
 };
 
 export type DevServerActionResponse = {
@@ -1130,16 +1136,30 @@ export function stopPreviewSession(
   );
 }
 
-/** Prepare the environment (toolchain + dependencies) without running the app. */
-export function setupDevServer(workspaceId: string): Promise<DevServerActionResponse> {
-  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/setup`, {
+/**
+ * Prepare the environment (toolchain + dependencies) without running the app.
+ * Scoped to a worktree when `worktreeId` is given (defaults to the base clone).
+ */
+export function setupDevServer(
+  workspaceId: string,
+  worktreeId?: string | null,
+): Promise<DevServerActionResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/setup${query}`, {
     method: "POST",
   });
 }
 
-/** Run the app's dev task on demand (the Preview "Run App" button). */
-export function runDevServer(workspaceId: string): Promise<DevServerActionResponse> {
-  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/run`, {
+/**
+ * Run the app's dev task on demand (the Preview "Run App" button), in the given
+ * worktree when `worktreeId` is set (defaults to the base clone).
+ */
+export function runDevServer(
+  workspaceId: string,
+  worktreeId?: string | null,
+): Promise<DevServerActionResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/run${query}`, {
     method: "POST",
   });
 }

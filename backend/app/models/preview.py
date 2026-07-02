@@ -20,6 +20,7 @@ class PreviewSession(Base):
         Index("ix_preview_sessions_workspace_id", "workspace_id"),
         Index("ix_preview_sessions_status", "status"),
         Index("ix_preview_sessions_last_seen_at", "last_seen_at"),
+        Index("ix_preview_sessions_worktree_id", "worktree_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -27,6 +28,12 @@ class PreviewSession(Base):
         UUID(as_uuid=True),
         ForeignKey("workspaces.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    # Which worktree this preview belongs to (NULL = base clone).
+    worktree_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspace_worktrees.id", ondelete="SET NULL"),
+        nullable=True,
     )
     port: Mapped[int] = mapped_column(Integer, nullable=False)
     public_url: Mapped[str] = mapped_column(String(1024), nullable=False)

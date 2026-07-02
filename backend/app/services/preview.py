@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.models import PreviewSession, Workspace
+from app.models import PreviewSession, Workspace, WorkspaceWorktree
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import (
     DaytonaRuntime,
@@ -62,6 +62,8 @@ class PreviewService:
                 preview.public_url = self._proxy_url(preview)
                 self.session.add(preview)
         await self.session.commit()
+        for preview in sessions:
+            await self._attach_branch(workspace, preview)
         return sessions
 
     async def detect(self, workspace_id: UUID, user_id: UUID) -> PreviewSession:
@@ -94,6 +96,9 @@ class PreviewService:
             await self.session.flush()
         else:
             preview.last_seen_at = now
+        # Tag the preview with whichever worktree the dev server is running in, so the
+        # UI can show which branch is being previewed (None = base clone).
+        preview.worktree_id = workspace.dev_worktree_id
         preview.public_url = self._proxy_url(preview)
         self.session.add(preview)
         await self.session.commit()
@@ -105,9 +110,12 @@ class PreviewService:
                 action="preview_session_detect",
                 target_type="preview_session",
                 target_id=preview.id,
-                metadata={"port": port},
+                metadata={
+                    "port": port,
+                    "worktree_id": str(preview.worktree_id) if preview.worktree_id else None,
+                },
             )
-        return preview
+        return await self._attach_branch(workspace, preview)
 
     async def refresh(
         self,
@@ -129,7 +137,7 @@ class PreviewService:
         self.session.add(preview)
         await self.session.commit()
         await self.session.refresh(preview)
-        return preview
+        return await self._attach_branch(workspace, preview)
 
     def _proxy_url(self, preview: PreviewSession) -> str:
         ttl_seconds = min(
@@ -180,7 +188,7 @@ class PreviewService:
         self.session.add(preview)
         await self.session.commit()
         await self.session.refresh(preview)
-        return preview
+        return await self._attach_branch(_workspace, preview)
 
     async def get_for_workspace(
         self,
@@ -201,6 +209,22 @@ class PreviewService:
         if not workspace.daytona_sandbox_id:
             raise PreviewWorkspacePathError
         return workspace
+
+    async def _attach_branch(
+        self, workspace: Workspace, preview: PreviewSession
+    ) -> PreviewSession:
+        """Attach the (non-persisted) branch name for the preview's worktree so the
+        response tells the client which branch is being previewed."""
+        preview.branch = await self._branch_for(workspace, preview.worktree_id)
+        return preview
+
+    async def _branch_for(self, workspace: Workspace, worktree_id: UUID | None) -> str:
+        if worktree_id is None:
+            return workspace.default_branch
+        row = await self.session.get(WorkspaceWorktree, worktree_id)
+        if row is None or row.workspace_id != workspace.id:
+            return workspace.default_branch
+        return row.branch
 
     async def _first_open_port(self, workspace: Workspace) -> int | None:
         for port in self.common_ports:

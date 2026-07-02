@@ -9,7 +9,7 @@ from app.api import dev_server as dev_server_module
 from app.core.config import get_settings
 from app.core.security import hash_password
 from app.main import app
-from app.models import User, Workspace
+from app.models import User, Workspace, WorkspaceWorktree
 from app.services.daytona_runtime import RuntimeCommandResult
 from app.services.dev_server import (
     DevServerNotClonedError,
@@ -18,6 +18,7 @@ from app.services.dev_server import (
 )
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError
+from app.services.worktrees import WorktreeNotFoundError
 
 
 class FakeUserStore:
@@ -79,12 +80,14 @@ class FakeRuntime:
         self.open_ports = open_ports or set()
         self.dev_process_alive = dev_process_alive
         self.commands: list[str] = []
+        self.cwds: list[str | None] = []
 
     async def get_sandbox(self, workspace, *, start: bool = True) -> FakeSandbox:
         return self.sandbox
 
     async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
         self.commands.append(command)
+        self.cwds.append(cwd)
         if command.startswith("cat "):
             return RuntimeCommandResult(exit_code=0, stdout=f"{self.status_value}\n", stderr="")
         if "pgrep" in command:
@@ -103,11 +106,30 @@ class FakeRuntime:
 
 
 class FakeSession:
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(
+        self, workspace: Workspace, worktree: WorkspaceWorktree | None = None
+    ) -> None:
         self.workspace = workspace
+        self.worktree = worktree
 
     async def get(self, model, pk):
-        return self.workspace if self.workspace.id == pk else None
+        if self.workspace.id == pk:
+            return self.workspace
+        if self.worktree is not None and self.worktree.id == pk:
+            return self.worktree
+        return None
+
+
+def _worktree(workspace: Workspace, *, branch: str = "feature-x") -> WorkspaceWorktree:
+    return WorkspaceWorktree(
+        id=uuid4(),
+        workspace_id=workspace.id,
+        branch=branch,
+        path=f"worktrees/{branch}",
+        base_ref="main",
+        is_base=False,
+        status="active",
+    )
 
 
 def _workspace(user: User) -> Workspace:
@@ -248,6 +270,101 @@ async def test_run_no_ops_when_already_running():
     assert state.port == 5173
     assert all("nohup" not in command for command in runtime.commands)
     assert workspace.dev_autostart
+
+
+# --- worktree-aware run/setup/status -------------------------------------
+
+
+async def test_run_in_feature_worktree_uses_its_path_and_installs_deps():
+    user = _user()
+    workspace = _workspace(user)
+    worktree = _worktree(workspace)
+    runtime = FakeRuntime(
+        FakeSandbox({"worktrees/feature-x/.git", "worktrees/feature-x/mise.toml"})
+    )
+    service = DevServerService(FakeSession(workspace, worktree), get_settings(), runtime)
+
+    state = await service.run(workspace.id, user.id, worktree.id)
+
+    assert state.status == "installing"
+    assert state.worktree_id == worktree.id
+    assert state.branch == "feature-x"
+    # The dev task is launched in the worktree's working directory…
+    launch_idx = next(i for i, c in enumerate(runtime.commands) if "nohup" in c)
+    assert runtime.cwds[launch_idx] == "worktrees/feature-x"
+    launch = runtime.commands[launch_idx]
+    assert "mise run dev" in launch
+    # …and a feature worktree installs its own project deps before serving.
+    assert "mise run install" in launch
+    assert workspace.dev_autostart
+    assert workspace.dev_worktree_id == worktree.id
+
+
+async def test_run_switching_worktree_stops_previous_server():
+    user = _user()
+    workspace = _workspace(user)
+    worktree = _worktree(workspace)
+    # A dev server is already running for the base clone (dev_worktree_id is None).
+    runtime = FakeRuntime(
+        FakeSandbox({"worktrees/feature-x/.git", "worktrees/feature-x/mise.toml"}),
+        status_value="running",
+        open_ports={5173},
+    )
+    service = DevServerService(FakeSession(workspace, worktree), get_settings(), runtime)
+
+    state = await service.run(workspace.id, user.id, worktree.id)
+
+    # Switching worktrees kills the running dev server before launching the new one.
+    assert any("pkill" in c and "ise run dev" in c for c in runtime.commands)
+    assert any("nohup" in c for c in runtime.commands)
+    assert state.worktree_id == worktree.id
+    assert workspace.dev_worktree_id == worktree.id
+
+
+async def test_run_unknown_worktree_raises():
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git", "workspace/mise.toml"}))
+    service = _service(runtime, workspace)
+
+    with pytest.raises(WorktreeNotFoundError):
+        await service.run(workspace.id, user.id, uuid4())
+
+
+async def test_status_reports_running_worktree_branch():
+    user = _user()
+    workspace = _workspace(user)
+    worktree = _worktree(workspace)
+    workspace.dev_worktree_id = worktree.id
+    runtime = FakeRuntime(
+        FakeSandbox({"worktrees/feature-x/.git"}),
+        status_value="running",
+        open_ports={5173},
+    )
+    service = DevServerService(FakeSession(workspace, worktree), get_settings(), runtime)
+
+    state = await service.status(workspace.id, user.id)
+
+    assert state.status == "running"
+    assert state.port == 5173
+    assert state.worktree_id == worktree.id
+    assert state.branch == "feature-x"
+
+
+async def test_status_reports_base_branch_when_no_worktree():
+    user = _user()
+    workspace = _workspace(user)  # dev_worktree_id defaults to None (base clone)
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git"}),
+        status_value="running",
+        open_ports={5173},
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.status(workspace.id, user.id)
+
+    assert state.worktree_id is None
+    assert state.branch == "main"
 
 
 async def test_status_running_with_open_port():
@@ -437,12 +554,16 @@ class FakeDevServerService:
         self.workspace = workspace
         self.state = DevServerState(status="idle")
 
-    async def setup(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
+    async def setup(
+        self, workspace_id: UUID, user_id: UUID, worktree_id: UUID | None = None
+    ) -> DevServerState:
         self._ensure_workspace(workspace_id, user_id)
         self.state = DevServerState(status="installing", message="Setting up environment…")
         return self.state
 
-    async def run(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
+    async def run(
+        self, workspace_id: UUID, user_id: UUID, worktree_id: UUID | None = None
+    ) -> DevServerState:
         self._ensure_workspace(workspace_id, user_id)
         self.state = DevServerState(status="installing", message="Starting app…")
         return self.state

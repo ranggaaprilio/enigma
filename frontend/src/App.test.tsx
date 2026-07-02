@@ -1071,6 +1071,8 @@ describe("App auth routing", () => {
 
     await userEvent.click(await screen.findByRole("link", { name: "Preview" }));
     expect(await screen.findByText("Preview is not running.")).toBeInTheDocument();
+    // Preview follows the active worktree; with none selected it shows the base clone.
+    expect(screen.getByText(/Branch:/)).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("button", { name: "Detect/Open" }));
 

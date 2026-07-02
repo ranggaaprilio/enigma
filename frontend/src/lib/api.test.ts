@@ -634,6 +634,36 @@ describe("getHealth", () => {
     );
   });
 
+  it("scopes dev-server setup/run to a worktree when given", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const worktreeId = "7c9d15db-19e2-4c04-95ad-a4e4508ef80d";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ok: true, status: "installing", message: null }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setupDevServer(workspaceId, worktreeId);
+    await runDevServer(workspaceId, worktreeId);
+    await runDevServer(workspaceId); // base clone → no worktree_id query param
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/setup?worktree_id=${worktreeId}`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/run?worktree_id=${worktreeId}`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/run`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+  });
+
   it("sends credentialed notification and audit requests", async () => {
     const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
     const notificationId = "db59cbaa-c95d-4bd5-8984-16a30e4dce15";

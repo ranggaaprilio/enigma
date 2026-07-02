@@ -1,11 +1,11 @@
-from dataclasses import dataclass
-from uuid import UUID
+from dataclasses import dataclass, replace
+from uuid import UUID, uuid4
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.models import Workspace
+from app.models import Workspace, WorkspaceWorktree
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import (
     DaytonaRuntime,
@@ -14,6 +14,7 @@ from app.services.daytona_runtime import (
 )
 from app.services.preview import COMMON_PREVIEW_PORTS
 from app.services.workspaces import WorkspaceNotFoundError
+from app.services.worktrees import WorktreeNotFoundError
 
 logger = structlog.get_logger(__name__)
 
@@ -21,6 +22,10 @@ logger = structlog.get_logger(__name__)
 STATUS_PATH = "/tmp/enigma-dev.status"
 LOG_PATH = "/tmp/enigma-dev.log"
 MISE_INSTALL_LOG_PATH = "/tmp/enigma-mise-install.log"
+# Records the generation token of the most recent `run` launch. Only the launch that
+# owns the current token may write terminal status states — so a dev server killed
+# during a worktree switch cannot clobber the status of the launch that replaced it.
+GEN_PATH = "/tmp/enigma-dev.gen"
 
 # Config filenames mise looks for, in precedence order we care about for detection.
 MISE_CONFIG_FILES = (
@@ -48,6 +53,9 @@ class DevServerState:
     status: str
     port: int | None = None
     message: str | None = None
+    # The worktree the current dev server belongs to (None = base clone) and its branch.
+    worktree_id: UUID | None = None
+    branch: str | None = None
 
 
 class DevServerService:
@@ -63,52 +71,80 @@ class DevServerService:
         self.runtime = runtime or get_daytona_runtime()
         self.common_ports = common_ports
 
-    async def setup(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
-        """Prepare the workspace: install the mise toolchain + project dependencies,
+    async def setup(
+        self, workspace_id: UUID, user_id: UUID, worktree_id: UUID | None = None
+    ) -> DevServerState:
+        """Prepare a worktree: install the mise toolchain + project dependencies,
         then stop at `ready`. This does NOT run the app and does NOT mark it as
         desired — actually running the dev task is an explicit user action (`run`)."""
         workspace = await self._get_workspace(workspace_id, user_id)
+        cwd, branch, resolved_id = await self._resolve_worktree(workspace, worktree_id)
 
-        # Setup already in flight, environment already prepared, or the app is
-        # already up → nothing to do (re-running would redo a minutes-long install).
+        # Skip a re-install only when the prepared/running environment already belongs
+        # to the requested worktree; a different worktree needs its own dependencies
+        # installed into its own working directory.
         current = await self._read_status(workspace)
-        if current in {"installing", "ready", "running"}:
-            return await self._resolve_state(workspace, current)
+        if workspace.dev_worktree_id == resolved_id and current in {
+            "installing",
+            "ready",
+            "running",
+        }:
+            state = await self._resolve_state(workspace, current)
+            return await self._with_worktree(workspace, state)
 
-        return await self._launch_setup(workspace, user_id)
+        return await self._launch_setup(workspace, user_id, cwd, resolved_id, branch)
 
-    async def run(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
-        """Run the app's `dev` task. Marks it as desired so it auto-resumes after the
-        sandbox sleeps and wakes. Dependencies installed by `setup` persist on disk."""
+    async def run(
+        self, workspace_id: UUID, user_id: UUID, worktree_id: UUID | None = None
+    ) -> DevServerState:
+        """Run the app's `dev` task in a worktree. Marks it as desired so it auto-resumes
+        after the sandbox sleeps and wakes. Only one dev server runs per sandbox, so
+        switching to a different worktree stops the previous one first."""
         workspace = await self._get_workspace(workspace_id, user_id)
+        cwd, branch, resolved_id = await self._resolve_worktree(workspace, worktree_id)
 
         current = await self._read_status(workspace)
-        # Already serving → just record the desire and report the current state.
-        if current == "running":
+        same_worktree = workspace.dev_worktree_id == resolved_id
+        # Already serving this worktree → just record the desire and report state.
+        if current == "running" and same_worktree:
             await self._mark_autostart(workspace, True)
-            return await self._resolve_state(workspace, current)
-        # Setup still in progress → can't run yet; surface the in-flight progress.
-        if current == "installing":
-            return await self._resolve_state(workspace, current)
+            state = await self._resolve_state(workspace, current)
+            return await self._with_worktree(workspace, state)
+        # Setup still in progress for this worktree → can't run yet; surface progress.
+        if current == "installing" and same_worktree:
+            state = await self._resolve_state(workspace, current)
+            return await self._with_worktree(workspace, state)
 
-        return await self._launch_run(workspace, user_id)
+        # Switching worktrees (or a stale server elsewhere) → stop the running dev
+        # server so only one exists, then launch in the target worktree.
+        if not same_worktree:
+            await self._stop_processes(workspace)
 
-    async def _ensure_runnable(self, workspace: Workspace) -> DevServerState | None:
-        """Validate the repo is cloned and carries a mise config. Returns a `no-config`
-        state to surface, or `None` when good. Raises if the repo isn't cloned."""
+        return await self._launch_run(workspace, user_id, cwd, resolved_id, branch)
+
+    async def _ensure_runnable(self, workspace: Workspace, cwd: str) -> DevServerState | None:
+        """Validate the working directory is a checkout with a mise config. Returns a
+        `no-config` state to surface, or `None` when good. Raises if it isn't a checkout."""
         sandbox = await self.runtime.get_sandbox(workspace)
-        if not await self._is_cloned(sandbox, workspace.workspace_path):
+        if not await self._is_cloned(sandbox, cwd):
             raise DevServerNotClonedError
-        if not await self._has_mise_config(sandbox, workspace.workspace_path):
+        if not await self._has_mise_config(sandbox, cwd):
             return DevServerState(
                 status="no-config",
                 message="No mise.toml found in the repository.",
             )
         return None
 
-    async def _launch_setup(self, workspace: Workspace, user_id: UUID) -> DevServerState:
+    async def _launch_setup(
+        self,
+        workspace: Workspace,
+        user_id: UUID,
+        cwd: str,
+        worktree_id: UUID | None,
+        branch: str,
+    ) -> DevServerState:
         """Install the toolchain + dependencies in the background, ending at `ready`."""
-        blocked = await self._ensure_runnable(workspace)
+        blocked = await self._ensure_runnable(workspace, cwd)
         if blocked is not None:
             return blocked
 
@@ -116,81 +152,113 @@ class DevServerService:
             await self.runtime.exec(
                 workspace,
                 self._setup_command(),
-                cwd=workspace.workspace_path,
+                cwd=cwd,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
         except DaytonaRuntimeError as error:
             raise DevServerRuntimeError(str(error)) from error
 
+        # Record which worktree the prepared environment belongs to (does NOT mark the
+        # app as desired — that is the separate `run` phase).
+        workspace.dev_worktree_id = worktree_id
+        await self._commit_workspace(workspace)
         await AuditLogService(self.session).record(
             user_id=user_id,
             workspace_id=workspace.id,
             action="dev_server_setup",
             target_type="dev_server",
             target_id=workspace.id,
-            metadata={},
+            metadata={"worktree_id": str(worktree_id) if worktree_id else None},
         )
-        return DevServerState(status="installing", message="Setting up environment…")
+        return DevServerState(
+            status="installing",
+            message="Setting up environment…",
+            worktree_id=worktree_id,
+            branch=branch,
+        )
 
-    async def _launch_run(self, workspace: Workspace, user_id: UUID) -> DevServerState:
-        """Run the `dev` task in the background and mark it as desired so it
-        auto-resumes after a sandbox sleep/wake."""
-        blocked = await self._ensure_runnable(workspace)
+    async def _launch_run(
+        self,
+        workspace: Workspace,
+        user_id: UUID,
+        cwd: str,
+        worktree_id: UUID | None,
+        branch: str,
+    ) -> DevServerState:
+        """Run the `dev` task in a worktree in the background and mark it as desired so
+        it auto-resumes after a sandbox sleep/wake."""
+        blocked = await self._ensure_runnable(workspace, cwd)
         if blocked is not None:
             return blocked
 
+        # A feature worktree has no project deps installed yet (the post-clone setup
+        # only prepares the base clone), so its run installs them first — a fast no-op
+        # once installed. The base clone keeps its fast run (deps prepared by setup).
+        install_deps = worktree_id is not None
         try:
             await self.runtime.exec(
                 workspace,
-                self._run_command(),
-                cwd=workspace.workspace_path,
+                self._run_command(uuid4().hex, install_deps=install_deps),
+                cwd=cwd,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
         except DaytonaRuntimeError as error:
             raise DevServerRuntimeError(str(error)) from error
 
-        await self._mark_autostart(workspace, True)
+        workspace.dev_autostart = True
+        workspace.dev_worktree_id = worktree_id
+        await self._commit_workspace(workspace)
         await AuditLogService(self.session).record(
             user_id=user_id,
             workspace_id=workspace.id,
             action="dev_server_run",
             target_type="dev_server",
             target_id=workspace.id,
-            metadata={},
+            metadata={"worktree_id": str(worktree_id) if worktree_id else None},
         )
-        return DevServerState(status="installing", message="Starting app…")
+        return DevServerState(
+            status="installing",
+            message="Starting app…",
+            worktree_id=worktree_id,
+            branch=branch,
+        )
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
         workspace = await self._get_workspace(workspace_id, user_id)
         raw = await self._read_status(workspace)
-        return await self._resolve_state(workspace, raw)
+        return await self._with_worktree(workspace, await self._resolve_state(workspace, raw))
 
     async def ensure_running(self, workspace_id: UUID, user_id: UUID) -> DevServerState:
         """Idempotent auto-resume: if the dev server is *desired* (was started before)
         but is no longer actually serving — typically because the sandbox auto-stopped
-        and woke — relaunch it. Reading status already wakes the sandbox VM."""
+        and woke — relaunch it in the worktree it was last running in. Reading status
+        already wakes the sandbox VM."""
         workspace = await self._get_workspace(workspace_id, user_id)
         raw = await self._read_status(workspace)
         resolved = await self._resolve_state(workspace, raw)
 
         # Never auto-start a dev server the user never asked for (or explicitly stopped).
         if not workspace.dev_autostart:
-            return resolved
+            return await self._with_worktree(workspace, resolved)
 
         # Serving / setup in progress / nothing to run / surfaced failure → leave it.
         if resolved.status in {"running", "installing", "no-dev-task", "error"}:
-            return resolved
+            return await self._with_worktree(workspace, resolved)
 
         # Status file says "running" but no port is open yet. Only relaunch if the
         # process is actually dead (stale status after a wake); otherwise it's just a
         # genuinely slow startup and we must not double-launch.
         if resolved.status == "starting" and await self._dev_process_alive(workspace):
-            return resolved
+            return await self._with_worktree(workspace, resolved)
 
         # Desired but down (stopped / idle / ready / dead-after-wake) → relaunch the
-        # dev task only; dependencies installed by `setup` persist on the sandbox disk.
+        # dev task in the worktree it was last running in; dependencies installed by
+        # `setup`/a previous run persist on the sandbox disk.
+        cwd, branch, resolved_id = await self._resolve_worktree(
+            workspace, workspace.dev_worktree_id
+        )
         try:
-            return await self._launch_run(workspace, user_id)
+            return await self._launch_run(workspace, user_id, cwd, resolved_id, branch)
         except DevServerNotClonedError:
             return DevServerState(status="idle", message="Repository is not cloned yet.")
 
@@ -210,8 +278,11 @@ class DevServerService:
             )
         except DaytonaRuntimeError as error:
             raise DevServerRuntimeError(str(error)) from error
-        # An explicit stop clears the desired flag so it is not auto-resumed on wake.
-        await self._mark_autostart(workspace, False)
+        # An explicit stop clears the desired flag and the bound worktree so it is not
+        # auto-resumed on wake.
+        workspace.dev_autostart = False
+        workspace.dev_worktree_id = None
+        await self._commit_workspace(workspace)
         await AuditLogService(self.session).record(
             user_id=user_id,
             workspace_id=workspace.id,
@@ -222,10 +293,27 @@ class DevServerService:
         )
         return DevServerState(status="stopped")
 
+    async def _stop_processes(self, workspace: Workspace) -> None:
+        """Kill any running dev server without touching the desired flag or status file,
+        so a worktree switch can launch a fresh one. The generation guard in the run
+        script prevents the killed server from clobbering the new launch's status."""
+        try:
+            await self.runtime.exec(
+                workspace,
+                "pkill -f '[m]ise run dev' >/dev/null 2>&1 || true",
+                cwd=workspace.workspace_path,
+                timeout=self.settings.dev_server_command_timeout_seconds,
+            )
+        except DaytonaRuntimeError:
+            pass
+
     async def _mark_autostart(self, workspace: Workspace, value: bool) -> None:
         if workspace.dev_autostart == value:
             return
         workspace.dev_autostart = value
+        await self._commit_workspace(workspace)
+
+    async def _commit_workspace(self, workspace: Workspace) -> None:
         # Persist only when backed by a real session (mirrors AuditLogService.record).
         if not all(hasattr(self.session, method) for method in ("add", "commit")):
             return
@@ -246,6 +334,33 @@ class DevServerService:
         except DaytonaRuntimeError:
             return False
         return (result.stdout or "").strip() == "0"
+
+    async def _resolve_worktree(
+        self, workspace: Workspace, worktree_id: UUID | None
+    ) -> tuple[str, str, UUID | None]:
+        """Map a worktree id to ``(cwd, branch, worktree_id)``; ``None`` => base clone.
+
+        Mirrors ``WorktreeService.resolve_path`` — raw paths never cross the API; a
+        worktree is only ever targeted by its database id, confined to the workspace."""
+        if worktree_id is None:
+            return workspace.workspace_path, workspace.default_branch, None
+        row = await self.session.get(WorkspaceWorktree, worktree_id)
+        if row is None or row.workspace_id != workspace.id:
+            raise WorktreeNotFoundError
+        return row.path, row.branch, row.id
+
+    async def _with_worktree(self, workspace: Workspace, state: DevServerState) -> DevServerState:
+        """Attach the running worktree id/branch to a state that does not already carry
+        them, so status/ensure responses tell the client which branch is live."""
+        if state.worktree_id is not None or state.branch is not None:
+            return state
+        try:
+            _, branch, resolved_id = await self._resolve_worktree(
+                workspace, workspace.dev_worktree_id
+            )
+        except WorktreeNotFoundError:
+            branch, resolved_id = workspace.default_branch, None
+        return replace(state, worktree_id=resolved_id, branch=branch)
 
     async def _resolve_state(self, workspace: Workspace, raw: str) -> DevServerState:
         if raw == "running":
@@ -323,30 +438,48 @@ class DevServerService:
         )
         return f"nohup sh -c {self._shell_quote(script)} >/dev/null 2>&1 &"
 
-    def _run_command(self) -> str:
-        """Background script that runs the app's `dev` task. The toolchain and
-        dependencies are installed by `setup` and persist on the sandbox disk; a bare
-        `mise install` here is a cheap no-op when tools are cached and re-provisions
-        them on a cold/woken sandbox before the dev task starts."""
-        # `launching` mirrors `installing` semantics for the auto-resume poller (so it
-        # never double-launches) while the toolchain check runs; `mise run dev` then
-        # flips the status to `running` and serves until stopped.
+    def _run_command(self, gen: str, install_deps: bool) -> str:
+        """Background script that runs the app's `dev` task in the current directory.
+
+        A generation token guards every terminal status write and the dev-server launch
+        itself: only the launch that owns the current token (last writer of `GEN_PATH`)
+        may act. This lets a worktree switch kill the previous dev server without it
+        clobbering the new launch's status or starting a second server."""
+        # Optionally (re)install project deps first — a feature worktree starts with an
+        # empty working directory, so its first run installs before serving.
+        deps_block = ""
+        if install_deps:
+            deps_block = (
+                "if mise task ls 2>/dev/null | grep -qw install; then "
+                "echo '[run] installing project dependencies'; "
+                "mise run install || "
+                "{ echo '[run] dependency install failed'; setst error; exit 1; }; "
+                "fi\n"
+            )
         script = (
             f"exec >{LOG_PATH} 2>&1\n"
             "set -x\n"
             'export PATH="$HOME/.local/bin:$PATH"\n'
             'export MISE_INSTALL_PATH="$HOME/.local/bin/mise"\n'
-            f"echo launching > {STATUS_PATH}\n"
+            # Claim this generation, then guard every status write against it.
+            f"echo {gen} > {GEN_PATH}\n"
+            f'setst() {{ [ "$(cat {GEN_PATH} 2>/dev/null)" = {gen} ] && '
+            f'echo "$1" > {STATUS_PATH}; }}\n'
+            "setst launching\n"
             "command -v mise || "
-            f"{{ echo '[run] mise not found on PATH'; echo error > {STATUS_PATH}; exit 127; }}\n"
+            "{ echo '[run] mise not found on PATH'; setst error; exit 127; }\n"
             "mise trust || echo '[run] mise trust failed (continuing)'\n"
-            "mise install || "
-            f"{{ echo '[run] mise install failed'; echo error > {STATUS_PATH}; exit 1; }}\n"
+            "mise install || { echo '[run] mise install failed'; setst error; exit 1; }\n"
+            f"{deps_block}"
+            # Bail out if a newer launch superseded us (e.g. a worktree switch) before we
+            # start the dev server, so two dev servers never run at once.
+            f'[ "$(cat {GEN_PATH} 2>/dev/null)" = {gen} ] || '
+            "{ echo '[run] superseded before start'; exit 0; }\n"
             "if mise task ls 2>/dev/null | grep -qw dev; then "
-            f"echo running > {STATUS_PATH}; "
+            "setst running; "
             "mise run dev; "
-            f"echo stopped > {STATUS_PATH}; "
-            f"else echo '[run] no dev task found'; echo no-dev-task > {STATUS_PATH}; fi\n"
+            "setst stopped; "
+            "else echo '[run] no dev task found'; setst no-dev-task; fi\n"
         )
         return f"nohup sh -c {self._shell_quote(script)} >/dev/null 2>&1 &"
 
@@ -420,11 +553,13 @@ class DevServerService:
         return False
 
     async def _is_cloned(self, sandbox, repo_path: str) -> bool:
+        # A base clone's `.git` is a directory; a worktree's `.git` is a file (a gitdir
+        # link). Either presence means the working directory is a git checkout.
         try:
-            info = await sandbox.fs.get_file_info(f"{repo_path}/.git")
+            await sandbox.fs.get_file_info(f"{repo_path}/.git")
         except Exception:
             return False
-        return bool(getattr(info, "is_dir", False))
+        return True
 
     async def _get_workspace(self, workspace_id: UUID, user_id: UUID) -> Workspace:
         workspace = await self.session.get(Workspace, workspace_id)

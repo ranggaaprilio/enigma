@@ -16,6 +16,9 @@ class PreviewSessionResponse(BaseModel):
     status: PreviewSessionStatus
     created_at: datetime
     last_seen_at: datetime
+    # The worktree this preview belongs to (None = base clone) and its branch.
+    worktree_id: UUID | None = None
+    branch: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

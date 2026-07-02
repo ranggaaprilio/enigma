@@ -18,6 +18,7 @@ from app.services.dev_server import (
     DevServerWorkspacePathError,
 )
 from app.services.workspaces import WorkspaceNotFoundError
+from app.services.worktrees import WorktreeNotFoundError
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/dev", tags=["dev-server"])
 
@@ -26,9 +27,13 @@ SETTINGS_DEP = Depends(get_settings)
 
 
 class DevServerServiceProtocol(Protocol):
-    async def setup(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
+    async def setup(
+        self, workspace_id: UUID, user_id: UUID, worktree_id: UUID | None = None
+    ) -> DevServerState: ...
 
-    async def run(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
+    async def run(
+        self, workspace_id: UUID, user_id: UUID, worktree_id: UUID | None = None
+    ) -> DevServerState: ...
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> DevServerState: ...
 
@@ -54,14 +59,18 @@ def not_found() -> HTTPException:
 @router.post("/setup", response_model=DevServerActionResponse)
 async def setup_dev_server(
     workspace_id: UUID,
+    worktree_id: UUID | None = None,
     current_user: User = CURRENT_USER_DEP,
     service: DevServerServiceProtocol = DEV_SERVER_SERVICE_DEP,
 ) -> DevServerActionResponse:
-    """Prepare the environment (toolchain + dependencies) without running the app."""
+    """Prepare the environment (toolchain + dependencies) for a worktree without
+    running the app. Defaults to the base clone when no worktree is given."""
     try:
-        state = await service.setup(workspace_id, current_user.id)
+        state = await service.setup(workspace_id, current_user.id, worktree_id)
     except WorkspaceNotFoundError:
         raise not_found() from None
+    except WorktreeNotFoundError:
+        raise HTTPException(status_code=404, detail="Worktree not found") from None
     except DevServerWorkspacePathError:
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
     except DevServerNotClonedError:
@@ -74,14 +83,18 @@ async def setup_dev_server(
 @router.post("/run", response_model=DevServerActionResponse)
 async def run_dev_server(
     workspace_id: UUID,
+    worktree_id: UUID | None = None,
     current_user: User = CURRENT_USER_DEP,
     service: DevServerServiceProtocol = DEV_SERVER_SERVICE_DEP,
 ) -> DevServerActionResponse:
-    """Run the app's `dev` task on demand. Requires the environment to be prepared."""
+    """Run the app's `dev` task in a worktree on demand (defaults to the base clone).
+    Switching to a different worktree stops the previously running dev server first."""
     try:
-        state = await service.run(workspace_id, current_user.id)
+        state = await service.run(workspace_id, current_user.id, worktree_id)
     except WorkspaceNotFoundError:
         raise not_found() from None
+    except WorktreeNotFoundError:
+        raise HTTPException(status_code=404, detail="Worktree not found") from None
     except DevServerWorkspacePathError:
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
     except DevServerNotClonedError:
@@ -105,7 +118,13 @@ async def get_dev_server_status(
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
     except (DevServerRuntimeError, DaytonaRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
-    return DevServerStatusResponse(status=state.status, port=state.port, message=state.message)
+    return DevServerStatusResponse(
+        status=state.status,
+        port=state.port,
+        message=state.message,
+        worktree_id=state.worktree_id,
+        branch=state.branch,
+    )
 
 
 @router.post("/ensure", response_model=DevServerStatusResponse)
@@ -124,7 +143,13 @@ async def ensure_dev_server(
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
     except (DevServerRuntimeError, DaytonaRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
-    return DevServerStatusResponse(status=state.status, port=state.port, message=state.message)
+    return DevServerStatusResponse(
+        status=state.status,
+        port=state.port,
+        message=state.message,
+        worktree_id=state.worktree_id,
+        branch=state.branch,
+    )
 
 
 @router.post("/stop", response_model=DevServerActionResponse)

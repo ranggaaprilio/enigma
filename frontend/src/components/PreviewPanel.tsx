@@ -22,6 +22,7 @@ import {
   type PreviewSessionResponse,
   type WorkspaceResponse,
 } from "../lib/api";
+import { useActiveWorktree } from "../lib/activeWorktree";
 
 const DEV_STATUS_POLL_MS = 4000;
 
@@ -76,6 +77,12 @@ const deviceWidthClass: Record<DeviceMode, string> = {
 };
 
 export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
+  // Preview follows the shared active-worktree selection (as Terminal/Agents do);
+  // null = the base clone / default branch.
+  const [activeWorktree] = useActiveWorktree(workspace.id);
+  const worktreeId = activeWorktree?.id ?? null;
+  const activeBranch = activeWorktree?.branch ?? "base";
+
   const [panelState, setPanelState] = useState<PreviewPanelState>({ status: "loading" });
   const [deviceMode, setDeviceMode] = useState<DeviceMode>("desktop");
   const [busyAction, setBusyAction] = useState<string | null>(null);
@@ -200,7 +207,9 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
         window.clearTimeout(timer);
       }
     };
-  }, [applySessionState, workspace.id, pollNonce]);
+    // `worktreeId` re-enters the loop when the active worktree changes, so the panel
+    // re-reads which branch the dev server is actually serving.
+  }, [applySessionState, workspace.id, pollNonce, worktreeId]);
 
   const session =
     panelState.status === "ready" ||
@@ -219,8 +228,14 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
   async function runApp() {
     setBusyAction("run");
     try {
-      const response = await runDevServer(workspace.id);
-      setDevStatus({ status: response.status, port: null, message: response.message });
+      const response = await runDevServer(workspace.id, worktreeId);
+      setDevStatus({
+        status: response.status,
+        port: null,
+        message: response.message,
+        worktree_id: worktreeId,
+        branch: activeBranch,
+      });
       // Re-enter the poll loop to surface startup progress and auto-open the preview
       // once the dev server binds its port.
       setPollNonce((current) => current + 1);
@@ -317,6 +332,17 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
     error: "Error",
   }[panelState.status];
 
+  // Compare by worktree id (null = base clone), not branch name — the base clone's
+  // branch (e.g. "main") differs from the "base" label we show for a null selection.
+  const runningWorktreeId = devStatus?.worktree_id ?? null;
+  const runningBranchLabel = runningWorktreeId ? devStatus?.branch ?? "" : "base";
+  const isServing =
+    devStatus?.status === "running" ||
+    devStatus?.status === "starting" ||
+    panelState.status === "ready";
+  // The dev server is serving a different worktree than the one now selected.
+  const branchMismatch = isServing && runningWorktreeId !== worktreeId;
+
   return (
     <section className="rounded-md border border-line bg-white p-5 shadow-soft">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -325,6 +351,9 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
             Preview
           </p>
           <h3 className="mt-1 text-base font-semibold">{workspace.name}</h3>
+          <p className="mt-0.5 text-xs text-ink/55">
+            Branch: <span className="font-medium text-ink/75">{activeBranch}</span>
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-ink/65">
@@ -338,12 +367,17 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
               busyAction !== null ||
               devStatus?.status === "installing" ||
               devStatus?.status === "no-config" ||
-              panelState.status === "ready"
+              // Allow Run App while a preview is active only to switch to another branch.
+              (panelState.status === "ready" && !branchMismatch)
             }
             onClick={() => void runApp()}
           >
             <Play className="h-4 w-4" aria-hidden="true" />
-            {busyAction === "run" ? "Starting..." : "Run App"}
+            {busyAction === "run"
+              ? "Starting..."
+              : branchMismatch
+                ? `Run ${activeBranch}`
+                : "Run App"}
           </button>
           <button
             className="inline-flex items-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
@@ -404,6 +438,14 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
           </button>
         ))}
       </div>
+
+      {branchMismatch && (
+        <div className="mb-4 rounded-md border border-line bg-panel p-3 text-sm text-ink/72">
+          Previewing <span className="font-medium text-ink/85">{runningBranchLabel}</span>. Click{" "}
+          <span className="font-medium text-ink/85">Run {activeBranch}</span> to preview the active
+          branch.
+        </div>
+      )}
 
       {devStatus && devStatusLabel(devStatus) && (
         <div
