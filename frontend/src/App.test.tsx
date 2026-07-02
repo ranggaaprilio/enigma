@@ -629,6 +629,7 @@ describe("App auth routing", () => {
       id: "68b44d9c-4c0a-4770-8c6a-a4a462d0528d",
       workspace_id: workspace.id,
       user_id: authUser.id,
+      session_id: null,
       prompt: "Inspect files",
       status: "thinking",
       provider: "mock",

@@ -10,6 +10,49 @@ from app.db.base import Base
 AGENT_RUN_STATUSES = ("thinking", "executing", "completed", "error", "stopped")
 AGENT_EVENT_TYPES = ("status", "output_text", "tool_call", "tool_result", "error")
 AGENT_FILE_CHANGE_STATUSES = ("created", "modified", "deleted", "renamed")
+AGENT_SESSION_STATUSES = ("active", "archived")
+
+
+class AgentSession(Base):
+    __tablename__ = "agent_sessions"
+    __table_args__ = (
+        CheckConstraint(
+            "status in ('active', 'archived')",
+            name="ck_agent_sessions_status",
+        ),
+        Index("ix_agent_sessions_workspace_id", "workspace_id"),
+        Index("ix_agent_sessions_user_id", "user_id"),
+        Index("ix_agent_sessions_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    title: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, default="active")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    # No cascade delete: session_id uses ON DELETE SET NULL, so turns (runs) and their
+    # events/file-changes survive deletion of the grouping session.
+    runs: Mapped[list["AgentRun"]] = relationship(back_populates="session")
 
 
 class AgentRun(Base):
@@ -23,6 +66,7 @@ class AgentRun(Base):
         Index("ix_agent_runs_user_id", "user_id"),
         Index("ix_agent_runs_status", "status"),
         Index("ix_agent_runs_created_at", "started_at"),
+        Index("ix_agent_runs_session_id", "session_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -41,6 +85,11 @@ class AgentRun(Base):
         ForeignKey("workspace_worktrees.id", ondelete="SET NULL"),
         nullable=True,
     )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_sessions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     prompt: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="thinking")
     provider: Mapped[str] = mapped_column(String(80), nullable=False)
@@ -54,6 +103,7 @@ class AgentRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    session: Mapped["AgentSession | None"] = relationship(back_populates="runs")
     events: Mapped[list["AgentEvent"]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",

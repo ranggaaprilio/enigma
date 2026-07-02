@@ -1,73 +1,56 @@
 import { useState, useCallback } from "react";
 import { ArrowUp, Square } from "lucide-react";
-import {
-  createAgentRun,
-  stopAgentRun,
-  type AgentRunResponse,
-} from "../../lib/api";
+import type { AgentRunResponse } from "../../lib/api";
 
 interface PromptComposerProps {
-  workspaceId: string;
-  worktreeId?: string | null;
-  activeRunId?: string | null;
+  /** Submit the typed prompt; resolves with the created run. Throwing surfaces an error. */
+  submitPrompt: (prompt: string) => Promise<AgentRunResponse>;
+  onStop?: () => Promise<void> | void;
   isRunning?: boolean;
+  disabled?: boolean;
+  /** An error owned by the parent (e.g. a 409) shown inline; keeps the prompt intact. */
+  externalError?: string | null;
+  placeholder?: string;
   onRunCreated?: (run: AgentRunResponse) => void;
-  onRunStopped?: (run: AgentRunResponse) => void;
 }
 
 export function PromptComposer({
-  workspaceId,
-  worktreeId,
-  activeRunId: externalActiveRunId,
-  isRunning: externalIsRunning,
+  submitPrompt,
+  onStop,
+  isRunning = false,
+  disabled = false,
+  externalError,
+  placeholder = "Describe what you want the agent to do…",
   onRunCreated,
-  onRunStopped,
 }: PromptComposerProps) {
   const [prompt, setPrompt] = useState("");
-  const [internalIsRunning, setInternalIsRunning] = useState(false);
-  const [internalActiveRunId, setInternalActiveRunId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-
-  const isRunning = externalIsRunning ?? internalIsRunning;
-  const activeRunId = externalActiveRunId ?? internalActiveRunId;
-  const isControlled = externalIsRunning !== undefined;
+  const [submitting, setSubmitting] = useState(false);
 
   const handleSubmit = useCallback(async () => {
     const trimmed = prompt.trim();
-    if (!trimmed || isRunning) return;
+    if (!trimmed || isRunning || submitting) return;
 
     setError(null);
-    if (!isControlled) setInternalIsRunning(true);
-
+    setSubmitting(true);
     try {
-      const run = await createAgentRun(workspaceId, {
-        prompt: trimmed,
-        worktree_id: worktreeId ?? null,
-      });
-      if (!isControlled) setInternalActiveRunId(run.id);
-      setPrompt("");
+      const run = await submitPrompt(trimmed);
+      setPrompt(""); // clear only on success
       onRunCreated?.(run);
     } catch (err) {
-      if (!isControlled) setInternalIsRunning(false);
       setError(err instanceof Error ? err.message : "Failed to start run");
+    } finally {
+      setSubmitting(false);
     }
-  }, [prompt, workspaceId, worktreeId, isRunning, isControlled, onRunCreated]);
+  }, [prompt, isRunning, submitting, submitPrompt, onRunCreated]);
 
   const handleStop = useCallback(async () => {
-    if (!activeRunId) return;
-
     try {
-      const run = await stopAgentRun(workspaceId, activeRunId);
-      onRunStopped?.(run);
+      await onStop?.();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to stop run");
-    } finally {
-      if (!isControlled) {
-        setInternalIsRunning(false);
-        setInternalActiveRunId(null);
-      }
     }
-  }, [activeRunId, workspaceId, isControlled, onRunStopped]);
+  }, [onStop]);
 
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
@@ -79,21 +62,22 @@ export function PromptComposer({
     [handleSubmit],
   );
 
+  const inputDisabled = isRunning || disabled;
+  const shownError = error ?? externalError ?? null;
+
   return (
     <div className="rounded-lg border border-line-strong bg-white p-2 transition focus-within:border-ink">
       <textarea
         className="min-h-16 w-full resize-none bg-transparent px-2 py-1.5 text-sm leading-6 text-ink outline-none placeholder:text-muted-soft disabled:cursor-not-allowed disabled:opacity-60"
         rows={2}
-        placeholder="Describe what you want the agent to do…"
+        placeholder={placeholder}
         value={prompt}
         onChange={(e) => setPrompt(e.target.value)}
         onKeyDown={handleKeyDown}
-        disabled={isRunning}
+        disabled={inputDisabled}
       />
 
-      {error && (
-        <p className="px-2 pb-1 text-xs text-danger">{error}</p>
-      )}
+      {shownError && <p className="px-2 pb-1 text-xs text-danger">{shownError}</p>}
 
       <div className="flex items-center justify-between gap-3 px-1">
         <span className="text-xs text-muted">
@@ -112,7 +96,7 @@ export function PromptComposer({
           <button
             type="button"
             onClick={handleSubmit}
-            disabled={!prompt.trim()}
+            disabled={!prompt.trim() || disabled || submitting}
             className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-sm font-medium text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
           >
             <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />

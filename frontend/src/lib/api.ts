@@ -218,6 +218,7 @@ export type AgentRunResponse = {
   id: string;
   workspace_id: string;
   user_id: string;
+  session_id: string | null;
   prompt: string;
   status: AgentRunStatus;
   provider: string;
@@ -247,6 +248,38 @@ export type AgentFileChangeListResponse = {
 };
 
 export type AgentRunCreatePayload = {
+  prompt: string;
+  worktree_id?: string | null;
+};
+
+export type AgentSessionStatus = "active" | "archived";
+
+export type AgentSessionResponse = {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  title: string | null;
+  status: AgentSessionStatus;
+  created_at: string;
+  updated_at: string;
+};
+
+// Detail returns turns as AgentRun summaries (no events); per-turn events come from
+// getAgentRun / the WebSocket stream.
+export type AgentSessionDetailResponse = AgentSessionResponse & {
+  turns: AgentRunResponse[]; // ordered oldest → newest
+};
+
+export type AgentSessionCreatePayload = {
+  title?: string | null;
+};
+
+export type AgentSessionUpdatePayload = {
+  title?: string | null;
+  status?: AgentSessionStatus;
+};
+
+export type AgentTurnCreatePayload = {
   prompt: string;
   worktree_id?: string | null;
 };
@@ -868,6 +901,83 @@ export function getAgentFileChanges(
   return requestJson<AgentFileChangeListResponse>(
     `/workspaces/${workspaceId}/agent/runs/${runId}/file-changes`,
     { signal },
+  );
+}
+
+export function createAgentSession(
+  workspaceId: string,
+  payload: AgentSessionCreatePayload = {},
+): Promise<AgentSessionResponse> {
+  return requestJson<AgentSessionResponse>(`/workspaces/${workspaceId}/agent/sessions`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listAgentSessions(
+  workspaceId: string,
+  signal?: AbortSignal,
+  limit?: number,
+  offset?: number,
+  status?: AgentSessionStatus,
+): Promise<AgentSessionResponse[]> {
+  const params = new URLSearchParams();
+  if (limit !== undefined) params.set("limit", String(limit));
+  if (offset !== undefined) params.set("offset", String(offset));
+  if (status !== undefined) params.set("status", status);
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return requestJson<AgentSessionResponse[]>(
+    `/workspaces/${workspaceId}/agent/sessions${query}`,
+    { signal },
+  );
+}
+
+export function getAgentSession(
+  workspaceId: string,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<AgentSessionDetailResponse> {
+  return requestJson<AgentSessionDetailResponse>(
+    `/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+    { signal },
+  );
+}
+
+export function updateAgentSession(
+  workspaceId: string,
+  sessionId: string,
+  payload: AgentSessionUpdatePayload,
+): Promise<AgentSessionResponse> {
+  return requestJson<AgentSessionResponse>(
+    `/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function deleteAgentSession(
+  workspaceId: string,
+  sessionId: string,
+): Promise<{ ok: boolean }> {
+  return requestJson<{ ok: boolean }>(
+    `/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+    { method: "DELETE" },
+  );
+}
+
+export function createAgentSessionTurn(
+  workspaceId: string,
+  sessionId: string,
+  payload: AgentTurnCreatePayload,
+): Promise<AgentRunResponse> {
+  return requestJson<AgentRunResponse>(
+    `/workspaces/${workspaceId}/agent/sessions/${sessionId}/turns`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
   );
 }
 

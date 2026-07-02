@@ -1,5 +1,5 @@
 """SQLAlchemy model imports live here as domains are added."""
-from app.models.agent import AgentEvent, AgentFileChange, AgentRun
+from app.models.agent import AgentEvent, AgentFileChange, AgentRun, AgentSession
 from app.models.command import CommandRun, CustomCommand
 from app.models.editor import EditorSession
 from app.models.notification import AuditLog, Notification
@@ -16,6 +16,7 @@ __all__ = [
     "AgentEvent",
     "AgentFileChange",
     "AgentRun",
+    "AgentSession",
     "AuditLog",
     "CommandRun",
     "CustomCommand",

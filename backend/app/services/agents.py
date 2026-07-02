@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
-from app.models import AgentEvent, AgentFileChange, AgentRun, Workspace
+from app.models import AgentEvent, AgentFileChange, AgentRun, AgentSession, Workspace
 from app.services.agent_providers import AgentProvider, MockAgentProvider, OpenAIResponsesProvider
 from app.services.agent_tools import WorkspaceTools
 from app.services.audit import AuditLogService
@@ -18,6 +18,7 @@ from app.services.repositories import RepositoryService
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 ACTIVE_RUN_STATUSES = ("thinking", "executing")
+SESSION_TITLE_MAX_CHARS = 80
 
 
 class AgentRunAlreadyActiveError(Exception):
@@ -33,6 +34,14 @@ class AgentRunNotInWorkspaceError(Exception):
 
 
 class AgentConfigurationError(Exception):
+    pass
+
+
+class AgentSessionNotFoundError(Exception):
+    pass
+
+
+class AgentSessionArchivedError(Exception):
     pass
 
 
@@ -138,6 +147,7 @@ class AgentService:
         prompt: str,
         working_dir: str | None = None,
         worktree_id: UUID | None = None,
+        session_id: UUID | None = None,
     ) -> AgentRun:
         workspace = await self._get_workspace(workspace_id, user_id)
         active = await self.session.execute(
@@ -154,6 +164,7 @@ class AgentService:
             workspace_id=workspace.id,
             user_id=user_id,
             worktree_id=worktree_id,
+            session_id=session_id,
             prompt=prompt,
             status="thinking",
             provider=provider.provider_name,
@@ -161,6 +172,17 @@ class AgentService:
         )
         self.session.add(run)
         await self.session.flush()
+
+        if session_id is not None:
+            agent_session = await self.session.get(AgentSession, session_id)
+            if agent_session is not None:
+                # Auto-title from the first turn's prompt, and bump updated_at so the session
+                # sorts as recently active (onupdate only fires when a column actually changes).
+                if not agent_session.title:
+                    agent_session.title = prompt[:SESSION_TITLE_MAX_CHARS]
+                agent_session.updated_at = datetime.now(UTC)
+                self.session.add(agent_session)
+
         await self.session.commit()
         await self.session.refresh(run)
         await AuditLogService(self.session).record(
@@ -176,6 +198,130 @@ class AgentService:
         task = asyncio.create_task(self._execute_run(run.id, stop_event, working_dir))
         self.runtime.register_run(run.id, task, stop_event)
         return run
+
+    # ------------------------------------------------------------------
+    # Sessions (multi-turn conversations grouping runs)
+    # ------------------------------------------------------------------
+
+    async def _get_session(
+        self, workspace_id: UUID, session_id: UUID, user_id: UUID
+    ) -> AgentSession:
+        result = await self.session.execute(
+            select(AgentSession).where(
+                AgentSession.id == session_id,
+                AgentSession.workspace_id == workspace_id,
+                AgentSession.user_id == user_id,
+            )
+        )
+        agent_session = result.scalar_one_or_none()
+        if agent_session is None:
+            raise AgentSessionNotFoundError
+        return agent_session
+
+    async def create_session(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        title: str | None = None,
+    ) -> AgentSession:
+        workspace = await self._get_workspace(workspace_id, user_id)
+        agent_session = AgentSession(
+            workspace_id=workspace.id,
+            user_id=user_id,
+            title=title,
+            status="active",
+        )
+        self.session.add(agent_session)
+        await self.session.flush()
+        await self.session.commit()
+        await self.session.refresh(agent_session)
+        return agent_session
+
+    async def list_sessions(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        limit: int = 20,
+        offset: int = 0,
+        status: str | None = None,
+    ) -> list[AgentSession]:
+        await self._get_workspace(workspace_id, user_id)
+        stmt = select(AgentSession).where(
+            AgentSession.workspace_id == workspace_id,
+            AgentSession.user_id == user_id,
+        )
+        if status is not None:
+            stmt = stmt.where(AgentSession.status == status)
+        stmt = stmt.order_by(AgentSession.updated_at.desc()).offset(offset).limit(limit)
+        result = await self.session.execute(stmt)
+        return list(result.scalars().all())
+
+    async def get_session_detail(
+        self,
+        workspace_id: UUID,
+        session_id: UUID,
+        user_id: UUID,
+    ) -> tuple[AgentSession, list[AgentRun]]:
+        agent_session = await self._get_session(workspace_id, session_id, user_id)
+        result = await self.session.execute(
+            select(AgentRun)
+            .where(AgentRun.session_id == agent_session.id)
+            .order_by(AgentRun.started_at.asc(), AgentRun.id.asc())
+        )
+        return agent_session, list(result.scalars().all())
+
+    async def update_session(
+        self,
+        workspace_id: UUID,
+        session_id: UUID,
+        user_id: UUID,
+        title: str | None | object = ...,
+        status: str | object = ...,
+    ) -> AgentSession:
+        agent_session = await self._get_session(workspace_id, session_id, user_id)
+        if title is not ...:
+            agent_session.title = title  # type: ignore[assignment]
+        if status is not ...:
+            agent_session.status = status  # type: ignore[assignment]
+        agent_session.updated_at = datetime.now(UTC)
+        self.session.add(agent_session)
+        await self.session.flush()
+        await self.session.commit()
+        await self.session.refresh(agent_session)
+        return agent_session
+
+    async def delete_session(
+        self,
+        workspace_id: UUID,
+        session_id: UUID,
+        user_id: UUID,
+    ) -> None:
+        agent_session = await self._get_session(workspace_id, session_id, user_id)
+        # ON DELETE SET NULL detaches the runs; their history/events/file-changes survive.
+        await self.session.delete(agent_session)
+        await self.session.commit()
+
+    async def append_turn(
+        self,
+        workspace_id: UUID,
+        session_id: UUID,
+        user_id: UUID,
+        prompt: str,
+        working_dir: str | None = None,
+        worktree_id: UUID | None = None,
+    ) -> AgentRun:
+        await self._get_workspace(workspace_id, user_id)
+        agent_session = await self._get_session(workspace_id, session_id, user_id)
+        if agent_session.status == "archived":
+            raise AgentSessionArchivedError
+        return await self.create_run(
+            workspace_id,
+            user_id,
+            prompt,
+            working_dir=working_dir,
+            worktree_id=worktree_id,
+            session_id=session_id,
+        )
 
     async def list_runs(
         self,
@@ -395,6 +541,72 @@ class AgentService:
             raise WorkspaceNotFoundError
         return workspace
 
+    async def _build_session_context(
+        self, session: AsyncSession, run: AgentRun
+    ) -> str | None:
+        """Assemble a transcript of prior turns in this run's session.
+
+        Returns None for one-shot runs (no session) or a session's first turn, so those
+        runs receive their raw prompt unchanged. Otherwise returns a chronological
+        transcript of prior turns, keeping the most recent turns within a char budget.
+        """
+        if run.session_id is None:
+            return None
+        result = await session.execute(
+            select(AgentRun)
+            .where(AgentRun.session_id == run.session_id, AgentRun.id != run.id)
+            .order_by(AgentRun.started_at.asc(), AgentRun.id.asc())
+        )
+        prior = list(result.scalars().all())
+        if not prior:
+            return None
+
+        budget = self.settings.agent_session_context_char_budget
+        blocks: list[str] = []
+        used = 0
+        # Walk newest-first so we keep the freshest turns when the budget is tight, then
+        # reverse to restore chronological order for the transcript.
+        for turn in reversed(prior):
+            block = await self._format_turn_block(session, turn)
+            if blocks and used + len(block) > budget:
+                break
+            blocks.append(block)
+            used += len(block)
+        blocks.reverse()
+        return "\n\n".join(blocks)
+
+    async def _format_turn_block(self, session: AsyncSession, turn: AgentRun) -> str:
+        # output_text events are token-streamed fragments; concatenate in created_at order.
+        text_result = await session.execute(
+            select(AgentEvent.content)
+            .where(
+                AgentEvent.agent_run_id == turn.id,
+                AgentEvent.event_type == "output_text",
+            )
+            .order_by(AgentEvent.created_at.asc())
+        )
+        assistant = "".join(text_result.scalars().all()).strip()
+        cap = self.settings.agent_session_context_per_turn_char_cap
+        if len(assistant) > cap:
+            assistant = assistant[:cap] + "\n...[truncated]"
+
+        files_result = await session.execute(
+            select(AgentFileChange.path, AgentFileChange.status)
+            .where(AgentFileChange.agent_run_id == turn.id)
+            .order_by(AgentFileChange.created_at.asc())
+        )
+        files = list(files_result.all())
+
+        parts = [f"User: {turn.prompt}"]
+        if assistant:
+            parts.append(f"Assistant: {assistant}")
+        if turn.status == "error" and turn.error_message:
+            parts.append(f"(Previous turn ended with error: {turn.error_message})")
+        if files:
+            summary = ", ".join(f"{path} ({status})" for path, status in files[:30])
+            parts.append(f"Files changed: {summary}")
+        return "\n".join(parts)
+
     async def _execute_run(
         self,
         run_id: UUID,
@@ -427,7 +639,16 @@ class AgentService:
                     workspace.id, workspace.owner_id, session
                 )
 
-                async for provider_event in provider.stream_response(run.prompt, tools, stop_event):
+                context = await self._build_session_context(session, run)
+                prompt_for_provider = run.prompt
+                if context:
+                    prompt_for_provider = (
+                        f"{context}\n\n---\nCurrent request:\nUser: {run.prompt}"
+                    )
+
+                async for provider_event in provider.stream_response(
+                    prompt_for_provider, tools, stop_event
+                ):
                     if stop_event.is_set():
                         break
                     if provider_event.event_type == "status":

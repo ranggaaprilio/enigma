@@ -124,6 +124,7 @@ def agent_run_detail_response(run: AgentRun) -> AgentRunDetailResponse:
         id=run.id,
         workspace_id=run.workspace_id,
         user_id=run.user_id,
+        session_id=run.session_id,
         prompt=run.prompt,
         status=run.status,
         provider=run.provider,

@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 AgentRunStatus = Literal["thinking", "executing", "completed", "error", "stopped"]
 AgentEventType = Literal["status", "output_text", "tool_call", "tool_result", "error"]
 AgentFileChangeStatus = Literal["created", "modified", "deleted", "renamed"]
+AgentSessionStatus = Literal["active", "archived"]
 
 
 class AgentRunCreateRequest(BaseModel):
@@ -36,6 +37,7 @@ class AgentRunResponse(BaseModel):
     id: UUID
     workspace_id: UUID
     user_id: UUID
+    session_id: UUID | None = None
     prompt: str
     status: AgentRunStatus
     provider: str
@@ -66,3 +68,44 @@ class AgentFileChangeListResponse(BaseModel):
 
 class AgentRunDetailResponse(AgentRunResponse):
     events: list[AgentEventResponse]
+
+
+class AgentSessionCreateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class AgentSessionUpdateRequest(BaseModel):
+    title: str | None = Field(default=None, max_length=200)
+    status: AgentSessionStatus | None = None
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class AgentSessionResponse(BaseModel):
+    id: UUID
+    workspace_id: UUID
+    user_id: UUID
+    title: str | None
+    status: AgentSessionStatus
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class AgentSessionDetailResponse(AgentSessionResponse):
+    turns: list[AgentRunResponse]

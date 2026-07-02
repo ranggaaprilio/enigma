@@ -5,6 +5,12 @@ import {
   commitRepository,
   connectRepository,
   createAgentRun,
+  createAgentSession,
+  createAgentSessionTurn,
+  deleteAgentSession,
+  getAgentSession,
+  listAgentSessions,
+  updateAgentSession,
   createCustomCommand,
   createTerminalSession,
   createWorkspaceFolder,
@@ -388,6 +394,54 @@ describe("getHealth", () => {
     );
     expect(getAgentStreamUrl(workspaceId, runId)).toBe(
       `ws://localhost:8000/workspaces/${workspaceId}/agent/runs/${runId}/stream`,
+    );
+  });
+
+  it("sends credentialed agent session requests", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const sessionId = "aa11bb22-cc33-dd44-ee55-ff6677889900";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: sessionId }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createAgentSession(workspaceId, { title: "Fix parser" });
+    await listAgentSessions(workspaceId, undefined, 20, 0, "active");
+    await getAgentSession(workspaceId, sessionId);
+    await updateAgentSession(workspaceId, sessionId, { title: "New" });
+    await deleteAgentSession(workspaceId, sessionId);
+    await createAgentSessionTurn(workspaceId, sessionId, { prompt: "Add JSON" });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions?limit=20&offset=0&status=active`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+      expect.objectContaining({ credentials: "include", method: "PATCH" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+      expect.objectContaining({ credentials: "include", method: "DELETE" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions/${sessionId}/turns`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
     );
   });
 

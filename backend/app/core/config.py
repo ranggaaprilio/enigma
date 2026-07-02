@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     agent_max_command_output_chars: int = 20_000
     agent_command_allowlist_enabled: bool = False
     agent_command_allowlist: str | list[str] = Field(default_factory=list)
+    # Multi-turn session context: total char budget for the prior-turn transcript prepended to
+    # a session turn's prompt, and a per-turn cap on how much of a single turn's assistant text
+    # is kept. ~4 chars/token, so 24k chars ≈ 6k tokens.
+    agent_session_context_char_budget: int = 24_000
+    agent_session_context_per_turn_char_cap: int = 8_000
     terminal_default_cols: int = 120
     terminal_default_rows: int = 34
     editor_code_server_binary: str = "code-server"

@@ -9,6 +9,7 @@ function makeRun(overrides: Partial<AgentRunResponse> = {}): AgentRunResponse {
     id: `run-${Math.random().toString(36).slice(2, 10)}`,
     workspace_id: "ws-1",
     user_id: "user-1",
+    session_id: null,
     prompt: "Fix the login bug",
     status: "completed",
     provider: "mock",
