@@ -24,7 +24,9 @@ from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 from app.services.worktrees import (
     CannotRemoveBaseWorktreeError,
+    CannotSyncBaseWorktreeError,
     InvalidBranchNameError,
+    MergeConflictError,
     WorktreeAlreadyExistsError,
     WorktreeDirtyError,
     WorktreeInfo,
@@ -229,6 +231,50 @@ async def test_resolve_path_defaults_to_base(db_session):
 
     assert await service.resolve_path(workspace, None) == "workspace"
     assert await service.resolve_path(workspace, row.id) == "worktrees/feat-login"
+
+
+async def test_sync_from_base_merges_origin_base_into_worktree(db_session):
+    user, workspace = await make_workspace(db_session)
+    runtime = FakeRuntime()
+    service = WorktreeService(db_session, runtime, Settings())
+    row = await service.create_worktree(workspace.id, user.id, "feat/login")
+
+    await service.sync_from_base(workspace.id, user.id, row.id)
+
+    # Merges the already-fetched remote base inside the worktree directory (base clone untouched).
+    assert ("git merge --no-edit origin/main", "worktrees/feat-login") in runtime.calls
+
+
+async def test_sync_from_base_rebase_strategy(db_session):
+    user, workspace = await make_workspace(db_session)
+    runtime = FakeRuntime()
+    service = WorktreeService(db_session, runtime, Settings())
+    row = await service.create_worktree(workspace.id, user.id, "feat/login")
+
+    await service.sync_from_base(workspace.id, user.id, row.id, strategy="rebase")
+
+    assert ("git rebase origin/main", "worktrees/feat-login") in runtime.calls
+
+
+async def test_sync_from_base_conflict_raises(db_session):
+    user, workspace = await make_workspace(db_session)
+    runtime = FakeRuntime()
+    runtime.set("git merge", 1, "CONFLICT (content): Merge conflict in README.md")
+    service = WorktreeService(db_session, runtime, Settings())
+    row = await service.create_worktree(workspace.id, user.id, "feat/login")
+
+    with pytest.raises(MergeConflictError):
+        await service.sync_from_base(workspace.id, user.id, row.id)
+
+
+async def test_sync_from_base_rejects_base_worktree(db_session):
+    user, workspace = await make_workspace(db_session)
+    service = WorktreeService(db_session, FakeRuntime(), Settings())
+    await service.list_worktrees(workspace.id, user.id)  # lazily creates the base row
+    base = next(r for r in await service._list_rows(workspace.id) if r.is_base)  # noqa: SLF001
+
+    with pytest.raises(CannotSyncBaseWorktreeError):
+        await service.sync_from_base(workspace.id, user.id, base.id)
 
 
 # --------------------------------------------------------------------------------------

@@ -7,8 +7,10 @@ import {
   createWorktree,
   listPullRequests,
   listWorktrees,
+  pullWorktree,
   pushWorktree,
   removeWorktree,
+  syncWorktree,
   type PullRequestResponse,
   type WorkspaceResponse,
   type WorktreeResponse,
@@ -132,6 +134,20 @@ export function WorktreesPanel({ workspace }: { workspace: WorkspaceResponse }) 
     });
   }
 
+  async function handlePull(tree: WorktreeResponse) {
+    await runAction(`pull-${tree.id}`, async () => {
+      const response = await pullWorktree(workspace.id, tree.id);
+      return response.message;
+    });
+  }
+
+  async function handleSync(tree: WorktreeResponse) {
+    await runAction(`sync-${tree.id}`, async () => {
+      const response = await syncWorktree(workspace.id, tree.id);
+      return response.message;
+    });
+  }
+
   async function handleCommitActive(tree: WorktreeResponse) {
     const messageText = window.prompt(`Commit message for '${tree.branch}':`);
     if (!messageText || !messageText.trim()) return;
@@ -237,6 +253,17 @@ export function WorktreesPanel({ workspace }: { workspace: WorkspaceResponse }) 
                           label="Commit"
                           disabled={busy !== null || tree.is_clean}
                           onClick={() => void handleCommitActive(tree)}
+                        />
+                        <SmallButton
+                          label={busy === `pull-${tree.id}` ? "Pulling…" : "Pull"}
+                          disabled={busy !== null}
+                          onClick={() => void handlePull(tree)}
+                        />
+                        <SmallButton
+                          label={busy === `sync-${tree.id}` ? "Updating…" : "Update"}
+                          title={`Merge ${tree.base_ref} into ${tree.branch}`}
+                          disabled={busy !== null}
+                          onClick={() => void handleSync(tree)}
                         />
                         <SmallButton
                           label={busy === `push-${tree.id}` ? "Pushing…" : "Push"}
@@ -395,14 +422,17 @@ function SmallButton({
   label,
   disabled,
   onClick,
+  title,
 }: {
   label: string;
   disabled: boolean;
   onClick: () => void;
+  title?: string;
 }) {
   return (
     <button
       type="button"
+      title={title}
       className="rounded-md border border-line bg-white px-2.5 py-1 text-xs font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
       disabled={disabled}
       onClick={onClick}

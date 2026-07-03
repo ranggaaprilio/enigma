@@ -3,6 +3,7 @@ import { Outlet, useOutletContext, useParams } from "react-router";
 
 import { useAuth } from "../auth/context";
 import { AgentTab } from "../components/AgentTab";
+import { DiffView } from "../components/AgentTab/DiffView";
 import { DashboardShell } from "../components/DashboardShell";
 import { CustomCommandsPanel } from "../components/CustomCommandsPanel";
 import { EditorPanel } from "../components/EditorPanel";
@@ -11,6 +12,7 @@ import { PreviewPanel } from "../components/PreviewPanel";
 import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import { WorktreesPanel } from "../components/WorktreesPanel";
+import { ConfirmModal } from "../components/ui/ConfirmModal";
 import { BudgetConfig } from "../components/usage/BudgetConfig";
 import { UsagePanel } from "../components/usage/UsagePanel";
 import { useActiveWorktree } from "../lib/activeWorktree";
@@ -22,8 +24,12 @@ import {
   connectRepository,
   createWorkspace,
   deleteWorkspaceEnvVar,
+  discardRepositoryChanges,
+  fetchRepository,
   setupDevServer,
+  getCommitDetail,
   getRepositoryDiff,
+  getRepositoryLog,
   getRepositoryStatus,
   getHealth,
   getWorkspace,
@@ -31,11 +37,15 @@ import {
   listWorkspaceEnvVars,
   listWorkspaces,
   pullRepository,
+  pullWorktree,
   pushRepository,
+  pushWorktree,
   updateWorkspace,
   upsertWorkspaceEnvVar,
   type AuditLogResponse,
+  type GitCommitResponse,
   type HealthResponse,
+  type RepositoryCommitDetailResponse,
   type RepositoryStatusResponse,
   type WorkspaceEnvVarResponse,
   type WorkspaceResponse,
@@ -631,6 +641,21 @@ type RepositoryState =
   | { status: "ready"; data: RepositoryStatusResponse }
   | { status: "error"; message: string };
 
+function formatCommitTime(iso: string): string {
+  const then = new Date(iso).getTime();
+  const diffMs = Date.now() - then;
+  if (Number.isNaN(diffMs)) return "";
+  const seconds = Math.floor(diffMs / 1000);
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
 function RepositoryPanel({
   workspace,
   onWorkspaceChanged,
@@ -652,6 +677,15 @@ function RepositoryPanel({
   // null => the base clone.
   const [active] = useActiveWorktree(workspace.id);
   const worktreeId = active?.id;
+  // The right-hand panel toggles between the working-tree diff (Changes) and commit history.
+  const [rightTab, setRightTab] = useState<"changes" | "history">("changes");
+  const [history, setHistory] = useState<GitCommitResponse[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [selectedCommit, setSelectedCommit] = useState<string | null>(null);
+  const [commitDetail, setCommitDetail] = useState<RepositoryCommitDetailResponse | null>(null);
+  // A pending discard awaiting confirmation. `path === null` means discard every change.
+  const [pendingDiscard, setPendingDiscard] = useState<{ path: string | null } | null>(null);
 
   useEffect(() => {
     setRepoUrl(workspace.repo_url);
@@ -715,6 +749,55 @@ function RepositoryPanel({
     return () => controller.abort();
   }, [selectedPath, workspace.id, worktreeId]);
 
+  const loadHistory = useCallback(
+    async (signal?: AbortSignal) => {
+      setHistoryLoading(true);
+      setHistoryError(null);
+      try {
+        const response = await getRepositoryLog(workspace.id, worktreeId, 50, 0, signal);
+        setHistory(response.commits);
+        setSelectedCommit((current) => {
+          if (current && response.commits.some((commit) => commit.hash === current)) {
+            return current;
+          }
+          return response.commits[0]?.hash ?? null;
+        });
+        setHistoryLoading(false);
+      } catch (caughtError) {
+        if (caughtError instanceof DOMException && caughtError.name === "AbortError") return;
+        setHistory([]);
+        setHistoryError(
+          caughtError instanceof ApiError ? caughtError.message : "Unable to load history.",
+        );
+        setHistoryLoading(false);
+      }
+    },
+    [workspace.id, worktreeId],
+  );
+
+  // Load history lazily — only when the History tab is active — and reload when the branch changes.
+  useEffect(() => {
+    if (rightTab !== "history") return;
+    const controller = new AbortController();
+    void loadHistory(controller.signal);
+    return () => controller.abort();
+  }, [rightTab, loadHistory]);
+
+  useEffect(() => {
+    if (rightTab !== "history" || !selectedCommit) {
+      setCommitDetail(null);
+      return;
+    }
+    const controller = new AbortController();
+    getCommitDetail(workspace.id, selectedCommit, worktreeId, controller.signal)
+      .then(setCommitDetail)
+      .catch((caughtError: unknown) => {
+        if (caughtError instanceof DOMException && caughtError.name === "AbortError") return;
+        setCommitDetail(null);
+      });
+    return () => controller.abort();
+  }, [rightTab, selectedCommit, workspace.id, worktreeId]);
+
   async function runAction(actionName: string, action: () => Promise<string>) {
     setBusyAction(actionName);
     setError(null);
@@ -744,6 +827,15 @@ function RepositoryPanel({
       onWorkspaceChanged(updated);
       setToken("");
       return "Repository credentials saved.";
+    });
+  }
+
+  async function handleDiscard(path: string | null) {
+    setPendingDiscard(null);
+    await runAction("discard", async () => {
+      const response = await discardRepositoryChanges(workspace.id, path ?? undefined, worktreeId);
+      if (path === null || path === selectedPath) setSelectedPath(null);
+      return response.message;
     });
   }
 
@@ -791,7 +883,7 @@ function RepositoryPanel({
           </button>
         </form>
 
-        <div className="mt-5 grid grid-cols-3 gap-2">
+        <div className="mt-5 grid grid-cols-2 gap-2">
           <RepoActionButton
             label="Clone"
             disabled={busyAction !== null || statusData?.cloned === true}
@@ -807,11 +899,25 @@ function RepositoryPanel({
             }
           />
           <RepoActionButton
+            label="Fetch"
+            disabled={busyAction !== null || statusData?.cloned !== true}
+            onClick={() =>
+              void runAction("fetch", async () => {
+                const response = await fetchRepository(workspace.id, worktreeId);
+                return response.message;
+              })
+            }
+          />
+          <RepoActionButton
             label="Pull"
             disabled={busyAction !== null || statusData?.cloned !== true}
             onClick={() =>
               void runAction("pull", async () => {
-                const response = await pullRepository(workspace.id);
+                // Pull the branch the Changes view is showing — a worktree when one is active,
+                // otherwise the base clone.
+                const response = active
+                  ? await pullWorktree(workspace.id, active.id)
+                  : await pullRepository(workspace.id);
                 return response.message;
               })
             }
@@ -821,7 +927,9 @@ function RepositoryPanel({
             disabled={busyAction !== null || statusData?.cloned !== true}
             onClick={() =>
               void runAction("push", async () => {
-                const response = await pushRepository(workspace.id);
+                const response = active
+                  ? await pushWorktree(workspace.id, active.id)
+                  : await pushRepository(workspace.id);
                 return response.message;
               })
             }
@@ -855,81 +963,231 @@ function RepositoryPanel({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
             <div className="flex flex-wrap items-center gap-2">
-              <h3 className="text-base font-semibold">Changes</h3>
+              <div className="inline-flex rounded-md border border-line bg-panel p-0.5 text-sm font-medium">
+                {(["changes", "history"] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    className={`rounded px-3 py-1 capitalize transition ${
+                      rightTab === tab
+                        ? "bg-white text-ink shadow-soft"
+                        : "text-ink/55 hover:text-ink"
+                    }`}
+                    onClick={() => setRightTab(tab)}
+                  >
+                    {tab}
+                  </button>
+                ))}
+              </div>
               <span className="rounded-full bg-line px-2 py-0.5 font-mono text-xs text-ink/65">
                 {active?.branch ?? statusData?.branch ?? workspace.default_branch}
                 {!active && <span className="ml-1 font-sans text-ink/45">base</span>}
               </span>
             </div>
             <p className="mt-1 text-sm text-ink/60">
-              {repoState.status === "ready"
-                ? statusData?.is_clean
-                  ? "Working tree clean"
-                  : `${statusData?.files.length ?? 0} changed file${
-                      statusData?.files.length === 1 ? "" : "s"
-                    }`
-                : "Checking repository"}
+              {rightTab === "history"
+                ? historyLoading
+                  ? "Loading history"
+                  : `${history.length} commit${history.length === 1 ? "" : "s"}`
+                : repoState.status === "ready"
+                  ? statusData?.is_clean
+                    ? "Working tree clean"
+                    : `${statusData?.files.length ?? 0} changed file${
+                        statusData?.files.length === 1 ? "" : "s"
+                      }`
+                  : "Checking repository"}
             </p>
           </div>
           <button
             className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel"
             type="button"
-            onClick={() => void loadRepositoryStatus()}
+            onClick={() =>
+              void (rightTab === "history" ? loadHistory() : loadRepositoryStatus())
+            }
           >
             Refresh
           </button>
         </div>
 
-        {repoState.status === "loading" && (
-          <div className="mt-4">
-            <LoadingState message="Loading repository status..." />
-          </div>
-        )}
-        {repoState.status === "error" && (
-          <div className="mt-4">
-            <ErrorState message={repoState.message} />
-          </div>
-        )}
-        {repoState.status === "ready" && (
-          <div className="mt-4 grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
-            <div className="space-y-2">
-              {repoState.data.files.length === 0 && (
-                <div className="rounded-md border border-dashed border-line bg-white p-4 text-sm text-ink/65">
-                  No changed files.
-                </div>
-              )}
-              {repoState.data.files.map((file) => (
-                <button
-                  className={`flex w-full items-center justify-between gap-3 rounded-md border px-3 py-2 text-left transition ${
-                    file.path === selectedPath
-                      ? "border-ink bg-white"
-                      : "border-line bg-white hover:bg-panel"
-                  }`}
-                  key={`${file.status}-${file.path}`}
-                  type="button"
-                  onClick={() => setSelectedPath(file.path)}
-                >
-                  <span className="min-w-0 truncate font-mono text-sm">{file.path}</span>
-                  <span className="shrink-0 rounded bg-line px-2 py-1 font-mono text-xs">
-                    {file.status}
-                  </span>
-                </button>
-              ))}
-            </div>
-
-            <div className="min-w-0 rounded-md border border-line bg-white">
-              <div className="border-b border-line px-3 py-2">
-                <p className="truncate font-mono text-sm font-semibold">
-                  {selectedFile?.path ?? "No file selected"}
-                </p>
+        {rightTab === "changes" && (
+          <>
+            {repoState.status === "loading" && (
+              <div className="mt-4">
+                <LoadingState message="Loading repository status..." />
               </div>
-              <pre className="max-h-[460px] overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-5 text-ink/80">
-                {diff || "Select a changed file to view its diff."}
-              </pre>
-            </div>
-          </div>
+            )}
+            {repoState.status === "error" && (
+              <div className="mt-4">
+                <ErrorState message={repoState.message} />
+              </div>
+            )}
+            {repoState.status === "ready" && (
+              <div className="mt-4 grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+                <div className="space-y-2">
+                  {repoState.data.files.length === 0 && (
+                    <div className="rounded-md border border-dashed border-line bg-white p-4 text-sm text-ink/65">
+                      No changed files.
+                    </div>
+                  )}
+                  {repoState.data.files.length > 0 && (
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        disabled={busyAction !== null}
+                        onClick={() => setPendingDiscard({ path: null })}
+                        className="text-xs font-medium text-danger/80 transition hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Discard all
+                      </button>
+                    </div>
+                  )}
+                  {repoState.data.files.map((file) => (
+                    <div
+                      key={`${file.status}-${file.path}`}
+                      className={`flex items-center gap-1 rounded-md border pr-1 transition ${
+                        file.path === selectedPath
+                          ? "border-ink bg-white"
+                          : "border-line bg-white hover:bg-panel"
+                      }`}
+                    >
+                      <button
+                        className="flex min-w-0 flex-1 items-center justify-between gap-3 px-3 py-2 text-left"
+                        type="button"
+                        onClick={() => setSelectedPath(file.path)}
+                      >
+                        <span className="min-w-0 truncate font-mono text-sm">{file.path}</span>
+                        <span className="shrink-0 rounded bg-line px-2 py-1 font-mono text-xs">
+                          {file.status}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        title="Discard changes"
+                        disabled={busyAction !== null}
+                        onClick={() => setPendingDiscard({ path: file.path })}
+                        className="shrink-0 rounded border border-line px-2 py-1 text-xs font-medium text-ink/70 transition hover:border-danger/40 hover:bg-danger/10 hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Discard
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="min-w-0 rounded-md border border-line bg-white">
+                  <div className="border-b border-line px-3 py-2">
+                    <p className="truncate font-mono text-sm font-semibold">
+                      {selectedFile?.path ?? "No file selected"}
+                    </p>
+                  </div>
+                  <div className="p-3">
+                    {selectedPath && diff ? (
+                      <DiffView diff={diff} />
+                    ) : (
+                      <p className="p-1 text-xs text-ink/60">
+                        Select a changed file to view its diff.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {rightTab === "history" && (
+          <>
+            {historyLoading && (
+              <div className="mt-4">
+                <LoadingState message="Loading history..." />
+              </div>
+            )}
+            {historyError && (
+              <div className="mt-4">
+                <ErrorState message={historyError} />
+              </div>
+            )}
+            {!historyLoading && !historyError && (
+              <div className="mt-4 grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+                <div className="max-h-[460px] space-y-2 overflow-auto">
+                  {history.length === 0 && (
+                    <div className="rounded-md border border-dashed border-line bg-white p-4 text-sm text-ink/65">
+                      No commits on this branch yet.
+                    </div>
+                  )}
+                  {history.map((commit) => (
+                    <button
+                      key={commit.hash}
+                      type="button"
+                      className={`flex w-full flex-col gap-1 rounded-md border px-3 py-2 text-left transition ${
+                        commit.hash === selectedCommit
+                          ? "border-ink bg-white"
+                          : "border-line bg-white hover:bg-panel"
+                      }`}
+                      onClick={() => setSelectedCommit(commit.hash)}
+                    >
+                      <span className="truncate text-sm font-medium text-ink">
+                        {commit.subject}
+                      </span>
+                      <span className="flex items-center gap-2 text-xs text-ink/55">
+                        <span className="rounded bg-line px-1.5 py-0.5 font-mono">
+                          {commit.short_hash}
+                        </span>
+                        <span className="min-w-0 truncate">{commit.author_name}</span>
+                        <span className="shrink-0">{formatCommitTime(commit.date)}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="min-w-0 rounded-md border border-line bg-white">
+                  <div className="border-b border-line px-3 py-2">
+                    <p className="truncate font-mono text-sm font-semibold">
+                      {commitDetail
+                        ? `${commitDetail.short_hash} · ${commitDetail.subject}`
+                        : "No commit selected"}
+                    </p>
+                    {commitDetail && (
+                      <p className="mt-0.5 truncate text-xs text-ink/55">
+                        {commitDetail.author_name} · {commitDetail.date}
+                      </p>
+                    )}
+                  </div>
+                  <div className="p-3">
+                    {commitDetail ? (
+                      <>
+                        {commitDetail.body && (
+                          <pre className="mb-3 whitespace-pre-wrap break-words font-mono text-xs text-ink/70">
+                            {commitDetail.body}
+                          </pre>
+                        )}
+                        <DiffView diff={commitDetail.diff} />
+                      </>
+                    ) : (
+                      <p className="p-1 text-xs text-ink/60">
+                        Select a commit to view its changes.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
         )}
       </div>
+
+      {pendingDiscard && (
+        <ConfirmModal
+          title={pendingDiscard.path ? "Discard file changes?" : "Discard all changes?"}
+          body={
+            pendingDiscard.path
+              ? `Uncommitted changes to "${pendingDiscard.path}" will be permanently lost.`
+              : "All uncommitted changes on this branch will be permanently lost."
+          }
+          confirmLabel="Discard"
+          onCancel={() => setPendingDiscard(null)}
+          onConfirm={() => void handleDiscard(pendingDiscard.path)}
+        />
+      )}
     </section>
   );
 }

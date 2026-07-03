@@ -13,6 +13,8 @@ from app.main import app
 from app.models import User, Workspace
 from app.services.repositories import (
     GitCommandError,
+    GitCommit,
+    GitCommitDetail,
     GitFileStatus,
     GitStatus,
     InvalidRepositoryUrlError,
@@ -20,9 +22,11 @@ from app.services.repositories import (
     RepositoryAlreadyClonedError,
     RepositoryCredentialNotFoundError,
     RepositoryNotClonedError,
+    RepositoryPathError,
     RepositoryService,
     parse_porcelain_status,
     sanitize_repository_url,
+    validate_commit_sha,
 )
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
@@ -609,3 +613,254 @@ async def test_status_uses_git_cli_for_worktrees(tmp_path):
     # Both reads run via the git CLI against the worktree directory, not the SDK.
     assert ("git status --porcelain", worktree_path) in commands
     assert ("git branch --show-current", worktree_path) in commands
+
+
+# --------------------------------------------------------------------------------------
+# History, fetch, and discard (worktree-aware git operations)
+# --------------------------------------------------------------------------------------
+
+
+def _demo_workspace(owner_id: UUID | None = None) -> Workspace:
+    return Workspace(
+        id=uuid4(),
+        owner_id=owner_id or uuid4(),
+        name="Demo",
+        slug="demo",
+        repo_url="https://github.com/example/demo.git",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-1",
+        workspace_path="/workspace",
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+
+def _repo_service_with_exec(workspace: Workspace, exec_impl, *, token="raw-secret-token"):
+    """Build a RepositoryService whose sandbox reports "cloned" and routes exec to ``exec_impl``."""
+
+    class FakeFs:
+        async def get_file_info(self, path):
+            return SimpleNamespace(name=path)  # exists => treated as cloned
+
+    class FakeRuntime:
+        async def get_sandbox(self, ws):
+            return SimpleNamespace(fs=FakeFs())
+
+        async def exec(self, ws, command, *, cwd=None, env=None, timeout=None):
+            return await exec_impl(command, cwd)
+
+    service = RepositoryService(
+        session=None,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(Settings().workspace_env_encryption_key),
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+    )
+
+    async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
+        return workspace
+
+    async def fake_get_token(workspace_id: UUID) -> str:
+        return token
+
+    service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
+    service._get_token = fake_get_token  # type: ignore[method-assign]
+    return service
+
+
+def test_validate_commit_sha_accepts_hashes_and_rejects_refs():
+    assert validate_commit_sha("abc1234") == "abc1234"
+    assert validate_commit_sha("A" * 40) == "A" * 40
+    for bad in ["", "HEAD", "main", "abc", "../etc/passwd", "abc123; rm -rf /", "g" * 8]:
+        with pytest.raises(RepositoryPathError):
+            validate_commit_sha(bad)
+
+
+def test_parse_log_splits_records_and_fields():
+    fs, rs = "\x1f", "\x1e"
+    output = (
+        f"h1{fs}s1{fs}Alice{fs}alice@x.com{fs}2026-01-01T00:00:00+00:00{fs}first commit{rs}\n"
+        f"h2{fs}s2{fs}Bob{fs}bob@x.com{fs}2026-01-02T00:00:00+00:00{fs}second commit{rs}"
+    )
+    commits = RepositoryService._parse_log(output)
+    assert commits == [
+        GitCommit(
+            hash="h1",
+            short_hash="s1",
+            author_name="Alice",
+            author_email="alice@x.com",
+            date="2026-01-01T00:00:00+00:00",
+            subject="first commit",
+        ),
+        GitCommit(
+            hash="h2",
+            short_hash="s2",
+            author_name="Bob",
+            author_email="bob@x.com",
+            date="2026-01-02T00:00:00+00:00",
+            subject="second commit",
+        ),
+    ]
+
+
+def test_parse_log_empty_output_is_empty_list():
+    assert RepositoryService._parse_log("") == []
+
+
+async def test_log_runs_git_log_scoped_to_worktree():
+    workspace = _demo_workspace()
+    fs, rs = "\x1f", "\x1e"
+    log_out = f"deadbeef{fs}deadbee{fs}Alice{fs}a@x.com{fs}2026-01-01T00:00:00+00:00{fs}Init{rs}"
+    calls: list[tuple[str, str | None]] = []
+
+    async def exec_impl(command, cwd):
+        calls.append((command, cwd))
+        if command.startswith("git log"):
+            return SimpleNamespace(exit_code=0, stdout=log_out, stderr="")
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+    commits = await service.log(
+        workspace.id,
+        workspace.owner_id,
+        worktree_path="/workspace/worktrees/feat",
+        limit=10,
+    )
+
+    assert [c.hash for c in commits] == ["deadbeef"]
+    command, cwd = calls[-1]
+    assert command.startswith("git log")
+    assert "--pretty=format:" in command
+    assert cwd == "/workspace/worktrees/feat"
+
+
+async def test_log_empty_repository_returns_empty_list():
+    workspace = _demo_workspace()
+
+    async def exec_impl(command, cwd):
+        return SimpleNamespace(
+            exit_code=128,
+            stdout="",
+            stderr="fatal: your current branch 'main' does not have any commits yet",
+        )
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+    assert await service.log(workspace.id, workspace.owner_id) == []
+
+
+async def test_commit_detail_returns_metadata_and_patch():
+    workspace = _demo_workspace()
+    fs = "\x1f"
+    meta = (
+        f"deadbeef{fs}deadbee{fs}Alice{fs}a@x.com{fs}2026-01-01T00:00:00+00:00"
+        f"{fs}Add feature{fs}Body line"
+    )
+    patch = "\ndiff --git a/x b/x\n+new\n"
+
+    async def exec_impl(command, cwd):
+        if command.startswith("git show -s"):
+            return SimpleNamespace(exit_code=0, stdout=meta, stderr="")
+        if command.startswith("git show"):
+            return SimpleNamespace(exit_code=0, stdout=patch, stderr="")
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+    detail = await service.commit_detail(workspace.id, workspace.owner_id, "deadbeef")
+
+    assert isinstance(detail, GitCommitDetail)
+    assert detail.hash == "deadbeef"
+    assert detail.subject == "Add feature"
+    assert detail.body == "Body line"
+    # Leading blank line from the empty --pretty=format is trimmed so the diff renders cleanly.
+    assert detail.diff == "diff --git a/x b/x\n+new\n"
+
+
+async def test_commit_detail_rejects_non_sha():
+    workspace = _demo_workspace()
+
+    async def exec_impl(command, cwd):
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+    with pytest.raises(RepositoryPathError):
+        await service.commit_detail(workspace.id, workspace.owner_id, "HEAD")
+
+
+async def test_fetch_uses_authenticated_git_in_worktree():
+    import base64
+
+    workspace = _demo_workspace()
+    worktree_path = "/workspace/worktrees/feat-login"
+    calls: list[tuple[str, str | None]] = []
+
+    async def exec_impl(command, cwd):
+        calls.append((command, cwd))
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+    await service.fetch(workspace.id, workspace.owner_id, worktree_path=worktree_path)
+
+    command, cwd = calls[-1]
+    assert "fetch origin" in command
+    assert cwd == worktree_path
+    expected = base64.b64encode(b"x-access-token:raw-secret-token").decode()
+    assert f"http.extraHeader=AUTHORIZATION: basic {expected}" in command
+    assert "raw-secret-token" not in command
+
+
+async def test_discard_all_resets_hard_and_cleans():
+    workspace = _demo_workspace()
+    calls: list[str] = []
+
+    async def exec_impl(command, cwd):
+        calls.append(command)
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+    await service.discard(workspace.id, workspace.owner_id)
+
+    assert "git reset --hard HEAD" in calls
+    assert "git clean -fd" in calls
+
+
+async def test_discard_untracked_file_uses_clean():
+    workspace = _demo_workspace()
+    calls: list[str] = []
+
+    async def exec_impl(command, cwd):
+        calls.append(command)
+        if command.startswith("git status --porcelain"):
+            return SimpleNamespace(exit_code=0, stdout="?? new.py\n", stderr="")
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+    await service.discard(workspace.id, workspace.owner_id, path="new.py")
+
+    assert any(c.startswith("git clean -fd -- new.py") for c in calls)
+    assert not any("checkout" in c for c in calls)
+
+
+async def test_discard_tracked_file_restores_from_head():
+    workspace = _demo_workspace()
+    calls: list[str] = []
+
+    async def exec_impl(command, cwd):
+        calls.append(command)
+        if command.startswith("git status --porcelain"):
+            return SimpleNamespace(exit_code=0, stdout=" M README.md\n", stderr="")
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+    await service.discard(workspace.id, workspace.owner_id, path="README.md")
+
+    assert any(c.startswith("git checkout HEAD -- README.md") for c in calls)
+    assert not any(c.startswith("git clean") for c in calls)
+
+
+def test_worktree_sync_errors_map_to_expected_http_statuses():
+    from app.api.workspaces import repository_error
+    from app.services.worktrees import CannotSyncBaseWorktreeError, MergeConflictError
+
+    conflict = MergeConflictError("CONFLICT (content): merge conflict")
+    assert repository_error(conflict).status_code == 409
+    assert repository_error(CannotSyncBaseWorktreeError()).status_code == 409

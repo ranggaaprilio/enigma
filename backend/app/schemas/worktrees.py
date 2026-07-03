@@ -1,3 +1,4 @@
+from typing import Literal
 from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
@@ -42,6 +43,10 @@ class WorktreeCommitRequest(BaseModel):
     @classmethod
     def normalize_message(cls, value: str) -> str:
         return normalize_nonempty(value)
+
+
+class WorktreeSyncRequest(BaseModel):
+    strategy: Literal["merge", "rebase"] = "merge"
 
 
 class PullRequestCreateRequest(BaseModel):

@@ -9,10 +9,14 @@ from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.models import User, Workspace, WorkspaceEnvVar
 from app.schemas.repositories import (
+    GitCommitResponse,
+    RepositoryCommitDetailResponse,
     RepositoryCommitRequest,
     RepositoryConnectRequest,
     RepositoryDiffResponse,
+    RepositoryDiscardRequest,
     RepositoryFileStatus,
+    RepositoryLogResponse,
     RepositoryOperationResponse,
     RepositoryStatusResponse,
 )
@@ -31,6 +35,7 @@ from app.schemas.worktrees import (
     WorktreeCommitRequest,
     WorktreeCreateRequest,
     WorktreeResponse,
+    WorktreeSyncRequest,
 )
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntimeError, get_daytona_runtime
@@ -59,8 +64,10 @@ from app.services.workspaces import (
 )
 from app.services.worktrees import (
     CannotRemoveBaseWorktreeError,
+    CannotSyncBaseWorktreeError,
     GitWorktreeError,
     InvalidBranchNameError,
+    MergeConflictError,
     WorktreeAlreadyExistsError,
     WorktreeDirtyError,
     WorktreeLimitError,
@@ -265,6 +272,14 @@ def repository_error(error: Exception) -> HTTPException:
             status_code=status.HTTP_409_CONFLICT,
             detail="Worktree has uncommitted changes; pass force to remove it",
         )
+    if isinstance(error, CannotSyncBaseWorktreeError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The base worktree has no base branch to sync from",
+        )
+    # MergeConflictError subclasses GitWorktreeError, so it must be checked first.
+    if isinstance(error, MergeConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error.message)
     if isinstance(error, GitWorktreeError):
         return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error.message)
     if isinstance(error, GitHubApiError):
@@ -442,6 +457,108 @@ async def get_repository_diff(
     return RepositoryDiffResponse(diff=diff)
 
 
+@router.get("/{workspace_id}/repo/log", response_model=RepositoryLogResponse)
+async def get_repository_log(
+    workspace_id: UUID,
+    worktree_id: UUID | None = Query(default=None),
+    limit: int = Query(default=50, ge=1, le=200),
+    skip: int = Query(default=0, ge=0),
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
+) -> RepositoryLogResponse:
+    try:
+        worktree_path: str | None = None
+        if worktree_id is not None:
+            worktree = await worktree_service.get_worktree(
+                workspace_id, current_user.id, worktree_id
+            )
+            worktree_path = worktree.path
+        commits = await service.log(
+            workspace_id,
+            current_user.id,
+            worktree_path=worktree_path,
+            limit=limit,
+            skip=skip,
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+        DaytonaRuntimeError,
+        WorktreeNotFoundError,
+    ) as error:
+        raise repository_error(error) from None
+    return RepositoryLogResponse(
+        commits=[
+            GitCommitResponse(
+                hash=commit.hash,
+                short_hash=commit.short_hash,
+                author_name=commit.author_name,
+                author_email=commit.author_email,
+                date=commit.date,
+                subject=commit.subject,
+            )
+            for commit in commits
+        ]
+    )
+
+
+@router.get(
+    "/{workspace_id}/repo/commits/{sha}", response_model=RepositoryCommitDetailResponse
+)
+async def get_repository_commit(
+    workspace_id: UUID,
+    sha: str,
+    worktree_id: UUID | None = Query(default=None),
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
+) -> RepositoryCommitDetailResponse:
+    try:
+        worktree_path: str | None = None
+        if worktree_id is not None:
+            worktree = await worktree_service.get_worktree(
+                workspace_id, current_user.id, worktree_id
+            )
+            worktree_path = worktree.path
+        detail = await service.commit_detail(
+            workspace_id, current_user.id, sha, worktree_path=worktree_path
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+        DaytonaRuntimeError,
+        WorktreeNotFoundError,
+    ) as error:
+        raise repository_error(error) from None
+    return RepositoryCommitDetailResponse(
+        hash=detail.hash,
+        short_hash=detail.short_hash,
+        author_name=detail.author_name,
+        author_email=detail.author_email,
+        date=detail.date,
+        subject=detail.subject,
+        body=detail.body,
+        diff=detail.diff,
+    )
+
+
 @router.post("/{workspace_id}/repo/pull", response_model=RepositoryOperationResponse)
 async def pull_repository(
     workspace_id: UUID,
@@ -475,6 +592,50 @@ async def pull_repository(
         metadata={},
     )
     return RepositoryOperationResponse(ok=True, message="Repository pulled.")
+
+
+@router.post("/{workspace_id}/repo/fetch", response_model=RepositoryOperationResponse)
+async def fetch_repository(
+    workspace_id: UUID,
+    worktree_id: UUID | None = Query(default=None),
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        worktree_path: str | None = None
+        if worktree_id is not None:
+            worktree = await worktree_service.get_worktree(
+                workspace_id, current_user.id, worktree_id
+            )
+            worktree_path = worktree.path
+        await service.fetch(workspace_id, current_user.id, worktree_path=worktree_path)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+        DaytonaRuntimeError,
+        WorktreeNotFoundError,
+    ) as error:
+        raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="repo_fetch",
+        target_type="repository",
+        target_id=workspace_id,
+        metadata={"worktree_id": str(worktree_id) if worktree_id else None},
+    )
+    return RepositoryOperationResponse(ok=True, message="Fetched from origin.")
 
 
 @router.post("/{workspace_id}/repo/commit", response_model=RepositoryOperationResponse)
@@ -519,6 +680,59 @@ async def commit_repository(
     return RepositoryOperationResponse(ok=True, message="Changes committed.")
 
 
+@router.post("/{workspace_id}/repo/discard", response_model=RepositoryOperationResponse)
+async def discard_repository_changes(
+    workspace_id: UUID,
+    payload: RepositoryDiscardRequest,
+    worktree_id: UUID | None = Query(default=None),
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        worktree_path: str | None = None
+        if worktree_id is not None:
+            worktree = await worktree_service.get_worktree(
+                workspace_id, current_user.id, worktree_id
+            )
+            worktree_path = worktree.path
+        await service.discard(
+            workspace_id,
+            current_user.id,
+            path=payload.path,
+            worktree_path=worktree_path,
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except (
+        InvalidRepositoryUrlError,
+        RepositoryPathError,
+        RepositoryCredentialNotFoundError,
+        RepositoryTokenError,
+        RepositoryAlreadyClonedError,
+        RepositoryNotClonedError,
+        NoChangesToCommitError,
+        GitCommandError,
+        DaytonaRuntimeError,
+        WorktreeNotFoundError,
+    ) as error:
+        raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="repo_discard",
+        target_type="repository",
+        target_id=workspace_id,
+        metadata={"path": payload.path},
+    )
+    message = (
+        f"Discarded changes to {payload.path}." if payload.path else "Discarded all changes."
+    )
+    return RepositoryOperationResponse(ok=True, message=message)
+
+
 @router.post("/{workspace_id}/repo/push", response_model=RepositoryOperationResponse)
 async def push_repository(
     workspace_id: UUID,
@@ -561,7 +775,9 @@ WORKTREE_ERRORS = (
     WorktreeLimitError,
     InvalidBranchNameError,
     CannotRemoveBaseWorktreeError,
+    CannotSyncBaseWorktreeError,
     WorktreeDirtyError,
+    MergeConflictError,
     GitWorktreeError,
     GitHubApiError,
     InvalidRepositoryUrlError,
@@ -785,6 +1001,84 @@ async def push_worktree(
         message=f"Branch '{worktree.branch}' was pushed to GitHub.",
     )
     return RepositoryOperationResponse(ok=True, message="Changes pushed.")
+
+
+@router.post(
+    "/{workspace_id}/repo/worktrees/{worktree_id}/pull",
+    response_model=RepositoryOperationResponse,
+)
+async def pull_worktree(
+    workspace_id: UUID,
+    worktree_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        worktree = await worktree_service.get_worktree(
+            workspace_id, current_user.id, worktree_id
+        )
+        await service.pull(workspace_id, current_user.id, worktree_path=worktree.path)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="worktree_pull",
+        target_type="worktree",
+        target_id=worktree_id,
+        metadata={"branch": worktree.branch},
+    )
+    return RepositoryOperationResponse(ok=True, message="Branch pulled.")
+
+
+@router.post(
+    "/{workspace_id}/repo/worktrees/{worktree_id}/sync",
+    response_model=RepositoryOperationResponse,
+)
+async def sync_worktree(
+    workspace_id: UUID,
+    worktree_id: UUID,
+    payload: WorktreeSyncRequest,
+    current_user: User = CURRENT_USER_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+) -> RepositoryOperationResponse:
+    try:
+        worktree = await worktree_service.get_worktree(
+            workspace_id, current_user.id, worktree_id
+        )
+        # Fetch first (authenticated) so origin/<base_ref> reflects the true remote base, then
+        # merge/rebase it into the worktree locally.
+        await service.fetch(workspace_id, current_user.id, worktree_path=worktree.path)
+        await worktree_service.sync_from_base(
+            workspace_id, current_user.id, worktree_id, strategy=payload.strategy
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKTREE_ERRORS as error:
+        raise repository_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="worktree_sync",
+        target_type="worktree",
+        target_id=worktree_id,
+        metadata={
+            "branch": worktree.branch,
+            "base": worktree.base_ref,
+            "strategy": payload.strategy,
+        },
+    )
+    return RepositoryOperationResponse(
+        ok=True, message=f"Updated '{worktree.branch}' from {worktree.base_ref}."
+    )
 
 
 @router.post(

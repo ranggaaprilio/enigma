@@ -34,6 +34,30 @@ class RepositoryDiffResponse(BaseModel):
     diff: str
 
 
+class GitCommitResponse(BaseModel):
+    hash: str
+    short_hash: str
+    author_name: str
+    author_email: str
+    date: str
+    subject: str
+
+
+class RepositoryLogResponse(BaseModel):
+    commits: list[GitCommitResponse]
+
+
+class RepositoryCommitDetailResponse(BaseModel):
+    hash: str
+    short_hash: str
+    author_name: str
+    author_email: str
+    date: str
+    subject: str
+    body: str
+    diff: str
+
+
 class RepositoryCommitRequest(BaseModel):
     message: str = Field(min_length=1, max_length=500)
 
@@ -41,6 +65,19 @@ class RepositoryCommitRequest(BaseModel):
     @classmethod
     def normalize_message(cls, value: str) -> str:
         return normalize_nonempty(value)
+
+
+class RepositoryDiscardRequest(BaseModel):
+    # A specific file to discard; when omitted, discard all uncommitted changes.
+    path: str | None = Field(default=None, max_length=1024)
+
+    @field_validator("path")
+    @classmethod
+    def normalize_path(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
 
 
 class RepositoryOperationResponse(BaseModel):

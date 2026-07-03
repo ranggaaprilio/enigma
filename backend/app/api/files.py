@@ -32,6 +32,7 @@ from app.services.files import (
     FileWorkspaceUnavailableError,
 )
 from app.services.workspaces import WorkspaceNotFoundError
+from app.services.worktrees import WorktreeNotFoundError
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/files", tags=["files"])
 
@@ -42,13 +43,30 @@ SETTINGS_DEP = Depends(get_settings)
 class FileServiceProtocol(Protocol):
     settings: Settings
 
-    async def tree(self, workspace_id: UUID, owner_id: UUID, path: str | None = None) -> FileNode:
-        ...
+    async def tree(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        path: str | None = None,
+        worktree_id: UUID | None = None,
+    ) -> FileNode: ...
 
-    async def read(self, workspace_id: UUID, owner_id: UUID, path: str) -> FileReadResponse: ...
+    async def read(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        path: str,
+        worktree_id: UUID | None = None,
+    ) -> FileReadResponse: ...
 
-    async def write(self, workspace_id: UUID, owner_id: UUID, path: str, content: str) -> None:
-        ...
+    async def write(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        path: str,
+        content: str,
+        worktree_id: UUID | None = None,
+    ) -> None: ...
 
     async def upload(
         self,
@@ -57,9 +75,16 @@ class FileServiceProtocol(Protocol):
         path: str,
         content: bytes,
         filename: str | None = None,
+        worktree_id: UUID | None = None,
     ) -> str: ...
 
-    async def create_folder(self, workspace_id: UUID, owner_id: UUID, path: str) -> None: ...
+    async def create_folder(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        path: str,
+        worktree_id: UUID | None = None,
+    ) -> None: ...
 
     async def rename(
         self,
@@ -67,19 +92,31 @@ class FileServiceProtocol(Protocol):
         owner_id: UUID,
         path: str,
         new_path: str,
+        worktree_id: UUID | None = None,
     ) -> str: ...
 
-    async def delete(self, workspace_id: UUID, owner_id: UUID, path: str) -> None: ...
+    async def delete(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        path: str,
+        worktree_id: UUID | None = None,
+    ) -> None: ...
 
     async def search(
         self,
         workspace_id: UUID,
         owner_id: UUID,
         query: str,
+        worktree_id: UUID | None = None,
     ) -> list[FileSearchResult]: ...
 
     async def download_path(
-        self, workspace_id: UUID, owner_id: UUID, path: str
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        path: str,
+        worktree_id: UUID | None = None,
     ) -> tuple[str, bytes]: ...
 
 
@@ -117,6 +154,8 @@ async def read_limited_body(request: Request, max_bytes: int) -> bytes:
 def translate_file_error(error: Exception) -> HTTPException:
     if isinstance(error, WorkspaceNotFoundError):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+    if isinstance(error, WorktreeNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Worktree not found")
     if isinstance(error, FileWorkspaceUnavailableError):
         return HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -145,13 +184,17 @@ def translate_file_error(error: Exception) -> HTTPException:
 async def get_file_tree(
     workspace_id: UUID,
     path: str = Query(default=""),
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileNode:
     try:
-        return await service.tree(workspace_id, current_user.id, normalize_query_path(path))
+        return await service.tree(
+            workspace_id, current_user.id, normalize_query_path(path), worktree_id=worktree_id
+        )
     except (
         WorkspaceNotFoundError,
+        WorktreeNotFoundError,
         FileWorkspaceUnavailableError,
         FileNotFoundErrorInWorkspace,
         FileConflictError,
@@ -167,13 +210,17 @@ async def get_file_tree(
 async def read_file(
     workspace_id: UUID,
     path: str = Query(min_length=1, max_length=4096),
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileReadResponse:
     try:
-        return await service.read(workspace_id, current_user.id, normalize_query_path(path))
+        return await service.read(
+            workspace_id, current_user.id, normalize_query_path(path), worktree_id=worktree_id
+        )
     except (
         WorkspaceNotFoundError,
+        WorktreeNotFoundError,
         FileWorkspaceUnavailableError,
         FileNotFoundErrorInWorkspace,
         FileConflictError,
@@ -189,13 +236,21 @@ async def read_file(
 async def write_file(
     workspace_id: UUID,
     payload: FileWriteRequest,
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileOperationResponse:
     try:
-        await service.write(workspace_id, current_user.id, payload.path, payload.content)
+        await service.write(
+            workspace_id,
+            current_user.id,
+            payload.path,
+            payload.content,
+            worktree_id=worktree_id,
+        )
     except (
         WorkspaceNotFoundError,
+        WorktreeNotFoundError,
         FileWorkspaceUnavailableError,
         FileNotFoundErrorInWorkspace,
         FileConflictError,
@@ -214,6 +269,7 @@ async def upload_file(
     request: Request,
     path: str = Query(default="", max_length=4096),
     filename: str | None = Query(default=None, min_length=1, max_length=255),
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileOperationResponse:
@@ -225,9 +281,11 @@ async def upload_file(
             normalize_query_path(path),
             content,
             filename,
+            worktree_id=worktree_id,
         )
     except (
         WorkspaceNotFoundError,
+        WorktreeNotFoundError,
         FileWorkspaceUnavailableError,
         FileNotFoundErrorInWorkspace,
         FileConflictError,
@@ -244,6 +302,7 @@ async def upload_file(
 async def download_file(
     workspace_id: UUID,
     path: str = Query(min_length=1, max_length=4096),
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> Response:
@@ -252,9 +311,11 @@ async def download_file(
             workspace_id,
             current_user.id,
             normalize_query_path(path),
+            worktree_id=worktree_id,
         )
     except (
         WorkspaceNotFoundError,
+        WorktreeNotFoundError,
         FileWorkspaceUnavailableError,
         FileNotFoundErrorInWorkspace,
         FileConflictError,
@@ -275,13 +336,17 @@ async def download_file(
 async def create_folder(
     workspace_id: UUID,
     payload: FolderCreateRequest,
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileOperationResponse:
     try:
-        await service.create_folder(workspace_id, current_user.id, payload.path)
+        await service.create_folder(
+            workspace_id, current_user.id, payload.path, worktree_id=worktree_id
+        )
     except (
         WorkspaceNotFoundError,
+        WorktreeNotFoundError,
         FileWorkspaceUnavailableError,
         FileNotFoundErrorInWorkspace,
         FileConflictError,
@@ -298,6 +363,7 @@ async def create_folder(
 async def rename_file(
     workspace_id: UUID,
     payload: FileRenameRequest,
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> FileOperationResponse:
@@ -307,9 +373,11 @@ async def rename_file(
             current_user.id,
             payload.path,
             payload.new_path,
+            worktree_id=worktree_id,
         )
     except (
         WorkspaceNotFoundError,
+        WorktreeNotFoundError,
         FileWorkspaceUnavailableError,
         FileNotFoundErrorInWorkspace,
         FileConflictError,
@@ -326,13 +394,17 @@ async def rename_file(
 async def delete_file(
     workspace_id: UUID,
     path: str = Query(min_length=1, max_length=4096),
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> DeleteResponse:
     try:
-        await service.delete(workspace_id, current_user.id, normalize_query_path(path))
+        await service.delete(
+            workspace_id, current_user.id, normalize_query_path(path), worktree_id=worktree_id
+        )
     except (
         WorkspaceNotFoundError,
+        WorktreeNotFoundError,
         FileWorkspaceUnavailableError,
         FileNotFoundErrorInWorkspace,
         FileConflictError,
@@ -349,13 +421,15 @@ async def delete_file(
 async def search_files(
     workspace_id: UUID,
     q: str = Query(min_length=1, max_length=255),
+    worktree_id: UUID | None = Query(default=None),
     current_user: User = CURRENT_USER_DEP,
     service: FileServiceProtocol = FILE_SERVICE_DEP,
 ) -> list[FileNode]:
     try:
-        results = await service.search(workspace_id, current_user.id, q)
+        results = await service.search(workspace_id, current_user.id, q, worktree_id=worktree_id)
     except (
         WorkspaceNotFoundError,
+        WorktreeNotFoundError,
         FileWorkspaceUnavailableError,
         FileNotFoundErrorInWorkspace,
         FileConflictError,

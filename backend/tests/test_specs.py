@@ -16,6 +16,7 @@ from app.main import app
 from app.models import AgentRun, AuditLog, Notification, SpecPhase, SpecWorkflow, User, Workspace
 from app.services.speckit import (
     PHASE_ORDER,
+    PHASE_PLANS,
     InvalidArtifactPathError,
     SpecGateError,
     SpecKitService,
@@ -219,14 +220,21 @@ async def test_implement_gate_returns_409_via_api(db_session):
     assert response.status_code == 409
 
 
-# --- start workflow generates spec.md and halts -----------------------------------------
+# --- start workflow: constitution-first, else straight to specify -----------------------
 
 
-async def test_start_workflow_creates_phases_and_runs_specify(db_session, monkeypatch):
-    session, session_maker = db_session
-    user, workspace = await make_user_workspace(session, owner_email=f"start-{uuid4()}@example.com")
-    await session.commit()
+# A filled-in constitution (no bracketed UPPER_SNAKE template placeholders remain).
+RATIFIED_CONSTITUTION = """# Demo Constitution
 
+## Core Principles
+- Library-first: every feature ships as a standalone library.
+- Test-driven: tests are written before implementation.
+
+**Ratified**: 2026-01-01 | **Version**: 1.0.0
+"""
+
+
+def _fake_create_run():
     async def fake_create_run(self, workspace_id, user_id, prompt, working_dir=None):
         run = AgentRun(
             workspace_id=workspace_id,
@@ -240,20 +248,32 @@ async def test_start_workflow_creates_phases_and_runs_specify(db_session, monkey
         await self.session.flush()
         return run
 
-    async def noop_finalize(self, *args, **kwargs):
-        return None
+    return fake_create_run
 
-    monkeypatch.setattr("app.services.agents.AgentService.create_run", fake_create_run)
-    monkeypatch.setattr(SpecKitService, "_finalize_phase", noop_finalize)
 
+async def _noop_finalize(self, *args, **kwargs):
+    return None
+
+
+async def test_start_workflow_without_constitution_runs_constitution_first(db_session, monkeypatch):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"start-{uuid4()}@example.com")
+    await session.commit()
+
+    monkeypatch.setattr("app.services.agents.AgentService.create_run", _fake_create_run())
+    monkeypatch.setattr(SpecKitService, "_finalize_phase", _noop_finalize)
+
+    # FakeRuntime's ``cat`` reports the constitution absent -> unratified -> generate it first.
     service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
     workflow = await service.start_workflow(workspace.id, user.id, "Add Auth", "We need login")
 
     assert len(workflow.phases) == len(PHASE_ORDER)
+    assert workflow.current_phase == "constitution"
+    constitution = next(p for p in workflow.phases if p.phase == "constitution")
     specify = next(p for p in workflow.phases if p.phase == "specify")
-    assert specify.status == "running"
-    assert specify.agent_run_id is not None
-    assert workflow.worktree_path == "worktrees/001-add-auth"
+    assert constitution.status == "running"
+    assert constitution.agent_run_id is not None
+    assert specify.status == "pending"
 
     audits = (
         (
@@ -265,6 +285,89 @@ async def test_start_workflow_creates_phases_and_runs_specify(db_session, monkey
         .all()
     )
     assert len(audits) >= 1
+
+
+async def test_start_workflow_with_ratified_constitution_runs_specify(db_session, monkeypatch):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"rat-{uuid4()}@example.com")
+    await session.commit()
+
+    monkeypatch.setattr("app.services.agents.AgentService.create_run", _fake_create_run())
+    monkeypatch.setattr(SpecKitService, "_finalize_phase", _noop_finalize)
+
+    # A ratified constitution already exists -> skip straight to specify (prior behavior).
+    runtime = ScriptedRuntime(
+        files={PHASE_PLANS["constitution"].artifact: RATIFIED_CONSTITUTION}
+    )
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+    workflow = await service.start_workflow(workspace.id, user.id, "Add Auth", "We need login")
+
+    assert workflow.current_phase == "specify"
+    constitution = next(p for p in workflow.phases if p.phase == "constitution")
+    specify = next(p for p in workflow.phases if p.phase == "specify")
+    assert specify.status == "running"
+    assert specify.agent_run_id is not None
+    assert constitution.status == "pending"
+    assert workflow.worktree_path == "worktrees/001-add-auth"
+
+
+async def test_constitution_finalizer_auto_chains_to_specify(db_session, monkeypatch):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"chain-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user, phase_status={"constitution": "running"})
+    run = AgentRun(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        prompt="generate constitution",
+        status="completed",
+        provider="mock",
+        model="mock-agent",
+    )
+    session.add(run)
+    await session.flush()
+    await session.commit()
+
+    called: dict[str, str] = {}
+
+    async def spy_run_phase(self, workspace_id, workflow_id, phase_name, user_id, feedback=None):
+        # Record the chained call and flip specify to running without scheduling a background
+        # finalizer task (which would otherwise poll a non-terminal run for the whole timeout).
+        called["phase"] = phase_name
+        specify = (
+            await self.session.execute(
+                select(SpecPhase).where(
+                    SpecPhase.workflow_id == workflow_id, SpecPhase.phase == "specify"
+                )
+            )
+        ).scalar_one()
+        specify.status = "running"
+        self.session.add(specify)
+        await self.session.commit()
+        return specify
+
+    monkeypatch.setattr(SpecKitService, "run_phase", spy_run_phase)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    await service._finalize_phase(workflow.id, "constitution", run.id, user.id)
+
+    assert called.get("phase") == "specify"
+    async with session_maker() as verify:
+        constitution = (
+            await verify.execute(
+                select(SpecPhase).where(
+                    SpecPhase.workflow_id == workflow.id, SpecPhase.phase == "constitution"
+                )
+            )
+        ).scalar_one()
+        specify = (
+            await verify.execute(
+                select(SpecPhase).where(
+                    SpecPhase.workflow_id == workflow.id, SpecPhase.phase == "specify"
+                )
+            )
+        ).scalar_one()
+        assert constitution.status == "completed"
+        assert specify.status == "running"
 
 
 # --- approval gate transitions -----------------------------------------------------------

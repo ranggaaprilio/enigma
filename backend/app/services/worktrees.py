@@ -60,10 +60,18 @@ class WorktreeDirtyError(WorktreeError):
     pass
 
 
+class CannotSyncBaseWorktreeError(WorktreeError):
+    pass
+
+
 class GitWorktreeError(WorktreeError):
     def __init__(self, message: str) -> None:
         self.message = message
         super().__init__(message)
+
+
+class MergeConflictError(GitWorktreeError):
+    """A merge/rebase left the worktree with conflicts the user must resolve manually."""
 
 
 @dataclass(frozen=True)
@@ -231,6 +239,40 @@ class WorktreeService:
         await self.session.delete(row)
         await self.session.commit()
         return row
+
+    async def sync_from_base(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        worktree_id: UUID,
+        strategy: str = "merge",
+    ) -> str:
+        """Bring a feature worktree up to date with its base branch.
+
+        The caller is expected to have fetched ``origin`` first (the API layer does this via
+        ``RepositoryService.fetch``), so this merges/rebases the already-fetched ``origin/<base>``
+        entirely inside the worktree — the base clone is never checked out or dirtied. A conflict
+        leaves the worktree mid-merge/rebase and raises ``MergeConflictError`` for the user to
+        resolve in the editor/terminal.
+        """
+        workspace = await self._get_workspace(workspace_id, owner_id)
+        row = await self._get_row(workspace_id, worktree_id)
+        if row.is_base:
+            raise CannotSyncBaseWorktreeError
+        target = f"origin/{row.base_ref}"
+        if strategy == "rebase":
+            args = ["rebase", target]
+        else:
+            args = ["merge", "--no-edit", target]
+        result = await self._run_git(workspace, args, cwd=row.path)
+        if result.exit_code != 0:
+            output = sanitize_git_output(f"{result.stdout}\n{result.stderr}".strip())
+            if "conflict" in output.lower():
+                raise MergeConflictError(
+                    output or f"{strategy} left conflicts to resolve"
+                )
+            raise GitWorktreeError(f"git {strategy} failed: {output}".strip())
+        return sanitize_git_output((result.stdout or "").strip())
 
     async def prune_worktrees(self, workspace_id: UUID, owner_id: UUID) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)

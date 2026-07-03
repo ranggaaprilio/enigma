@@ -121,6 +121,30 @@ export type RepositoryDiffResponse = {
   diff: string;
 };
 
+export type GitCommitResponse = {
+  hash: string;
+  short_hash: string;
+  author_name: string;
+  author_email: string;
+  date: string;
+  subject: string;
+};
+
+export type RepositoryLogResponse = {
+  commits: GitCommitResponse[];
+};
+
+export type RepositoryCommitDetailResponse = {
+  hash: string;
+  short_hash: string;
+  author_name: string;
+  author_email: string;
+  date: string;
+  subject: string;
+  body: string;
+  diff: string;
+};
+
 export type RepositoryCommitPayload = {
   message: string;
 };
@@ -466,10 +490,16 @@ export function getNotificationStreamUrl() {
   return baseUrl.toString();
 }
 
-export function getWorkspaceFileDownloadUrl(workspaceId: string, path: string) {
+export function getWorkspaceFileDownloadUrl(
+  workspaceId: string,
+  path: string,
+  worktreeId?: string,
+) {
   const baseUrl = new URL(getApiBaseUrl());
   baseUrl.pathname = `/workspaces/${workspaceId}/files/download`;
-  baseUrl.search = `?path=${encodeURIComponent(path)}`;
+  const params = new URLSearchParams({ path });
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  baseUrl.search = params.toString();
   return baseUrl.toString();
 }
 
@@ -650,6 +680,36 @@ export function getRepositoryDiff(
   });
 }
 
+export function getRepositoryLog(
+  workspaceId: string,
+  worktreeId?: string,
+  limit?: number,
+  skip?: number,
+  signal?: AbortSignal,
+): Promise<RepositoryLogResponse> {
+  const params = new URLSearchParams();
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  if (limit != null) params.set("limit", String(limit));
+  if (skip != null) params.set("skip", String(skip));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return requestJson<RepositoryLogResponse>(`/workspaces/${workspaceId}/repo/log${query}`, {
+    signal,
+  });
+}
+
+export function getCommitDetail(
+  workspaceId: string,
+  sha: string,
+  worktreeId?: string,
+  signal?: AbortSignal,
+): Promise<RepositoryCommitDetailResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<RepositoryCommitDetailResponse>(
+    `/workspaces/${workspaceId}/repo/commits/${encodeURIComponent(sha)}${query}`,
+    { signal },
+  );
+}
+
 export function pullRepository(workspaceId: string): Promise<RepositoryOperationResponse> {
   return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/pull`, {
     method: "POST",
@@ -670,6 +730,29 @@ export function pushRepository(workspaceId: string): Promise<RepositoryOperation
   return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/push`, {
     method: "POST",
   });
+}
+
+export function discardRepositoryChanges(
+  workspaceId: string,
+  path?: string,
+  worktreeId?: string,
+): Promise<RepositoryOperationResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/discard${query}`,
+    { method: "POST", body: JSON.stringify({ path: path ?? null }) },
+  );
+}
+
+export function fetchRepository(
+  workspaceId: string,
+  worktreeId?: string,
+): Promise<RepositoryOperationResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/fetch${query}`,
+    { method: "POST" },
+  );
 }
 
 export function listWorktrees(
@@ -724,6 +807,27 @@ export function pushWorktree(
   );
 }
 
+export function pullWorktree(
+  workspaceId: string,
+  worktreeId: string,
+): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}/pull`,
+    { method: "POST" },
+  );
+}
+
+export function syncWorktree(
+  workspaceId: string,
+  worktreeId: string,
+  strategy: "merge" | "rebase" = "merge",
+): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}/sync`,
+    { method: "POST", body: JSON.stringify({ strategy }) },
+  );
+}
+
 export function createPullRequest(
   workspaceId: string,
   payload: PullRequestCreatePayload,
@@ -758,9 +862,13 @@ export function getPullRequest(
 export function getWorkspaceFileTree(
   workspaceId: string,
   path = "",
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileNode> {
-  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  const query = params.toString() ? `?${params.toString()}` : "";
   return requestJson<WorkspaceFileNode>(`/workspaces/${workspaceId}/files/tree${query}`, {
     signal,
   });
@@ -769,10 +877,13 @@ export function getWorkspaceFileTree(
 export function readWorkspaceFile(
   workspaceId: string,
   path: string,
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileReadResponse> {
+  const params = new URLSearchParams({ path });
+  if (worktreeId) params.set("worktree_id", worktreeId);
   return requestJson<WorkspaceFileReadResponse>(
-    `/workspaces/${workspaceId}/files/read?path=${encodeURIComponent(path)}`,
+    `/workspaces/${workspaceId}/files/read?${params.toString()}`,
     { signal },
   );
 }
@@ -780,11 +891,16 @@ export function readWorkspaceFile(
 export function writeWorkspaceFile(
   workspaceId: string,
   payload: WorkspaceFileWritePayload,
+  worktreeId?: string,
 ): Promise<WorkspaceFileOperationResponse> {
-  return requestJson<WorkspaceFileOperationResponse>(`/workspaces/${workspaceId}/files/write`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<WorkspaceFileOperationResponse>(
+    `/workspaces/${workspaceId}/files/write${query}`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
 export async function uploadWorkspaceFile(
@@ -792,15 +908,16 @@ export async function uploadWorkspaceFile(
   path: string,
   file: File | Blob,
   filename?: string,
+  worktreeId?: string,
 ): Promise<WorkspaceFileOperationResponse> {
   const name =
     filename ??
     (typeof File !== "undefined" && file instanceof File ? file.name : undefined) ??
     "upload.bin";
+  const params = new URLSearchParams({ path, filename: name });
+  if (worktreeId) params.set("worktree_id", worktreeId);
   const response = await fetch(
-    `${getApiBaseUrl()}/workspaces/${workspaceId}/files/upload?path=${encodeURIComponent(
-      path,
-    )}&filename=${encodeURIComponent(name)}`,
+    `${getApiBaseUrl()}/workspaces/${workspaceId}/files/upload?${params.toString()}`,
     {
       method: "POST",
       credentials: "include",
@@ -827,37 +944,55 @@ export async function uploadWorkspaceFile(
 export function createWorkspaceFolder(
   workspaceId: string,
   payload: WorkspaceFolderCreatePayload,
+  worktreeId?: string,
 ): Promise<WorkspaceFileOperationResponse> {
-  return requestJson<WorkspaceFileOperationResponse>(`/workspaces/${workspaceId}/files/folders`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<WorkspaceFileOperationResponse>(
+    `/workspaces/${workspaceId}/files/folders${query}`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
 export function renameWorkspaceFile(
   workspaceId: string,
   payload: WorkspaceFileRenamePayload,
+  worktreeId?: string,
 ): Promise<WorkspaceFileOperationResponse> {
-  return requestJson<WorkspaceFileOperationResponse>(`/workspaces/${workspaceId}/files/rename`, {
-    method: "PATCH",
-    body: JSON.stringify(payload),
-  });
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<WorkspaceFileOperationResponse>(
+    `/workspaces/${workspaceId}/files/rename${query}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
-export function deleteWorkspaceFile(workspaceId: string, path: string): Promise<{ ok: boolean }> {
-  return requestJson<{ ok: boolean }>(
-    `/workspaces/${workspaceId}/files?path=${encodeURIComponent(path)}`,
-    { method: "DELETE" },
-  );
+export function deleteWorkspaceFile(
+  workspaceId: string,
+  path: string,
+  worktreeId?: string,
+): Promise<{ ok: boolean }> {
+  const params = new URLSearchParams({ path });
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  return requestJson<{ ok: boolean }>(`/workspaces/${workspaceId}/files?${params.toString()}`, {
+    method: "DELETE",
+  });
 }
 
 export function searchWorkspaceFiles(
   workspaceId: string,
   query: string,
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileNode[]> {
+  const params = new URLSearchParams({ q: query });
+  if (worktreeId) params.set("worktree_id", worktreeId);
   return requestJson<WorkspaceFileNode[]>(
-    `/workspaces/${workspaceId}/files/search?q=${encodeURIComponent(query)}`,
+    `/workspaces/${workspaceId}/files/search?${params.toString()}`,
     { signal },
   );
 }

@@ -16,6 +16,20 @@ from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCiphe
 GITHUB_REPO_PATTERN = re.compile(r"^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$")
 GIT_TIMEOUT_SECONDS = 60
 
+# Commit SHAs are hex; accept an abbreviated (>=4) or full (40) hash. ``shlex.quote`` already blocks
+# shell injection, but validating the shape keeps arbitrary refs/paths out of ``git show``.
+COMMIT_SHA_PATTERN = re.compile(r"^[0-9a-fA-F]{4,40}$")
+
+# ASCII unit (\x1f) / record (\x1e) separators delimit the machine-parseable log format so commit
+# metadata never collides with the delimiter — subjects may contain almost anything but not these
+# control bytes.
+_LOG_FIELD_SEP = "\x1f"
+_LOG_RECORD_SEP = "\x1e"
+LOG_FORMAT = "%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1e"
+# Same field layout as ``LOG_FORMAT`` but with the body (%b) appended last so embedded newlines can
+# never shift earlier fields; used by ``commit_detail`` with ``git show -s``.
+COMMIT_META_FORMAT = "%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b"
+
 # Fallback commit identity used when the acting user has no name/email. The signed-in user's
 # name/email is preferred; this is shared with speckit so the fallback is consistent.
 DEFAULT_COMMIT_AUTHOR = "Enigma app"
@@ -70,6 +84,28 @@ class GitStatus:
     files: list[GitFileStatus]
 
 
+@dataclass(frozen=True)
+class GitCommit:
+    hash: str
+    short_hash: str
+    author_name: str
+    author_email: str
+    date: str
+    subject: str
+
+
+@dataclass(frozen=True)
+class GitCommitDetail:
+    hash: str
+    short_hash: str
+    author_name: str
+    author_email: str
+    date: str
+    subject: str
+    body: str
+    diff: str
+
+
 def sanitize_repository_url(repo_url: str) -> str:
     parsed = urlparse(repo_url.strip())
     if parsed.scheme != "https" or parsed.hostname != "github.com":
@@ -113,6 +149,13 @@ def validate_diff_path(path: str) -> str:
         raise RepositoryPathError
     pure_path = PurePosixPath(candidate)
     if pure_path.is_absolute() or ".." in pure_path.parts:
+        raise RepositoryPathError
+    return candidate
+
+
+def validate_commit_sha(value: str) -> str:
+    candidate = value.strip()
+    if not COMMIT_SHA_PATTERN.fullmatch(candidate):
         raise RepositoryPathError
     return candidate
 
@@ -263,18 +306,148 @@ class RepositoryService:
             raise GitCommandError(result.stderr or result.stdout or "Git diff failed")
         return result.stdout
 
-    async def pull(self, workspace_id: UUID, owner_id: UUID) -> None:
+    async def log(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        *,
+        worktree_path: str | None = None,
+        limit: int = 50,
+        skip: int = 0,
+    ) -> list[GitCommit]:
+        workspace = await self._get_workspace(workspace_id, owner_id)
+        repo_path = worktree_path or workspace.workspace_path
+        sandbox = await self.runtime.get_sandbox(workspace)
+        await self._ensure_cloned(sandbox, repo_path)
+        capped = max(1, min(limit, 200))
+        offset = max(0, skip)
+        args = ["log", "-n", str(capped), f"--skip={offset}", f"--pretty=format:{LOG_FORMAT}"]
+        result = await self.runtime.exec(
+            workspace,
+            "git " + " ".join(shlex.quote(arg) for arg in args),
+            cwd=repo_path,
+        )
+        if result.exit_code != 0:
+            output = (result.stderr or result.stdout or "").lower()
+            # A branch with no commits yet is an empty history, not an error.
+            if "does not have any commits" in output or "unknown revision" in output:
+                return []
+            raise GitCommandError(result.stderr or result.stdout or "git log failed")
+        return self._parse_log(result.stdout)
+
+    async def commit_detail(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        sha: str,
+        *,
+        worktree_path: str | None = None,
+    ) -> GitCommitDetail:
+        workspace = await self._get_workspace(workspace_id, owner_id)
+        repo_path = worktree_path or workspace.workspace_path
+        sandbox = await self.runtime.get_sandbox(workspace)
+        await self._ensure_cloned(sandbox, repo_path)
+        rev = validate_commit_sha(sha)
+        # Metadata without the diff (``-s``); body (%b) is the final field so it can't shift others.
+        meta = await self.runtime.exec(
+            workspace,
+            "git "
+            + " ".join(
+                shlex.quote(arg)
+                for arg in ["show", "-s", f"--pretty=format:{COMMIT_META_FORMAT}", rev]
+            ),
+            cwd=repo_path,
+        )
+        if meta.exit_code != 0:
+            raise GitCommandError(meta.stderr or meta.stdout or "git show failed")
+        fields = meta.stdout.split(_LOG_FIELD_SEP)
+        if len(fields) < 7:
+            raise GitCommandError("Unexpected git show output")
+        # Patch only — an empty ``--pretty=format:`` prints just the unified diff and handles the
+        # root commit (no parent) by showing the file contents as additions.
+        patch = await self.runtime.exec(
+            workspace,
+            "git " + " ".join(shlex.quote(arg) for arg in ["show", "--pretty=format:", rev]),
+            cwd=repo_path,
+        )
+        if patch.exit_code != 0:
+            raise GitCommandError(patch.stderr or patch.stdout or "git show failed")
+        return GitCommitDetail(
+            hash=fields[0],
+            short_hash=fields[1],
+            author_name=fields[2],
+            author_email=fields[3],
+            date=fields[4],
+            subject=fields[5],
+            body=fields[6],
+            diff=patch.stdout.lstrip("\n"),
+        )
+
+    @staticmethod
+    def _parse_log(output: str) -> list[GitCommit]:
+        commits: list[GitCommit] = []
+        for raw in output.split(_LOG_RECORD_SEP):
+            record = raw.strip("\n")
+            if not record.strip():
+                continue
+            fields = record.split(_LOG_FIELD_SEP)
+            if len(fields) < 6:
+                continue
+            commits.append(
+                GitCommit(
+                    hash=fields[0],
+                    short_hash=fields[1],
+                    author_name=fields[2],
+                    author_email=fields[3],
+                    date=fields[4],
+                    subject=fields[5],
+                )
+            )
+        return commits
+
+    async def pull(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        *,
+        worktree_path: str | None = None,
+    ) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
         token = await self._get_token(workspace.id)
+        repo_path = worktree_path or workspace.workspace_path
         sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, workspace.workspace_path)
+        await self._ensure_cloned(sandbox, repo_path)
         result = await self._run_authenticated_git(
-            workspace, ["pull"], token, cwd=workspace.workspace_path
+            workspace, ["pull"], token, cwd=repo_path
         )
         if result.exit_code != 0:
             raise GitCommandError(
                 sanitize_git_output(
                     result.stdout or result.stderr or "git pull failed", token
+                )
+            )
+
+    async def fetch(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        *,
+        worktree_path: str | None = None,
+    ) -> None:
+        workspace = await self._get_workspace(workspace_id, owner_id)
+        token = await self._get_token(workspace.id)
+        repo_path = worktree_path or workspace.workspace_path
+        sandbox = await self.runtime.get_sandbox(workspace)
+        await self._ensure_cloned(sandbox, repo_path)
+        # A fetch updates the shared object store for every worktree in the clone, so ahead/behind
+        # counts (WorktreeService._stats) become accurate afterward regardless of the cwd used.
+        result = await self._run_authenticated_git(
+            workspace, ["fetch", "origin"], token, cwd=repo_path
+        )
+        if result.exit_code != 0:
+            raise GitCommandError(
+                sanitize_git_output(
+                    result.stdout or result.stderr or "git fetch failed", token
                 )
             )
 
@@ -361,6 +534,59 @@ class RepositoryService:
                     result.stdout or result.stderr or "git push failed", token
                 )
             )
+
+    async def discard(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        *,
+        path: str | None = None,
+        worktree_path: str | None = None,
+    ) -> None:
+        """Discard uncommitted changes — a single file when ``path`` is given, otherwise all.
+
+        This is destructive and cannot be undone. Callers must confirm intent in the UI.
+        """
+        workspace = await self._get_workspace(workspace_id, owner_id)
+        repo_path = worktree_path or workspace.workspace_path
+        sandbox = await self.runtime.get_sandbox(workspace)
+        await self._ensure_cloned(sandbox, repo_path)
+        if path is None:
+            # Everything: staged + unstaged tracked changes (reset --hard) and untracked files/dirs
+            # (clean -fd).
+            reset = await self.runtime.exec(
+                workspace, "git reset --hard HEAD", cwd=repo_path, timeout=GIT_TIMEOUT_SECONDS
+            )
+            if reset.exit_code != 0:
+                raise GitCommandError(reset.stderr or reset.stdout or "git reset failed")
+            clean = await self.runtime.exec(
+                workspace, "git clean -fd", cwd=repo_path, timeout=GIT_TIMEOUT_SECONDS
+            )
+            if clean.exit_code != 0:
+                raise GitCommandError(clean.stderr or clean.stdout or "git clean failed")
+            return
+        target = validate_diff_path(path)
+        # Handle the working-tree states the Changes list surfaces: an untracked file is removed
+        # (clean), a tracked modification/deletion is restored from HEAD (checkout).
+        status = await self.runtime.exec(
+            workspace,
+            "git "
+            + " ".join(shlex.quote(arg) for arg in ["status", "--porcelain", "--", target]),
+            cwd=repo_path,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if status.exit_code != 0:
+            raise GitCommandError(status.stderr or status.stdout or "git status failed")
+        untracked = any(line.startswith("??") for line in status.stdout.splitlines())
+        args = ["clean", "-fd", "--", target] if untracked else ["checkout", "HEAD", "--", target]
+        result = await self.runtime.exec(
+            workspace,
+            "git " + " ".join(shlex.quote(arg) for arg in args),
+            cwd=repo_path,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            raise GitCommandError(result.stderr or result.stdout or "git discard failed")
 
     async def _get_workspace(self, workspace_id: UUID, owner_id: UUID) -> Workspace:
         workspace = await self.session.get(Workspace, workspace_id)

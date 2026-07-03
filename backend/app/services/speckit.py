@@ -75,6 +75,12 @@ GIT_TIMEOUT_SECONDS = 120
 PHASE_FINALIZE_TIMEOUT_SECONDS = 1800
 PHASE_POLL_INTERVAL_SECONDS = 2.0
 
+# Spec Kit's constitution template ships with bracketed UPPER_SNAKE placeholder tokens
+# (e.g. [PROJECT_NAME], [PRINCIPLE_1_NAME], [RATIFICATION_DATE]). Their presence means
+# `/speckit.constitution` has not filled the file in yet, so the constitution is unratified.
+# The required underscore avoids false positives on ordinary bracketed acronyms (e.g. [API]).
+CONSTITUTION_PLACEHOLDER = re.compile(r"\[[A-Z][A-Z0-9]*_[A-Z0-9_]*\]")
+
 _TERMINAL_RUN_STATUSES = ("completed", "error", "stopped")
 
 
@@ -234,6 +240,11 @@ class SpecKitService:
     ) -> SpecWorkflow:
         await self.ensure_initialized(workspace_id, user_id)
 
+        # Constitution-first: only skip straight to ``specify`` when the repo already has a
+        # ratified constitution; otherwise generate it first (auto-chained to specify below).
+        workspace = await self._get_workspace(workspace_id, user_id)
+        first_phase = "specify" if await self._constitution_ratified(workspace) else "constitution"
+
         count_result = await self.session.execute(
             select(func.count())
             .select_from(SpecWorkflow)
@@ -252,7 +263,7 @@ class SpecKitService:
             spec_dir=f"specs/{slug}",
             worktree_path=None,
             status="pending",
-            current_phase="specify",
+            current_phase=first_phase,
         )
         self.session.add(workflow)
         await self.session.flush()
@@ -270,8 +281,9 @@ class SpecKitService:
             metadata={"feature_slug": slug, "feature_name": feature_name},
         )
 
-        # Auto-run the first phase: starting a workflow generates spec.md.
-        await self.run_phase(workspace_id, workflow.id, "specify", user_id)
+        # Auto-run the first phase. When there is no ratified constitution yet this generates it
+        # first; ``_finalize_phase`` then auto-chains ``specify`` once the constitution completes.
+        await self.run_phase(workspace_id, workflow.id, first_phase, user_id)
         return await self.get_workflow(workspace_id, workflow.id, user_id)
 
     async def run_phase(
@@ -747,7 +759,22 @@ class SpecKitService:
 
             await self._commit_phase_artifact(session, workspace, workflow, phase_name, user_id)
 
-            if phase_name in REVIEW_PHASES:
+            # Constitution-first fresh start: the constitution was auto-generated and ``specify``
+            # has not run yet. Complete it without review and auto-chain ``specify`` below. A
+            # manual re-run of constitution later (specify no longer pending) is unaffected and
+            # still halts for review like any other REVIEW_PHASE.
+            auto_chain_specify = False
+            if phase_name == "constitution":
+                specify_phase = await self._load_phase(session, workflow_id, "specify")
+                auto_chain_specify = (
+                    specify_phase is not None and specify_phase.status == "pending"
+                )
+            ws_id = workflow.workspace_id
+
+            if auto_chain_specify:
+                phase.status = "completed"
+                workflow.status = "running"
+            elif phase_name in REVIEW_PHASES:
                 phase.status = "awaiting_review"
                 workflow.status = "awaiting_review"
             elif phase_name == "analyze":
@@ -787,6 +814,39 @@ class SpecKitService:
                     title="Spec phase completed",
                     message=f"The '{phase_name}' phase completed.",
                 )
+
+        # Auto-chain: now that the constitution is in place, generate spec.md. Runs on a fresh
+        # session/service because the request session is long gone; the constitution's agent run
+        # is already terminal, so specify won't trip the one-active-run guard.
+        if auto_chain_specify:
+            async with self.session_maker() as chain_session:
+                chained = SpecKitService(
+                    chain_session, self.session_maker, self.settings, self.runtime
+                )
+                try:
+                    await chained.run_phase(ws_id, workflow_id, "specify", user_id)
+                except Exception:  # noqa: BLE001 - best-effort chain in a fire-and-forget task
+                    workflow_row = await chain_session.get(SpecWorkflow, workflow_id)
+                    specify_row = await self._load_phase(chain_session, workflow_id, "specify")
+                    if workflow_row is not None:
+                        workflow_row.status = "error"
+                        chain_session.add(workflow_row)
+                    if specify_row is not None:
+                        specify_row.status = "error"
+                        chain_session.add(specify_row)
+                    await chain_session.commit()
+                    if specify_row is not None:
+                        await self._notify_and_audit(
+                            chain_session,
+                            workspace_id=ws_id,
+                            user_id=user_id,
+                            action="spec_phase_error",
+                            phase=specify_row,
+                            notification_type="spec_phase_error",
+                            title="Spec phase failed",
+                            message="Failed to auto-start the 'specify' phase after the "
+                            "constitution was generated.",
+                        )
 
     async def _await_run_terminal(self, run_id: UUID) -> str:
         elapsed = 0.0
@@ -859,6 +919,20 @@ class SpecKitService:
             timeout=GIT_TIMEOUT_SECONDS,
         )
         return result.exit_code == 0
+
+    async def _constitution_ratified(self, workspace: Workspace) -> bool:
+        """True only when constitution.md exists AND its placeholder tokens are filled in.
+
+        ``specify init`` always scaffolds a placeholder ``.specify/memory/constitution.md``, so a
+        plain existence check is meaningless; we treat the constitution as established only once
+        ``/speckit.constitution`` has replaced the bracketed template tokens.
+        """
+        content = await self._read_file(
+            workspace, workspace.workspace_path, PHASE_PLANS["constitution"].artifact
+        )
+        if not content or not content.strip():
+            return False
+        return CONSTITUTION_PLACEHOLDER.search(content) is None
 
     async def _list_dir(self, workspace: Workspace, cwd: str, rel_dir: str) -> list[str]:
         result = await self.runtime.exec(
