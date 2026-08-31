@@ -26,6 +26,8 @@ import {
   type CustomCommandResponse,
   type WorkspaceResponse,
 } from "../lib/api";
+import { useReconnectingWebSocket } from "../lib/useReconnectingWebSocket";
+import { usePermissions } from "../auth/permissions";
 
 type ModalMode = "create" | "edit";
 type CommandFormState = {
@@ -59,7 +61,13 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
-  const socketRef = useRef<WebSocket | null>(null);
+  // Non-null while a freshly-started run should be streamed; drives the reconnecting socket.
+  const [streamingRunId, setStreamingRunId] = useState<string | null>(null);
+  const stopStreamRef = useRef<() => void>(() => {});
+
+  const { can } = usePermissions();
+  const canRunCommand = can("command.run");
+  const canManageCommand = can("command.manage");
 
   const selectedCommand = useMemo(
     () => commands.find((command) => command.id === selectedCommandId) ?? null,
@@ -68,7 +76,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
   const visibleOutput = activeRun?.status === "running" ? streamOutput : activeRun?.output ?? "";
 
   useEffect(() => {
-    socketRef.current?.close();
+    setStreamingRunId(null);
     setCommands([]);
     setRuns([]);
     setActiveRun(null);
@@ -92,11 +100,11 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
 
     return () => {
       controller.abort();
-      socketRef.current?.close();
     };
   }, [workspace.id]);
 
   useEffect(() => {
+    setStreamingRunId(null);
     setRuns([]);
     setActiveRun(null);
     setStreamOutput("");
@@ -200,12 +208,13 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
     setError(null);
     setPendingConfirmation(null);
     setStreamOutput("");
-    socketRef.current?.close();
+    setStreamingRunId(null);
     try {
       const run = await runCustomCommand(workspace.id, command.id, { confirmed });
       setActiveRun(run);
       setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
-      connectRunStream(run);
+      // Drive the reconnecting stream off state; the hook opens/closes the socket.
+      setStreamingRunId(run.id);
     } catch (caughtError) {
       setError(caughtError instanceof ApiError ? caughtError.message : "Unable to run command.");
     } finally {
@@ -213,11 +222,21 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
     }
   }
 
-  function connectRunStream(run: CommandRunResponse) {
-    const socket = new window.WebSocket(getCommandRunStreamUrl(workspace.id, run.id));
-    socketRef.current = socket;
-    socket.onmessage = (message) => {
-      const payload = JSON.parse(message.data) as CommandRunStreamMessage;
+  const streamUrl = streamingRunId ? getCommandRunStreamUrl(workspace.id, streamingRunId) : null;
+
+  const { connectionState, stopReconnect } = useReconnectingWebSocket(streamUrl, {
+    onBeforeConnect: () => {
+      // Backend replays the run's full output on every (re)connect; reset to avoid duplicates.
+      setStreamOutput("");
+      setActiveRun((current) => (current ? { ...current, output: "" } : current));
+    },
+    onMessage: (message) => {
+      let payload: CommandRunStreamMessage;
+      try {
+        payload = JSON.parse(message.data);
+      } catch {
+        return; // ignore malformed / keepalive frames
+      }
       if (payload.type === "output") {
         setStreamOutput((current) => `${current}${payload.content}`);
         setActiveRun((current) =>
@@ -237,14 +256,28 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
       );
       setRuns((current) =>
         current.map((item) =>
-          item.id === run.id
+          item.id === streamingRunId
             ? { ...item, status: payload.status, exit_code: payload.exit_code }
             : item,
         ),
       );
-    };
-    socket.onerror = () => setError("Command stream disconnected.");
-  }
+      if (payload.status !== "running") {
+        // Terminal: stop reconnecting before the backend closes the socket, then detach.
+        stopStreamRef.current();
+        setStreamingRunId(null);
+      }
+    },
+  });
+
+  useEffect(() => {
+    stopStreamRef.current = stopReconnect;
+  }, [stopReconnect]);
+
+  useEffect(() => {
+    if (connectionState === "disconnected") {
+      setError("Command stream disconnected.");
+    }
+  }, [connectionState]);
 
   return (
     <section className="rounded-md border border-line bg-white p-5 shadow-soft">
@@ -255,14 +288,16 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
           </p>
           <h3 className="mt-1 text-base font-semibold">{workspace.name}</h3>
         </div>
-        <button
-          className="flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-white transition hover:bg-primary-active"
-          type="button"
-          onClick={openCreateModal}
-        >
-          <Plus className="h-4 w-4" aria-hidden="true" />
-          New command
-        </button>
+        {canManageCommand && (
+          <button
+            className="flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-white transition hover:bg-primary-active"
+            type="button"
+            onClick={openCreateModal}
+          >
+            <Plus className="h-4 w-4" aria-hidden="true" />
+            New command
+          </button>
+        )}
       </div>
 
       {error && (
@@ -335,30 +370,34 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                     aria-label="Run command"
                     className="flex h-10 w-10 items-center justify-center rounded-md bg-primary text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
                     type="button"
-                    disabled={isRunning || activeRun?.status === "running"}
-                    title="Run command"
+                    disabled={isRunning || activeRun?.status === "running" || !canRunCommand}
+                    title={canRunCommand ? "Run command" : "You do not have permission to run commands"}
                     onClick={() => requestRun(selectedCommand)}
                   >
                     <Play className="h-4 w-4" aria-hidden="true" />
                   </button>
-                  <button
-                    aria-label="Edit command"
-                    className="flex h-10 w-10 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink"
-                    type="button"
-                    title="Edit command"
-                    onClick={() => openEditModal(selectedCommand)}
-                  >
-                    <Pencil className="h-4 w-4" aria-hidden="true" />
-                  </button>
-                  <button
-                    aria-label="Delete command"
-                    className="flex h-10 w-10 items-center justify-center rounded-md border border-line bg-white text-danger transition hover:bg-[#fff5f2]"
-                    type="button"
-                    title="Delete command"
-                    onClick={() => void removeCommand(selectedCommand)}
-                  >
-                    <Trash2 className="h-4 w-4" aria-hidden="true" />
-                  </button>
+                  {canManageCommand && (
+                    <>
+                      <button
+                        aria-label="Edit command"
+                        className="flex h-10 w-10 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink"
+                        type="button"
+                        title="Edit command"
+                        onClick={() => openEditModal(selectedCommand)}
+                      >
+                        <Pencil className="h-4 w-4" aria-hidden="true" />
+                      </button>
+                      <button
+                        aria-label="Delete command"
+                        className="flex h-10 w-10 items-center justify-center rounded-md border border-line bg-white text-danger transition hover:bg-[#fff5f2]"
+                        type="button"
+                        title="Delete command"
+                        onClick={() => void removeCommand(selectedCommand)}
+                      >
+                        <Trash2 className="h-4 w-4" aria-hidden="true" />
+                      </button>
+                    </>
+                  )}
                 </div>
               </div>
 

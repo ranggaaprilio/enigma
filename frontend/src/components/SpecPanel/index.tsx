@@ -1,4 +1,4 @@
-import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useState } from "react";
 import Markdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
@@ -18,7 +18,6 @@ import {
   ApiError,
   approveSpecPhase,
   createSpecWorkflow,
-  getAgentStreamUrl,
   getAnalyzeQuestions,
   getSpecArtifact,
   getSpecWorkflow,
@@ -27,7 +26,6 @@ import {
   requestSpecChanges,
   runSpecPhase,
   submitAnalyzeAnswers,
-  type AgentEventResponse,
   type OpenQuestion,
   type SpecArtifactItem,
   type SpecPhaseName,
@@ -36,6 +34,7 @@ import {
   type SpecWorkflowResponse,
   type WorkspaceResponse,
 } from "../../lib/api";
+import { useAgentRunStream } from "../../lib/useAgentRunStream";
 import { ToolCard, pairToolEvents } from "../AgentTab/ToolCard";
 import { ConfirmModal } from "../ui/ConfirmModal";
 
@@ -735,113 +734,10 @@ function PhaseDetail({
   );
 }
 
-type StreamConnectionState = "connecting" | "live" | "reconnecting" | "disconnected";
-
-const PHASE_RECONNECT_DELAYS = [1000, 2000, 4000];
-const PHASE_MAX_RECONNECT_RETRIES = 3;
-const TERMINAL_RUN_STATUSES = ["completed", "error", "stopped"];
-
 function PhaseStream({ workspaceId, runId }: { workspaceId: string; runId: string }) {
-  const [events, setEvents] = useState<AgentEventResponse[]>([]);
-  const [connectionState, setConnectionState] =
-    useState<StreamConnectionState>("connecting");
-
-  const socketRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectAttemptRef = useRef(0);
-  const intentionalCloseRef = useRef(false);
-  const runDoneRef = useRef(false);
-
-  const connect = useCallback(() => {
-    if (reconnectTimeoutRef.current) {
-      clearTimeout(reconnectTimeoutRef.current);
-      reconnectTimeoutRef.current = null;
-    }
-    if (socketRef.current) {
-      intentionalCloseRef.current = true;
-      socketRef.current.close();
-    }
-
-    // The backend replays all prior events on every (re)connect, so reset to
-    // avoid duplicating them.
-    setEvents([]);
-
-    const socket = new WebSocket(getAgentStreamUrl(workspaceId, runId));
-    socketRef.current = socket;
-    intentionalCloseRef.current = false;
-
-    socket.onopen = () => {
-      setConnectionState("live");
-      reconnectAttemptRef.current = 0;
-    };
-
-    socket.onmessage = (event) => {
-      let message: AgentEventResponse & { type?: string };
-      try {
-        message = JSON.parse(event.data);
-      } catch {
-        return; // ignore malformed frames
-      }
-      if (message.type === "ping") {
-        return; // keepalive frame, nothing to render
-      }
-      setEvents((prev) => [...prev, message]);
-      const statusValue =
-        message.event_type === "status" ? message.content : undefined;
-      const metadataStatus = message.metadata?.status as string | undefined;
-      if (
-        (statusValue && TERMINAL_RUN_STATUSES.includes(statusValue)) ||
-        (metadataStatus && TERMINAL_RUN_STATUSES.includes(metadataStatus))
-      ) {
-        // Run finished; the parent will unmount this stream shortly. Don't
-        // treat the imminent socket close as an unexpected drop.
-        runDoneRef.current = true;
-      }
-    };
-
-    socket.onclose = () => {
-      if (
-        intentionalCloseRef.current ||
-        runDoneRef.current ||
-        socketRef.current !== socket
-      ) {
-        return;
-      }
-
-      const attempt = reconnectAttemptRef.current + 1;
-      reconnectAttemptRef.current = attempt;
-
-      if (attempt > PHASE_MAX_RECONNECT_RETRIES) {
-        setConnectionState("disconnected");
-        return;
-      }
-
-      setConnectionState("reconnecting");
-      const delay =
-        PHASE_RECONNECT_DELAYS[
-          Math.min(attempt - 1, PHASE_RECONNECT_DELAYS.length - 1)
-        ];
-      reconnectTimeoutRef.current = setTimeout(connect, delay);
-    };
-  }, [workspaceId, runId]);
-
-  useEffect(() => {
-    reconnectAttemptRef.current = 0;
-    runDoneRef.current = false;
-    setConnectionState("connecting");
-    connect();
-    return () => {
-      intentionalCloseRef.current = true;
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-        reconnectTimeoutRef.current = null;
-      }
-      if (socketRef.current) {
-        socketRef.current.close();
-        socketRef.current = null;
-      }
-    };
-  }, [connect]);
+  // Reuse the shared agent-run stream: backend event replay, ping filtering, terminal-status
+  // detection, and backoff reconnection all live in the hook.
+  const { events, connectionState } = useAgentRunStream(workspaceId, runId);
 
   const paired = pairToolEvents(events);
   const outputText = events

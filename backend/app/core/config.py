@@ -1,7 +1,12 @@
 from functools import lru_cache
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Insecure defaults that must never be used outside a local environment. The fail-fast
+# validator below refuses to boot when these are still in place and environment != "local".
+_DEFAULT_AUTH_SECRET_KEY = "local-development-auth-secret-change-me"
+_DEFAULT_ENV_ENCRYPTION_KEY = "SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc="
 
 
 class Settings(BaseSettings):
@@ -9,13 +14,15 @@ class Settings(BaseSettings):
     environment: str = "local"
     database_url: str = "postgresql+asyncpg://execute:execute@localhost:5432/execute_dashboard"
     redis_url: str = "redis://localhost:6379/0"
-    auth_secret_key: str = "local-development-auth-secret-change-me"
+    auth_secret_key: str = _DEFAULT_AUTH_SECRET_KEY
     auth_cookie_name: str = "execute_session"
     auth_session_ttl_seconds: int = 60 * 60 * 24 * 7
     auth_cookie_secure: bool = False
     auth_login_rate_limit_attempts: int = 5
     auth_login_rate_limit_window_seconds: int = 60 * 15
-    workspace_env_encryption_key: str = "SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc="
+    agent_run_rate_limit_attempts: int = 30
+    agent_run_rate_limit_window_seconds: int = 60
+    workspace_env_encryption_key: str = _DEFAULT_ENV_ENCRYPTION_KEY
     daytona_api_key: str | None = None
     daytona_api_url: str | None = None
     daytona_target: str | None = None
@@ -102,6 +109,33 @@ class Settings(BaseSettings):
 
             return json.loads(stripped)
         return value
+
+    @model_validator(mode="after")
+    def enforce_secure_defaults(self) -> "Settings":
+        """Refuse to boot with insecure defaults outside a local environment.
+
+        In any non-``local`` environment the app must be configured with real secrets and
+        must serve cookies over HTTPS only. Constructing ``Settings`` (via ``get_settings``
+        in ``create_app``) will raise here, so the process never starts insecurely.
+        """
+        if self.environment == "local":
+            return self
+
+        insecure = []
+        if self.auth_secret_key == _DEFAULT_AUTH_SECRET_KEY:
+            insecure.append("auth_secret_key")
+        if self.workspace_env_encryption_key == _DEFAULT_ENV_ENCRYPTION_KEY:
+            insecure.append("workspace_env_encryption_key")
+        if insecure:
+            raise ValueError(
+                f"Insecure default secret(s) {insecure} are not allowed when "
+                f"environment={self.environment!r}. Set real values via the environment "
+                "before starting the app."
+            )
+
+        # Harden cookie handling in non-local environments regardless of the configured value.
+        self.auth_cookie_secure = True
+        return self
 
 
 @lru_cache

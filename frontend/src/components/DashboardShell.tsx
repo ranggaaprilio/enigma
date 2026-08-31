@@ -17,6 +17,11 @@ import {
   type WorkspaceResponse,
   type WorkspaceStatus,
 } from "../lib/api";
+import { useOnlineStatus } from "../lib/useOnlineStatus";
+import {
+  useReconnectingWebSocket,
+  type StreamConnectionState,
+} from "../lib/useReconnectingWebSocket";
 
 type DashboardShellProps = {
   healthLabel: string;
@@ -53,6 +58,8 @@ export function DashboardShell({
   teamId,
 }: DashboardShellProps) {
   const navigate = useNavigate();
+  const online = useOnlineStatus();
+  const [streamState, setStreamState] = useState<StreamConnectionState>("idle");
 
   async function handleLogout() {
     await onLogout();
@@ -70,6 +77,7 @@ export function DashboardShell({
         />
 
         <div className="flex min-h-screen min-w-0 flex-1 flex-col">
+          <ConnectionBanner online={online} streamState={streamState} />
           <header className="flex min-h-16 flex-wrap items-center justify-between gap-3 border-b border-line bg-canvas px-5 py-3">
             <div>
               {projectId && teamId ? (
@@ -94,7 +102,7 @@ export function DashboardShell({
             <div className="flex flex-wrap items-center gap-3">
               <StatusPill label={healthLabel} tone={healthTone} />
               <WorkspaceStatusPill status={workspaceStatus} />
-              {user && <NotificationBell />}
+              {user && <NotificationBell onConnectionStateChange={setStreamState} />}
               {user && <UserMenu user={user} onLogout={handleLogout} />}
             </div>
           </header>
@@ -111,7 +119,41 @@ export function DashboardShell({
   );
 }
 
-function NotificationBell() {
+function ConnectionBanner({
+  online,
+  streamState,
+}: {
+  online: boolean;
+  streamState: StreamConnectionState;
+}) {
+  if (!online) {
+    return (
+      <div
+        role="status"
+        className="bg-[#fff5f2] px-5 py-2 text-center text-sm font-medium text-danger"
+      >
+        You are offline. Live updates will resume when your connection returns.
+      </div>
+    );
+  }
+  if (streamState === "reconnecting" || streamState === "disconnected") {
+    return (
+      <div
+        role="status"
+        className="bg-[#fff8f3] px-5 py-2 text-center text-sm font-medium text-warn"
+      >
+        Reconnecting to the server…
+      </div>
+    );
+  }
+  return null;
+}
+
+function NotificationBell({
+  onConnectionStateChange,
+}: {
+  onConnectionStateChange?: (state: StreamConnectionState) => void;
+}) {
   const [notifications, setNotifications] = useState<NotificationResponse[]>(
     [],
   );
@@ -130,12 +172,12 @@ function NotificationBell() {
     return () => controller.abort();
   }, []);
 
-  useEffect(() => {
-    if (typeof WebSocket === "undefined") {
-      return;
-    }
-    const socket = new WebSocket(getNotificationStreamUrl());
-    socket.onmessage = (event) => {
+  // Long-lived notification stream: reconnect indefinitely so a transient drop recovers
+  // without a page reload.
+  const { connectionState } = useReconnectingWebSocket(getNotificationStreamUrl(), {
+    enabled: typeof WebSocket !== "undefined",
+    maxRetries: Infinity,
+    onMessage: (event) => {
       try {
         const notification = JSON.parse(event.data) as NotificationResponse;
         setNotifications((current) => [
@@ -145,9 +187,12 @@ function NotificationBell() {
       } catch {
         return;
       }
-    };
-    return () => socket.close();
-  }, []);
+    },
+  });
+
+  useEffect(() => {
+    onConnectionStateChange?.(connectionState);
+  }, [connectionState, onConnectionStateChange]);
 
   const unreadCount = notifications.filter(
     (notification) => !notification.read_at,

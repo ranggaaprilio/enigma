@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
+from app.core.metrics import agent_runs_created_total
 from app.core.security import verify_session_token
 from app.db.session import async_session_maker, get_db_session
 from app.models import AgentEvent, AgentFileChange, AgentRun, User
@@ -29,6 +30,7 @@ from app.services.agents import (
 )
 from app.services.budgets import BudgetExceededError
 from app.services.daytona_runtime import get_daytona_runtime
+from app.services.rate_limit import RedisRateLimiter
 from app.services.workspaces import WorkspaceNotFoundError
 from app.services.worktrees import WorktreeNotFoundError, WorktreeService
 
@@ -36,6 +38,25 @@ router = APIRouter(prefix="/workspaces/{workspace_id}/agent", tags=["agents"])
 
 DB_SESSION_DEP = Depends(get_db_session)
 SETTINGS_DEP = Depends(get_settings)
+
+
+async def enforce_agent_run_rate_limit(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    settings: Settings = SETTINGS_DEP,
+) -> None:
+    """Throttle agent-run creation per (user, workspace). Raises 429 when the window limit
+    is exceeded — protects the AI/compute path from being hammered."""
+    limiter = RedisRateLimiter(
+        prefix="agent:run",
+        scope="agent_run",
+        attempts=settings.agent_run_rate_limit_attempts,
+        window_seconds=settings.agent_run_rate_limit_window_seconds,
+    )
+    await limiter.check(f"{current_user.id}:{workspace_id}")
+
+
+AGENT_RUN_RATE_LIMIT_DEP = Depends(enforce_agent_run_rate_limit)
 
 # Send a lightweight keepalive frame when the agent produces no events for this
 # long, so idle WebSockets are not reaped by intermediaries during long pauses.
@@ -145,7 +166,12 @@ def not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
 
 
-@router.post("/runs", response_model=AgentRunResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/runs",
+    response_model=AgentRunResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[AGENT_RUN_RATE_LIMIT_DEP],
+)
 async def create_agent_run(
     workspace_id: UUID,
     payload: AgentRunCreateRequest,
@@ -160,13 +186,15 @@ async def create_agent_run(
                 workspace_id, current_user.id, payload.worktree_id
             )
             working_dir = worktree.path
-        return await service.create_run(
+        run = await service.create_run(
             workspace_id,
             current_user.id,
             payload.prompt,
             working_dir=working_dir,
             worktree_id=payload.worktree_id,
         )
+        agent_runs_created_total.inc()
+        return run
     except WorkspaceNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,

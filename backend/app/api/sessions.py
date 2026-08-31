@@ -4,6 +4,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.agents import AGENT_RUN_RATE_LIMIT_DEP
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
 from app.db.session import async_session_maker, get_db_session
@@ -233,6 +234,7 @@ async def delete_agent_session(
     "/{session_id}/turns",
     response_model=AgentRunResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[AGENT_RUN_RATE_LIMIT_DEP],
 )
 async def create_agent_session_turn(
     workspace_id: UUID,

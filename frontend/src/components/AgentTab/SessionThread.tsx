@@ -14,6 +14,7 @@ import {
   type AgentSessionResponse,
 } from "../../lib/api";
 import { useAgentRunStream } from "../../lib/useAgentRunStream";
+import { usePermissions } from "../../auth/permissions";
 import { Notice } from "./Notice";
 import { PromptComposer } from "./PromptComposer";
 import { TurnView } from "./TurnView";
@@ -120,6 +121,8 @@ export function SessionThread({
     onTerminal: handleTerminal,
   });
 
+  const { can } = usePermissions();
+  const canRunAgent = can("agent.run");
   const turns = detail?.turns ?? [];
   const isRunning = activeTurnId !== null;
 
@@ -306,11 +309,14 @@ export function SessionThread({
             submitPrompt={submitTurn}
             onStop={handleStop}
             isRunning={isRunning}
+            disabled={!canRunAgent}
             externalError={continueError}
             placeholder={
-              turns.length === 0
-                ? "Describe what you want the agent to do…"
-                : "Send a follow-up message…"
+              !canRunAgent
+                ? "You have read-only access to this workspace."
+                : turns.length === 0
+                  ? "Describe what you want the agent to do…"
+                  : "Send a follow-up message…"
             }
           />
         </div>

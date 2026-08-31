@@ -18,6 +18,12 @@ class HealthResponse(BaseModel):
     daytona: str
 
 
+class ReadyResponse(BaseModel):
+    status: str
+    database: str
+    redis: str
+
+
 async def check_database() -> str:
     async with async_session_maker() as session:
         await session.execute(text("SELECT 1"))
@@ -73,6 +79,36 @@ async def health() -> HealthResponse | JSONResponse:
     )
 
     if status == "ok":
+        return payload
+
+    return JSONResponse(status_code=503, content=payload.model_dump())
+
+
+@router.get("/ready", response_model=ReadyResponse)
+async def ready() -> ReadyResponse | JSONResponse:
+    """Readiness probe: can this instance serve API traffic?
+
+    Checks the hard dependencies required to serve requests — Postgres and Redis. Daytona
+    is deliberately excluded: it is an external sandbox provider whose outage should not pull
+    the instance out of the load balancer.
+    """
+    database_status = "ok"
+    redis_status = "ok"
+
+    try:
+        database_status = await check_database()
+    except Exception:
+        database_status = "error"
+
+    try:
+        redis_status = await check_redis()
+    except Exception:
+        redis_status = "error"
+
+    status = "ready" if database_status == "ok" and redis_status == "ok" else "not_ready"
+    payload = ReadyResponse(status=status, database=database_status, redis=redis_status)
+
+    if status == "ready":
         return payload
 
     return JSONResponse(status_code=503, content=payload.model_dump())

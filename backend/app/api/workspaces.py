@@ -1,6 +1,7 @@
 from typing import Protocol
 from uuid import UUID
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -182,6 +183,8 @@ async def get_audit_log_service(session: AsyncSession = DB_SESSION_DEP) -> Audit
 
 AUDIT_LOG_SERVICE_DEP = Depends(get_audit_log_service)
 
+logger = structlog.get_logger("app.audit")
+
 
 async def get_notification_service(session: AsyncSession = DB_SESSION_DEP) -> NotificationService:
     return NotificationService(session)
@@ -194,7 +197,7 @@ async def record_audit_safely(audit_log_service: AuditLogService, **values) -> N
     try:
         await audit_log_service.record(**values)
     except Exception:
-        return
+        logger.exception("audit.record_failed", action=values.get("action"))
 
 
 async def notify_safely(notification_service: NotificationService, **values) -> None:

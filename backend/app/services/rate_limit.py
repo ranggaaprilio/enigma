@@ -3,6 +3,7 @@ import hashlib
 from fastapi import HTTPException, Request, status
 
 from app.core.config import get_settings
+from app.core.metrics import rate_limit_rejections_total
 from app.services.redis import get_redis_client
 
 
@@ -15,6 +16,60 @@ def _client_ip(request: Request) -> str:
     return request.client.host
 
 
+async def _register_attempt(key: str, window_seconds: int) -> int:
+    """Increment the fixed-window counter for ``key``, setting its expiry on the first hit.
+
+    Returns the current attempt count within the window.
+    """
+    redis = get_redis_client()
+    try:
+        attempts = await redis.incr(key)
+        if attempts == 1:
+            await redis.expire(key, window_seconds)
+        return attempts
+    finally:
+        await redis.aclose()
+
+
+async def _reset_key(key: str) -> None:
+    redis = get_redis_client()
+    try:
+        await redis.delete(key)
+    finally:
+        await redis.aclose()
+
+
+class RedisRateLimiter:
+    """Fixed-window rate limiter keyed by an arbitrary identity string.
+
+    Generalises the login limiter's INCR/EXPIRE/429 pattern so any expensive endpoint can be
+    throttled per user/workspace/etc. Raises ``429`` once ``attempts`` is exceeded within the
+    window and records a ``rate_limit_rejections_total{scope}`` metric.
+    """
+
+    def __init__(self, *, prefix: str, scope: str, attempts: int, window_seconds: int) -> None:
+        self.prefix = prefix
+        self.scope = scope
+        self.attempts = attempts
+        self.window_seconds = window_seconds
+
+    def _key(self, identity: str) -> str:
+        fingerprint = hashlib.sha256(identity.encode()).hexdigest()
+        return f"{self.prefix}:{fingerprint}"
+
+    async def check(self, identity: str) -> None:
+        attempts = await _register_attempt(self._key(identity), self.window_seconds)
+        if attempts > self.attempts:
+            rate_limit_rejections_total.labels(self.scope).inc()
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many requests. Please slow down and try again later.",
+            )
+
+    async def reset(self, identity: str) -> None:
+        await _reset_key(self._key(identity))
+
+
 class RedisLoginRateLimiter:
     def __init__(self) -> None:
         self.settings = get_settings()
@@ -24,24 +79,16 @@ class RedisLoginRateLimiter:
         return f"auth:login:{fingerprint}"
 
     async def check(self, email: str, request: Request) -> None:
-        redis = get_redis_client()
-        try:
-            key = self._key(email, request)
-            attempts = await redis.incr(key)
-            if attempts == 1:
-                await redis.expire(key, self.settings.auth_login_rate_limit_window_seconds)
-
-            if attempts > self.settings.auth_login_rate_limit_attempts:
-                raise HTTPException(
-                    status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-                    detail="Too many login attempts. Please try again later.",
-                )
-        finally:
-            await redis.aclose()
+        attempts = await _register_attempt(
+            self._key(email, request),
+            self.settings.auth_login_rate_limit_window_seconds,
+        )
+        if attempts > self.settings.auth_login_rate_limit_attempts:
+            rate_limit_rejections_total.labels("auth_login").inc()
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Too many login attempts. Please try again later.",
+            )
 
     async def reset(self, email: str, request: Request) -> None:
-        redis = get_redis_client()
-        try:
-            await redis.delete(self._key(email, request))
-        finally:
-            await redis.aclose()
+        await _reset_key(self._key(email, request))

@@ -182,6 +182,8 @@ def agent_context(tmp_path):
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
     app.dependency_overrides[auth_module.get_login_rate_limiter] = lambda: FakeRateLimiter()
     app.dependency_overrides[agents_module.get_agent_service] = lambda: service
+    # Agent-run creation is rate-limited via Redis; no-op it so tests don't need a live Redis.
+    app.dependency_overrides[agents_module.enforce_agent_run_rate_limit] = lambda: None
     yield user, workspace, service
     app.dependency_overrides.clear()
 
