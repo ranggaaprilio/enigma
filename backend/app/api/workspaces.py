@@ -1,11 +1,16 @@
 from typing import Protocol
 from uuid import UUID
 
-import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.audit_support import (
+    AUDIT_LOG_SERVICE_DEP,
+    get_audit_log_service,  # noqa: F401 - re-exported: tests override this dependency here
+    record_audit_safely,
+)
 from app.api.auth import CURRENT_USER_DEP
+from app.api.workspace_support import workspace_response, workspace_responses
 from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.models import User, Workspace, WorkspaceEnvVar
@@ -177,27 +182,11 @@ async def get_pull_request_service(
 PULL_REQUEST_SERVICE_DEP = Depends(get_pull_request_service)
 
 
-async def get_audit_log_service(session: AsyncSession = DB_SESSION_DEP) -> AuditLogService:
-    return AuditLogService(session)
-
-
-AUDIT_LOG_SERVICE_DEP = Depends(get_audit_log_service)
-
-logger = structlog.get_logger("app.audit")
-
-
 async def get_notification_service(session: AsyncSession = DB_SESSION_DEP) -> NotificationService:
     return NotificationService(session)
 
 
 NOTIFICATION_SERVICE_DEP = Depends(get_notification_service)
-
-
-async def record_audit_safely(audit_log_service: AuditLogService, **values) -> None:
-    try:
-        await audit_log_service.record(**values)
-    except Exception:
-        logger.exception("audit.record_failed", action=values.get("action"))
 
 
 async def notify_safely(notification_service: NotificationService, **values) -> None:
@@ -307,10 +296,11 @@ def env_response(env_var: WorkspaceEnvVar) -> WorkspaceEnvVarResponse:
 async def connect_repository(
     workspace_id: UUID,
     payload: RepositoryConnectRequest,
+    session: AsyncSession = DB_SESSION_DEP,
     current_user: User = CURRENT_USER_DEP,
     service: RepositoryService = REPOSITORY_SERVICE_DEP,
     audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
-) -> Workspace:
+) -> WorkspaceResponse:
     try:
         workspace = await service.connect(
             workspace_id=workspace_id,
@@ -341,7 +331,7 @@ async def connect_repository(
         target_id=workspace.id,
         metadata={"repo_url": workspace.repo_url},
     )
-    return workspace
+    return await workspace_response(session, workspace, current_user.id)
 
 
 @router.post("/{workspace_id}/repo/clone", response_model=RepositoryOperationResponse)
@@ -1180,10 +1170,11 @@ async def get_pull_request(
 @router.post("", response_model=WorkspaceResponse, status_code=status.HTTP_201_CREATED)
 async def create_workspace(
     payload: WorkspaceCreateRequest,
+    session: AsyncSession = DB_SESSION_DEP,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
     audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
-) -> Workspace:
+) -> WorkspaceResponse:
     try:
         create_values = dict(
             owner_id=current_user.id,
@@ -1213,37 +1204,42 @@ async def create_workspace(
         target_id=workspace.id,
         metadata={"name": workspace.name},
     )
-    return workspace
+    return await workspace_response(session, workspace, current_user.id)
 
 
 @router.get("", response_model=list[WorkspaceResponse])
 async def list_workspaces(
+    session: AsyncSession = DB_SESSION_DEP,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
-) -> list[Workspace]:
-    return await service.list_for_owner(current_user.id)
+) -> list[WorkspaceResponse]:
+    workspaces = await service.list_for_owner(current_user.id)
+    return await workspace_responses(session, workspaces, current_user.id)
 
 
 @router.get("/{workspace_id}", response_model=WorkspaceResponse)
 async def get_workspace(
     workspace_id: UUID,
+    session: AsyncSession = DB_SESSION_DEP,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
-) -> Workspace:
+) -> WorkspaceResponse:
     try:
-        return await service.get_for_owner(workspace_id, current_user.id)
+        workspace = await service.get_for_owner(workspace_id, current_user.id)
     except WorkspaceNotFoundError:
         raise not_found() from None
+    return await workspace_response(session, workspace, current_user.id)
 
 
 @router.patch("/{workspace_id}", response_model=WorkspaceResponse)
 async def update_workspace(
     workspace_id: UUID,
     payload: WorkspaceUpdateRequest,
+    session: AsyncSession = DB_SESSION_DEP,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
     audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
-) -> Workspace:
+) -> WorkspaceResponse:
     try:
         update_values = dict(
             workspace_id=workspace_id,
@@ -1271,7 +1267,7 @@ async def update_workspace(
         target_id=workspace.id,
         metadata={"name": workspace.name},
     )
-    return workspace
+    return await workspace_response(session, workspace, current_user.id)
 
 
 @router.delete("/{workspace_id}", response_model=DeleteResponse)

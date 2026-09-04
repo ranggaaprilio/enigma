@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { AlertCircle, Check, CircleDot, Pencil, RefreshCw, Sparkles, WifiOff, X } from "lucide-react";
+import { AlertCircle, Check, CircleDot, Eye, Pencil, RefreshCw, Sparkles, WifiOff, X } from "lucide-react";
 
 import {
   ApiError,
@@ -116,6 +116,7 @@ export function SessionThread({
     events: streamEvents,
     connectionState,
     agentError,
+    viewerRole,
   } = useAgentRunStream(workspaceId, activeTurnId, {
     enabled: activeTurnId !== null,
     onTerminal: handleTerminal,
@@ -125,6 +126,7 @@ export function SessionThread({
   const canRunAgent = can("agent.run");
   const turns = detail?.turns ?? [];
   const isRunning = activeTurnId !== null;
+  const isObserving = isRunning && viewerRole === "observer";
 
   // Auto-scroll to the newest activity.
   useEffect(() => {
@@ -247,6 +249,12 @@ export function SessionThread({
         data-testid="agent-process"
       >
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-5">
+          {isObserving && (
+            <Notice tone="warn" testId="observing-status">
+              <Eye className="h-4 w-4" />
+              Watching — someone else is driving this run, you can't send input.
+            </Notice>
+          )}
           {connectionState === "reconnecting" && (
             <Notice tone="warn" testId="reconnecting-status">
               <RefreshCw className="h-4 w-4 animate-spin" />
@@ -309,14 +317,16 @@ export function SessionThread({
             submitPrompt={submitTurn}
             onStop={handleStop}
             isRunning={isRunning}
-            disabled={!canRunAgent}
+            disabled={!canRunAgent || isObserving}
             externalError={continueError}
             placeholder={
               !canRunAgent
                 ? "You have read-only access to this workspace."
-                : turns.length === 0
-                  ? "Describe what you want the agent to do…"
-                  : "Send a follow-up message…"
+                : isObserving
+                  ? "You're observing this run — you can't send input."
+                  : turns.length === 0
+                    ? "Describe what you want the agent to do…"
+                    : "Send a follow-up message…"
             }
           />
         </div>

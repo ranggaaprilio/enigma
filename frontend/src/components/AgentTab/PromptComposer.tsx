@@ -87,6 +87,7 @@ export function PromptComposer({
           <button
             type="button"
             onClick={handleStop}
+            disabled={disabled}
             className="inline-flex h-8 items-center gap-1.5 rounded-md border border-line bg-white px-3 text-sm font-medium text-ink transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-45"
           >
             <Square className="h-3.5 w-3.5" aria-hidden="true" />

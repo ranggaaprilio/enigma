@@ -16,6 +16,7 @@ import {
   type WorktreeResponse,
 } from "../lib/api";
 import { type ActiveWorktree, useActiveWorktree } from "../lib/activeWorktree";
+import { CommentThread } from "./comments/CommentThread";
 
 type LoadState =
   | { status: "loading" }
@@ -25,6 +26,7 @@ type LoadState =
 export function WorktreesPanel({ workspace }: { workspace: WorkspaceResponse }) {
   const [worktrees, setWorktrees] = useState<WorktreeResponse[]>([]);
   const [pullRequests, setPullRequests] = useState<PullRequestResponse[]>([]);
+  const [expandedPrIds, setExpandedPrIds] = useState<Set<string>>(new Set());
   const [state, setState] = useState<LoadState>({ status: "loading" });
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -408,6 +410,25 @@ export function WorktreesPanel({ workspace }: { workspace: WorkspaceResponse }) 
                   <p className="mt-1 font-mono text-xs text-ink/55">
                     {pr.head} → {pr.base}
                   </p>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setExpandedPrIds((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(pr.id)) next.delete(pr.id);
+                        else next.add(pr.id);
+                        return next;
+                      })
+                    }
+                    className="mt-2 text-xs font-medium text-primary hover:underline"
+                  >
+                    {expandedPrIds.has(pr.id) ? "Hide comments" : "Show comments"}
+                  </button>
+                  {expandedPrIds.has(pr.id) && (
+                    <div className="mt-2">
+                      <CommentThread targetType="pr" targetId={pr.id} />
+                    </div>
+                  )}
                 </li>
               ))}
             </ul>

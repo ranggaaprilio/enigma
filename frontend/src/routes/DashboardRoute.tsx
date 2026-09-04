@@ -1,7 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { Outlet, useOutletContext, useParams } from "react-router";
 
-import { useAuth } from "../auth/context";
+import { useAuth, WorkspaceRoleContext } from "../auth/context";
 import { AgentTab } from "../components/AgentTab";
 import { DiffView } from "../components/AgentTab/DiffView";
 import { DashboardShell } from "../components/DashboardShell";
@@ -202,30 +202,33 @@ export function DashboardRoute() {
       : "/";
 
   return (
-    <DashboardShell
-      healthLabel={shellStatus.label}
-      healthTone={shellStatus.tone}
-      workspace={workspace}
-      workspaceStatus={workspaceStatus}
-      previewStatusLabel={previewStatusLabel}
-      user={user}
-      onLogout={logout}
-      basePath={basePath}
-      projectId={projectId}
-      teamId={teamId}
-    >
-      <Outlet
-        context={{
-          health,
-          workspaceState,
-          workspaceStatus,
-          onWorkspaceCreated: loadWorkspaceAfterCreate,
-          onWorkspaceChanged: handleWorkspaceChanged,
-          onEnvVarsChanged: handleEnvVarsChanged,
-          onPreviewStatusChange: handlePreviewStatusChange,
-        } satisfies DashboardOutletContext}
-      />
-    </DashboardShell>
+    // Everything below gates its actions on the caller's role in this workspace.
+    <WorkspaceRoleContext.Provider value={workspace?.viewer_role ?? null}>
+      <DashboardShell
+        healthLabel={shellStatus.label}
+        healthTone={shellStatus.tone}
+        workspace={workspace}
+        workspaceStatus={workspaceStatus}
+        previewStatusLabel={previewStatusLabel}
+        user={user}
+        onLogout={logout}
+        basePath={basePath}
+        projectId={projectId}
+        teamId={teamId}
+      >
+        <Outlet
+          context={{
+            health,
+            workspaceState,
+            workspaceStatus,
+            onWorkspaceCreated: loadWorkspaceAfterCreate,
+            onWorkspaceChanged: handleWorkspaceChanged,
+            onEnvVarsChanged: handleEnvVarsChanged,
+            onPreviewStatusChange: handlePreviewStatusChange,
+          } satisfies DashboardOutletContext}
+        />
+      </DashboardShell>
+    </WorkspaceRoleContext.Provider>
   );
 }
 

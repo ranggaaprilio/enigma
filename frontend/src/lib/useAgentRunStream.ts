@@ -19,11 +19,16 @@ export interface UseAgentRunStreamOptions {
   onTerminal?: (status: AgentRunStatus) => void;
 }
 
+export type AgentRunViewerRole = "driver" | "observer";
+
 export interface UseAgentRunStreamResult {
   events: AgentEventResponse[];
   connectionState: StreamConnectionState;
   runStatus: AgentRunStatus | null;
   agentError: string | null;
+  /** Whether this viewer can drive the run (send input/stop it) or is only observing.
+   * Null until the backend's initial "role" frame arrives. */
+  viewerRole: AgentRunViewerRole | null;
 }
 
 const TERMINAL_RUN_STATUSES: AgentRunStatus[] = ["completed", "error", "stopped"];
@@ -57,6 +62,7 @@ export function useAgentRunStream(
   const [events, setEvents] = useState<AgentEventResponse[]>([]);
   const [runStatus, setRunStatus] = useState<AgentRunStatus | null>(null);
   const [agentError, setAgentError] = useState<string | null>(null);
+  const [viewerRole, setViewerRole] = useState<AgentRunViewerRole | null>(null);
 
   const runDoneRef = useRef(false);
   const stopReconnectRef = useRef<() => void>(() => {});
@@ -84,6 +90,13 @@ export function useAgentRunStream(
     }
     if (message.type === "ping") {
       return; // keepalive frame, nothing to render
+    }
+    if (message.type === "role") {
+      const role = (message as unknown as { content?: string }).content;
+      if (role === "driver" || role === "observer") {
+        setViewerRole(role);
+      }
+      return;
     }
     setEvents((prev) => [...prev, message]);
 
@@ -124,10 +137,11 @@ export function useAgentRunStream(
     runDoneRef.current = false;
     setRunStatus(null);
     setAgentError(null);
+    setViewerRole(null);
     if (!active) {
       setEvents([]);
     }
   }, [active, url]);
 
-  return { events, connectionState, runStatus, agentError };
+  return { events, connectionState, runStatus, agentError, viewerRole };
 }

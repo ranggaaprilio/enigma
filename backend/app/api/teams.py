@@ -1,10 +1,11 @@
 from uuid import UUID
 
-import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.audit_support import AUDIT_LOG_SERVICE_DEP, record_audit_safely
 from app.api.auth import CURRENT_USER_DEP
+from app.api.workspace_support import workspace_response, workspace_responses
 from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.models import User
@@ -44,23 +45,6 @@ async def get_project_service(session: AsyncSession = DB_SESSION_DEP) -> SqlAlch
 
 
 PROJECT_SERVICE_DEP = Depends(get_project_service)
-
-
-async def get_audit_log_service(session: AsyncSession = DB_SESSION_DEP) -> AuditLogService:
-    return AuditLogService(session)
-
-
-AUDIT_LOG_SERVICE_DEP = Depends(get_audit_log_service)
-
-logger = structlog.get_logger("app.audit")
-
-
-async def record_audit_safely(audit_log_service: AuditLogService, **values) -> None:
-    """Best-effort audit write — an audit failure must never break the primary action."""
-    try:
-        await audit_log_service.record(**values)
-    except Exception:
-        logger.exception("audit.record_failed", action=values.get("action"))
 
 
 # ── teams ─────────────────────────────────────────────────────────────────────
@@ -318,6 +302,7 @@ WORKSPACE_SERVICE_DEP = Depends(get_workspace_service)
 async def list_team_workspaces(
     project_id: UUID,
     team_id: UUID,
+    session: AsyncSession = DB_SESSION_DEP,
     current_user: User = CURRENT_USER_DEP,
     workspace_svc: SqlAlchemyWorkspaceService = WORKSPACE_SERVICE_DEP,
 ) -> list[WorkspaceResponse]:
@@ -327,7 +312,7 @@ async def list_team_workspaces(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
         ) from None
-    return [WorkspaceResponse.model_validate(w) for w in workspaces]
+    return await workspace_responses(session, workspaces, current_user.id)
 
 
 @router.post(
@@ -339,6 +324,7 @@ async def create_team_workspace(
     project_id: UUID,
     team_id: UUID,
     payload: WorkspaceCreateRequest,
+    session: AsyncSession = DB_SESSION_DEP,
     current_user: User = CURRENT_USER_DEP,
     svc: SqlAlchemyProjectService = PROJECT_SERVICE_DEP,
     workspace_svc: SqlAlchemyWorkspaceService = WORKSPACE_SERVICE_DEP,
@@ -364,4 +350,4 @@ async def create_team_workspace(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Workspace runtime error: {exc}",
         ) from None
-    return WorkspaceResponse.model_validate(workspace)
+    return await workspace_response(session, workspace, current_user.id)

@@ -20,6 +20,7 @@ from app.schemas.specs import (
     SpecWorkflowCreateRequest,
     SpecWorkflowResponse,
 )
+from app.services.access import WorkspaceAccessDeniedError
 from app.services.agents import AgentConfigurationError, AgentRunAlreadyActiveError
 from app.services.speckit import (
     InvalidArtifactPathError,
@@ -56,6 +57,11 @@ SPECKIT_SERVICE_DEP = Depends(get_speckit_service)
 def _map_spec_error(error: Exception) -> HTTPException:
     if isinstance(error, WorkspaceNotFoundError):
         return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
+    if isinstance(error, WorkspaceAccessDeniedError):
+        return HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to drive this workspace",
+        )
     if isinstance(error, SpecWorkflowNotFoundError):
         return HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="Spec workflow not found"

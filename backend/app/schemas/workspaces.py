@@ -5,6 +5,8 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 WorkspaceStatus = Literal["creating", "ready", "busy", "error", "stopped"]
+# The requesting user's role *in this workspace* (see app.services.access.WorkspaceRole).
+WorkspaceViewerRole = Literal["owner", "team_lead", "team_member", "team_viewer"]
 
 
 def normalize_nonempty(value: str) -> str:
@@ -71,6 +73,9 @@ class WorkspaceResponse(BaseModel):
     status: WorkspaceStatus
     created_at: datetime
     updated_at: datetime
+    # Role of the user who requested this workspace; `None` when the caller's role could not
+    # be resolved. Clients use it to hide/disable actions they cannot perform.
+    viewer_role: WorkspaceViewerRole | None = None
 
     model_config = ConfigDict(from_attributes=True)
 

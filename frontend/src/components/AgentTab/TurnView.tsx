@@ -1,7 +1,8 @@
 import { useState } from "react";
-import { AlertCircle, Bot, ChevronDown, ChevronRight, FileDiff } from "lucide-react";
+import { AlertCircle, Bot, ChevronDown, ChevronRight, FileDiff, MessageSquare } from "lucide-react";
 
 import type { AgentEventResponse, AgentRunResponse } from "../../lib/api";
+import { CommentThread } from "../comments/CommentThread";
 import { ChangedFiles } from "./ChangedFiles";
 import { Notice } from "./Notice";
 import { ToolCard, pairToolEvents } from "./ToolCard";
@@ -29,6 +30,7 @@ export function TurnView({
   streamError,
 }: TurnViewProps) {
   const [showFiles, setShowFiles] = useState(false);
+  const [showComments, setShowComments] = useState(false);
 
   const paired = pairToolEvents(events);
   const outputEvents = events.filter((event) => event.event_type === "output_text");
@@ -107,6 +109,24 @@ export function TurnView({
             {showFiles && (
               <div className="mt-2">
                 <ChangedFiles workspaceId={workspaceId} runId={turn.id} />
+              </div>
+            )}
+            <button
+              type="button"
+              onClick={() => setShowComments((value) => !value)}
+              className="mt-2 inline-flex items-center gap-1.5 text-xs font-medium text-primary transition hover:text-primary-active"
+            >
+              {showComments ? (
+                <ChevronDown className="h-3.5 w-3.5" aria-hidden="true" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5" aria-hidden="true" />
+              )}
+              <MessageSquare className="h-3.5 w-3.5" aria-hidden="true" />
+              Comments
+            </button>
+            {showComments && (
+              <div className="mt-2">
+                <CommentThread targetType="run" targetId={turn.id} />
               </div>
             )}
           </div>

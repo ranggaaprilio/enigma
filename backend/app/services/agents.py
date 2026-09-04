@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 from app.core.config import Settings
 from app.core.pricing import estimate_cost
 from app.models import AgentEvent, AgentFileChange, AgentRun, AgentSession, Workspace
+from app.services.access import require_workspace_access
 from app.services.agent_providers import AgentProvider, MockAgentProvider, OpenAIResponsesProvider
 from app.services.agent_tools import WorkspaceTools
 from app.services.audit import AuditLogService
@@ -17,7 +18,7 @@ from app.services.budgets import BudgetService
 from app.services.daytona_runtime import get_daytona_runtime
 from app.services.notifications import NotificationService
 from app.services.repositories import RepositoryService
-from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
+from app.services.workspaces import WorkspaceSecretCipher
 
 ACTIVE_RUN_STATUSES = ("thinking", "executing")
 SESSION_TITLE_MAX_CHARS = 80
@@ -151,7 +152,7 @@ class AgentService:
         worktree_id: UUID | None = None,
         session_id: UUID | None = None,
     ) -> AgentRun:
-        workspace = await self._get_workspace(workspace_id, user_id)
+        workspace = await self._get_workspace(workspace_id, user_id, require_drive=True)
         active = await self.session.execute(
             select(AgentRun.id).where(
                 AgentRun.workspace_id == workspace.id,
@@ -209,13 +210,18 @@ class AgentService:
     # ------------------------------------------------------------------
 
     async def _get_session(
-        self, workspace_id: UUID, session_id: UUID, user_id: UUID
+        self,
+        workspace_id: UUID,
+        session_id: UUID,
+        user_id: UUID,
+        *,
+        require_drive: bool = False,
     ) -> AgentSession:
+        await self._get_workspace(workspace_id, user_id, require_drive=require_drive)
         result = await self.session.execute(
             select(AgentSession).where(
                 AgentSession.id == session_id,
                 AgentSession.workspace_id == workspace_id,
-                AgentSession.user_id == user_id,
             )
         )
         agent_session = result.scalar_one_or_none()
@@ -229,7 +235,7 @@ class AgentService:
         user_id: UUID,
         title: str | None = None,
     ) -> AgentSession:
-        workspace = await self._get_workspace(workspace_id, user_id)
+        workspace = await self._get_workspace(workspace_id, user_id, require_drive=True)
         agent_session = AgentSession(
             workspace_id=workspace.id,
             user_id=user_id,
@@ -251,10 +257,7 @@ class AgentService:
         status: str | None = None,
     ) -> list[AgentSession]:
         await self._get_workspace(workspace_id, user_id)
-        stmt = select(AgentSession).where(
-            AgentSession.workspace_id == workspace_id,
-            AgentSession.user_id == user_id,
-        )
+        stmt = select(AgentSession).where(AgentSession.workspace_id == workspace_id)
         if status is not None:
             stmt = stmt.where(AgentSession.status == status)
         stmt = stmt.order_by(AgentSession.updated_at.desc()).offset(offset).limit(limit)
@@ -283,7 +286,9 @@ class AgentService:
         title: str | None | object = ...,
         status: str | object = ...,
     ) -> AgentSession:
-        agent_session = await self._get_session(workspace_id, session_id, user_id)
+        agent_session = await self._get_session(
+            workspace_id, session_id, user_id, require_drive=True
+        )
         if title is not ...:
             agent_session.title = title  # type: ignore[assignment]
         if status is not ...:
@@ -301,7 +306,9 @@ class AgentService:
         session_id: UUID,
         user_id: UUID,
     ) -> None:
-        agent_session = await self._get_session(workspace_id, session_id, user_id)
+        agent_session = await self._get_session(
+            workspace_id, session_id, user_id, require_drive=True
+        )
         # ON DELETE SET NULL detaches the runs; their history/events/file-changes survive.
         await self.session.delete(agent_session)
         await self.session.commit()
@@ -315,8 +322,11 @@ class AgentService:
         working_dir: str | None = None,
         worktree_id: UUID | None = None,
     ) -> AgentRun:
-        await self._get_workspace(workspace_id, user_id)
-        agent_session = await self._get_session(workspace_id, session_id, user_id)
+        # `_get_session` already enforces drive access on the workspace, and `create_run`
+        # re-checks it, so no separate `_get_workspace` call is needed here.
+        agent_session = await self._get_session(
+            workspace_id, session_id, user_id, require_drive=True
+        )
         if agent_session.status == "archived":
             raise AgentSessionArchivedError
         return await self.create_run(
@@ -338,22 +348,28 @@ class AgentService:
         workspace = await self._get_workspace(workspace_id, user_id)
         result = await self.session.execute(
             select(AgentRun)
-            .where(AgentRun.workspace_id == workspace.id, AgentRun.user_id == user_id)
+            .where(AgentRun.workspace_id == workspace.id)
             .order_by(AgentRun.started_at.desc())
             .offset(offset)
             .limit(limit)
         )
         return list(result.scalars().all())
 
-    async def get_run(self, workspace_id: UUID, run_id: UUID, user_id: UUID) -> AgentRun:
-        await self._get_workspace(workspace_id, user_id)
+    async def get_run(
+        self,
+        workspace_id: UUID,
+        run_id: UUID,
+        user_id: UUID,
+        *,
+        require_drive: bool = False,
+    ) -> AgentRun:
+        await self._get_workspace(workspace_id, user_id, require_drive=require_drive)
         result = await self.session.execute(
             select(AgentRun)
             .options(selectinload(AgentRun.events))
             .where(
                 AgentRun.id == run_id,
                 AgentRun.workspace_id == workspace_id,
-                AgentRun.user_id == user_id,
             )
         )
         run = result.scalar_one_or_none()
@@ -372,7 +388,7 @@ class AgentService:
         return list(run.events)
 
     async def stop_run(self, workspace_id: UUID, run_id: UUID, user_id: UUID) -> AgentRun:
-        run = await self.get_run(workspace_id, run_id, user_id)
+        run = await self.get_run(workspace_id, run_id, user_id, require_drive=True)
         if run.status in ACTIVE_RUN_STATUSES:
             self.runtime.request_stop(run.id)
             run.status = "stopped"
@@ -540,10 +556,16 @@ class AgentService:
             await session.commit()
         return changes
 
-    async def _get_workspace(self, workspace_id: UUID, user_id: UUID) -> Workspace:
-        workspace = await self.session.get(Workspace, workspace_id)
-        if workspace is None or workspace.owner_id != user_id:
-            raise WorkspaceNotFoundError
+    async def _get_workspace(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        *,
+        require_drive: bool = False,
+    ) -> Workspace:
+        workspace, _role = await require_workspace_access(
+            self.session, workspace_id, user_id, require_drive=require_drive
+        )
         return workspace
 
     async def _build_session_context(

@@ -6,6 +6,8 @@ export type HealthResponse = {
 };
 
 export type UserRole = "owner" | "developer" | "viewer";
+/** The requesting user's role in a specific workspace, as reported by the backend. */
+export type WorkspaceRole = "owner" | "team_lead" | "team_member" | "team_viewer";
 
 export type UserResponse = {
   id: string;
@@ -39,6 +41,27 @@ export type NotificationResponse = {
   created_at: string;
 };
 
+export type CommentTargetType = "run" | "spec_phase" | "pr";
+
+export type CommentResponse = {
+  id: string;
+  target_type: CommentTargetType;
+  target_id: string;
+  user_id: string;
+  body: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PresenceUser = {
+  user_id: string;
+  name: string;
+  connection_id: string;
+  joined_at: string;
+};
+
 export type AuditLogResponse = {
   id: string;
   user_id: string;
@@ -64,6 +87,8 @@ export type WorkspaceResponse = {
   status: WorkspaceStatus;
   created_at: string;
   updated_at: string;
+  /** Caller's role in this workspace; null when the backend could not resolve one. */
+  viewer_role: WorkspaceRole | null;
 };
 
 export type WorkspaceStatusResponse = Pick<
@@ -490,6 +515,14 @@ export function getNotificationStreamUrl() {
   return baseUrl.toString();
 }
 
+export function getPresenceStreamUrl(workspaceId: string) {
+  const baseUrl = new URL(getApiBaseUrl());
+  baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+  baseUrl.pathname = `/workspaces/${workspaceId}/presence/stream`;
+  baseUrl.search = "";
+  return baseUrl.toString();
+}
+
 export function getWorkspaceFileDownloadUrl(
   workspaceId: string,
   path: string,
@@ -573,6 +606,30 @@ export function markNotificationRead(
 
 export function markAllNotificationsRead(): Promise<NotificationResponse[]> {
   return requestJson<NotificationResponse[]>("/notifications/read-all", { method: "POST" });
+}
+
+export function listComments(
+  targetType: CommentTargetType,
+  targetId: string,
+  signal?: AbortSignal,
+): Promise<CommentResponse[]> {
+  const params = new URLSearchParams({ target_type: targetType, target_id: targetId });
+  return requestJson<CommentResponse[]>(`/comments?${params.toString()}`, { signal });
+}
+
+export function createComment(
+  targetType: CommentTargetType,
+  targetId: string,
+  body: string,
+): Promise<CommentResponse> {
+  return requestJson<CommentResponse>("/comments", {
+    method: "POST",
+    body: JSON.stringify({ target_type: targetType, target_id: targetId, body }),
+  });
+}
+
+export function resolveComment(commentId: string): Promise<CommentResponse> {
+  return requestJson<CommentResponse>(`/comments/${commentId}/resolve`, { method: "PATCH" });
 }
 
 export function listWorkspaces(signal?: AbortSignal): Promise<WorkspaceResponse[]> {

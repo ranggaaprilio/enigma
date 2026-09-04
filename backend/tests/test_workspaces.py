@@ -7,6 +7,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api import auth as auth_module
 from app.api import workspaces as workspaces_module
+from app.api.workspace_support import workspace_response
 from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
@@ -347,3 +348,72 @@ async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
     assert session.commits == 2
     assert session.refreshed == [workspace]
     assert workspace.updated_at is not None
+
+
+async def test_workspace_payloads_expose_the_callers_role(workspace_context):
+    _user, _service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post(
+            "/auth/login",
+            json={"email": "owner@example.com", "password": "password"},
+        )
+        created = await client.post(
+            "/workspaces",
+            json={"name": "Demo", "repo_url": "https://github.com/example/demo"},
+        )
+        workspace_id = created.json()["id"]
+        listed = await client.get("/workspaces")
+        detail = await client.get(f"/workspaces/{workspace_id}")
+
+    assert created.json()["viewer_role"] == "owner"
+    assert [item["viewer_role"] for item in listed.json()] == ["owner"]
+    assert detail.json()["viewer_role"] == "owner"
+
+
+async def test_viewer_role_maps_team_membership_to_a_workspace_role():
+    class StubResult:
+        def __init__(self, value: str | None) -> None:
+            self.value = value
+
+        def scalar_one_or_none(self) -> str | None:
+            return self.value
+
+    class StubSession:
+        def __init__(self, team_role: str | None) -> None:
+            self.team_role = team_role
+
+        async def execute(self, _statement):
+            return StubResult(self.team_role)
+
+    now = datetime.now(UTC)
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=uuid4(),
+        team_id=uuid4(),
+        name="Demo",
+        slug="demo",
+        repo_url="https://github.com/example/demo",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        snapshot=None,
+        workspace_path="workspace",
+        status="ready",
+        created_at=now,
+        updated_at=now,
+    )
+
+    member = await workspace_response(
+        StubSession("viewer"),  # type: ignore[arg-type]
+        workspace,
+        uuid4(),
+    )
+    owner = await workspace_response(
+        StubSession(None),  # type: ignore[arg-type]
+        workspace,
+        workspace.owner_id,
+    )
+
+    assert member.viewer_role == "team_viewer"
+    assert owner.viewer_role == "owner"

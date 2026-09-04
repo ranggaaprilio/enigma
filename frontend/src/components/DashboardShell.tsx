@@ -7,6 +7,7 @@ import { Bell, CheckCheck } from "lucide-react";
 import { NavLink, useNavigate } from "react-router";
 
 import { AppSidebar } from "./AppSidebar";
+import { PresenceAvatars } from "./PresenceAvatars";
 import {
   getNotificationStreamUrl,
   listNotifications,
@@ -47,7 +48,7 @@ function formatDateTime(value: string) {
 export function DashboardShell({
   healthLabel,
   healthTone,
-  workspace: _workspace, // eslint-disable-line @typescript-eslint/no-unused-vars -- will be wired back in Task 8
+  workspace,
   workspaceStatus,
   previewStatusLabel,
   user,
@@ -102,6 +103,7 @@ export function DashboardShell({
             <div className="flex flex-wrap items-center gap-3">
               <StatusPill label={healthLabel} tone={healthTone} />
               <WorkspaceStatusPill status={workspaceStatus} />
+              {user && workspace && <PresenceAvatars workspaceId={workspace.id} />}
               {user && <NotificationBell onConnectionStateChange={setStreamState} />}
               {user && <UserMenu user={user} onLogout={handleLogout} />}
             </div>

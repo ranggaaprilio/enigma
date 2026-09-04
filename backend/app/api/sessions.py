@@ -18,6 +18,7 @@ from app.schemas.agents import (
     AgentSessionUpdateRequest,
 )
 from app.schemas.workspaces import DeleteResponse
+from app.services.access import WorkspaceAccessDeniedError
 from app.services.agents import (
     AgentConfigurationError,
     AgentRunAlreadyActiveError,
@@ -122,6 +123,13 @@ def _session_not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found")
 
 
+def _access_denied() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="You do not have permission to drive this workspace",
+    )
+
+
 def agent_session_detail_response(
     agent_session: AgentSession, turns: list[AgentRun]
 ) -> AgentSessionDetailResponse:
@@ -148,6 +156,8 @@ async def create_agent_session(
         return await service.create_session(workspace_id, current_user.id, title=payload.title)
     except WorkspaceNotFoundError:
         raise _workspace_not_found() from None
+    except WorkspaceAccessDeniedError:
+        raise _access_denied() from None
 
 
 @router.get("", response_model=list[AgentSessionResponse])
@@ -210,6 +220,8 @@ async def update_agent_session(
         )
     except WorkspaceNotFoundError:
         raise _workspace_not_found() from None
+    except WorkspaceAccessDeniedError:
+        raise _access_denied() from None
     except AgentSessionNotFoundError:
         raise _session_not_found() from None
 
@@ -225,6 +237,8 @@ async def delete_agent_session(
         await service.delete_session(workspace_id, session_id, current_user.id)
     except WorkspaceNotFoundError:
         raise _workspace_not_found() from None
+    except WorkspaceAccessDeniedError:
+        raise _access_denied() from None
     except AgentSessionNotFoundError:
         raise _session_not_found() from None
     return DeleteResponse(ok=True)
@@ -261,6 +275,8 @@ async def create_agent_session_turn(
         )
     except WorkspaceNotFoundError:
         raise _workspace_not_found() from None
+    except WorkspaceAccessDeniedError:
+        raise _access_denied() from None
     except AgentSessionNotFoundError:
         raise _session_not_found() from None
     except WorktreeNotFoundError:

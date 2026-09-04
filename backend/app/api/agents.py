@@ -19,6 +19,7 @@ from app.schemas.agents import (
     AgentRunDetailResponse,
     AgentRunResponse,
 )
+from app.services.access import WorkspaceAccessDeniedError, can_drive, require_workspace_access
 from app.services.agents import (
     AgentConfigurationError,
     AgentRunAlreadyActiveError,
@@ -200,6 +201,11 @@ async def create_agent_run(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workspace not found",
         ) from None
+    except WorkspaceAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to drive this workspace",
+        ) from None
     except WorktreeNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -302,6 +308,11 @@ async def stop_agent_run(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workspace not found",
         ) from None
+    except WorkspaceAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to drive this workspace",
+        ) from None
     except AgentRunNotFoundError:
         raise not_found() from None
 
@@ -321,6 +332,9 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
             settings=settings,
         )
         try:
+            _workspace, viewer_role = await require_workspace_access(
+                session, workspace_id, user.id
+            )
             events = await service.list_events(workspace_id, run_id, user.id)
             run = await service.get_run(workspace_id, run_id, user.id)
         except (WorkspaceNotFoundError, AgentRunNotFoundError):
@@ -328,6 +342,9 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
             return
 
     await websocket.accept()
+    await websocket.send_json(
+        {"type": "role", "content": "driver" if can_drive(viewer_role) else "observer"}
+    )
     for event in events:
         await websocket.send_json(event_payload(event))
 

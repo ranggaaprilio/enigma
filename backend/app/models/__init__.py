@@ -2,6 +2,7 @@
 from app.models.agent import AgentEvent, AgentFileChange, AgentRun, AgentSession
 from app.models.budget import UsageBudget
 from app.models.command import CommandRun, CustomCommand
+from app.models.comment import Comment
 from app.models.editor import EditorSession
 from app.models.notification import AuditLog, Notification
 from app.models.preview import PreviewSession
@@ -19,6 +20,7 @@ __all__ = [
     "AgentRun",
     "AgentSession",
     "AuditLog",
+    "Comment",
     "CommandRun",
     "CustomCommand",
     "EditorSession",

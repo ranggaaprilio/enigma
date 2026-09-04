@@ -1,9 +1,9 @@
 from uuid import UUID
 
-import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.audit_support import AUDIT_LOG_SERVICE_DEP, record_audit_safely
 from app.api.auth import CURRENT_USER_DEP
 from app.db.session import get_db_session
 from app.models import User
@@ -33,23 +33,6 @@ async def get_project_service(session: AsyncSession = DB_SESSION_DEP) -> SqlAlch
 
 
 PROJECT_SERVICE_DEP = Depends(get_project_service)
-
-
-async def get_audit_log_service(session: AsyncSession = DB_SESSION_DEP) -> AuditLogService:
-    return AuditLogService(session)
-
-
-AUDIT_LOG_SERVICE_DEP = Depends(get_audit_log_service)
-
-logger = structlog.get_logger("app.audit")
-
-
-async def record_audit_safely(audit_log_service: AuditLogService, **values) -> None:
-    """Best-effort audit write — an audit failure must never break the primary action."""
-    try:
-        await audit_log_service.record(**values)
-    except Exception:
-        logger.exception("audit.record_failed", action=values.get("action"))
 
 
 @router.post("", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)

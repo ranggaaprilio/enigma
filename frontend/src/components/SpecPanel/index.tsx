@@ -36,6 +36,7 @@ import {
 } from "../../lib/api";
 import { useAgentRunStream } from "../../lib/useAgentRunStream";
 import { ToolCard, pairToolEvents } from "../AgentTab/ToolCard";
+import { CommentThread } from "../comments/CommentThread";
 import { ConfirmModal } from "../ui/ConfirmModal";
 
 const PHASE_ORDER: SpecPhaseName[] = [
@@ -716,6 +717,10 @@ function PhaseDetail({
             )}
           </>
         )}
+      </div>
+
+      <div className="mt-4">
+        <CommentThread targetType="spec_phase" targetId={phase.id} />
       </div>
 
       {confirmImplement && (
