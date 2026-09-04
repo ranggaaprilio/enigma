@@ -12,6 +12,7 @@ from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
 from app.models import User, Workspace, WorkspaceEnvVar
+from app.services.daytona_runtime import DaytonaRuntimeError
 from app.services.git_providers import sanitize_repository_url
 from app.services.templates import TemplateNotFoundError
 from app.services.users import DuplicateUserEmailError
@@ -21,6 +22,7 @@ from app.services.workspaces import (
     SqlAlchemyWorkspaceService,
     WorkspaceAlreadyExistsError,
     WorkspaceNotFoundError,
+    WorkspaceRuntimeError,
     WorkspaceSecretCipher,
     validate_env_key,
 )
@@ -611,3 +613,94 @@ async def test_sqlalchemy_create_repository_sanitizes_url():
 
     assert workspace.repo_url == "https://gitlab.com/team/demo.git"
     assert workspace.source == "repository"
+
+
+class _FakeReprovisionSession(_FakeCreateSession):
+    """`_FakeCreateSession` plus the `get` that `get_for_owner` needs."""
+
+    def __init__(self, workspace: Workspace) -> None:
+        super().__init__()
+        self.workspace = workspace
+
+    async def get(self, model, workspace_id):
+        return self.workspace if workspace_id == self.workspace.id else None
+
+
+def _errored_workspace(owner_id, *, source: str = "blank", sandbox_id: str | None = None):
+    return Workspace(
+        id=uuid4(),
+        owner_id=owner_id,
+        name="Scratch",
+        slug="scratch",
+        repo_url=None,
+        source=source,
+        default_branch="main",
+        runtime="daytona",
+        workspace_path="workspace",
+        status="error",
+        daytona_sandbox_id=sandbox_id,
+    )
+
+
+async def test_reprovision_recovers_a_workspace_whose_sandbox_never_came_up():
+    settings = Settings()
+    owner_id = uuid4()
+    workspace = _errored_workspace(owner_id)
+    initializer = _RecordingInitializer()
+    service = SqlAlchemyWorkspaceService(
+        session=_FakeReprovisionSession(workspace),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=initializer,  # type: ignore[arg-type]
+    )
+
+    recovered = await service.reprovision(workspace.id, owner_id)
+
+    assert recovered.status == "ready"
+    assert recovered.daytona_sandbox_id == f"sandbox-{workspace.id}"
+    # It never finished creating, so the blank seed commit still has to run.
+    assert initializer.calls == ["blank"]
+
+
+async def test_reprovision_leaves_an_existing_sandbox_uninitialized():
+    settings = Settings()
+    owner_id = uuid4()
+    workspace = _errored_workspace(owner_id, sandbox_id="sandbox-existing")
+    initializer = _RecordingInitializer()
+    service = SqlAlchemyWorkspaceService(
+        session=_FakeReprovisionSession(workspace),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=initializer,  # type: ignore[arg-type]
+    )
+
+    recovered = await service.reprovision(workspace.id, owner_id)
+
+    assert recovered.status == "ready"
+    # Re-seeding would write over the working tree the sandbox already has.
+    assert initializer.calls == []
+
+
+async def test_reprovision_marks_error_when_the_runtime_still_fails():
+    settings = Settings()
+    owner_id = uuid4()
+    workspace = _errored_workspace(owner_id)
+
+    class _FailingRuntime:
+        def __init__(self, runtime_settings):
+            self.settings = runtime_settings
+
+        async def provision(self, workspace_id, owner_id, snapshot):
+            raise DaytonaRuntimeError("snapshot not found")
+
+    service = SqlAlchemyWorkspaceService(
+        session=_FakeReprovisionSession(workspace),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FailingRuntime(settings),  # type: ignore[arg-type]
+        initializer=_RecordingInitializer(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(WorkspaceRuntimeError):
+        await service.reprovision(workspace.id, owner_id)
+
+    assert workspace.status == "error"

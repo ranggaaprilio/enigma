@@ -23,6 +23,7 @@ import {
 } from "../lib/activeWorktree";
 import { detectProvider, prNoun, providerHost, providerLabel } from "../lib/gitProviders";
 import { CommentThread } from "./comments/CommentThread";
+import { Spinner } from "./ui/Spinner";
 
 type LoadState =
   | { status: "loading" }
@@ -276,27 +277,32 @@ export function WorktreesPanel({
                       <>
                         <SmallButton
                           label="Commit"
+                          busy={busy === `commit-${tree.id}`}
                           disabled={busy !== null || tree.is_clean}
                           onClick={() => void handleCommitActive(tree)}
                         />
                         <SmallButton
                           label={busy === `pull-${tree.id}` ? "Pulling…" : "Pull"}
+                          busy={busy === `pull-${tree.id}`}
                           disabled={busy !== null}
                           onClick={() => void handlePull(tree)}
                         />
                         <SmallButton
                           label={busy === `sync-${tree.id}` ? "Updating…" : "Update"}
+                          busy={busy === `sync-${tree.id}`}
                           title={`Merge ${tree.base_ref} into ${tree.branch}`}
                           disabled={busy !== null}
                           onClick={() => void handleSync(tree)}
                         />
                         <SmallButton
                           label={busy === `push-${tree.id}` ? "Pushing…" : "Push"}
+                          busy={busy === `push-${tree.id}`}
                           disabled={busy !== null}
                           onClick={() => void handlePush(tree)}
                         />
                         <SmallButton
                           label="Remove"
+                          busy={busy === `remove-${tree.id}`}
                           disabled={busy !== null}
                           onClick={() => void handleRemove(tree)}
                         />
@@ -323,10 +329,12 @@ export function WorktreesPanel({
             onChange={(event) => setNewBase(event.target.value)}
           />
           <button
-            className="rounded-md bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
+            className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="submit"
             disabled={busy === "create"}
+            aria-busy={busy === "create"}
           >
+            {busy === "create" && <Spinner className="h-4 w-4" />}
             {busy === "create" ? "Creating…" : "New worktree"}
           </button>
         </form>
@@ -406,10 +414,12 @@ export function WorktreesPanel({
               Draft {noun}
             </label>
             <button
-              className="w-full rounded-md bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
+              className="inline-flex w-full items-center justify-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
               type="submit"
               disabled={busy === "open-pr" || featureWorktrees.length === 0}
+              aria-busy={busy === "open-pr"}
             >
+              {busy === "open-pr" && <Spinner className="h-4 w-4" />}
               {busy === "open-pr" ? "Opening…" : `Open ${noun}`}
             </button>
           </form>
@@ -477,20 +487,24 @@ function SmallButton({
   disabled,
   onClick,
   title,
+  busy = false,
 }: {
   label: string;
   disabled: boolean;
   onClick: () => void;
   title?: string;
+  busy?: boolean;
 }) {
   return (
     <button
       type="button"
       title={title}
-      className="rounded-md border border-line bg-white px-2.5 py-1 text-xs font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
+      className="inline-flex items-center gap-1.5 rounded-md border border-line bg-white px-2.5 py-1 text-xs font-medium transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
       disabled={disabled}
+      aria-busy={busy}
       onClick={onClick}
     >
+      {busy && <Spinner className="h-3 w-3" />}
       {label}
     </button>
   );

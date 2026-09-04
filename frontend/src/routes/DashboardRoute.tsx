@@ -13,6 +13,7 @@ import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import { WorktreesPanel } from "../components/WorktreesPanel";
 import { ConfirmModal } from "../components/ui/ConfirmModal";
+import { Spinner } from "../components/ui/Spinner";
 import { TextInput } from "../components/ui/TextInput";
 import { BudgetConfig } from "../components/usage/BudgetConfig";
 import { UsagePanel } from "../components/usage/UsagePanel";
@@ -50,6 +51,8 @@ import {
   pullWorktree,
   pushRepository,
   pushWorktree,
+  getWorkspaceStatus,
+  reprovisionWorkspace,
   updateWorkspace,
   upsertWorkspaceEnvVar,
   type AuditLogResponse,
@@ -871,12 +874,12 @@ function RepositoryPanel({
   }
 
   async function handleDiscard(path: string | null) {
-    setPendingDiscard(null);
     await runAction("discard", async () => {
       const response = await discardRepositoryChanges(workspace.id, path ?? undefined, worktreeId);
       if (path === null || path === selectedPath) setSelectedPath(null);
       return response.message;
     });
+    setPendingDiscard(null);
   }
 
   async function handleCommit(event: FormEvent<HTMLFormElement>) {
@@ -983,10 +986,12 @@ function RepositoryPanel({
               disabled={busyAction === "connect"}
             />
             <button
-              className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
+              className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
               type="submit"
               disabled={busyAction === "connect"}
+              aria-busy={busyAction === "connect"}
             >
+              {busyAction === "connect" && <Spinner className="h-4 w-4" />}
               {busyAction === "connect" ? "Saving..." : "Connect repository"}
             </button>
           </form>
@@ -995,6 +1000,7 @@ function RepositoryPanel({
         <div className="mt-5 grid grid-cols-2 gap-2">
           <RepoActionButton
             label="Clone"
+            busy={busyAction === "clone"}
             disabled={busyAction !== null || statusData?.cloned === true || !workspace.repo_url}
             onClick={() =>
               void runAction("clone", async () => {
@@ -1009,6 +1015,7 @@ function RepositoryPanel({
           />
           <RepoActionButton
             label="Fetch"
+            busy={busyAction === "fetch"}
             disabled={busyAction !== null || statusData?.cloned !== true}
             onClick={() =>
               void runAction("fetch", async () => {
@@ -1019,6 +1026,7 @@ function RepositoryPanel({
           />
           <RepoActionButton
             label="Pull"
+            busy={busyAction === "pull"}
             disabled={busyAction !== null || statusData?.cloned !== true}
             onClick={() =>
               void runAction("pull", async () => {
@@ -1033,6 +1041,7 @@ function RepositoryPanel({
           />
           <RepoActionButton
             label="Push"
+            busy={busyAction === "push"}
             disabled={busyAction !== null || statusData?.cloned !== true}
             onClick={() =>
               void runAction("push", async () => {
@@ -1048,10 +1057,12 @@ function RepositoryPanel({
         <form className="mt-5 space-y-3" onSubmit={handleCommit}>
           <TextInput label="Commit message" value={commitMessage} onChange={setCommitMessage} />
           <button
-            className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="submit"
             disabled={busyAction === "commit" || statusData?.cloned !== true}
+            aria-busy={busyAction === "commit"}
           >
+            {busyAction === "commit" && <Spinner className="h-4 w-4" />}
             {busyAction === "commit" ? "Committing..." : "Commit changes"}
           </button>
         </form>
@@ -1293,6 +1304,7 @@ function RepositoryPanel({
               : "All uncommitted changes on this branch will be permanently lost."
           }
           confirmLabel="Discard"
+          busy={busyAction === "discard"}
           onCancel={() => setPendingDiscard(null)}
           onConfirm={() => void handleDiscard(pendingDiscard.path)}
         />
@@ -1304,19 +1316,23 @@ function RepositoryPanel({
 function RepoActionButton({
   label,
   disabled,
+  busy = false,
   onClick,
 }: {
   label: string;
   disabled: boolean;
+  busy?: boolean;
   onClick: () => void;
 }) {
   return (
     <button
-      className="rounded-md border border-line bg-white px-3 py-2 text-sm font-semibold transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
+      className="inline-flex items-center justify-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-semibold transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
       type="button"
       disabled={disabled}
+      aria-busy={busy}
       onClick={onClick}
     >
+      {busy && <Spinner />}
       {label}
     </button>
   );
@@ -1336,6 +1352,7 @@ function WorkspaceMetadataForm({
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isChecking, setIsChecking] = useState(false);
 
   useEffect(() => {
     setName(workspace.name);
@@ -1344,27 +1361,61 @@ function WorkspaceMetadataForm({
     setSnapshot(workspace.snapshot ?? "");
   }, [workspace]);
 
+  /**
+   * Re-check the sandbox after a save so the page reflects reality instead of the status the
+   * row was left with. A workspace with no sandbox (a create that failed at the runtime step)
+   * cannot be recovered by a status read — there is nothing to query — so it is re-provisioned
+   * instead. That is idempotent, and saving corrected settings is the moment the retry is
+   * most likely to succeed.
+   */
+  async function refreshSandbox(saved: WorkspaceResponse) {
+    setIsChecking(true);
+    try {
+      if (saved.status === "error" || !saved.sandbox_id) {
+        const provisioned = await reprovisionWorkspace(saved.id);
+        onWorkspaceChanged(provisioned);
+        setMessage(`Workspace settings saved. Sandbox is ${provisioned.status}.`);
+      } else {
+        const checked = await getWorkspaceStatus(saved.id);
+        onWorkspaceChanged({ ...saved, ...checked });
+        setMessage(`Workspace settings saved. Sandbox is ${checked.status}.`);
+      }
+    } catch (caughtError) {
+      setError(
+        `Settings saved, but the sandbox is still unavailable: ${
+          caughtError instanceof ApiError ? caughtError.message : "check failed"
+        }`,
+      );
+    } finally {
+      setIsChecking(false);
+    }
+  }
+
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setError(null);
     setMessage(null);
     setIsSubmitting(true);
 
+    let updated: WorkspaceResponse;
     try {
       // Blank/template workspaces have no remote; sending "" would be rejected, so omit it.
-      const updated = await updateWorkspace(workspace.id, {
+      updated = await updateWorkspace(workspace.id, {
         name,
         default_branch: defaultBranch,
         snapshot: snapshot.trim() || null,
         ...(repoUrl.trim() ? { repo_url: repoUrl.trim() } : {}),
       });
-      onWorkspaceChanged(updated);
-      setMessage("Workspace settings saved.");
     } catch (caughtError) {
       setError(caughtError instanceof ApiError ? caughtError.message : "Unable to save workspace.");
+      return;
     } finally {
       setIsSubmitting(false);
     }
+
+    onWorkspaceChanged(updated);
+    setMessage("Workspace settings saved.");
+    await refreshSandbox(updated);
   }
 
   return (
@@ -1404,9 +1455,9 @@ function WorkspaceMetadataForm({
       <button
         className="mt-4 rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
         type="submit"
-        disabled={isSubmitting}
+        disabled={isSubmitting || isChecking}
       >
-        {isSubmitting ? "Saving..." : "Save settings"}
+        {isSubmitting ? "Saving..." : isChecking ? "Checking sandbox..." : "Save settings"}
       </button>
     </form>
   );

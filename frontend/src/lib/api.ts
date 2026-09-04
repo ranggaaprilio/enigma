@@ -705,6 +705,17 @@ export function deleteWorkspace(workspaceId: string): Promise<{ ok: boolean }> {
   return requestJson<{ ok: boolean }>(`/workspaces/${workspaceId}`, { method: "DELETE" });
 }
 
+/**
+ * Retry provisioning a workspace whose sandbox failed to come up. Idempotent — the backend
+ * reuses the existing sandbox when there is one. `getWorkspaceStatus` cannot recover such a
+ * workspace because it has no sandbox to query.
+ */
+export function reprovisionWorkspace(workspaceId: string): Promise<WorkspaceResponse> {
+  return requestJson<WorkspaceResponse>(`/workspaces/${workspaceId}/provision`, {
+    method: "POST",
+  });
+}
+
 export function getWorkspaceStatus(
   workspaceId: string,
   signal?: AbortSignal,

@@ -164,26 +164,48 @@ class SqlAlchemyWorkspaceService:
         await self.session.flush()
         await self.session.commit()
 
+        return await self._provision(workspace, template, initialize=True)
+
+    async def _mark_error(self, workspace: Workspace) -> None:
+        workspace.status = "error"
+        self.session.add(workspace)
+        await self.session.commit()
+
+    async def _provision(
+        self,
+        workspace: Workspace,
+        template: WorkspaceTemplate | None,
+        *,
+        initialize: bool,
+    ) -> Workspace:
+        """Bring an already-persisted workspace row up to a running sandbox.
+
+        Shared by `create` and `reprovision`. `DaytonaRuntime.provision` looks the sandbox up
+        by the name derived from the workspace id and reuses it when it exists, so calling
+        this a second time repairs the row instead of leaking a second sandbox.
+
+        `initialize` is False when the workspace already had a sandbox: the template/blank
+        seed commit runs only for a workspace that never finished creating, so a repair never
+        writes over an existing working tree.
+        """
         try:
-            sandbox = await self.runtime.provision(workspace.id, owner_id, snapshot)
+            sandbox = await self.runtime.provision(
+                workspace.id, workspace.owner_id, workspace.snapshot
+            )
             workspace.daytona_sandbox_id = sandbox.id
         except DaytonaRuntimeError as error:
-            workspace.status = "error"
-            self.session.add(workspace)
-            await self.session.commit()
+            await self._mark_error(workspace)
             raise WorkspaceRuntimeError(str(error)) from error
 
         # Template/blank workspaces get their first commit now so the sandbox is usable (and
         # worktree-capable) before any remote is connected.
         try:
-            if template is not None:
+            if initialize and template is not None:
                 await self.initializer.initialize_from_template(workspace, template)
-            elif source == "blank":
+            elif initialize and workspace.source == "blank":
                 await self.initializer.initialize_blank(workspace)
         except WorkspaceInitializationError:
-            workspace.status = "error"
-            self.session.add(workspace)
-            await self.session.commit()
+            await self._mark_error(workspace)
             raise
 
         workspace.status = "ready"
@@ -192,6 +214,26 @@ class SqlAlchemyWorkspaceService:
         await self.session.refresh(workspace)
 
         return workspace
+
+    async def reprovision(self, workspace_id: UUID, owner_id: UUID) -> Workspace:
+        """Retry provisioning for a workspace whose sandbox failed to come up.
+
+        A create that fails at the runtime step leaves the row behind with status "error" and
+        no sandbox id; nothing retries it, and `status` cannot recover it because there is no
+        sandbox to query. This is the repair path — typically after correcting the snapshot.
+        """
+        workspace = await self.get_for_owner(workspace_id, owner_id)
+        had_sandbox = workspace.daytona_sandbox_id is not None
+
+        template: WorkspaceTemplate | None = None
+        if workspace.source == "template" and workspace.template_id is not None:
+            template = await TemplateService(self.session).get(workspace.template_id)
+
+        workspace.status = "creating"
+        self.session.add(workspace)
+        await self.session.commit()
+
+        return await self._provision(workspace, template, initialize=not had_sandbox)
 
     async def update(
         self,

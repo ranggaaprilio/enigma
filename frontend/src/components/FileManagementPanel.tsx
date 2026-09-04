@@ -21,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 
+import { Spinner } from "./ui/Spinner";
 import {
   ApiError,
   createWorkspaceFolder,
@@ -71,12 +72,15 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
       setSelectedPath((current) => current ?? nextTree.path);
     } catch (caughtError) {
       if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
+        // An aborted load has already been replaced by a newer one (StrictMode's double
+        // mount, or a worktree switch). Clearing the busy flag here would switch off the
+        // *replacement's* spinner, so this run must leave every piece of state alone —
+        // which is why the clear below sits after the catch rather than in a `finally`.
         return;
       }
       setError(caughtError instanceof ApiError ? caughtError.message : "Unable to load files.");
-    } finally {
-      setBusyAction((current) => (current === "tree" ? null : current));
     }
+    setBusyAction((current) => (current === "tree" ? null : current));
   }, [workspace.id, worktreeId]);
 
   useEffect(() => {
@@ -221,12 +225,16 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
           </div>
           <button
             aria-label="Refresh files"
-            className="flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink"
+            className="flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={busyAction === "tree"}
+            aria-busy={busyAction === "tree"}
             onClick={() => void loadTree()}
           >
-            <RefreshCw className="h-4 w-4" aria-hidden="true" />
+            <RefreshCw
+              className={`h-4 w-4 ${busyAction === "tree" ? "animate-spin" : ""}`}
+              aria-hidden="true"
+            />
           </button>
         </div>
 
@@ -282,8 +290,11 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
         )}
 
         <div className="mt-4 max-h-[620px] overflow-auto rounded-md border border-line bg-white p-2">
-          {busyAction === "tree" && !tree && (
-            <div className="p-4 text-sm text-ink/65">Loading files...</div>
+          {!tree && !error && (
+            <div className="flex items-center gap-2 p-4 text-sm text-ink/65">
+              <Spinner className="h-4 w-4" />
+              Loading files...
+            </div>
           )}
           {visibleNodes.length === 0 && tree && (
             <div className="p-4 text-sm text-ink/65">

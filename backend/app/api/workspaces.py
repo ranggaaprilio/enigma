@@ -120,6 +120,8 @@ class WorkspaceService(Protocol):
         snapshot: str | None | object = SNAPSHOT_UNSET,
     ) -> Workspace: ...
 
+    async def reprovision(self, workspace_id: UUID, owner_id: UUID) -> Workspace: ...
+
     async def delete(self, workspace_id: UUID, owner_id: UUID) -> None: ...
 
     async def list_env_vars(self, workspace_id: UUID, owner_id: UUID) -> list[WorkspaceEnvVar]: ...
@@ -1414,6 +1416,37 @@ async def delete_workspace(
             detail=str(error),
         ) from None
     return DeleteResponse(ok=True)
+
+
+@router.post("/{workspace_id}/provision", response_model=WorkspaceResponse)
+async def reprovision_workspace(
+    workspace_id: UUID,
+    session: AsyncSession = DB_SESSION_DEP,
+    current_user: User = CURRENT_USER_DEP,
+    service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+) -> WorkspaceResponse:
+    """Retry provisioning a workspace whose sandbox never came up.
+
+    `GET /status` cannot recover such a workspace — it has no sandbox to query — so this is
+    the only way back from "error" short of deleting and recreating it.
+    """
+    try:
+        workspace = await service.reprovision(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except WORKSPACE_CREATE_ERRORS as error:
+        raise workspace_create_error(error) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace.id,
+        action="workspace_reprovision",
+        target_type="workspace",
+        target_id=workspace.id,
+        metadata={"status": workspace.status},
+    )
+    return await workspace_response(session, workspace, current_user.id)
 
 
 @router.get("/{workspace_id}/status", response_model=WorkspaceStatusResponse)

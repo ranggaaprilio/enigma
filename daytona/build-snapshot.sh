@@ -14,7 +14,7 @@
 # then recreate any existing sandboxes so they pick up the new image.
 set -euo pipefail
 
-SNAPSHOT_NAME="${SNAPSHOT_NAME:-enigma-mise-code}"
+SNAPSHOT_NAME="${SNAPSHOT_NAME:-enigma-base}"
 DOCKERFILE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Daytona snapshots must be linux/amd64. The CLI builds the image and parses the

@@ -1,13 +1,18 @@
+import { Spinner } from "./Spinner";
+
 export function ConfirmModal({
   title,
   body,
   confirmLabel,
+  busy = false,
   onCancel,
   onConfirm,
 }: {
   title: string;
   body: string;
   confirmLabel: string;
+  /** Keeps the modal up with a spinner while the confirmed action runs. */
+  busy?: boolean;
   onCancel: () => void;
   onConfirm: () => void;
 }) {
@@ -20,15 +25,19 @@ export function ConfirmModal({
           <button
             type="button"
             onClick={onCancel}
-            className="rounded-md border border-line px-3 py-1.5 text-sm text-body transition hover:bg-panel"
+            disabled={busy}
+            className="rounded-md border border-line px-3 py-1.5 text-sm text-body transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
           >
             Cancel
           </button>
           <button
             type="button"
             onClick={onConfirm}
-            className="rounded-md bg-ink px-3 py-1.5 text-sm font-semibold text-white transition hover:opacity-90"
+            disabled={busy}
+            aria-busy={busy}
+            className="inline-flex items-center gap-2 rounded-md bg-ink px-3 py-1.5 text-sm font-semibold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-60"
           >
+            {busy && <Spinner />}
             {confirmLabel}
           </button>
         </div>

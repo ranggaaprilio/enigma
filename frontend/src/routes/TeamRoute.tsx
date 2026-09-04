@@ -10,6 +10,7 @@ import {
   LayoutTemplate,
   Pencil,
   Plus,
+  Trash2,
   Users,
 } from "lucide-react";
 
@@ -20,6 +21,7 @@ import { CreateWorkspaceWizard } from "../components/workspace/CreateWorkspaceWi
 import { useAuth } from "../auth/context";
 import {
   createTeamWorkspace,
+  deleteWorkspace,
   getProject,
   getTeam,
   listProjectMembers,
@@ -96,6 +98,12 @@ export function TeamRoute() {
   const [showCreate, setShowCreate] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
   const [saving, setSaving] = useState(false);
+  // A workspace whose sandbox failed to provision is persisted with status "error" and is
+  // never retried, so retrying the create leaves an identical dead card behind. Deleting is
+  // the only way to clear one.
+  const [pendingDelete, setPendingDelete] = useState<WorkspaceResponse | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
   const [editDesc, setEditDesc] = useState("");
   // Mirrors `BudgetService._assert_manage_access` for the team scope: a team lead or a
@@ -160,6 +168,23 @@ export function TeamRoute() {
       setError(err instanceof Error ? err.message : "Failed to update team");
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleDeleteWorkspace() {
+    if (!pendingDelete) return;
+    setDeleting(true);
+    setDeleteError(null);
+    try {
+      await deleteWorkspace(pendingDelete.id);
+      setWorkspaces((prev) => prev.filter((ws) => ws.id !== pendingDelete.id));
+      setPendingDelete(null);
+    } catch (err: unknown) {
+      setDeleteError(
+        err instanceof Error ? err.message : "Failed to delete workspace",
+      );
+    } finally {
+      setDeleting(false);
     }
   }
 
@@ -308,10 +333,9 @@ export function TeamRoute() {
         ) : (
           <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
             {workspaces.map((ws) => (
-              <Link
+              <div
                 key={ws.id}
-                to={`/projects/${projectId}/teams/${teamId}/workspaces/${ws.id}`}
-                className="group flex flex-col rounded-xl border border-line bg-panel p-5 transition hover:border-primary hover:shadow-sm"
+                className="group relative flex flex-col rounded-xl border border-line bg-panel p-5 transition hover:border-primary hover:shadow-sm"
               >
                 <div className="flex items-start justify-between gap-3">
                   <div className="flex min-w-0 items-center gap-3">
@@ -319,17 +343,37 @@ export function TeamRoute() {
                       <Box className="h-5 w-5" aria-hidden="true" />
                     </div>
                     <h3 className="truncate font-semibold text-ink group-hover:text-primary">
-                      {ws.name}
+                      {/* Stretched link: the whole card stays clickable without nesting the
+                          delete button inside an anchor. */}
+                      <Link
+                        to={`/projects/${projectId}/teams/${teamId}/workspaces/${ws.id}`}
+                        className="after:absolute after:inset-0 after:content-['']"
+                      >
+                        {ws.name}
+                      </Link>
                     </h3>
                   </div>
-                  <span
-                    className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${statusMeta[ws.status]?.pill ?? "bg-white text-muted ring-1 ring-line"}`}
-                  >
+                  <div className="flex shrink-0 items-center gap-1.5">
                     <span
-                      className={`h-1.5 w-1.5 rounded-full ${statusMeta[ws.status]?.dot ?? "bg-muted-soft"}`}
-                    />
-                    {ws.status}
-                  </span>
+                      className={`inline-flex shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium ${statusMeta[ws.status]?.pill ?? "bg-white text-muted ring-1 ring-line"}`}
+                    >
+                      <span
+                        className={`h-1.5 w-1.5 rounded-full ${statusMeta[ws.status]?.dot ?? "bg-muted-soft"}`}
+                      />
+                      {ws.status}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDeleteError(null);
+                        setPendingDelete(ws);
+                      }}
+                      aria-label={`Delete workspace ${ws.name}`}
+                      className="relative z-10 rounded-lg p-1.5 text-muted transition hover:bg-[#fff5f2] hover:text-danger"
+                    >
+                      <Trash2 className="h-4 w-4" aria-hidden="true" />
+                    </button>
+                  </div>
                 </div>
 
                 <div className="mt-4 space-y-2 text-xs text-muted">
@@ -356,7 +400,7 @@ export function TeamRoute() {
                     aria-hidden="true"
                   />
                 </div>
-              </Link>
+              </div>
             ))}
           </div>
         )}
@@ -379,6 +423,49 @@ export function TeamRoute() {
             navigate(`/projects/${projectId}/teams/${teamId}/workspaces/${ws.id}`)
           }
         />
+      )}
+
+      {pendingDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
+          <div className="w-full max-w-md rounded-xl border border-line bg-panel p-6 shadow-lg">
+            <div className="mb-4 flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-danger/10 text-danger">
+                <Trash2 className="h-5 w-5" aria-hidden="true" />
+              </div>
+              <div className="min-w-0">
+                <h2 className="text-lg font-semibold text-ink">Delete workspace</h2>
+                <p className="truncate text-xs text-muted">{pendingDelete.name}</p>
+              </div>
+            </div>
+            <p className="text-sm text-body">
+              This removes the workspace and its Daytona sandbox for the whole team. It
+              cannot be undone.
+            </p>
+            {deleteError && (
+              <p className="mt-3 rounded-lg border border-danger/30 bg-[#fff5f2] px-3 py-2 text-sm text-danger">
+                {deleteError}
+              </p>
+            )}
+            <div className="flex justify-end gap-2 pt-4">
+              <button
+                type="button"
+                onClick={() => setPendingDelete(null)}
+                disabled={deleting}
+                className="rounded-lg px-4 py-2 text-sm text-body hover:bg-line disabled:opacity-60"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleDeleteWorkspace}
+                disabled={deleting}
+                className="rounded-lg bg-danger px-4 py-2 text-sm font-medium text-white hover:opacity-90 disabled:opacity-60"
+              >
+                {deleting ? "Deleting…" : "Delete workspace"}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
 
       {showEdit && (
