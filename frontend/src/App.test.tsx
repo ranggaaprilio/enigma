@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -57,6 +57,9 @@ const authUser = {
   updated_at: "2026-05-22T00:00:00Z",
 };
 
+const projectId = "1f0a9b3c-6d21-4a58-9c77-2b8e5d4f1a90";
+const teamId = "7c4d2e18-5b93-4f60-8a12-e3d97f5b6c24";
+
 const workspace = {
   id: "3e15be87-2551-4d70-b972-33fdf68c49eb",
   owner_id: authUser.id,
@@ -71,7 +74,13 @@ const workspace = {
   status: "ready",
   created_at: "2026-05-23T00:00:00Z",
   updated_at: "2026-05-23T00:00:00Z",
+  // The shell gates every action on this; "owner" keeps the role-gated controls enabled.
+  viewer_role: "owner",
 };
+
+// Workspace views live under the project/team hierarchy — there are no top-level `/files`,
+// `/terminal`, … routes, and `*` redirects to `/`.
+const workspaceBase = `/projects/${projectId}/teams/${teamId}/workspaces/${workspace.id}`;
 
 const fileTree = {
   path: "",
@@ -146,16 +155,126 @@ function jsonResponse(payload: unknown, ok = true, status = 200) {
   };
 }
 
+const healthResponse = { status: "ok", database: "ok", redis: "ok" };
+
+// `GET /dashboard/summary`, in the shape `DashboardSummary` declares. The overview route
+// renders `summary.workspaces_by_status[...]`, `summary.recent_projects` and
+// `summary.recent_workspaces` as soon as `summary` is non-null, so a stand-in that is
+// merely truthy is not enough.
+const dashboardSummary = {
+  projects_total: 0,
+  teams_total: 0,
+  workspaces_total: 0,
+  workspaces_by_status: { creating: 0, ready: 0, busy: 0, error: 0, stopped: 0 },
+  recent_projects: [],
+  recent_workspaces: [],
+};
+
+// `GET /dashboard/usage`, in the shape `UsageSummary` declares (the overview route mounts
+// `UsagePanel`).
+const usageSummary = {
+  scope: null,
+  scope_id: null,
+  date_from: "2026-05-01T00:00:00Z",
+  date_to: "2026-05-31T00:00:00Z",
+  totals: {
+    run_count: 0,
+    input_tokens: 0,
+    output_tokens: 0,
+    tokens_used: 0,
+    estimated_cost: 0,
+  },
+  series: [],
+  breakdown_dimension: "project",
+  breakdown: [],
+  top_spenders: [],
+};
+
+/**
+ * Fallback for requests a test does not stub itself.
+ *
+ * Every authenticated view mounts the app shell, which resolves the workspace from the URL
+ * and reads its env vars; the overview route additionally loads the dashboard summary and
+ * usage. Those are hit no matter which tab a test drives, so they are answered here in
+ * their real shapes and each test only stubs what it actually asserts on. Serving one
+ * catch-all health payload for all of them handed the overview route a `summary` with no
+ * `recent_projects`, which crashed the tree on render.
+ */
+function fallbackResponse(url: string) {
+  if (url.includes("/dashboard/summary")) {
+    return Promise.resolve(jsonResponse(dashboardSummary));
+  }
+  if (url.includes("/dashboard/usage")) {
+    return Promise.resolve(jsonResponse(usageSummary));
+  }
+  if (url.endsWith(`/workspaces/${workspace.id}`)) {
+    return Promise.resolve(jsonResponse(workspace));
+  }
+  if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+    return Promise.resolve(jsonResponse([]));
+  }
+  if (url.endsWith("/notifications")) {
+    return Promise.resolve(jsonResponse([]));
+  }
+  // `RepositoryPanel` indexes `data.files` as soon as the request resolves, so the
+  // repository view needs a real `RepositoryStatusResponse` even in tests that only pass
+  // through it on their way somewhere else.
+  if (url.includes("/repo/status")) {
+    return Promise.resolve(
+      jsonResponse({ cloned: true, branch: "main", is_clean: true, files: [] }),
+    );
+  }
+  if (url.includes("/repo/log")) {
+    return Promise.resolve(jsonResponse({ commits: [], has_more: false }));
+  }
+  if (url.includes("/repo/worktrees") || url.includes("/repo/pull-requests")) {
+    return Promise.resolve(jsonResponse([]));
+  }
+  // Collection endpoints every panel loads on mount. Each of these renders its result
+  // immediately (`.map`, `[0]`, `.length`), so an unstubbed one used to crash the view the
+  // moment the sidebar navigated to it.
+  if (
+    url.includes("/agent/runs") ||
+    url.includes("/agent/sessions") ||
+    url.includes("/audit-logs") ||
+    url.includes("/commands") ||
+    url.includes("/spec/workflows") ||
+    url.includes("/terminal/sessions") ||
+    url.includes("/preview/sessions") ||
+    url.includes("/comments") ||
+    url.includes("/budgets")
+  ) {
+    return Promise.resolve(jsonResponse([]));
+  }
+  if (url.includes("/files/tree")) {
+    return Promise.resolve(jsonResponse(fileTree));
+  }
+  if (url.includes("/files/search")) {
+    return Promise.resolve(jsonResponse([]));
+  }
+  if (url.includes("/editor/status")) {
+    return Promise.resolve(jsonResponse({ status: "stopped", session: null }));
+  }
+  if (url.includes("/dev/status") || url.includes("/dev/ensure")) {
+    return Promise.resolve(
+      jsonResponse({
+        status: "idle",
+        port: null,
+        message: null,
+        worktree_id: null,
+        branch: null,
+      }),
+    );
+  }
+  return Promise.resolve(jsonResponse(healthResponse));
+}
+
 describe("App auth routing", () => {
   afterEach(() => {
     vi.restoreAllMocks();
     MockWebSocket.instances = [];
     if (typeof window.localStorage?.clear === "function") {
       window.localStorage.clear();
-    }
-    if (typeof window.localStorage?.removeItem === "function") {
-      window.localStorage.removeItem("execute-dashboard-left-sidebar-collapsed");
-      window.localStorage.removeItem("execute-dashboard-right-sidebar-collapsed");
     }
     window.history.pushState({}, "", "/");
   });
@@ -186,7 +305,7 @@ describe("App auth routing", () => {
   });
 
   it("redirects protected dashboard routes to login when unauthenticated", async () => {
-    window.history.pushState({}, "", "/terminal");
+    window.history.pushState({}, "", `${workspaceBase}/terminal`);
     vi.stubGlobal(
       "fetch",
       vi.fn().mockResolvedValue(jsonResponse({ detail: "Not authenticated" }, false, 401)),
@@ -227,8 +346,8 @@ describe("App auth routing", () => {
     expect(screen.queryByRole("navigation", { name: "Mobile navigation" })).not.toBeInTheDocument();
   });
 
-  it("renders the dashboard for an authenticated user", async () => {
-    window.history.pushState({}, "", "/");
+  it("renders the workspace shell for an authenticated user", async () => {
+    window.history.pushState({}, "", workspaceBase);
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -236,9 +355,9 @@ describe("App auth routing", () => {
           return Promise.resolve(jsonResponse(authUser));
         }
         if (url.endsWith("/workspaces")) {
-          return Promise.resolve(jsonResponse([]));
+          return Promise.resolve(jsonResponse([workspace]));
         }
-        return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+        return fallbackResponse(url);
       }),
     );
 
@@ -247,6 +366,33 @@ describe("App auth routing", () => {
     expect(await screen.findByText("AI Agent Control Room")).toBeInTheDocument();
     expect(screen.getByText("Owner")).toBeInTheDocument();
     expect(screen.getByText("owner")).toBeInTheDocument();
+  });
+
+  it("renders the projects-first overview at the root for an authenticated user", async () => {
+    window.history.pushState({}, "", "/");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        if (url.endsWith("/workspaces")) {
+          return Promise.resolve(jsonResponse([workspace]));
+        }
+        return fallbackResponse(url);
+      }),
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard", level: 1 }),
+    ).toBeInTheDocument();
+    expect(screen.getByText("System health")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /View all projects/ })).toHaveAttribute(
+      "href",
+      "/projects",
+    );
   });
 
   it("uses the sidebar as the only view navigation and updates active URLs", async () => {
@@ -259,23 +405,25 @@ describe("App auth routing", () => {
         if (url.endsWith("/workspaces")) {
           return Promise.resolve(jsonResponse([]));
         }
-        return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+        return fallbackResponse(url);
       }),
     );
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
     const destinations = [
-      ["Overview", "/"],
-      ["Repository", "/repository"],
-      ["Files", "/files"],
-      ["Commands", "/commands"],
-      ["Agent", "/agents"],
-      ["Editor", "/editor"],
-      ["Terminal", "/terminal"],
-      ["Preview", "/preview"],
-      ["Audit", "/audit"],
+      ["Overview", workspaceBase],
+      ["Repository", `${workspaceBase}/repository`],
+      ["Files", `${workspaceBase}/files`],
+      ["Commands", `${workspaceBase}/commands`],
+      ["Spec", `${workspaceBase}/spec`],
+      ["Agent", `${workspaceBase}/agents`],
+      ["Usage", `${workspaceBase}/usage`],
+      ["Editor", `${workspaceBase}/editor`],
+      ["Terminal", `${workspaceBase}/terminal`],
+      ["Preview", `${workspaceBase}/preview`],
+      ["Audit", `${workspaceBase}/audit`],
     ] as const;
 
     await screen.findByText("Project workspace");
@@ -300,10 +448,10 @@ describe("App auth routing", () => {
         if (url.endsWith("/workspaces")) {
           return Promise.resolve(jsonResponse([]));
         }
-        return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+        return fallbackResponse(url);
       }),
     );
-    window.history.pushState({}, "", "/terminal");
+    window.history.pushState({}, "", `${workspaceBase}/terminal`);
 
     render(<App />);
 
@@ -311,17 +459,16 @@ describe("App auth routing", () => {
       "aria-current",
       "page",
     );
-    expect(
-      await screen.findByRole("button", { name: "Create workspace" }),
-    ).toBeInTheDocument();
 
     await userEvent.click(screen.getByRole("link", { name: "Repository" }));
     await userEvent.click(screen.getByRole("link", { name: "Files" }));
-    expect(window.location.pathname).toBe("/files");
+    expect(window.location.pathname).toBe(`${workspaceBase}/files`);
 
     act(() => window.history.back());
 
-    await waitFor(() => expect(window.location.pathname).toBe("/repository"));
+    await waitFor(() =>
+      expect(window.location.pathname).toBe(`${workspaceBase}/repository`),
+    );
     expect(screen.getByRole("link", { name: "Repository" })).toHaveAttribute(
       "aria-current",
       "page",
@@ -338,23 +485,25 @@ describe("App auth routing", () => {
         if (url.endsWith("/workspaces")) {
           return Promise.resolve(jsonResponse([]));
         }
-        return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+        return fallbackResponse(url);
       }),
     );
     window.history.pushState({}, "", "/not-a-real-route");
 
     render(<App />);
 
-    expect(await screen.findByText("Project workspace")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard", level: 1 }),
+    ).toBeInTheDocument();
     await waitFor(() => expect(window.location.pathname).toBe("/"));
-    expect(screen.getByRole("link", { name: "Overview" })).toHaveAttribute(
+    expect(screen.getByRole("link", { name: "Dashboard" })).toHaveAttribute(
       "aria-current",
       "page",
     );
   });
 
-  it("expands the sidebar on hover and collapses it on leave", async () => {
-    window.history.pushState({}, "", "/");
+  it("keeps the sidebar permanently expanded with the workspace nav and breadcrumbs", async () => {
+    window.history.pushState({}, "", workspaceBase);
     vi.stubGlobal(
       "fetch",
       vi.fn((url: string) => {
@@ -362,9 +511,9 @@ describe("App auth routing", () => {
           return Promise.resolve(jsonResponse(authUser));
         }
         if (url.endsWith("/workspaces")) {
-          return Promise.resolve(jsonResponse([]));
+          return Promise.resolve(jsonResponse([workspace]));
         }
-        return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+        return fallbackResponse(url);
       }),
     );
 
@@ -373,17 +522,22 @@ describe("App auth routing", () => {
     await screen.findByText("AI Agent Control Room");
     const sidebar = screen.getByRole("complementary");
 
-    expect(
-      screen.queryByRole("button", { name: "Collapse left sidebar" }),
-    ).not.toBeInTheDocument();
-    expect(sidebar).toHaveClass("lg:w-[72px]");
-
-    await userEvent.hover(sidebar);
+    // The sidebar is a fixed-width rail — the old hover-to-expand/collapse control (and the
+    // `execute-dashboard-*-sidebar-collapsed` flags it persisted) no longer exist.
     expect(sidebar).toHaveClass("lg:w-[240px]");
+    expect(
+      screen.queryByRole("button", { name: /Collapse .* sidebar/ }),
+    ).not.toBeInTheDocument();
 
-    await userEvent.unhover(sidebar);
-    expect(sidebar).toHaveClass("lg:w-[72px]");
-    expect(screen.getByRole("link", { name: "Overview" })).toBeInTheDocument();
+    // Above the workspace nav it links back out to the containing project and team.
+    expect(within(sidebar).getByRole("link", { name: "Projects" })).toHaveAttribute(
+      "href",
+      "/projects",
+    );
+    expect(within(sidebar).getByRole("link", { name: "Overview" })).toHaveAttribute(
+      "href",
+      workspaceBase,
+    );
   });
 
   it("renders notifications and workspace audit logs", async () => {
@@ -440,10 +594,10 @@ describe("App auth routing", () => {
       if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
         return Promise.resolve(jsonResponse([]));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -473,10 +627,10 @@ describe("App auth routing", () => {
       if (url.endsWith("/workspaces")) {
         return Promise.resolve(jsonResponse([]));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -548,10 +702,10 @@ describe("App auth routing", () => {
       if (url.endsWith(`/workspaces/${workspace.id}/repo/push`)) {
         return Promise.resolve(jsonResponse({ ok: true, message: "Changes pushed." }));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -610,10 +764,10 @@ describe("App auth routing", () => {
       ) {
         return Promise.resolve(jsonResponse({ ok: true }));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -647,6 +801,11 @@ describe("App auth routing", () => {
     );
   });
 
+  // Skipped since it was written (5b4d09f) and now also out of date: the one-shot
+  // "Prompt" + "Run" composer it drives was replaced by the session-based agent tab
+  // (SessionList + SessionThread + PromptComposer). Those flows are covered directly by
+  // SessionThread.test.tsx, SessionList.test.tsx and RunHistory.test.tsx; re-enabling this
+  // would mean writing a new end-to-end session test rather than repairing this one.
   it.skip("starts an agent run, renders streamed output, and stops it", async () => {
     vi.stubGlobal("WebSocket", MockWebSocket);
     Object.defineProperty(window, "WebSocket", {
@@ -692,10 +851,10 @@ describe("App auth routing", () => {
       if (url.endsWith(`/workspaces/${workspace.id}/agent/runs/${run.id}/stop`)) {
         return Promise.resolve(jsonResponse({ ...run, status: "stopped" }));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -790,10 +949,10 @@ describe("App auth routing", () => {
       if (url.endsWith(`/workspaces/${workspace.id}/commands/${command.id}/run`)) {
         return Promise.resolve(jsonResponse(run, true, 201));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -875,10 +1034,10 @@ describe("App auth routing", () => {
       if (url.endsWith(`/workspaces/${workspace.id}/terminal/sessions`)) {
         return Promise.resolve(jsonResponse(session));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -931,10 +1090,10 @@ describe("App auth routing", () => {
       if (url.endsWith(`/workspaces/${workspace.id}/editor/start`) && init?.method === "POST") {
         return Promise.resolve(jsonResponse(editorSession));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -978,10 +1137,10 @@ describe("App auth routing", () => {
       if (url.endsWith(`/workspaces/${workspace.id}/editor/start`) && init?.method === "POST") {
         return Promise.resolve(jsonResponse(editorSession));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -1029,10 +1188,10 @@ describe("App auth routing", () => {
       if (url.endsWith(`/workspaces/${workspace.id}/editor/start`) && init?.method === "POST") {
         return Promise.resolve(jsonResponse(activeSession));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 
@@ -1091,10 +1250,10 @@ describe("App auth routing", () => {
       ) {
         return Promise.resolve(jsonResponse({ ...previewSession, status: "stopped" }));
       }
-      return Promise.resolve(jsonResponse({ status: "ok", database: "ok", redis: "ok" }));
+      return fallbackResponse(url);
     });
     vi.stubGlobal("fetch", fetchMock);
-    window.history.pushState({}, "", "/");
+    window.history.pushState({}, "", workspaceBase);
 
     render(<App />);
 

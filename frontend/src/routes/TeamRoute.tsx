@@ -17,10 +17,13 @@ import { AppShell } from "../components/AppShell";
 import { BudgetConfig } from "../components/usage/BudgetConfig";
 import { UsagePanel } from "../components/usage/UsagePanel";
 import { CreateWorkspaceWizard } from "../components/workspace/CreateWorkspaceWizard";
+import { useAuth } from "../auth/context";
 import {
   createTeamWorkspace,
   getProject,
   getTeam,
+  listProjectMembers,
+  listTeamMembers,
   listTeamWorkspaces,
   updateTeam,
   type ProjectResponse,
@@ -95,6 +98,11 @@ export function TeamRoute() {
   const [saving, setSaving] = useState(false);
   const [editName, setEditName] = useState("");
   const [editDesc, setEditDesc] = useState("");
+  // Mirrors `BudgetService._assert_manage_access` for the team scope: a team lead or a
+  // project admin. Hardcoding this to true showed create/edit/delete controls to every
+  // member — including a team viewer — that the backend then always rejected.
+  const [canManageBudget, setCanManageBudget] = useState(false);
+  const { user } = useAuth();
 
   useEffect(() => {
     if (!projectId || !teamId) return;
@@ -103,11 +111,23 @@ export function TeamRoute() {
       getProject(projectId, controller.signal),
       getTeam(projectId, teamId, controller.signal),
       listTeamWorkspaces(projectId, teamId, controller.signal),
+      // Role lookups are advisory for the UI only — the backend re-checks every mutation —
+      // so a failure just leaves the budget controls hidden rather than failing the page.
+      listTeamMembers(projectId, teamId, controller.signal).catch(() => []),
+      listProjectMembers(projectId, controller.signal).catch(() => []),
     ])
-      .then(([proj, t, wsList]) => {
+      .then(([proj, t, wsList, teamMembers, projectMembers]) => {
         setProject(proj);
         setTeam(t);
         setWorkspaces(wsList);
+        setCanManageBudget(
+          teamMembers.some(
+            (member) => member.user_id === user?.id && member.role === "lead",
+          ) ||
+            projectMembers.some(
+              (member) => member.user_id === user?.id && member.role === "admin",
+            ),
+        );
         setLoading(false);
       })
       .catch((err: unknown) => {
@@ -116,7 +136,7 @@ export function TeamRoute() {
         setLoading(false);
       });
     return () => controller.abort();
-  }, [projectId, teamId]);
+  }, [projectId, teamId, user?.id]);
 
   function openEdit() {
     setEditName(team?.name ?? "");
@@ -344,7 +364,7 @@ export function TeamRoute() {
         {teamId && (
           <div className="mt-10 flex flex-col gap-4">
             <UsagePanel scope="team" scopeId={teamId} title="Team usage" />
-            <BudgetConfig scope="team" scopeId={teamId} canManage />
+            <BudgetConfig scope="team" scopeId={teamId} canManage={canManageBudget} />
           </div>
         )}
       </main>

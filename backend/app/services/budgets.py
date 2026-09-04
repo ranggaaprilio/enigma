@@ -3,10 +3,12 @@ from decimal import Decimal
 from uuid import UUID
 
 from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import (
     AgentRun,
+    Notification,
     ProjectMember,
     Team,
     TeamMember,
@@ -107,7 +109,13 @@ class BudgetService:
             created_by=user_id,
         )
         self.session.add(budget)
-        await self.session.commit()
+        try:
+            await self.session.commit()
+        except IntegrityError as error:
+            # Two concurrent creates passed the existence check above; surface the same 409
+            # the check produces rather than an opaque 500.
+            await self.session.rollback()
+            raise BudgetConflictError from error
         await self.session.refresh(budget)
         await self._audit(user_id, budget, "budget_create")
         return budget
@@ -130,7 +138,12 @@ class BudgetService:
         if budget.limit_cost is None and budget.limit_tokens is None:
             raise ValueError("At least one of limit_cost or limit_tokens is required")
         self.session.add(budget)
-        await self.session.commit()
+        try:
+            await self.session.commit()
+        except IntegrityError as error:
+            # A scope/period change can collide with an existing budget; 409, not 500.
+            await self.session.rollback()
+            raise BudgetConflictError from error
         await self.session.refresh(budget)
         await self._audit(user_id, budget, "budget_update")
         return budget
@@ -191,17 +204,84 @@ class BudgetService:
     async def _notify_threshold(
         self, workspace: Workspace, user_id: UUID, budget: UsageBudget, status: str
     ) -> None:
+        """Warn once per budget per period, and warn the people who can act on it.
+
+        Notifying the run's launcher on *every* run produced a notification storm aimed at
+        someone who usually cannot change the limit. Recipients are the users
+        ``_assert_manage_access`` would admit for this scope (falling back to the launcher if
+        none resolve), and a recipient who already has a warning for this budget in the
+        current period is skipped.
+        """
         verb = "exceeded" if status == "over" else "near"
-        await NotificationService(self.session).create(
-            user_id=user_id,
-            workspace_id=workspace.id,
-            notification_type="budget_warning",
-            title=f"Usage budget {verb}",
-            message=(
-                f"The {budget.scope} {budget.period} usage budget is {status} "
-                f"(threshold {budget.threshold_percent}%)."
-            ),
+        title = f"Usage budget {verb}"
+        message = (
+            f"The {budget.scope} {budget.period} usage budget is {status} "
+            f"(threshold {budget.threshold_percent}%)."
         )
+        recipients = await self._threshold_recipients(workspace, budget) or {user_id}
+        period_start = self._period_start(budget.period, datetime.now(UTC))
+        service = NotificationService(self.session)
+        for recipient in sorted(recipients):
+            if await self._already_warned(recipient, workspace.id, title, period_start):
+                continue
+            await service.create(
+                user_id=recipient,
+                workspace_id=workspace.id,
+                notification_type="budget_warning",
+                title=title,
+                message=message,
+            )
+
+    async def _already_warned(
+        self,
+        user_id: UUID,
+        workspace_id: UUID,
+        title: str,
+        period_start: datetime | None,
+    ) -> bool:
+        stmt = select(Notification.id).where(
+            Notification.user_id == user_id,
+            Notification.workspace_id == workspace_id,
+            Notification.notification_type == "budget_warning",
+            Notification.title == title,
+        )
+        if period_start is not None:
+            stmt = stmt.where(Notification.created_at >= period_start)
+        result = await self.session.execute(stmt.limit(1))
+        return result.scalar_one_or_none() is not None
+
+    async def _threshold_recipients(
+        self, workspace: Workspace, budget: UsageBudget
+    ) -> set[UUID]:
+        """The users allowed to manage ``budget`` — i.e. who can actually raise the limit."""
+        if budget.scope == "workspace":
+            return {workspace.owner_id}
+        if budget.scope == "team":
+            team = await self.session.get(Team, budget.scope_id)
+            leads = await self._team_leads(budget.scope_id)
+            admins = (
+                await self._project_admins(team.project_id) if team is not None else set()
+            )
+            return leads | admins
+        if budget.scope == "project":
+            return await self._project_admins(budget.scope_id)
+        return set()
+
+    async def _team_leads(self, team_id: UUID) -> set[UUID]:
+        result = await self.session.execute(
+            select(TeamMember.user_id).where(
+                TeamMember.team_id == team_id, TeamMember.role == "lead"
+            )
+        )
+        return set(result.scalars().all())
+
+    async def _project_admins(self, project_id: UUID) -> set[UUID]:
+        result = await self.session.execute(
+            select(ProjectMember.user_id).where(
+                ProjectMember.project_id == project_id, ProjectMember.role == "admin"
+            )
+        )
+        return set(result.scalars().all())
 
     # ------------------------------------------------------------------
     # Usage + status helpers
@@ -246,12 +326,26 @@ class BudgetService:
         return Decimal(row[0]), int(row[1])
 
     @staticmethod
+    def _consumed_ratio(used: Decimal, limit: Decimal) -> Decimal:
+        """Fraction of ``limit`` consumed.
+
+        A limit of zero is a deliberate hard freeze ("spend nothing"), which the schema allows
+        (``Field(ge=0)``). Skipping it as un-ratio-able left such a budget permanently ``ok``,
+        so ``assert_within_budget`` never tripped and the intended hard stop meant unlimited
+        spend. Zero is therefore always at/over limit.
+        """
+        if limit <= 0:
+            return Decimal(1)
+        return used / limit
+
+    @staticmethod
     def _status(budget: UsageBudget, cost: Decimal, tokens: int) -> str:
+        ratio = BudgetService._consumed_ratio
         ratios: list[Decimal] = []
-        if budget.limit_cost is not None and budget.limit_cost > 0:
-            ratios.append(cost / budget.limit_cost)
-        if budget.limit_tokens is not None and budget.limit_tokens > 0:
-            ratios.append(Decimal(tokens) / Decimal(budget.limit_tokens))
+        if budget.limit_cost is not None:
+            ratios.append(ratio(cost, Decimal(budget.limit_cost)))
+        if budget.limit_tokens is not None:
+            ratios.append(ratio(Decimal(tokens), Decimal(budget.limit_tokens)))
         if not ratios:
             return "ok"
         peak = max(ratios)

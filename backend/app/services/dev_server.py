@@ -148,10 +148,16 @@ class DevServerService:
         if blocked is not None:
             return blocked
 
+        # Only one dev environment is live per sandbox, so preparing a different worktree
+        # first stops whatever is serving the old one — otherwise the setup's `ready` status
+        # and the still-running server describe two different worktrees at once.
+        if workspace.dev_worktree_id != worktree_id:
+            await self._stop_processes(workspace)
+
         try:
             await self.runtime.exec(
                 workspace,
-                self._setup_command(),
+                self._setup_command(uuid4().hex),
                 cwd=cwd,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
@@ -251,6 +257,14 @@ class DevServerService:
         if resolved.status == "starting" and await self._dev_process_alive(workspace):
             return await self._with_worktree(workspace, resolved)
 
+        # Any other "desired but down" status still has to be checked against reality: a
+        # stale status (a `setup` that finished after the server came up, a crashed status
+        # write) would otherwise start a second `mise run dev` while the first still holds
+        # the port. The live process always belongs to `dev_worktree_id`, which is the very
+        # worktree this method would relaunch in, so leaving it alone is correct.
+        if await self._dev_process_alive(workspace):
+            return await self._with_worktree(workspace, resolved)
+
         # Desired but down (stopped / idle / ready / dead-after-wake) → relaunch the
         # dev task in the worktree it was last running in; dependencies installed by
         # `setup`/a previous run persist on the sandbox disk.
@@ -294,13 +308,18 @@ class DevServerService:
         return DevServerState(status="stopped")
 
     async def _stop_processes(self, workspace: Workspace) -> None:
-        """Kill any running dev server without touching the desired flag or status file,
-        so a worktree switch can launch a fresh one. The generation guard in the run
-        script prevents the killed server from clobbering the new launch's status."""
+        """Kill any running dev server or in-flight setup without touching the desired flag
+        or status file, so a worktree switch can launch a fresh one. The generation guard in
+        the run/setup scripts prevents a killed script from clobbering the new launch's
+        status."""
         try:
             await self.runtime.exec(
                 workspace,
-                "pkill -f '[m]ise run dev' >/dev/null 2>&1 || true",
+                (
+                    "pkill -f '[m]ise run dev' >/dev/null 2>&1 || true; "
+                    "pkill -f '[m]ise install' >/dev/null 2>&1 || true; "
+                    "pkill -f '[m]ise run install' >/dev/null 2>&1 || true"
+                ),
                 cwd=workspace.workspace_path,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
@@ -395,10 +414,16 @@ class DevServerService:
             return DevServerState(status="stopped")
         return DevServerState(status="idle")
 
-    def _setup_command(self) -> str:
+    def _setup_command(self, gen: str) -> str:
         """Background script that prepares the environment — installs the mise
         toolchain and project dependencies — then stops at `ready`. It deliberately
-        does NOT run the `dev` task; that is the separate `run` phase."""
+        does NOT run the `dev` task; that is the separate `run` phase.
+
+        Guarded by the same generation token as `_run_command`: an in-flight setup that has
+        been superseded (a different worktree was set up, or a dev server was started) must
+        not write `installing`/`ready`/`error` over the newer launch's status. Unguarded, its
+        trailing `ready` write turned a *running* dev server into "desired but down", and the
+        next `ensure_running` poll started a second server on the same port."""
         install_line = ""
         if self.settings.mise_auto_install:
             install_line = (
@@ -416,14 +441,18 @@ class DevServerService:
             "set -x\n"
             'export PATH="$HOME/.local/bin:$PATH"\n'
             'export MISE_INSTALL_PATH="$HOME/.local/bin/mise"\n'
-            f"echo installing > {STATUS_PATH}\n"
+            # Claim this generation, then guard every status write against it.
+            f"echo {gen} > {GEN_PATH}\n"
+            f'setst() {{ [ "$(cat {GEN_PATH} 2>/dev/null)" = {gen} ] && '
+            f'echo "$1" > {STATUS_PATH}; }}\n'
+            "setst installing\n"
             f"{install_line}"
             'export PATH="$HOME/.local/bin:$PATH"\n'
             "command -v mise || "
-            f"{{ echo '[setup] mise not found on PATH'; echo error > {STATUS_PATH}; exit 127; }}\n"
+            "{ echo '[setup] mise not found on PATH'; setst error; exit 127; }\n"
             "mise trust || echo '[setup] mise trust failed (continuing)'\n"
             "mise install || "
-            f"{{ echo '[setup] mise install failed'; echo error > {STATUS_PATH}; exit 1; }}\n"
+            "{ echo '[setup] mise install failed'; setst error; exit 1; }\n"
             # mise installs language *tools* (node, pnpm, …) but not project
             # dependencies. If the repo defines an `install` task (e.g. `pnpm install`),
             # run it now so the app is ready to start — otherwise `mise run dev` would
@@ -431,10 +460,10 @@ class DevServerService:
             "if mise task ls 2>/dev/null | grep -qw install; then "
             "echo '[setup] installing project dependencies'; "
             "mise run install || "
-            f"{{ echo '[setup] dependency install failed'; echo error > {STATUS_PATH}; exit 1; }}; "
+            "{ echo '[setup] dependency install failed'; setst error; exit 1; }; "
             "fi\n"
             # Environment prepared — stop here. The app is started on demand via `run`.
-            f"echo '[setup] environment ready'; echo ready > {STATUS_PATH}\n"
+            "echo '[setup] environment ready'; setst ready\n"
         )
         return f"nohup sh -c {self._shell_quote(script)} >/dev/null 2>&1 &"
 

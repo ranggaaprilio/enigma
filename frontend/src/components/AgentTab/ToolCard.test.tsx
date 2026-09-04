@@ -395,20 +395,65 @@ describe("ToolCard", () => {
 // ---------------------------------------------------------------------------
 
 describe("ToolCard editing-tool dispatch", () => {
+  // `openhands_provider` writes the tool identifier as `metadata.tool` on both events —
+  // mirror that exactly here, so a rename of the metadata key fails the dispatch tests
+  // instead of silently degrading every rich tool view to the generic <pre> fallback.
   function paired(toolName: string, resultMeta: Record<string, unknown>, content = "") {
     const call = makeEvent({
       event_type: "tool_call",
       tool_call_id: "tc",
-      metadata: { tool_name: toolName },
+      metadata: { tool: toolName },
     });
     const result = makeEvent({
       event_type: "tool_result",
       tool_call_id: "tc",
       content,
-      metadata: resultMeta,
+      metadata: { tool: toolName, ...resultMeta },
     });
     return { toolCallId: "tc", call, result };
   }
+
+  it("dispatches on a result-only tool identifier", async () => {
+    const user = userEvent.setup();
+    const diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n";
+    const event = {
+      toolCallId: "tc",
+      call: makeEvent({ event_type: "tool_call", tool_call_id: "tc", metadata: {} }),
+      result: makeEvent({
+        event_type: "tool_result",
+        tool_call_id: "tc",
+        metadata: { tool: "git_diff", diff },
+      }),
+    };
+    render(<ToolCard event={event} />);
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("Diff")).toBeInTheDocument();
+  });
+
+  it("never dispatches off the content summary", async () => {
+    const user = userEvent.setup();
+    const event = {
+      toolCallId: "tc",
+      call: makeEvent({
+        event_type: "tool_call",
+        tool_call_id: "tc",
+        content: "git_status",
+        metadata: {},
+      }),
+      result: makeEvent({
+        event_type: "tool_result",
+        tool_call_id: "tc",
+        content: "some prose",
+        metadata: { branch: "feat", is_clean: true, files: [] },
+      }),
+    };
+    render(<ToolCard event={event} />);
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.queryByText("Status")).not.toBeInTheDocument();
+  });
 
   it("renders apply_patch result as a diff", async () => {
     const user = userEvent.setup();

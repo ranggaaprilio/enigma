@@ -497,44 +497,57 @@ class AgentService:
     async def _capture_baseline(
         self,
         workspace_id: UUID,
-        user_id: UUID,
         session: AsyncSession | None = None,
+        *,
+        worktree_path: str | None = None,
     ) -> list:
         session = session or self.session
         workspace = await session.get(Workspace, workspace_id)
         if workspace is None:
             return []
+        git_status = await self._read_git_status(session, workspace, worktree_path)
+        if git_status is None or not git_status.cloned:
+            return []
+        return git_status.files
+
+    async def _read_git_status(
+        self,
+        session: AsyncSession,
+        workspace: Workspace,
+        worktree_path: str | None,
+    ):
+        """Read git status for a run's working directory, or ``None`` if it cannot be read.
+
+        Always reads as ``workspace.owner_id``: ``RepositoryService`` is owner-scoped, while a
+        run's ``user_id`` may be any team member allowed to drive the workspace. Passing the
+        run's user here made every non-owner run's status lookup raise, which the caller then
+        swallowed — leaving the run with no recorded file changes at all.
+        """
         cipher = WorkspaceSecretCipher(self.settings.workspace_env_encryption_key)
         runtime = get_daytona_runtime()
         repo_service = RepositoryService(session, cipher, runtime)
         try:
-            git_status = await repo_service.status(workspace_id, user_id)
+            return await repo_service.status(
+                workspace.id, workspace.owner_id, worktree_path=worktree_path
+            )
         except Exception:
-            return []
-        if not git_status.cloned:
-            return []
-        return git_status.files
+            return None
 
     async def _compute_file_changes(
         self,
         workspace_id: UUID,
         baseline: list,
-        user_id: UUID,
         run_id: UUID,
         session: AsyncSession | None = None,
+        *,
+        worktree_path: str | None = None,
     ) -> list[AgentFileChange]:
         session = session or self.session
         workspace = await session.get(Workspace, workspace_id)
         if workspace is None:
             return []
-        cipher = WorkspaceSecretCipher(self.settings.workspace_env_encryption_key)
-        runtime = get_daytona_runtime()
-        repo_service = RepositoryService(session, cipher, runtime)
-        try:
-            current_status = await repo_service.status(workspace_id, user_id)
-        except Exception:
-            return []
-        if not current_status.cloned:
+        current_status = await self._read_git_status(session, workspace, worktree_path)
+        if current_status is None or not current_status.cloned:
             return []
         baseline_dict = {f.path: f.status for f in baseline}
         changes: list[AgentFileChange] = []
@@ -662,8 +675,11 @@ class AgentService:
                     allowed_commands=frozenset(self.settings.agent_command_allowlist),
                 )
 
+                # Read the baseline in the run's own working directory: a worktree-scoped run
+                # edits ``worktrees/<slug>/``, so statting the base clone would both miss every
+                # change the run makes and attribute pre-existing base-clone dirt to it.
                 baseline = await self._capture_baseline(
-                    workspace.id, workspace.owner_id, session
+                    workspace.id, session, worktree_path=working_dir
                 )
 
                 context = await self._build_session_context(session, run)
@@ -705,7 +721,9 @@ class AgentService:
 
                 await session.refresh(run)
                 if terminal_event_received:
-                    await self._record_run_finished(session, run, baseline)
+                    await self._record_run_finished(
+                        session, run, baseline, worktree_path=working_dir
+                    )
                 elif run.status in ACTIVE_RUN_STATUSES:
                     run.status = "stopped" if stop_event.is_set() else "completed"
                     run.completed_at = datetime.now(UTC)
@@ -718,7 +736,9 @@ class AgentService:
                         run.status,
                         {"status": run.status},
                     )
-                    await self._record_run_finished(session, run, baseline)
+                    await self._record_run_finished(
+                        session, run, baseline, worktree_path=working_dir
+                    )
             except asyncio.CancelledError:
                 await self._mark_stopped(run_id)
             except Exception as error:
@@ -771,7 +791,9 @@ class AgentService:
             run.completed_at = datetime.now(UTC)
             session.add(run)
             await session.flush()
-            await self._persist_event(session, run.id, "error", message, {})
+            await self._persist_event(
+                session, run.id, "error", message, {"status": "error"}
+            )
             await session.commit()
             await self._record_run_finished(session, run)
 
@@ -780,14 +802,16 @@ class AgentService:
         session: AsyncSession,
         run: AgentRun,
         baseline: list | None = None,
+        *,
+        worktree_path: str | None = None,
     ) -> None:
         if baseline is not None:
             await self._compute_file_changes(
                 run.workspace_id,
                 baseline,
-                run.user_id,
                 run.id,
                 session,
+                worktree_path=worktree_path,
             )
         self._apply_estimated_cost(run)
         session.add(run)

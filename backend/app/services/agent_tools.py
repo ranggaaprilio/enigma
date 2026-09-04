@@ -348,10 +348,23 @@ class WorkspaceTools:
 
     @staticmethod
     def _is_command_missing(result: Any) -> bool:
+        """Whether the search binary itself was absent, as opposed to simply not matching.
+
+        Keyed off exit code 127 — the only reliable signal. Sniffing output for "not found"
+        misfired constantly: ``DaytonaRuntime.exec`` returns *combined* output in ``stdout``,
+        so any repository containing the phrase (``detail="Workspace not found"``, say) looked
+        like a missing ripgrep. The correct hits were then thrown away and the search re-ran
+        as POSIX-BRE ``grep``, silently returning wrong or zero matches for any ERE/PCRE
+        pattern the agent had asked for.
+        """
         if getattr(result, "exit_code", 0) == 127:
             return True
-        haystack = f"{getattr(result, 'stdout', '')}\n{getattr(result, 'stderr', '')}".lower()
-        return "command not found" in haystack or "not found" in haystack
+        # Some shells report a missing binary on stderr without propagating 127; require the
+        # full phrase *and* an empty stdout so real match output is never mistaken for it.
+        if (getattr(result, "stdout", "") or "").strip():
+            return False
+        stderr = (getattr(result, "stderr", "") or "").lower()
+        return "command not found" in stderr or "no such file or directory" in stderr
 
     def _parse_search_output(self, output: str, bounded: int) -> SearchResult:
         prefix = self.root.rstrip("/") + "/"

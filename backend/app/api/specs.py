@@ -25,6 +25,7 @@ from app.services.agents import AgentConfigurationError, AgentRunAlreadyActiveEr
 from app.services.speckit import (
     InvalidArtifactPathError,
     InvalidSpecPhaseError,
+    SpecFeatureSlugConflictError,
     SpecGateError,
     SpecKitNotReadyError,
     SpecKitService,
@@ -72,6 +73,8 @@ def _map_spec_error(error: Exception) -> HTTPException:
         return HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid artifact path"
         )
+    if isinstance(error, SpecFeatureSlugConflictError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
     if isinstance(error, SpecGateError):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
     if isinstance(error, SpecPhaseNotReviewableError):

@@ -50,6 +50,11 @@ class SpecWorkflow(Base):
             f"status in ({_sql_in_list(SPEC_WORKFLOW_STATUSES)})",
             name="ck_spec_workflows_status",
         ),
+        # A workflow's slug is also its branch name and its ``specs/<slug>`` directory, so
+        # two workflows sharing one would silently write over each other on disk.
+        UniqueConstraint(
+            "workspace_id", "feature_slug", name="uq_spec_workflows_workspace_feature_slug"
+        ),
         Index("ix_spec_workflows_workspace_id", "workspace_id"),
         Index("ix_spec_workflows_status", "status"),
         Index("ix_spec_workflows_current_phase", "current_phase"),

@@ -58,12 +58,28 @@ function deriveStatus(
   return "running";
 }
 
-/** Extract a human-readable tool name from a tool_call event. */
+/** The tool identifier as written by the provider, or null when metadata carries none.
+ *
+ * `openhands_provider` writes `metadata.tool` on both the call and the result;
+ * `tool_name`/`name` are accepted for events persisted by other providers. Deliberately
+ * has no `content` fallback: that is the model's free-text summary, and letting it through
+ * made `renderToolBody`'s dispatch compare prose against tool names — so the diff, search
+ * and git-status views never rendered in production.
+ */
+function toolKey(event: AgentEventResponse | null): string | null {
+  const meta = event?.metadata ?? {};
+  for (const field of ["tool", "tool_name", "name"] as const) {
+    const value = meta[field];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
+
+/** Extract a human-readable tool name for the card header. */
 function toolName(call: AgentEventResponse | null): string {
   if (!call) return "Unknown tool";
-  const meta = call.metadata ?? {};
-  if (typeof meta.tool_name === "string") return meta.tool_name;
-  if (typeof meta.name === "string") return meta.name;
+  const key = toolKey(call);
+  if (key) return key;
   // Fallback: use content first line
   const firstLine = call.content.split("\n")[0]?.trim();
   return firstLine || "Tool call";
@@ -182,7 +198,7 @@ function BlockedCommandNotice({ message }: { message: string }) {
 
 /** Render the tool-specific result body, falling back to a generic <pre>. */
 function renderToolBody(
-  name: string,
+  name: string | null,
   result: AgentEventResponse | null,
   output: string | null,
 ): ReactNode {
@@ -240,6 +256,8 @@ export function ToolCard({ event, fileChanges, streamError }: ToolCardProps) {
   const [expanded, setExpanded] = useState(false);
   const status = deriveStatus(event, streamError);
   const name = toolName(event.call ?? event.result);
+  // Dispatch on the provider's own identifier, which may only be on the result event.
+  const key = toolKey(event.call) ?? toolKey(event.result);
   const args = toolArguments(event.call);
   const output = toolOutput(event.result);
   const code = exitCode(event.result);
@@ -301,7 +319,7 @@ export function ToolCard({ event, fileChanges, streamError }: ToolCardProps) {
               />
             </div>
           ) : (
-            renderToolBody(name, event.result, output)
+            renderToolBody(key, event.result, output)
           )}
 
           {/* Exit code */}

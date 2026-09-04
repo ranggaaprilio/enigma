@@ -21,6 +21,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.models import Workspace, WorkspaceWorktree
+from app.services.access import require_workspace_access
 from app.services.daytona_runtime import DaytonaRuntime
 from app.services.repositories import RepositoryNotClonedError, sanitize_git_output
 from app.services.workspaces import WorkspaceNotFoundError
@@ -123,7 +124,7 @@ class WorktreeService:
         rows = await self._list_rows(workspace_id)
         infos: list[WorktreeInfo] = []
         for row in rows:
-            present = row.is_base or row.path in on_disk
+            present = on_disk is not None and (row.is_base or row.path in on_disk)
             if present:
                 is_clean, ahead, behind = await self._stats(workspace, row)
             else:
@@ -295,6 +296,21 @@ class WorktreeService:
         await self._get_workspace(workspace_id, owner_id)
         return await self._get_row(workspace_id, worktree_id)
 
+    async def get_worktree_for_driver(
+        self, workspace_id: UUID, user_id: UUID, worktree_id: UUID
+    ) -> WorkspaceWorktree:
+        """Resolve a worktree for anyone allowed to *drive* the workspace, not just its owner.
+
+        Agent runs and session turns are open to team leads and members, so resolving their
+        target worktree through the owner-only :meth:`get_worktree` would 404 for exactly the
+        users the drive check just admitted. Read-only: it never creates or mutates a worktree,
+        so team access here does not widen the mutating worktree endpoints.
+        """
+        await require_workspace_access(
+            self.session, workspace_id, user_id, require_drive=True
+        )
+        return await self._get_row(workspace_id, worktree_id)
+
     # ----- helpers ------------------------------------------------------------------
 
     async def _stats(
@@ -309,29 +325,45 @@ class WorktreeService:
             is_clean = True
         ahead = behind = 0
         if not row.is_base:
-            try:
-                rev = await self.runtime.exec(
-                    workspace,
-                    "git rev-list --left-right --count "
-                    f"{shlex.quote(row.base_ref)}...HEAD",
-                    cwd=row.path,
-                    timeout=GIT_TIMEOUT_SECONDS,
-                )
-                if rev.exit_code == 0:
-                    parts = rev.stdout.split()
-                    if len(parts) == 2:
-                        behind, ahead = int(parts[0]), int(parts[1])
-            except Exception:
-                pass
+            # Count against ``origin/<base>`` — the ref ``sync_from_base`` actually merges and
+            # the one ``git fetch`` advances. A local ``main`` in the base clone is never moved
+            # by a fetch, so comparing to it would report ``behind == 0`` forever and the UI
+            # would never prompt for a sync. Fall back to the local ref when there is no
+            # remote-tracking branch yet (a base branch that has never been pushed).
+            for ref in (f"origin/{row.base_ref}", row.base_ref):
+                try:
+                    rev = await self.runtime.exec(
+                        workspace,
+                        "git rev-list --left-right --count "
+                        f"{shlex.quote(ref)}...HEAD",
+                        cwd=row.path,
+                        timeout=GIT_TIMEOUT_SECONDS,
+                    )
+                except Exception:
+                    continue
+                if rev.exit_code != 0:
+                    continue
+                parts = rev.stdout.split()
+                if len(parts) == 2:
+                    behind, ahead = int(parts[0]), int(parts[1])
+                    break
         return is_clean, ahead, behind
 
-    async def _on_disk_worktrees(self, workspace: Workspace) -> dict[str, str | None]:
-        """Return ``{relative_path: branch_or_None}`` for every worktree git knows about."""
+    async def _on_disk_worktrees(self, workspace: Workspace) -> dict[str, str | None] | None:
+        """Return ``{relative_path: branch_or_None}`` for every worktree git knows about.
+
+        Returns ``None`` — never an empty dict — when git could not be consulted at all (the
+        repository is not cloned yet, ``.git`` is missing or unreadable, the sandbox was
+        restored). Callers must not reconcile against ``None``: an empty listing is
+        indistinguishable from "every feature worktree was deleted" and would drop their DB
+        rows, permanently severing the ``ON DELETE SET NULL`` agent-run, pull-request and
+        preview-session associations that point at them.
+        """
         result = await self._run_git(
             workspace, ["worktree", "list", "--porcelain"], cwd=workspace.workspace_path
         )
         if result.exit_code != 0:
-            return {}
+            return None
         home = self.settings.daytona_sandbox_home.rstrip("/")
         entries: dict[str, str | None] = {}
         cur_path: str | None = None
@@ -355,8 +387,16 @@ class WorktreeService:
         flush()
         return entries
 
-    async def _reconcile(self, workspace: Workspace, on_disk: dict[str, str | None]) -> None:
-        """Adopt on-disk feature worktrees missing from the DB; drop DB rows gone from disk."""
+    async def _reconcile(
+        self, workspace: Workspace, on_disk: dict[str, str | None] | None
+    ) -> None:
+        """Adopt on-disk feature worktrees missing from the DB; drop DB rows gone from disk.
+
+        ``on_disk is None`` means git could not be listed, so nothing is known about disk —
+        reconciling would delete every feature row. Leave the DB untouched instead.
+        """
+        if on_disk is None:
+            return
         rows = await self._list_rows(workspace.id)
         known_paths = {row.path for row in rows}
         changed = False

@@ -1,3 +1,4 @@
+import asyncio
 import json
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
@@ -39,10 +40,13 @@ class PresenceService:
             "joined_at": datetime.now(UTC).isoformat(),
             **meta,
         }
-        await self.redis.hset(self._viewers_key(scope), connection_id, json.dumps(entry))
+        # Liveness key first: `list_viewers` reaps any hash entry without one, so writing
+        # the hash first opens a window in which a concurrent listing sees this connection
+        # as dead and deletes it — the viewer then never appears at all.
         await self.redis.setex(
             self._conn_key(connection_id), PRESENCE_CONNECTION_TTL_SECONDS, "1"
         )
+        await self.redis.hset(self._viewers_key(scope), connection_id, json.dumps(entry))
         return entry
 
     async def leave(self, scope: str, user_id: UUID, connection_id: str) -> bool:
@@ -53,7 +57,12 @@ class PresenceService:
         return not any(viewer.get("user_id") == str(user_id) for viewer in remaining)
 
     async def heartbeat(self, connection_id: str) -> None:
-        await self.redis.expire(self._conn_key(connection_id), PRESENCE_CONNECTION_TTL_SECONDS)
+        # SETEX, not EXPIRE: `EXPIRE` is a no-op on a missing key, so a connection whose
+        # liveness key had already lapsed (a slow tick, a Redis restart) could never come
+        # back — it stayed reapable forever while its WebSocket was still open.
+        await self.redis.setex(
+            self._conn_key(connection_id), PRESENCE_CONNECTION_TTL_SECONDS, "1"
+        )
 
     async def list_viewers(self, scope: str) -> list[dict]:
         raw = await self.redis.hgetall(self._viewers_key(scope))
@@ -78,9 +87,21 @@ class PresenceService:
     async def publish_event(self, scope: str, event: dict) -> None:
         await self.redis.publish(self._channel(scope), json.dumps(event))
 
-    async def subscribe(self, scope: str) -> AsyncIterator[dict]:
+    async def subscribe(
+        self, scope: str, *, ready: asyncio.Event | None = None
+    ) -> AsyncIterator[dict]:
+        """Yield events published to ``scope``.
+
+        ``ready`` is set once the channel subscription is established, so a caller can take
+        a consistent snapshot *after* it is guaranteed to receive deltas — otherwise every
+        join/leave between the snapshot and the subscription is lost. Messages that arrive
+        while the caller is still assembling its snapshot are buffered by the connection and
+        delivered in order once iteration begins.
+        """
         pubsub = self.redis.pubsub()
         await pubsub.subscribe(self._channel(scope))
+        if ready is not None:
+            ready.set()
         try:
             async for message in pubsub.listen():
                 if message.get("type") != "message":

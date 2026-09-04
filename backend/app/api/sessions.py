@@ -26,6 +26,7 @@ from app.services.agents import (
     AgentSessionArchivedError,
     AgentSessionNotFoundError,
 )
+from app.services.budgets import BudgetExceededError
 from app.services.daytona_runtime import get_daytona_runtime
 from app.services.workspaces import WorkspaceNotFoundError
 from app.services.worktrees import WorktreeNotFoundError, WorktreeService
@@ -216,7 +217,10 @@ async def update_agent_session(
             session_id,
             current_user.id,
             title=payload.title if "title" in fields else ...,
-            status=payload.status if "status" in fields else ...,
+            # `agent_sessions.status` is NOT NULL, and an explicit `{"status": null}` puts
+            # the field in `model_fields_set` with a None value — pass it through and the
+            # write fails at the database. An explicit null means "leave it alone".
+            status=payload.status if payload.status is not None else ...,
         )
     except WorkspaceNotFoundError:
         raise _workspace_not_found() from None
@@ -261,7 +265,7 @@ async def create_agent_session_turn(
     try:
         working_dir: str | None = None
         if payload.worktree_id is not None:
-            worktree = await worktree_service.get_worktree(
+            worktree = await worktree_service.get_worktree_for_driver(
                 workspace_id, current_user.id, payload.worktree_id
             )
             working_dir = worktree.path
@@ -293,6 +297,11 @@ async def create_agent_session_turn(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Workspace already has an active agent run",
+        ) from None
+    except BudgetExceededError as error:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=str(error),
         ) from None
     except AgentConfigurationError as error:
         raise HTTPException(

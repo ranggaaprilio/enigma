@@ -18,6 +18,9 @@ class Settings(BaseSettings):
     auth_cookie_name: str = "execute_session"
     auth_session_ttl_seconds: int = 60 * 60 * 24 * 7
     auth_cookie_secure: bool = False
+    # Bearer token required to scrape ``/metrics``. Unset leaves the endpoint open, which is
+    # only allowed in a local environment (see ``enforce_secure_defaults``).
+    metrics_token: str | None = None
     auth_login_rate_limit_attempts: int = 5
     auth_login_rate_limit_window_seconds: int = 60 * 15
     agent_run_rate_limit_attempts: int = 30
@@ -126,6 +129,10 @@ class Settings(BaseSettings):
             insecure.append("auth_secret_key")
         if self.workspace_env_encryption_key == _DEFAULT_ENV_ENCRYPTION_KEY:
             insecure.append("workspace_env_encryption_key")
+        # `/metrics` reports per-route request volumes and workspace-level counters; it must
+        # not be world-readable outside local development.
+        if not self.metrics_token:
+            insecure.append("metrics_token")
         if insecure:
             raise ValueError(
                 f"Insecure default secret(s) {insecure} are not allowed when "

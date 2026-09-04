@@ -19,7 +19,9 @@ import shlex
 from datetime import UTC, datetime
 from uuid import UUID
 
-from sqlalchemy import func, select
+import structlog
+from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -36,6 +38,8 @@ from app.services.repositories import (
     RepositoryService,
 )
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
+
+logger = structlog.get_logger(__name__)
 
 # Phases, in pipeline order.
 PHASE_ORDER = (
@@ -110,6 +114,10 @@ class InvalidArtifactPathError(SpecKitError):
 
 class SpecGateError(SpecKitError):
     """A phase cannot run because its prerequisite phases are not approved."""
+
+
+class SpecFeatureSlugConflictError(SpecKitError):
+    """Another workflow already owns this feature slug (branch + ``specs/`` directory)."""
 
 
 class SpecKitNotReadyError(SpecKitError):
@@ -201,6 +209,9 @@ class SpecKitService:
         self.session_maker = session_maker
         self.settings = settings
         self.runtime = runtime or get_daytona_runtime()
+        # Strong references to in-flight phase finalizers, so the event loop cannot
+        # garbage-collect a running task out from under a workflow.
+        self._finalizers: set[asyncio.Task] = set()
 
     # ----- public API ---------------------------------------------------------------
 
@@ -245,12 +256,11 @@ class SpecKitService:
         workspace = await self._get_workspace(workspace_id, user_id)
         first_phase = "specify" if await self._constitution_ratified(workspace) else "constitution"
 
-        count_result = await self.session.execute(
-            select(func.count())
-            .select_from(SpecWorkflow)
-            .where(SpecWorkflow.workspace_id == workspace_id)
-        )
-        number = (count_result.scalar_one() or 0) + 1
+        # Number from the highest slug already used, not from a row count: a deleted
+        # workflow would otherwise hand its number to the next feature, colliding on both
+        # the branch and the `specs/<slug>` directory. Concurrent starts are caught by the
+        # unique constraint on (workspace_id, feature_slug) below.
+        number = await self._next_feature_number(workspace_id)
         slug = f"{number:03d}-{_slugify(feature_name)}"
 
         workflow = SpecWorkflow(
@@ -266,10 +276,19 @@ class SpecKitService:
             current_phase=first_phase,
         )
         self.session.add(workflow)
-        await self.session.flush()
-        for phase_name in PHASE_ORDER:
-            self.session.add(SpecPhase(workflow_id=workflow.id, phase=phase_name, status="pending"))
-        await self.session.commit()
+        try:
+            await self.session.flush()
+            for phase_name in PHASE_ORDER:
+                self.session.add(
+                    SpecPhase(workflow_id=workflow.id, phase=phase_name, status="pending")
+                )
+            await self.session.commit()
+        except IntegrityError as error:
+            # Two concurrent starts raced for the same slug; the loser retries with a name.
+            await self.session.rollback()
+            raise SpecFeatureSlugConflictError(
+                f"A workflow for '{slug}' already exists in this workspace"
+            ) from error
         await self.session.refresh(workflow)
 
         await AuditLogService(self.session).record(
@@ -285,6 +304,20 @@ class SpecKitService:
         # first; ``_finalize_phase`` then auto-chains ``specify`` once the constitution completes.
         await self.run_phase(workspace_id, workflow.id, first_phase, user_id)
         return await self.get_workflow(workspace_id, workflow.id, user_id)
+
+    async def _next_feature_number(self, workspace_id: UUID) -> int:
+        """One past the highest ``NNN-`` prefix already used in this workspace."""
+        result = await self.session.execute(
+            select(SpecWorkflow.feature_slug).where(
+                SpecWorkflow.workspace_id == workspace_id
+            )
+        )
+        highest = 0
+        for slug in result.scalars().all():
+            prefix = slug.split("-", 1)[0]
+            if prefix.isdigit():
+                highest = max(highest, int(prefix))
+        return highest + 1
 
     async def run_phase(
         self,
@@ -332,8 +365,14 @@ class SpecKitService:
         await self.session.commit()
         await self.session.refresh(phase)
 
-        # Finalize off-request once the agent run reaches a terminal state.
-        asyncio.create_task(self._finalize_phase(workflow_id, phase_name, run.id, user_id))
+        # Finalize off-request once the agent run reaches a terminal state. The task is
+        # retained until it finishes; a bare `create_task` reference can be collected
+        # mid-flight, silently abandoning the phase in `running`.
+        task = asyncio.create_task(
+            self._finalize_phase(workflow_id, phase_name, run.id, user_id)
+        )
+        self._finalizers.add(task)
+        task.add_done_callback(self._finalizers.discard)
         return phase
 
     async def approve_phase(
@@ -724,6 +763,68 @@ class SpecKitService:
     # ----- finalizer ----------------------------------------------------------------
 
     async def _finalize_phase(
+        self,
+        workflow_id: UUID,
+        phase_name: str,
+        run_id: UUID,
+        user_id: UUID,
+    ) -> None:
+        """Fire-and-forget finalizer wrapper: never let an exception escape.
+
+        ``_finalize_phase_inner`` commits the phase artifact before writing any status, so a
+        real failure there (``git commit`` blocked by an index lock, a hook or a missing
+        identity; a Daytona error) used to propagate out of a discarded task. The only trace
+        was an "exception never retrieved" warning while ``phase.status`` and
+        ``workflow.status`` stayed ``running`` — the UI then spun forever with no error and no
+        notification. Record the failure the same way a non-completed run does instead.
+        """
+        try:
+            await self._finalize_phase_inner(workflow_id, phase_name, run_id, user_id)
+        except Exception as error:  # noqa: BLE001 - last line of defence for a bare task
+            logger.exception(
+                "spec_phase_finalize_failed",
+                workflow_id=str(workflow_id),
+                phase=phase_name,
+                run_id=str(run_id),
+            )
+            await self._mark_phase_failed(workflow_id, phase_name, user_id, str(error))
+
+    async def _mark_phase_failed(
+        self,
+        workflow_id: UUID,
+        phase_name: str,
+        user_id: UUID,
+        detail: str,
+    ) -> None:
+        """Put a phase (and its workflow) into ``error`` and tell the user why."""
+        try:
+            async with self.session_maker() as session:
+                workflow = await session.get(SpecWorkflow, workflow_id)
+                phase = await self._load_phase(session, workflow_id, phase_name)
+                if workflow is None or phase is None:
+                    return
+                phase.status = "error"
+                workflow.status = "error"
+                session.add_all([phase, workflow])
+                await session.commit()
+                await self._notify_and_audit(
+                    session,
+                    workspace_id=workflow.workspace_id,
+                    user_id=user_id,
+                    action="spec_phase_error",
+                    phase=phase,
+                    notification_type="spec_phase_error",
+                    title="Spec phase failed",
+                    message=f"The '{phase_name}' phase could not be finalized: {detail}",
+                )
+        except Exception:  # noqa: BLE001 - nothing left to escalate to
+            logger.exception(
+                "spec_phase_error_record_failed",
+                workflow_id=str(workflow_id),
+                phase=phase_name,
+            )
+
+    async def _finalize_phase_inner(
         self,
         workflow_id: UUID,
         phase_name: str,

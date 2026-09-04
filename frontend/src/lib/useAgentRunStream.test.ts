@@ -148,6 +148,21 @@ describe("useAgentRunStream", () => {
     expect(onTerminal).toHaveBeenCalledWith("error");
   });
 
+  it("treats a bare error event as terminal", () => {
+    // The backend's crash path persists `event_type: "error"` with empty metadata and no
+    // status frame; without this the turn hangs on "Running" and the socket never closes.
+    stubWebSocket();
+    const onTerminal = vi.fn();
+    const { result } = renderHook(() => useAgentRunStream(WS, RUN, { onTerminal }));
+    act(() => latestSocket().onopen?.());
+    act(() => latestSocket().emit({ event_type: "error", content: "boom", metadata: {} }));
+
+    expect(onTerminal).toHaveBeenCalledTimes(1);
+    expect(onTerminal).toHaveBeenCalledWith("error");
+    expect(result.current.runStatus).toBe("error");
+    expect(result.current.agentError).toBe("boom");
+  });
+
   it("reconnects up to 3 times then reports disconnected", () => {
     vi.useFakeTimers();
     stubWebSocket();

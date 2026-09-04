@@ -1359,7 +1359,7 @@ class TestFileChangeComputation:
 
         service = AgentService(session, session_maker, Settings())
 
-        async def mock_status(self, workspace_id, owner_id):
+        async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(
                 cloned=True,
                 branch="main",
@@ -1375,7 +1375,7 @@ class TestFileChangeComputation:
             mock_status,
         )
 
-        baseline = await service._capture_baseline(workspace.id, workspace.owner_id, session)
+        baseline = await service._capture_baseline(workspace.id, session)
         assert len(baseline) == 2
         assert baseline[0].path == "a.py"
         assert baseline[1].path == "b.py"
@@ -1412,7 +1412,7 @@ class TestFileChangeComputation:
 
         service = AgentService(session, session_maker, Settings())
 
-        async def mock_status(self, workspace_id, owner_id):
+        async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(cloned=False, branch=None, is_clean=True, files=[])
 
         monkeypatch.setattr(
@@ -1420,7 +1420,7 @@ class TestFileChangeComputation:
             mock_status,
         )
 
-        baseline = await service._capture_baseline(workspace.id, workspace.owner_id, session)
+        baseline = await service._capture_baseline(workspace.id, session)
         assert baseline == []
 
     async def test_compute_file_changes_returns_diff(self, db_session, monkeypatch):
@@ -1468,7 +1468,7 @@ class TestFileChangeComputation:
 
         baseline = [GitFileStatus(path="a.py", status="Added")]
 
-        async def mock_status(self, workspace_id, owner_id):
+        async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(
                 cloned=True,
                 branch="main",
@@ -1486,7 +1486,7 @@ class TestFileChangeComputation:
         )
 
         changes = await service._compute_file_changes(
-            workspace.id, baseline, workspace.owner_id, run.id, session
+            workspace.id, baseline, run.id, session
         )
         paths = {c.path for c in changes}
         assert "b.py" in paths
@@ -1538,7 +1538,7 @@ class TestFileChangeComputation:
 
         baseline = []
 
-        async def mock_status(self, workspace_id, owner_id):
+        async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(
                 cloned=True,
                 branch="main",
@@ -1554,7 +1554,7 @@ class TestFileChangeComputation:
         )
 
         changes = await service._compute_file_changes(
-            workspace.id, baseline, workspace.owner_id, run.id, session
+            workspace.id, baseline, run.id, session
         )
         assert len(changes) == 1
         assert changes[0].path == "old.py -> new.py"
@@ -1896,7 +1896,7 @@ class TestAgentRunLifecycle:
 
         try:
 
-            async def mock_status(self, workspace_id, owner_id):
+            async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
                 return GitStatus(cloned=False, branch=None, is_clean=True, files=[])
 
             monkeypatch.setattr(
@@ -1906,7 +1906,7 @@ class TestAgentRunLifecycle:
 
             service = AgentService(session, session_maker, Settings())
 
-            baseline = await service._capture_baseline(workspace.id, workspace.owner_id, session)
+            baseline = await service._capture_baseline(workspace.id, session)
             assert baseline == []
 
             run = AgentRun(
@@ -1921,7 +1921,7 @@ class TestAgentRunLifecycle:
             await session.flush()
 
             changes = await service._compute_file_changes(
-                workspace.id, baseline, workspace.owner_id, run.id, session
+                workspace.id, baseline, run.id, session
             )
             assert changes == []
         finally:

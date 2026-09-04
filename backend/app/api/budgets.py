@@ -119,6 +119,11 @@ async def update_budget(
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail=str(error)
         ) from None
+    except BudgetConflictError:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A budget for this scope and period already exists",
+        ) from None
     except ValueError as error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)

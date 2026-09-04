@@ -1,4 +1,4 @@
-import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -64,6 +64,10 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
   // Non-null while a freshly-started run should be streamed; drives the reconnecting socket.
   const [streamingRunId, setStreamingRunId] = useState<string | null>(null);
   const stopStreamRef = useRef<() => void>(() => {});
+  // Read inside stream callbacks (which are not re-created per render) to tell whether the
+  // run being streamed is still the one on screen.
+  const activeRunIdRef = useRef<string | null>(null);
+  activeRunIdRef.current = activeRun?.id ?? null;
 
   const { can } = usePermissions();
   const canRunCommand = can("command.run");
@@ -73,7 +77,11 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
     () => commands.find((command) => command.id === selectedCommandId) ?? null,
     [commands, selectedCommandId],
   );
-  const visibleOutput = activeRun?.status === "running" ? streamOutput : activeRun?.output ?? "";
+  // The live buffer belongs to `streamingRunId` alone. Keying off `status === "running"`
+  // instead showed it under any selected run that happened to be running (an orphan from a
+  // previous session, say), attributing one run's output to another.
+  const visibleOutput =
+    activeRun && activeRun.id === streamingRunId ? streamOutput : activeRun?.output ?? "";
 
   useEffect(() => {
     setStreamingRunId(null);
@@ -224,11 +232,28 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
 
   const streamUrl = streamingRunId ? getCommandRunStreamUrl(workspace.id, streamingRunId) : null;
 
+  // Every stream write is addressed to the run the socket belongs to. Selecting an older
+  // run from the history reassigns `activeRun` while the socket stays open, so an
+  // unconditional update appended live chunks to that historical run and overwrote its
+  // recorded status/exit code with the live result.
+  const updateStreamingRun = useCallback(
+    (updater: (run: CommandRunResponse) => CommandRunResponse) => {
+      setActiveRun((current) =>
+        current && current.id === streamingRunId ? updater(current) : current,
+      );
+    },
+    [streamingRunId],
+  );
+
   const { connectionState, stopReconnect } = useReconnectingWebSocket(streamUrl, {
     onBeforeConnect: () => {
-      // Backend replays the run's full output on every (re)connect; reset to avoid duplicates.
-      setStreamOutput("");
-      setActiveRun((current) => (current ? { ...current, output: "" } : current));
+      // Backend replays the run's full output on every (re)connect; reset to avoid
+      // duplicates. Only ever blank the streaming run — a reconnect must not wipe the
+      // output of a finished run the user has selected in the meantime.
+      if (activeRunIdRef.current === streamingRunId) {
+        setStreamOutput("");
+      }
+      updateStreamingRun((run) => ({ ...run, output: "" }));
     },
     onMessage: (message) => {
       let payload: CommandRunStreamMessage;
@@ -238,22 +263,21 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
         return; // ignore malformed / keepalive frames
       }
       if (payload.type === "output") {
-        setStreamOutput((current) => `${current}${payload.content}`);
-        setActiveRun((current) =>
-          current ? { ...current, output: `${current.output}${payload.content}` } : current,
-        );
+        if (activeRunIdRef.current === streamingRunId) {
+          setStreamOutput((current) => `${current}${payload.content}`);
+        }
+        updateStreamingRun((run) => ({
+          ...run,
+          output: `${run.output}${payload.content}`,
+        }));
         return;
       }
-      setActiveRun((current) =>
-        current
-          ? {
-              ...current,
-              status: payload.status,
-              exit_code: payload.exit_code,
-              completed_at: payload.status === "running" ? null : new Date().toISOString(),
-            }
-          : current,
-      );
+      updateStreamingRun((run) => ({
+        ...run,
+        status: payload.status,
+        exit_code: payload.exit_code,
+        completed_at: payload.status === "running" ? null : new Date().toISOString(),
+      }));
       setRuns((current) =>
         current.map((item) =>
           item.id === streamingRunId
@@ -428,10 +452,9 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                           : "border-line hover:border-ink/45"
                       }`}
                       type="button"
-                      onClick={() => {
-                        setActiveRun(run);
-                        setStreamOutput(run.output);
-                      }}
+                      // Selecting a run only changes what is displayed; the live buffer is
+                      // left intact so switching back to a still-streaming run resumes it.
+                      onClick={() => setActiveRun(run)}
                     >
                       <div className="flex items-center justify-between gap-2">
                         <span className="capitalize">{run.status}</span>

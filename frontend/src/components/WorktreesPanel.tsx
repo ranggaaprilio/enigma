@@ -16,7 +16,11 @@ import {
   type WorkspaceResponse,
   type WorktreeResponse,
 } from "../lib/api";
-import { type ActiveWorktree, useActiveWorktree } from "../lib/activeWorktree";
+import {
+  type ActiveWorktree,
+  reconcileActiveWorktree,
+  useActiveWorktree,
+} from "../lib/activeWorktree";
 import { detectProvider, prNoun, providerHost, providerLabel } from "../lib/gitProviders";
 import { CommentThread } from "./comments/CommentThread";
 
@@ -67,6 +71,9 @@ export function WorktreesPanel({
         ]);
         setWorktrees(trees);
         setPullRequests(prs);
+        // This is the authoritative list, so use it to drop a selection (in localStorage,
+        // possibly written by another tab) that points at a worktree that is now gone.
+        reconcileActiveWorktree(workspace.id, trees);
         setState({ status: "ready" });
       } catch (caughtError) {
         if (caughtError instanceof DOMException && caughtError.name === "AbortError") return;
@@ -87,11 +94,13 @@ export function WorktreesPanel({
 
   const featureWorktrees = worktrees.filter((tree) => !tree.is_base);
 
-  // Default the PR source to the active (or first feature) worktree once data arrives.
+  // Default the PR source to the active (or first feature) worktree once data arrives, and
+  // re-default it whenever the chosen source disappears — otherwise a removed worktree
+  // stayed selected and "Open PR" targeted a branch that no longer has a checkout.
   useEffect(() => {
-    if (prWorktreeId) return;
+    if (prWorktreeId && featureWorktrees.some((tree) => tree.id === prWorktreeId)) return;
     const fallback = active?.id ?? featureWorktrees[0]?.id ?? "";
-    if (fallback) setPrWorktreeId(fallback);
+    if (fallback !== prWorktreeId) setPrWorktreeId(fallback);
   }, [active?.id, featureWorktrees, prWorktreeId]);
 
   async function runAction(name: string, action: () => Promise<string>) {

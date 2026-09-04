@@ -23,10 +23,16 @@ async def _register_attempt(key: str, window_seconds: int) -> int:
     """
     redis = get_redis_client()
     try:
-        attempts = await redis.incr(key)
-        if attempts == 1:
-            await redis.expire(key, window_seconds)
-        return attempts
+        # One round trip, one transaction. Incrementing and then expiring as separate
+        # commands leaves a TTL-less counter behind if the process dies (or the connection
+        # drops) in between — the key then never resets and the caller is 429'd forever.
+        # `EXPIRE ... NX` sets the window only when the key has no TTL yet, so a sustained
+        # burst cannot keep pushing the window out either.
+        async with redis.pipeline(transaction=True) as pipe:
+            pipe.incr(key)
+            pipe.expire(key, window_seconds, nx=True)
+            attempts, _ = await pipe.execute()
+        return int(attempts)
     finally:
         await redis.aclose()
 

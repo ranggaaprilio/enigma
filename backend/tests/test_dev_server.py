@@ -203,7 +203,7 @@ async def test_setup_installs_deps_without_running_dev():
     assert "mise run install" in launch  # project deps are installed during setup
     assert "mise.run" in launch  # auto-install of the mise binary
     assert "mise run dev" not in launch  # setup must NOT run the app
-    assert "echo ready" in launch  # ends prepared-but-not-running
+    assert "setst ready" in launch  # prepared-but-not-running, generation-guarded
     # Setup alone must not mark the dev server as desired (no auto-resume on wake).
     assert not workspace.dev_autostart
 

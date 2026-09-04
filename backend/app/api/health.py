@@ -32,8 +32,12 @@ async def check_database() -> str:
 
 async def check_redis() -> str:
     redis = get_redis_client()
-    await redis.ping()
-    await redis.aclose()
+    try:
+        await redis.ping()
+    finally:
+        # Always close: the caller swallows the exception and probes again, so an
+        # unclosed client on the failure path leaks a connection pool per failed probe.
+        await redis.aclose()
     return "ok"
 
 

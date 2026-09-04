@@ -45,8 +45,9 @@ function isTerminal(status: string | undefined): status is AgentRunStatus {
  * - Clears `events` on every (re)connect, because the backend replays all persisted events on
  *   connect — clearing avoids duplicating them.
  * - Ignores `{ type: "ping" }` keepalive frames.
- * - Detects terminal status from a `status` frame's content OR `metadata.status`, fires
- *   `onTerminal` exactly once, and stops reconnecting.
+ * - Detects terminal status from a `status` frame's content, `metadata.status`, or an
+ *   `error` event (the backend's crash path emits one with neither), fires `onTerminal`
+ *   exactly once, and stops reconnecting.
  * - Otherwise reconnects with backoff up to 3 attempts on unexpected drops.
  *
  * The hook is intentionally "dumb" about persistence: when a run finishes, the caller's
@@ -109,11 +110,16 @@ export function useAgentRunStream(
 
     const statusValue = message.event_type === "status" ? message.content : undefined;
     const metadataStatus = message.metadata?.status as string | undefined;
+    // An `error` event *is* terminal, whatever its metadata says. The backend's crash path
+    // persists one with no status frame, so keying only off status left `onTerminal`
+    // unfired: the turn stayed on "Running", the composer stayed in stop-mode, and the
+    // socket kept pinging forever.
+    const errorIsTerminal = message.event_type === "error" ? "error" : undefined;
     const terminal = isTerminal(statusValue)
       ? statusValue
       : isTerminal(metadataStatus)
         ? metadataStatus
-        : undefined;
+        : (errorIsTerminal as AgentRunStatus | undefined);
     if (terminal && !runDoneRef.current) {
       runDoneRef.current = true;
       setRunStatus(terminal);

@@ -257,6 +257,14 @@ class RepositoryService:
 
         Usable before a remote is connected (the wizard shows the public key first) — the
         provider is then a best guess from ``repo_url`` and is corrected by ``connect``.
+
+        Making a key available never switches a working HTTPS+token workspace over to SSH.
+        Doing so used to drop the (encrypted, unrecoverable) token *and* leave an ``https://``
+        remote paired with ``ssh_key`` auth, so every later fetch/pull/push went through
+        ``_run_ssh_git`` and failed. SSH only becomes the active mode when the remote can
+        actually be reached over it — an SSH URL, or no remote yet (the wizard's key-first
+        flow). Switching an existing HTTPS workspace is ``connect``'s job; it re-parses the
+        URL and enforces the URL/auth pairing.
         """
         workspace = await self._get_workspace(workspace_id, owner_id)
         credential = await self._load_credential(workspace.id)
@@ -274,9 +282,10 @@ class RepositoryService:
         )
         if needs_key:
             self._assign_keypair(credential, workspace.id)
-        credential.auth_type = "ssh_key"
-        credential.encrypted_token = None
-        credential.username = None
+        if self._ssh_reachable(workspace.repo_url):
+            credential.auth_type = "ssh_key"
+            credential.encrypted_token = None
+            credential.username = None
         self.session.add(credential)
         await self.session.commit()
         await self.session.refresh(credential)
@@ -288,6 +297,21 @@ class RepositoryService:
         if credential is None:
             raise RepositoryCredentialNotFoundError
         return credential
+
+    @staticmethod
+    def _ssh_reachable(repo_url: str | None) -> bool:
+        """Whether ``repo_url`` is one SSH auth can actually be used against.
+
+        An unset remote counts: the connect wizard shows the deploy key before a URL is
+        entered, and ``connect`` settles the pairing afterwards.
+        """
+        if not repo_url:
+            return True
+        try:
+            parse_repository_url(repo_url, auth_type="ssh_key")
+        except InvalidRepositoryUrlError:
+            return False
+        return True
 
     def _assign_keypair(self, credential: RepositoryCredential, workspace_id: UUID) -> None:
         pair = generate_ed25519_keypair(f"enigma-workspace-{workspace_id}")

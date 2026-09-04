@@ -26,6 +26,33 @@ export function getActiveWorktree(workspaceId: string): ActiveWorktree | null {
   }
 }
 
+/**
+ * Drop the stored selection if it names a worktree that no longer exists.
+ *
+ * The id is only a localStorage string, so it outlives the worktree it points at — removed
+ * in another tab, or gone with a re-provisioned sandbox. Every panel keyed off it
+ * (files, terminal, preview, agent, repository) then sends `worktree_id=<deleted>` and
+ * 404s dashboard-wide with nothing to explain it. `known` is the authoritative list from
+ * `listWorktrees`; an empty list is treated as "nothing known yet" and left alone.
+ */
+export function reconcileActiveWorktree(
+  workspaceId: string,
+  known: readonly { id: string; branch: string; is_base?: boolean }[],
+): void {
+  if (known.length === 0) return;
+  const current = getActiveWorktree(workspaceId);
+  if (!current) return;
+  const match = known.find((tree) => tree.id === current.id);
+  if (match === undefined) {
+    setActiveWorktree(workspaceId, null);
+    return;
+  }
+  // Keep the branch label honest too — a worktree can be recreated on a different branch.
+  if (match.branch !== current.branch) {
+    setActiveWorktree(workspaceId, { id: match.id, branch: match.branch });
+  }
+}
+
 export function setActiveWorktree(workspaceId: string, value: ActiveWorktree | null): void {
   try {
     if (value) {

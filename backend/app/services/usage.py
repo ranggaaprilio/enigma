@@ -14,6 +14,9 @@ from app.schemas.usage import (
 )
 
 TOP_SPENDERS_LIMIT = 5
+# Shown for breakdown rows with no grouping dimension — runs in workspaces that belong to
+# no team, which `_totals` counts and so the breakdown must too.
+UNGROUPED_LABEL = "Unassigned workspaces"
 
 
 class UsageAccessError(Exception):
@@ -188,6 +191,7 @@ class SqlAlchemyUsageService:
     async def _breakdown(
         self, scope, scope_id, workspace_filter, time_filter
     ) -> tuple[str, list[UsageBreakdownItem]]:
+        # Note: rows whose grouping dimension is NULL are labelled `UNGROUPED_LABEL`.
         count = func.count(AgentRun.id)
         tokens = func.coalesce(func.sum(AgentRun.tokens_used), 0)
         cost = func.coalesce(func.sum(AgentRun.estimated_cost), 0)
@@ -219,11 +223,14 @@ class SqlAlchemyUsageService:
             )
         else:
             dimension = "project"
+            # Outer joins: a workspace with no team (personal, un-assigned) still shows up
+            # in `_totals`, so inner-joining Team/Project here silently dropped its runs and
+            # the breakdown never summed to the totals it sits next to.
             stmt = (
                 select(Project.id, Project.name, count, tokens, cost)
                 .join(Workspace, Workspace.id == AgentRun.workspace_id)
-                .join(Team, Team.id == Workspace.team_id)
-                .join(Project, Project.id == Team.project_id)
+                .join(Team, Team.id == Workspace.team_id, isouter=True)
+                .join(Project, Project.id == Team.project_id, isouter=True)
                 .where(time_filter, workspace_filter)
                 .group_by(Project.id, Project.name)
             )
@@ -233,7 +240,8 @@ class SqlAlchemyUsageService:
         items = [
             UsageBreakdownItem(
                 id=row[0],
-                name=str(row[1]),
+                # The outer-joined project row is NULL for team-less workspaces.
+                name=str(row[1]) if row[1] is not None else UNGROUPED_LABEL,
                 run_count=int(row[2]),
                 tokens_used=int(row[3]),
                 estimated_cost=float(row[4]),

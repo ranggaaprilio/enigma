@@ -68,7 +68,12 @@ export function AgentTab({ workspaceId }: AgentTabProps) {
     setError(null);
     listAgentSessions(workspaceId, undefined, PAGE_SIZE, offset)
       .then((data) => {
-        setSessions((prev) => [...prev, ...data]);
+        // `offset` is kept in step with create/delete below, but belt-and-braces: drop any
+        // row already on screen so a shifted window can never produce duplicate React keys.
+        setSessions((prev) => {
+          const seen = new Set(prev.map((s) => s.id));
+          return [...prev, ...data.filter((s) => !seen.has(s.id))];
+        });
         setOffset((prev) => prev + data.length);
         setHasMore(data.length === PAGE_SIZE);
       })
@@ -87,6 +92,9 @@ export function AgentTab({ workspaceId }: AgentTabProps) {
     try {
       const session = await createAgentSession(workspaceId);
       setSessions((prev) => [session, ...prev]);
+      // A new session is prepended server-side too, shifting every loaded row down one.
+      // Without this the next page re-fetches a row already on screen (duplicate keys).
+      setOffset((prev) => prev + 1);
       setSelectedSessionId(session.id);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to create session");
@@ -117,6 +125,8 @@ export function AgentTab({ workspaceId }: AgentTabProps) {
       if (!workspaceId) return;
       try {
         await deleteAgentSession(workspaceId, sessionId);
+        // Rows shift up one server-side; without this the next page skips a session.
+        setOffset((prev) => Math.max(0, prev - 1));
         setSessions((prev) => {
           const next = prev.filter((s) => s.id !== sessionId);
           setSelectedSessionId((current) =>

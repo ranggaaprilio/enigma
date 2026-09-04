@@ -18,6 +18,8 @@ router = APIRouter(prefix="/workspaces/{workspace_id}/presence", tags=["presence
 # Refresh the connection's TTL well before it expires, so a brief scheduling delay
 # never lets an active viewer's presence entry lapse.
 PRESENCE_HEARTBEAT_INTERVAL_SECONDS = PRESENCE_CONNECTION_TTL_SECONDS / 3
+# How long to wait for the pub/sub subscription before snapshotting anyway.
+PRESENCE_SUBSCRIBE_TIMEOUT_SECONDS = 5
 
 
 @router.websocket("/stream")
@@ -43,15 +45,16 @@ async def stream_presence(websocket: WebSocket, workspace_id: UUID) -> None:
     presence = PresenceService(redis)
 
     try:
-        entry = await presence.join(scope, user.id, connection_id, meta)
-        # Publish the full viewer entry so subscribers get the same shape as a snapshot row.
-        await presence.publish_event(scope, {"type": "join", **entry})
-
-        viewers = await presence.list_viewers(scope)
-        await websocket.send_json({"type": "snapshot", "viewers": viewers})
+        # Subscribe *before* snapshotting, and hold delivery until the snapshot is on the
+        # wire. Snapshotting first left a gap in which another viewer's join/leave was
+        # published to nobody, so this client's list stayed wrong until it reconnected;
+        # delivering deltas first would let a stale snapshot overwrite them.
+        subscribed = asyncio.Event()
+        snapshot_sent = asyncio.Event()
 
         async def relay() -> None:
-            async for event in presence.subscribe(scope):
+            async for event in presence.subscribe(scope, ready=subscribed):
+                await snapshot_sent.wait()
                 await websocket.send_json(event)
 
         async def heartbeat_loop() -> None:
@@ -60,18 +63,41 @@ async def stream_presence(websocket: WebSocket, workspace_id: UUID) -> None:
                 await presence.heartbeat(connection_id)
 
         relay_task = asyncio.create_task(relay())
-        heartbeat_task = asyncio.create_task(heartbeat_loop())
+        heartbeat_task: asyncio.Task | None = None
+        joined = False
         try:
-            while True:
-                await websocket.receive_text()
-        except WebSocketDisconnect:
-            pass
+            try:
+                await asyncio.wait_for(
+                    subscribed.wait(), timeout=PRESENCE_SUBSCRIBE_TIMEOUT_SECONDS
+                )
+            except TimeoutError:
+                # Degraded but usable: the snapshot below is still correct, only the delta
+                # stream may have missed the moments before it came up.
+                pass
+
+            entry = await presence.join(scope, user.id, connection_id, meta)
+            joined = True
+            # Publish the full viewer entry so subscribers get the same shape as a
+            # snapshot row.
+            await presence.publish_event(scope, {"type": "join", **entry})
+
+            viewers = await presence.list_viewers(scope)
+            await websocket.send_json({"type": "snapshot", "viewers": viewers})
+            snapshot_sent.set()
+
+            heartbeat_task = asyncio.create_task(heartbeat_loop())
+            try:
+                while True:
+                    await websocket.receive_text()
+            except WebSocketDisconnect:
+                pass
         finally:
             relay_task.cancel()
-            heartbeat_task.cancel()
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
             # Only announce a departure once the user's last connection is gone, so a
             # second tab closing does not remove a viewer who is still watching.
-            if await presence.leave(scope, user.id, connection_id):
+            if joined and await presence.leave(scope, user.id, connection_id):
                 await presence.publish_event(
                     scope, {"type": "leave", "user_id": str(user.id), **meta}
                 )

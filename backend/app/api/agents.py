@@ -183,7 +183,7 @@ async def create_agent_run(
     try:
         working_dir: str | None = None
         if payload.worktree_id is not None:
-            worktree = await worktree_service.get_worktree(
+            worktree = await worktree_service.get_worktree_for_driver(
                 workspace_id, current_user.id, payload.worktree_id
             )
             working_dir = worktree.path
