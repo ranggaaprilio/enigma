@@ -12,10 +12,12 @@ import {
   removeWorktree,
   syncWorktree,
   type PullRequestResponse,
+  type RepositoryCredentialResponse,
   type WorkspaceResponse,
   type WorktreeResponse,
 } from "../lib/api";
 import { type ActiveWorktree, useActiveWorktree } from "../lib/activeWorktree";
+import { detectProvider, prNoun, providerHost, providerLabel } from "../lib/gitProviders";
 import { CommentThread } from "./comments/CommentThread";
 
 type LoadState =
@@ -23,7 +25,19 @@ type LoadState =
   | { status: "ready" }
   | { status: "error"; message: string };
 
-export function WorktreesPanel({ workspace }: { workspace: WorkspaceResponse }) {
+export function WorktreesPanel({
+  workspace,
+  credential,
+}: {
+  workspace: WorkspaceResponse;
+  /** The workspace's git credential; `undefined`/`null` = unknown, keep the GitHub defaults. */
+  credential?: RepositoryCredentialResponse | null;
+}) {
+  const provider = credential?.provider ?? detectProvider(workspace.repo_url ?? "");
+  const noun = prNoun(provider);
+  const nounTitle = noun.charAt(0).toUpperCase() + noun.slice(1);
+  // Provider-native pull requests are only available for GitHub + token credentials.
+  const prSupported = credential?.supports_pull_requests !== false;
   const [worktrees, setWorktrees] = useState<WorktreeResponse[]>([]);
   const [pullRequests, setPullRequests] = useState<PullRequestResponse[]>([]);
   const [expandedPrIds, setExpandedPrIds] = useState<Set<string>>(new Set());
@@ -166,7 +180,7 @@ export function WorktreesPanel({ workspace }: { workspace: WorkspaceResponse }) 
       return;
     }
     if (!prTitle.trim()) {
-      setError("Enter a pull request title.");
+      setError(`Enter a ${noun} title.`);
       return;
     }
     await runAction("open-pr", async () => {
@@ -179,7 +193,7 @@ export function WorktreesPanel({ workspace }: { workspace: WorkspaceResponse }) 
       });
       setPrTitle("");
       setPrBody("");
-      return `Pull request #${pr.number} opened.`;
+      return `${nounTitle} #${pr.number} opened.`;
     });
   }
 
@@ -321,8 +335,17 @@ export function WorktreesPanel({ workspace }: { workspace: WorkspaceResponse }) 
       </div>
 
       <div className="space-y-4">
+        {!prSupported ? (
+          <div className="rounded-md border border-dashed border-line bg-canvas p-4 text-sm text-body">
+            <h3 className="text-base font-semibold text-ink">{nounTitle}s</h3>
+            <p className="mt-2">
+              {nounTitle}s for {providerLabel(provider)} are not supported yet. Push the branch and
+              open it on {providerHost(provider, workspace.repo_url)}.
+            </p>
+          </div>
+        ) : (
         <div className="rounded-md border border-line bg-white p-5 shadow-soft">
-          <h3 className="text-base font-semibold">Open pull request</h3>
+          <h3 className="text-base font-semibold">Open {noun}</h3>
           <form className="mt-3 space-y-3" onSubmit={handleOpenPr}>
             <label className="block text-sm">
               <span className="mb-1 block text-ink/65">Source worktree</span>
@@ -371,22 +394,23 @@ export function WorktreesPanel({ workspace }: { workspace: WorkspaceResponse }) 
                 checked={prDraft}
                 onChange={(event) => setPrDraft(event.target.checked)}
               />
-              Draft pull request
+              Draft {noun}
             </label>
             <button
               className="w-full rounded-md bg-primary px-4 py-2 text-sm font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
               type="submit"
               disabled={busy === "open-pr" || featureWorktrees.length === 0}
             >
-              {busy === "open-pr" ? "Opening…" : "Open pull request"}
+              {busy === "open-pr" ? "Opening…" : `Open ${noun}`}
             </button>
           </form>
         </div>
+        )}
 
         <div className="rounded-md border border-line bg-white p-5 shadow-soft">
-          <h3 className="text-base font-semibold">Pull requests</h3>
+          <h3 className="text-base font-semibold">{nounTitle}s</h3>
           {pullRequests.length === 0 ? (
-            <p className="mt-3 text-sm text-ink/60">No pull requests opened from this workspace yet.</p>
+            <p className="mt-3 text-sm text-ink/60">No {noun}s opened from this workspace yet.</p>
           ) : (
             <ul className="mt-3 space-y-2">
               {pullRequests.map((pr) => (

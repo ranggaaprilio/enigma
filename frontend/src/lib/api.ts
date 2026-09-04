@@ -73,12 +73,50 @@ export type AuditLogResponse = {
   created_at: string;
 };
 
+/** Where a workspace's repository came from. Template/blank workspaces have no remote yet. */
+export type WorkspaceSource = "repository" | "template" | "blank";
+export type GitProvider = "github" | "gitlab" | "bitbucket" | "generic";
+/** `auto` lets the backend detect the provider from the URL host. */
+export type GitProviderChoice = GitProvider | "auto";
+export type RepositoryAuthType = "personal_access_token" | "ssh_key";
+
+export type WorkspaceTemplateResponse = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  source_repo_url: string;
+  default_branch: string;
+  icon: string | null;
+  tags: string[];
+  preview_port: number | null;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+};
+
+/** Public view of a workspace's git credential — never contains the token or private key. */
+export type RepositoryCredentialResponse = {
+  provider: GitProvider;
+  auth_type: RepositoryAuthType;
+  username: string | null;
+  /** Present for `ssh_key` credentials: add it as a deploy key with write access on the host. */
+  public_key: string | null;
+  supports_pull_requests: boolean;
+  repo_url: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type WorkspaceResponse = {
   id: string;
   owner_id: string;
   name: string;
   slug: string;
-  repo_url: string;
+  /** `null` for template/blank workspaces until a remote is connected. */
+  repo_url: string | null;
+  source?: WorkspaceSource;
+  template_id?: string | null;
   default_branch: string;
   runtime: string;
   sandbox_id: string | null;
@@ -105,12 +143,17 @@ export type WorkspaceStatusResponse = Pick<
 
 export type WorkspaceCreatePayload = {
   name: string;
-  repo_url: string;
+  /** Required when `source` is `repository`; omit for `template` and `blank`. */
+  repo_url?: string;
+  source?: WorkspaceSource;
+  template_id?: string;
   default_branch?: string;
   snapshot?: string | null;
 };
 
-export type WorkspaceUpdatePayload = Partial<WorkspaceCreatePayload>;
+export type WorkspaceUpdatePayload = Partial<
+  Pick<WorkspaceCreatePayload, "name" | "repo_url" | "default_branch" | "snapshot">
+>;
 
 export type WorkspaceEnvVarResponse = {
   id: string;
@@ -127,7 +170,12 @@ export type WorkspaceEnvVarPayload = {
 
 export type RepositoryConnectPayload = {
   repo_url: string;
-  token: string;
+  provider?: GitProviderChoice;
+  auth_type: RepositoryAuthType;
+  /** Required for `personal_access_token`; must be omitted for `ssh_key`. */
+  token?: string;
+  /** Optional basic-auth username override (Bitbucket app passwords, generic hosts). */
+  username?: string;
 };
 
 export type RepositoryFileStatus = {
@@ -703,6 +751,29 @@ export function connectRepository(
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+export function getRepositoryCredential(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<RepositoryCredentialResponse> {
+  return requestJson<RepositoryCredentialResponse>(`/workspaces/${workspaceId}/repo/credential`, {
+    signal,
+  });
+}
+
+export function ensureRepositorySshKey(
+  workspaceId: string,
+  rotate = false,
+): Promise<RepositoryCredentialResponse> {
+  return requestJson<RepositoryCredentialResponse>(`/workspaces/${workspaceId}/repo/ssh-key`, {
+    method: "POST",
+    body: JSON.stringify({ rotate }),
+  });
+}
+
+export function listWorkspaceTemplates(signal?: AbortSignal): Promise<WorkspaceTemplateResponse[]> {
+  return requestJson<WorkspaceTemplateResponse[]>("/workspace-templates", { signal });
 }
 
 export function cloneRepository(workspaceId: string): Promise<RepositoryOperationResponse> {

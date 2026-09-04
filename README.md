@@ -28,9 +28,9 @@ The workspace dashboard exposes each capability as a surface (tab):
 | Surface | What it does |
 |---|---|
 | **Overview & Settings** | Create the workspace, view sandbox status, manage encrypted per-workspace environment variables. |
-| **Repository** | Connect a GitHub repo with a personal access token (PAT), clone, view `git status`/diff per file, commit, pull, push. |
+| **Repository** | Create a workspace from a template, blank, or an existing repo on GitHub, GitLab, Bitbucket, or any git host; authenticate with an access token or a server-generated SSH deploy key; clone, view `git status`/diff per file, commit, pull, push. |
 | **Worktrees** | Create one git worktree per feature branch inside the sandbox so several branches live side-by-side; commit/push and track ahead/behind counts per worktree. |
-| **Pull Requests** | Open and list GitHub pull requests from a worktree branch via the GitHub REST API (cached locally). |
+| **Pull Requests** | Open and list GitHub pull requests from a worktree branch via the GitHub REST API (cached locally). Other providers: push the branch and open the MR/PR on the host. |
 | **Spec (SDD)** | Run the GitHub Spec Kit pipeline (`constitution → specify → clarify → plan → analyze → tasks → implement`) with human review gates between phases. |
 | **Agents** | Run an AI coding agent against the sandbox; stream thinking/tool-call events live over WebSocket, review the files it changed, and stop a run mid-flight. |
 | **Editor** | Launch `code-server` (VS Code in the browser) bound to the workspace. |
@@ -181,8 +181,10 @@ Key points:
   are reconciled on every list (adopt new ones, drop removed ones).
 - **Push-ready branches.** Each feature worktree is configured with `push.autoSetupRemote=true` and
   `push.default=current`, so the first credentialed push creates and tracks the remote branch.
-- **GitHub HTTPS only.** Repo URLs are validated to `https://github.com/<owner>/<repo>`; auth uses
-  `x-access-token` + the stored PAT.
+- **Multi-provider git.** Repo URLs (HTTPS or SSH) are validated and canonicalised per provider in
+  `services/git_providers.py`; token auth rides on a per-command HTTP basic header with the
+  provider's username (`x-access-token` / `oauth2` / `x-token-auth`), SSH auth uses a
+  server-generated deploy key materialised in the sandbox only for the duration of a command.
 - **Pull requests** are created from a worktree's branch into the default branch via the GitHub REST
   API and cached in the `pull_requests` table for listing.
 - **Spec-Driven Development** commits each phase's artifact to the feature branch
@@ -229,7 +231,8 @@ Key points:
 1. Log in and create a **Project**.
 2. Inside the project, create one or more **Teams**.
 3. Inside a team, create a **Workspace** — this provisions a Daytona sandbox.
-4. On the **Repository** tab, connect a GitHub repo with a PAT and click **Clone**.
+4. On the **Repository** tab, connect a repository (token or SSH deploy key) and click **Clone** —
+   or create the workspace from a template / blank and connect a remote later.
 5. Use the workspace surfaces: run the **Agent** or the **Spec** pipeline, branch in **Worktrees**,
    open a **Terminal** or **Editor**, watch the **Preview**, then **commit / push** and open a
    **Pull Request**.

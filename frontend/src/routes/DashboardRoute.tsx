@@ -13,9 +13,19 @@ import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import { WorktreesPanel } from "../components/WorktreesPanel";
 import { ConfirmModal } from "../components/ui/ConfirmModal";
+import { TextInput } from "../components/ui/TextInput";
 import { BudgetConfig } from "../components/usage/BudgetConfig";
 import { UsagePanel } from "../components/usage/UsagePanel";
+import { CreateWorkspaceWizard } from "../components/workspace/CreateWorkspaceWizard";
+import { ProviderAuthSelector } from "../components/workspace/ProviderAuthSelector";
 import { useActiveWorktree } from "../lib/activeWorktree";
+import {
+  PROVIDER_HELP,
+  authTypeLabel,
+  providerLabel,
+  resolveProvider,
+} from "../lib/gitProviders";
+import { useRepositoryCredential } from "../lib/useRepositoryCredential";
 import {
   ApiError,
   cloneRepository,
@@ -44,8 +54,11 @@ import {
   upsertWorkspaceEnvVar,
   type AuditLogResponse,
   type GitCommitResponse,
+  type GitProviderChoice,
   type HealthResponse,
+  type RepositoryAuthType,
   type RepositoryCommitDetailResponse,
+  type RepositoryCredentialResponse,
   type RepositoryStatusResponse,
   type WorkspaceEnvVarResponse,
   type WorkspaceResponse,
@@ -263,15 +276,7 @@ export function DashboardView({ view }: { view: DashboardViewId }) {
   const workspace = workspaceState.workspace;
 
   if (view === "repository") {
-    return (
-      <>
-        <RepositoryPanel
-          workspace={workspace}
-          onWorkspaceChanged={onWorkspaceChanged}
-        />
-        <WorktreesPanel workspace={workspace} />
-      </>
-    );
+    return <RepositoryView workspace={workspace} onWorkspaceChanged={onWorkspaceChanged} />;
   }
 
   if (view === "files") {
@@ -537,76 +542,47 @@ function ErrorState({ message }: { message: string }) {
 }
 
 function CreateWorkspacePanel({ onCreated }: { onCreated: (workspace: WorkspaceResponse) => void }) {
-  const [name, setName] = useState("");
-  const [repoUrl, setRepoUrl] = useState("");
-  const [defaultBranch, setDefaultBranch] = useState("main");
-  const [snapshot, setSnapshot] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setError(null);
-
-    if (!name.trim() || !repoUrl.trim() || !defaultBranch.trim()) {
-      setError("Enter a workspace name, repository URL, and default branch.");
-      return;
-    }
-
-    setIsSubmitting(true);
-    try {
-      const workspace = await createWorkspace({
-        name,
-        repo_url: repoUrl,
-        default_branch: defaultBranch,
-        snapshot: snapshot.trim() || null,
-      });
-      onCreated(workspace);
-    } catch (caughtError) {
-      setError(
-        caughtError instanceof ApiError ? caughtError.message : "Unable to create workspace.",
-      );
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
+  const [open, setOpen] = useState(false);
 
   return (
-    <form className="space-y-4" onSubmit={handleSubmit}>
+    <div className="space-y-4">
       <div className="rounded-md border border-dashed border-line bg-white p-5 text-ink/72">
-        No workspace has been created yet.
+        No workspace has been created yet. Start from a template, begin blank, or connect an
+        existing repository on GitHub, GitLab, Bitbucket, or any git host.
       </div>
-
-      <div className="grid gap-4 md:grid-cols-2">
-        <TextInput label="Workspace name" value={name} onChange={setName} />
-        <TextInput label="Default branch" value={defaultBranch} onChange={setDefaultBranch} />
-      </div>
-      <TextInput label="Repository URL" value={repoUrl} onChange={setRepoUrl} />
-      <TextInput
-        label="Daytona snapshot (optional)"
-        value={snapshot}
-        onChange={setSnapshot}
-      />
-
-      {error && <ErrorState message={error} />}
-
       <button
-        className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
-        type="submit"
-        disabled={isSubmitting}
+        className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active"
+        type="button"
+        onClick={() => setOpen(true)}
       >
-        {isSubmitting ? "Creating..." : "Create workspace"}
+        Create workspace
       </button>
-    </form>
+      <CreateWorkspaceWizard
+        open={open}
+        onClose={() => setOpen(false)}
+        createFn={createWorkspace}
+        onCreated={(workspace) => {
+          setOpen(false);
+          onCreated(workspace);
+        }}
+      />
+    </div>
   );
+}
+
+function sourceLabel(workspace: WorkspaceResponse): string {
+  if (workspace.source === "template") return "template";
+  if (workspace.source === "blank") return "blank";
+  return "repository";
 }
 
 function WorkspaceOverview({ workspace }: { workspace: WorkspaceResponse }) {
   return (
     <div className="space-y-4">
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-4">
         <Metric label="Status" value={workspace.status} />
         <Metric label="Branch" value={workspace.default_branch} />
+        <Metric label="Source" value={sourceLabel(workspace)} />
         <Metric label="Slug" value={workspace.slug} />
       </div>
 
@@ -659,15 +635,47 @@ function formatCommitTime(iso: string): string {
   return new Date(iso).toLocaleDateString();
 }
 
-function RepositoryPanel({
+function RepositoryView({
   workspace,
   onWorkspaceChanged,
 }: {
   workspace: WorkspaceResponse;
   onWorkspaceChanged: (workspace: WorkspaceResponse) => void;
 }) {
-  const [repoUrl, setRepoUrl] = useState(workspace.repo_url);
+  // One credential fetch shared by both panels: the connection card shows it, the worktrees
+  // panel uses it to decide whether provider-native pull requests are available.
+  const { credential, refresh } = useRepositoryCredential(workspace.id, workspace.repo_url);
+  return (
+    <>
+      <RepositoryPanel
+        workspace={workspace}
+        credential={credential}
+        onCredentialChanged={() => void refresh()}
+        onWorkspaceChanged={onWorkspaceChanged}
+      />
+      <WorktreesPanel workspace={workspace} credential={credential} />
+    </>
+  );
+}
+
+function RepositoryPanel({
+  workspace,
+  credential,
+  onCredentialChanged,
+  onWorkspaceChanged,
+}: {
+  workspace: WorkspaceResponse;
+  credential: RepositoryCredentialResponse | null;
+  onCredentialChanged: () => void;
+  onWorkspaceChanged: (workspace: WorkspaceResponse) => void;
+}) {
+  const [repoUrl, setRepoUrl] = useState(workspace.repo_url ?? "");
   const [token, setToken] = useState("");
+  const [username, setUsername] = useState("");
+  const [provider, setProvider] = useState<GitProviderChoice>("auto");
+  const [authType, setAuthType] = useState<RepositoryAuthType>("personal_access_token");
+  const [showConnectForm, setShowConnectForm] = useState(false);
+  const [copyLabel, setCopyLabel] = useState("Copy");
   const [commitMessage, setCommitMessage] = useState("");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [diff, setDiff] = useState("");
@@ -691,7 +699,7 @@ function RepositoryPanel({
   const [pendingDiscard, setPendingDiscard] = useState<{ path: string | null } | null>(null);
 
   useEffect(() => {
-    setRepoUrl(workspace.repo_url);
+    setRepoUrl(workspace.repo_url ?? "");
   }, [workspace.repo_url]);
 
   const loadRepositoryStatus = useCallback(
@@ -816,21 +824,50 @@ function RepositoryPanel({
     }
   }
 
+  const resolvedProvider = resolveProvider(repoUrl, provider);
+  const providerHelp = PROVIDER_HELP[resolvedProvider];
+  const connectFormVisible = credential === null || showConnectForm;
+
   async function handleConnect(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!repoUrl.trim() || !token.trim()) {
-      setError("Enter a GitHub repository URL and personal access token.");
+    if (!repoUrl.trim()) {
+      setError("Enter a repository URL.");
       return;
+    }
+    if (authType === "personal_access_token") {
+      if (!token.trim()) {
+        setError(`Enter your ${providerHelp.tokenLabel.toLowerCase()}.`);
+        return;
+      }
+      if (providerHelp.requiresUsername && !username.trim()) {
+        setError("Enter your username.");
+        return;
+      }
     }
     await runAction("connect", async () => {
       const updated = await connectRepository(workspace.id, {
         repo_url: repoUrl,
-        token,
+        provider,
+        auth_type: authType,
+        ...(authType === "personal_access_token"
+          ? { token, ...(username.trim() ? { username: username.trim() } : {}) }
+          : {}),
       });
       onWorkspaceChanged(updated);
+      onCredentialChanged();
       setToken("");
-      return "Repository credentials saved.";
+      setShowConnectForm(false);
+      return authType === "ssh_key"
+        ? "Deploy key ready. Add the public key on your git host, then clone."
+        : "Repository credentials saved.";
     });
+  }
+
+  async function copyPublicKey() {
+    if (!credential?.public_key) return;
+    await navigator.clipboard?.writeText(credential.public_key);
+    setCopyLabel("Copied");
+    window.setTimeout(() => setCopyLabel("Copy"), 1200);
   }
 
   async function handleDiscard(path: string | null) {
@@ -870,26 +907,95 @@ function RepositoryPanel({
             <h3 className="mt-1 text-base font-semibold">Connection</h3>
           </div>
           <span className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-ink/65">
-            {statusData?.cloned ? statusData.branch ?? "Detached" : "Not cloned"}
+            {statusData?.cloned
+              ? statusData.branch ?? "Detached"
+              : workspace.repo_url
+                ? "Not cloned"
+                : "No remote"}
           </span>
         </div>
 
-        <form className="mt-4 space-y-3" onSubmit={handleConnect}>
-          <TextInput label="GitHub repository URL" value={repoUrl} onChange={setRepoUrl} />
-          <TextInput label="Personal access token" type="password" value={token} onChange={setToken} />
-          <button
-            className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
-            type="submit"
-            disabled={busyAction === "connect"}
-          >
-            {busyAction === "connect" ? "Saving..." : "Connect repository"}
-          </button>
-        </form>
+        {!workspace.repo_url && credential === null && (
+          <div className="mt-4 rounded-md border border-dashed border-line bg-canvas p-4 text-sm text-body">
+            <p className="font-semibold text-ink">Connect a remote</p>
+            <p className="mt-1">
+              This workspace was {workspace.source === "template" ? "created from a template" : "started blank"}.
+              Add a remote below to push, pull, and open pull requests.
+            </p>
+          </div>
+        )}
+
+        {credential && (
+          <div className="mt-4 rounded-md border border-line bg-canvas p-4 text-sm">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded-full bg-line px-2 py-0.5 text-xs font-semibold text-ink">
+                {providerLabel(credential.provider)}
+              </span>
+              <span className="text-body">{authTypeLabel(credential.auth_type)}</span>
+              {credential.username && (
+                <span className="font-mono text-xs text-muted">as {credential.username}</span>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowConnectForm((value) => !value)}
+                className="ml-auto text-xs font-medium text-primary hover:underline"
+              >
+                {showConnectForm ? "Cancel" : "Change credentials"}
+              </button>
+            </div>
+            {credential.public_key && (
+              <div className="mt-3">
+                <p className="text-xs text-body">{PROVIDER_HELP[credential.provider].sshHelp}</p>
+                <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-md bg-white p-2 font-mono text-xs text-ink">
+                  {credential.public_key}
+                </pre>
+                <button
+                  type="button"
+                  onClick={() => void copyPublicKey()}
+                  className="mt-2 rounded-md border border-line bg-white px-3 py-1 text-xs font-semibold text-ink hover:bg-panel"
+                >
+                  {copyLabel}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {connectFormVisible && (
+          <form className="mt-4 space-y-3" onSubmit={handleConnect}>
+            <TextInput
+              label="Repository URL"
+              value={repoUrl}
+              onChange={setRepoUrl}
+              placeholder={providerHelp.urlPlaceholder}
+              mono
+            />
+            <ProviderAuthSelector
+              repoUrl={repoUrl}
+              provider={provider}
+              onProviderChange={setProvider}
+              authType={authType}
+              onAuthTypeChange={setAuthType}
+              token={token}
+              onTokenChange={setToken}
+              username={username}
+              onUsernameChange={setUsername}
+              disabled={busyAction === "connect"}
+            />
+            <button
+              className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
+              type="submit"
+              disabled={busyAction === "connect"}
+            >
+              {busyAction === "connect" ? "Saving..." : "Connect repository"}
+            </button>
+          </form>
+        )}
 
         <div className="mt-5 grid grid-cols-2 gap-2">
           <RepoActionButton
             label="Clone"
-            disabled={busyAction !== null || statusData?.cloned === true}
+            disabled={busyAction !== null || statusData?.cloned === true || !workspace.repo_url}
             onClick={() =>
               void runAction("clone", async () => {
                 const response = await cloneRepository(workspace.id);
@@ -1224,7 +1330,7 @@ function WorkspaceMetadataForm({
   onWorkspaceChanged: (workspace: WorkspaceResponse) => void;
 }) {
   const [name, setName] = useState(workspace.name);
-  const [repoUrl, setRepoUrl] = useState(workspace.repo_url);
+  const [repoUrl, setRepoUrl] = useState(workspace.repo_url ?? "");
   const [defaultBranch, setDefaultBranch] = useState(workspace.default_branch);
   const [snapshot, setSnapshot] = useState(workspace.snapshot ?? "");
   const [message, setMessage] = useState<string | null>(null);
@@ -1233,7 +1339,7 @@ function WorkspaceMetadataForm({
 
   useEffect(() => {
     setName(workspace.name);
-    setRepoUrl(workspace.repo_url);
+    setRepoUrl(workspace.repo_url ?? "");
     setDefaultBranch(workspace.default_branch);
     setSnapshot(workspace.snapshot ?? "");
   }, [workspace]);
@@ -1245,11 +1351,12 @@ function WorkspaceMetadataForm({
     setIsSubmitting(true);
 
     try {
+      // Blank/template workspaces have no remote; sending "" would be rejected, so omit it.
       const updated = await updateWorkspace(workspace.id, {
         name,
-        repo_url: repoUrl,
         default_branch: defaultBranch,
         snapshot: snapshot.trim() || null,
+        ...(repoUrl.trim() ? { repo_url: repoUrl.trim() } : {}),
       });
       onWorkspaceChanged(updated);
       setMessage("Workspace settings saved.");
@@ -1268,7 +1375,12 @@ function WorkspaceMetadataForm({
         <TextInput label="Default branch" value={defaultBranch} onChange={setDefaultBranch} />
       </div>
       <div className="mt-4">
-        <TextInput label="Repository URL" value={repoUrl} onChange={setRepoUrl} />
+        <TextInput
+          label="Repository URL (optional)"
+          value={repoUrl}
+          onChange={setRepoUrl}
+          hint="Connecting credentials from the Repository tab also sets this."
+        />
       </div>
       <div className="mt-4">
         <TextInput
@@ -1397,29 +1509,5 @@ function Metric({ label, value }: { label: string; value: string }) {
       <p className="text-sm text-ink/60">{label}</p>
       <p className="mt-2 break-words text-xl font-semibold capitalize">{value}</p>
     </div>
-  );
-}
-
-function TextInput({
-  label,
-  value,
-  onChange,
-  type = "text",
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  type?: "text" | "password";
-}) {
-  return (
-    <label className="block text-sm font-medium">
-      {label}
-      <input
-        className="mt-2 w-full rounded-md border border-line bg-white px-3 py-2 outline-none transition focus:border-ink"
-        type={type}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </label>
   );
 }

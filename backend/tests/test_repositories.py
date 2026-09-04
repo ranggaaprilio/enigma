@@ -12,6 +12,7 @@ from app.core.security import hash_password
 from app.main import app
 from app.models import User, Workspace
 from app.services.repositories import (
+    GitAuth,
     GitCommandError,
     GitCommit,
     GitCommitDetail,
@@ -25,9 +26,11 @@ from app.services.repositories import (
     RepositoryPathError,
     RepositoryService,
     parse_porcelain_status,
+    sanitize_git_output,
     sanitize_repository_url,
     validate_commit_sha,
 )
+from app.services.ssh_keys import generate_ed25519_keypair
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
@@ -76,6 +79,9 @@ class FakeRepositoryService:
         self.workspace = workspace
         self.cipher = cipher
         self.encrypted_token: str | None = None
+        self.credential: SimpleNamespace | None = None
+        self.auth_type: str | None = None
+        self.username: str | None = None
         self.status_response = GitStatus(
             cloned=True,
             branch="main",
@@ -91,13 +97,60 @@ class FakeRepositoryService:
         workspace_id: UUID,
         owner_id: UUID,
         repo_url: str,
-        token: str,
+        *,
+        provider: str = "auto",
+        auth_type: str = "personal_access_token",
+        token: str | None = None,
+        username: str | None = None,
     ) -> Workspace:
         self._ensure_workspace(workspace_id, owner_id)
-        self.workspace.repo_url = sanitize_repository_url(repo_url)
-        self.encrypted_token = self.cipher.encrypt(token)
+        self.workspace.repo_url = sanitize_repository_url(
+            repo_url, provider=provider, auth_type=auth_type
+        )
+        self.auth_type = auth_type
+        self.username = username
+        if auth_type == "ssh_key":
+            self.encrypted_token = None
+            if self.credential is None or self.credential.auth_type != "ssh_key":
+                self._new_ssh_credential()
+        else:
+            self.encrypted_token = self.cipher.encrypt(token or "")
+            self.credential = SimpleNamespace(
+                provider=provider if provider != "auto" else "github",
+                auth_type="personal_access_token",
+                username=username,
+                public_key=None,
+                encrypted_private_key=None,
+                created_at=datetime.now(UTC),
+                updated_at=datetime.now(UTC),
+            )
         self.calls.append("connect")
         return self.workspace
+
+    async def get_credential(self, workspace_id: UUID, owner_id: UUID):
+        self._ensure_workspace(workspace_id, owner_id)
+        if self.credential is None:
+            raise RepositoryCredentialNotFoundError
+        return self.credential
+
+    async def ensure_ssh_key(self, workspace_id: UUID, owner_id: UUID, *, rotate: bool = False):
+        self._ensure_workspace(workspace_id, owner_id)
+        if rotate or self.credential is None or self.credential.auth_type != "ssh_key":
+            self._new_ssh_credential()
+        self.calls.append(f"ssh_key:{rotate}")
+        return self.credential
+
+    def _new_ssh_credential(self) -> None:
+        pair = generate_ed25519_keypair("enigma-test")
+        self.credential = SimpleNamespace(
+            provider="github",
+            auth_type="ssh_key",
+            username=None,
+            public_key=pair.public_key,
+            encrypted_private_key=self.cipher.encrypt(pair.private_key),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
 
     async def clone(self, workspace_id: UUID, owner_id: UUID) -> None:
         self._ensure_operation("clone", workspace_id, owner_id)
@@ -228,17 +281,80 @@ async def test_connect_sanitizes_url_encrypts_token_and_never_returns_token(repo
     assert repo_service.cipher.decrypt(repo_service.encrypted_token or "") == "raw-secret-token"
 
 
-async def test_connect_rejects_non_github_urls(repository_context):
+async def test_connect_accepts_gitlab_and_rejects_http_and_mismatched_auth(repository_context):
+    _user, workspace, repo_service = repository_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        gitlab = await client.post(
+            f"/workspaces/{workspace.id}/repo/connect",
+            json={"repo_url": "https://gitlab.com/example/demo", "token": "glpat-secret"},
+        )
+        http = await client.post(
+            f"/workspaces/{workspace.id}/repo/connect",
+            json={"repo_url": "http://gitlab.com/example/demo", "token": "glpat-secret"},
+        )
+        ssh_with_https = await client.post(
+            f"/workspaces/{workspace.id}/repo/connect",
+            json={"repo_url": "https://gitlab.com/example/demo", "auth_type": "ssh_key"},
+        )
+
+    assert gitlab.status_code == 200
+    assert gitlab.json()["repo_url"] == "https://gitlab.com/example/demo.git"
+    assert http.status_code == 400
+    assert ssh_with_https.status_code == 400
+    assert "SSH URL" in ssh_with_https.json()["detail"]
+    assert repo_service.cipher.decrypt(repo_service.encrypted_token or "") == "glpat-secret"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"repo_url": "https://github.com/example/demo"},  # token missing for PAT
+        {"repo_url": "git@github.com:example/demo.git", "auth_type": "ssh_key", "token": "x"},
+        {"repo_url": "https://github.com/example/demo", "token": "x", "provider": "svn"},
+        {"repo_url": "https://github.com/example/demo", "token": "x", "auth_type": "password"},
+    ],
+)
+async def test_connect_request_validation(repository_context, payload):
     _user, workspace, _repo_service = repository_context
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         await login(client)
-        response = await client.post(
+        response = await client.post(f"/workspaces/{workspace.id}/repo/connect", json=payload)
+
+    assert response.status_code == 422
+
+
+async def test_ssh_key_endpoint_returns_public_key_and_never_private_material(
+    repository_context,
+):
+    _user, workspace, repo_service = repository_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        missing = await client.get(f"/workspaces/{workspace.id}/repo/credential")
+        generated = await client.post(f"/workspaces/{workspace.id}/repo/ssh-key")
+        fetched = await client.get(f"/workspaces/{workspace.id}/repo/credential")
+        connected = await client.post(
             f"/workspaces/{workspace.id}/repo/connect",
-            json={"repo_url": "https://gitlab.com/example/demo", "token": "raw-secret-token"},
+            json={"repo_url": "git@gitlab.com:example/demo.git", "auth_type": "ssh_key"},
         )
 
-    assert response.status_code == 400
+    assert missing.status_code == 404
+    assert generated.status_code == 200
+    body = generated.json()
+    assert body["auth_type"] == "ssh_key"
+    assert body["public_key"].startswith("ssh-ed25519 ")
+    assert body["supports_pull_requests"] is False
+    assert "PRIVATE KEY" not in generated.text
+    assert "encrypted" not in body
+    assert fetched.status_code == 200
+    assert fetched.json()["public_key"] == body["public_key"]
+    assert connected.status_code == 200
+    assert connected.json()["repo_url"] == "ssh://git@gitlab.com/example/demo.git"
+    # The key pair generated up front is reused by connect (deploy key stays valid).
+    assert repo_service.credential.public_key == body["public_key"]
 
 
 async def test_repository_ownership_is_enforced(repository_context):
@@ -340,7 +456,7 @@ async def test_repository_operation_errors_map_to_http_statuses(
     assert response.status_code == expected_status
 
 
-def test_sanitize_repository_url_accepts_github_https_and_strips_credentials():
+def test_sanitize_repository_url_accepts_https_and_ssh_and_strips_credentials():
     assert (
         sanitize_repository_url("https://github.com/example/demo")
         == "https://github.com/example/demo.git"
@@ -349,20 +465,35 @@ def test_sanitize_repository_url_accepts_github_https_and_strips_credentials():
         sanitize_repository_url("https://token@github.com/example/demo.git")
         == "https://github.com/example/demo.git"
     )
+    assert (
+        sanitize_repository_url("https://gitlab.com/example/demo.git")
+        == "https://gitlab.com/example/demo.git"
+    )
+    assert (
+        sanitize_repository_url("git@github.com:example/demo.git")
+        == "ssh://git@github.com/example/demo.git"
+    )
 
 
 @pytest.mark.parametrize(
     "repo_url",
     [
-        "git@github.com:example/demo.git",
-        "https://gitlab.com/example/demo.git",
+        "http://github.com/example/demo.git",
         "https://github.com/example",
         "https://github.com/example/demo/issues",
+        "https://localhost/example/demo",
     ],
 )
 def test_sanitize_repository_url_rejects_unsupported_urls(repo_url):
     with pytest.raises(InvalidRepositoryUrlError):
         sanitize_repository_url(repo_url)
+
+
+def test_sanitize_git_output_redacts_any_host():
+    output = "fatal: unable to access 'https://oauth2:glpat-x@gitlab.example.com/t/d.git/'"
+    redacted = sanitize_git_output(output, "glpat-x")
+    assert "glpat-x" not in redacted
+    assert "https://[redacted]@gitlab.example.com" in redacted
 
 
 def test_parse_porcelain_status_handles_modified_untracked_and_renamed_files():
@@ -375,35 +506,29 @@ def test_parse_porcelain_status_handles_modified_untracked_and_renamed_files():
     ]
 
 
-async def test_clone_uses_daytona_git_with_branch_and_credentials(tmp_path):
+async def test_clone_uses_git_cli_with_pat_header_and_branch(tmp_path):
+    import base64
+
     user_id = uuid4()
-    workspace = Workspace(
-        id=uuid4(),
-        owner_id=user_id,
-        name="Demo",
-        slug="demo",
-        repo_url="https://github.com/example/demo.git",
-        default_branch="main",
-        runtime="daytona",
-        daytona_sandbox_id="sandbox-1",
-        workspace_path="/workspace",
-        status="ready",
-        created_at=datetime.now(UTC),
-        updated_at=datetime.now(UTC),
-    )
-    calls: list[dict[str, object]] = []
+    workspace = _demo_workspace(user_id)
+    commands: list[tuple[str, str | None]] = []
+    created: list[str] = []
 
     class FakeFs:
         async def get_file_info(self, path):
             raise FileNotFoundError
 
-    class FakeGit:
-        async def clone(self, url, path, **kwargs):
-            calls.append({"url": url, "path": path, **kwargs})
+        async def create_folder(self, path, mode):
+            created.append(path)
 
     class FakeRuntime:
         async def get_sandbox(self, workspace):
-            return SimpleNamespace(fs=FakeFs(), git=FakeGit())
+            # No ``git`` attribute: the SDK clone path is gone; only the CLI is used.
+            return SimpleNamespace(fs=FakeFs())
+
+        async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
+            commands.append((command, cwd))
+            return SimpleNamespace(exit_code=0, stdout="", stderr="")
 
     service = RepositoryService(
         session=None,  # type: ignore[arg-type]
@@ -416,24 +541,34 @@ async def test_clone_uses_daytona_git_with_branch_and_credentials(tmp_path):
         assert owner_id == user_id
         return workspace
 
-    async def fake_get_token(workspace_id: UUID) -> str:
+    async def fake_get_auth(workspace_id: UUID) -> GitAuth:
         assert workspace_id == workspace.id
-        return "raw-secret-token"
+        return GitAuth(kind="token", username="x-access-token", token="raw-secret-token")
 
     service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
-    service._get_token = fake_get_token  # type: ignore[method-assign]
+    service._get_auth = fake_get_auth  # type: ignore[method-assign]
 
     await service.clone(workspace.id, user_id)
 
-    assert calls == [
-        {
-            "url": workspace.repo_url,
-            "path": "/workspace",
-            "branch": "main",
-            "username": "x-access-token",
-            "password": "raw-secret-token",
-        }
-    ]
+    assert created == ["/workspace"]
+    command, cwd = commands[-1]
+    assert cwd == "/workspace"
+    assert "clone --branch main -- https://github.com/example/demo.git ." in command
+    expected = base64.b64encode(b"x-access-token:raw-secret-token").decode()
+    assert f"http.extraHeader=AUTHORIZATION: basic {expected}" in command
+    assert "raw-secret-token" not in command
+
+
+async def test_clone_requires_a_connected_remote():
+    workspace = _demo_workspace()
+    workspace.repo_url = None
+
+    async def exec_impl(command, cwd):
+        raise AssertionError("no git should run")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+    with pytest.raises(RepositoryCredentialNotFoundError):
+        await service.clone(workspace.id, workspace.owner_id)
 
 
 async def test_push_uses_authenticated_git_cli_in_worktree(tmp_path):
@@ -480,11 +615,11 @@ async def test_push_uses_authenticated_git_cli_in_worktree(tmp_path):
     async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
         return workspace
 
-    async def fake_get_token(workspace_id: UUID) -> str:
-        return "raw-secret-token"
+    async def fake_get_auth(workspace_id: UUID) -> GitAuth:
+        return GitAuth(kind="token", username="x-access-token", token="raw-secret-token")
 
     service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
-    service._get_token = fake_get_token  # type: ignore[method-assign]
+    service._get_auth = fake_get_auth  # type: ignore[method-assign]
 
     await service.push(workspace.id, user_id, worktree_path=worktree_path)
 
@@ -538,11 +673,11 @@ async def test_push_surfaces_sanitized_git_error(tmp_path):
     async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
         return workspace
 
-    async def fake_get_token(workspace_id: UUID) -> str:
-        return "raw-secret-token"
+    async def fake_get_auth(workspace_id: UUID) -> GitAuth:
+        return GitAuth(kind="token", username="x-access-token", token="raw-secret-token")
 
     service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
-    service._get_token = fake_get_token  # type: ignore[method-assign]
+    service._get_auth = fake_get_auth  # type: ignore[method-assign]
 
     with pytest.raises(GitCommandError) as excinfo:
         await service.push(workspace.id, workspace.owner_id)
@@ -660,11 +795,11 @@ def _repo_service_with_exec(workspace: Workspace, exec_impl, *, token="raw-secre
     async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
         return workspace
 
-    async def fake_get_token(workspace_id: UUID) -> str:
-        return token
+    async def fake_get_auth(workspace_id: UUID) -> GitAuth:
+        return GitAuth(kind="token", username="x-access-token", token=token)
 
     service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
-    service._get_token = fake_get_token  # type: ignore[method-assign]
+    service._get_auth = fake_get_auth  # type: ignore[method-assign]
     return service
 
 
@@ -864,3 +999,273 @@ def test_worktree_sync_errors_map_to_expected_http_statuses():
     conflict = MergeConflictError("CONFLICT (content): merge conflict")
     assert repository_error(conflict).status_code == 409
     assert repository_error(CannotSyncBaseWorktreeError()).status_code == 409
+
+
+def _ssh_service(workspace: Workspace, exec_impl, fs_log: list[tuple[str, ...]]):
+    private_key = generate_ed25519_keypair("enigma-test").private_key
+
+    class FakeFs:
+        async def get_file_info(self, path):
+            return SimpleNamespace(name=path)
+
+        async def create_folder(self, path, mode):
+            fs_log.append(("create_folder", path, mode))
+
+        async def upload_file(self, content, path):
+            fs_log.append(("upload_file", path, content.decode()))
+
+        async def set_file_permissions(self, path, mode=None, owner=None, group=None):
+            fs_log.append(("chmod", path, mode or ""))
+
+        async def delete_file(self, path, recursive=False):
+            fs_log.append(("delete", path, str(recursive)))
+
+    class FakeRuntime:
+        async def get_sandbox(self, ws):
+            return SimpleNamespace(fs=FakeFs())
+
+        async def exec(self, ws, command, *, cwd=None, env=None, timeout=None):
+            return await exec_impl(command, cwd, env)
+
+    service = RepositoryService(
+        session=None,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(Settings().workspace_env_encryption_key),
+        runtime=FakeRuntime(),  # type: ignore[arg-type]
+        settings=Settings(),
+    )
+
+    async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
+        return workspace
+
+    async def fake_get_auth(workspace_id: UUID) -> GitAuth:
+        return GitAuth(kind="ssh", private_key=private_key)
+
+    service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
+    service._get_auth = fake_get_auth  # type: ignore[method-assign]
+    return service, private_key
+
+
+async def test_push_uses_gitlab_oauth2_username_in_basic_header():
+    import base64
+
+    workspace = _demo_workspace()
+    workspace.repo_url = "https://gitlab.com/example/demo.git"
+    calls: list[str] = []
+
+    async def exec_impl(command, cwd):
+        calls.append(command)
+        return SimpleNamespace(exit_code=0, stdout=workspace.repo_url, stderr="")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+
+    async def fake_get_auth(workspace_id: UUID) -> GitAuth:
+        return GitAuth(kind="token", username="oauth2", token="glpat-secret")
+
+    service._get_auth = fake_get_auth  # type: ignore[method-assign]
+    await service.push(workspace.id, workspace.owner_id)
+
+    expected = base64.b64encode(b"oauth2:glpat-secret").decode()
+    assert f"http.extraHeader=AUTHORIZATION: basic {expected}" in calls[-1]
+    # origin already matched the workspace URL, so no remote add/set-url ran.
+    assert not any("remote add" in c or "remote set-url" in c for c in calls)
+
+
+async def test_push_adds_origin_when_missing_and_sets_url_when_changed():
+    workspace = _demo_workspace()
+    calls: list[str] = []
+    origin: dict[str, str | None] = {"url": None}
+
+    async def exec_impl(command, cwd):
+        calls.append(command)
+        if command == "git remote get-url origin":
+            if origin["url"] is None:
+                return SimpleNamespace(exit_code=2, stdout="", stderr="error: No such remote")
+            return SimpleNamespace(exit_code=0, stdout=origin["url"] + "\n", stderr="")
+        return SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    service = _repo_service_with_exec(workspace, exec_impl)
+
+    await service.push(workspace.id, workspace.owner_id)
+    assert any(c == f"git remote add origin {workspace.repo_url}" for c in calls)
+
+    calls.clear()
+    origin["url"] = "https://github.com/old/place.git"
+    await service.fetch(workspace.id, workspace.owner_id)
+    assert any(c == f"git remote set-url origin {workspace.repo_url}" for c in calls)
+    assert "fetch origin" in calls[-1]
+
+
+async def test_ssh_push_stages_key_passes_git_ssh_command_and_removes_key():
+    workspace = _demo_workspace()
+    workspace.repo_url = "ssh://git@git.example.com/team/demo.git"
+    fs_log: list[tuple[str, ...]] = []
+    execs: list[tuple[str, dict | None]] = []
+
+    async def exec_impl(command, cwd, env):
+        execs.append((command, env))
+        return SimpleNamespace(exit_code=0, stdout=workspace.repo_url, stderr="")
+
+    service, private_key = _ssh_service(workspace, exec_impl, fs_log)
+    await service.push(workspace.id, workspace.owner_id)
+
+    command, env = execs[-1]
+    assert command.endswith("git push --set-upstream origin HEAD")
+    assert command.startswith("mkdir -p /home/daytona/.ssh && ")
+    assert env is not None
+    ssh_command = env["GIT_SSH_COMMAND"]
+    assert "-o IdentitiesOnly=yes" in ssh_command
+    assert "-o BatchMode=yes" in ssh_command
+    assert "-o StrictHostKeyChecking=accept-new" in ssh_command
+    assert "/home/daytona/.ssh/known_hosts" in ssh_command
+    assert env["GIT_TERMINAL_PROMPT"] == "0"
+
+    ops = [entry[0] for entry in fs_log]
+    assert ops == ["create_folder", "upload_file", "chmod", "delete"]
+    key_dir = fs_log[0][1]
+    assert key_dir.startswith("/tmp/enigma-ssh/")
+    assert fs_log[0][2] == "700"
+    assert fs_log[1][1] == f"{key_dir}/id_ed25519"
+    assert fs_log[1][2] == private_key
+    assert fs_log[2][2] == "600"
+    assert fs_log[3][1] == key_dir and fs_log[3][2] == "True"
+    assert f"-i {key_dir}/id_ed25519" in ssh_command
+    assert private_key not in command
+
+
+async def test_ssh_push_removes_key_even_when_git_fails_and_redacts_output():
+    workspace = _demo_workspace()
+    workspace.repo_url = "ssh://git@git.example.com/team/demo.git"
+    fs_log: list[tuple[str, ...]] = []
+
+    async def exec_impl(command, cwd, env):
+        if "push" in command:
+            return SimpleNamespace(
+                exit_code=128,
+                stdout="git@git.example.com: Permission denied (publickey).",
+                stderr="",
+            )
+        return SimpleNamespace(exit_code=0, stdout=workspace.repo_url, stderr="")
+
+    service, _private_key = _ssh_service(workspace, exec_impl, fs_log)
+    with pytest.raises(GitCommandError) as excinfo:
+        await service.push(workspace.id, workspace.owner_id)
+
+    assert "Permission denied (publickey)" in excinfo.value.message
+    assert [entry[0] for entry in fs_log][-1] == "delete"
+
+
+async def test_ssh_push_reports_missing_ssh_client():
+    workspace = _demo_workspace()
+    workspace.repo_url = "ssh://git@git.example.com/team/demo.git"
+
+    async def exec_impl(command, cwd, env):
+        if "push" in command:
+            return SimpleNamespace(
+                exit_code=128, stdout="error: cannot run ssh: No such file or directory", stderr=""
+            )
+        return SimpleNamespace(exit_code=0, stdout=workspace.repo_url, stderr="")
+
+    service, _ = _ssh_service(workspace, exec_impl, [])
+    with pytest.raises(GitCommandError) as excinfo:
+        await service.push(workspace.id, workspace.owner_id)
+    assert "SSH client is not available" in excinfo.value.message
+
+
+class FakeCredentialSession:
+    """Minimal AsyncSession stand-in holding at most one credential row."""
+
+    def __init__(self) -> None:
+        self.credential = None
+        self.commits = 0
+
+    async def execute(self, statement):
+        credential = self.credential
+        return SimpleNamespace(scalar_one_or_none=lambda: credential)
+
+    def add(self, obj) -> None:
+        from app.models import RepositoryCredential
+
+        if isinstance(obj, RepositoryCredential):
+            self.credential = obj
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+    async def refresh(self, obj) -> None:
+        return None
+
+
+def _service_with_credential_session(workspace: Workspace):
+    session = FakeCredentialSession()
+    service = RepositoryService(
+        session=session,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(Settings().workspace_env_encryption_key),
+        runtime=SimpleNamespace(),  # type: ignore[arg-type]
+        settings=Settings(),
+    )
+
+    async def fake_get_workspace(workspace_id: UUID, owner_id: UUID) -> Workspace:
+        return workspace
+
+    service._get_workspace = fake_get_workspace  # type: ignore[method-assign]
+    return service, session
+
+
+async def test_connect_pat_stores_provider_username_and_encrypted_token():
+    workspace = _demo_workspace()
+    service, session = _service_with_credential_session(workspace)
+
+    await service.connect(
+        workspace.id,
+        workspace.owner_id,
+        "https://bitbucket.org/team/demo",
+        token="app-password",
+        username="alice",
+    )
+
+    credential = session.credential
+    assert credential.provider == "bitbucket"
+    assert credential.auth_type == "personal_access_token"
+    assert credential.username == "alice"
+    assert credential.encrypted_token != "app-password"
+    assert service.cipher.decrypt(credential.encrypted_token) == "app-password"
+    assert credential.encrypted_private_key is None and credential.public_key is None
+    assert workspace.repo_url == "https://bitbucket.org/team/demo.git"
+
+    auth = await service._get_auth(workspace.id)
+    assert auth == GitAuth(kind="token", username="alice", token="app-password")
+
+
+async def test_connect_ssh_generates_keypair_once_and_reuses_it():
+    workspace = _demo_workspace()
+    service, session = _service_with_credential_session(workspace)
+
+    first = await service.ensure_ssh_key(workspace.id, workspace.owner_id)
+    public_key = first.public_key
+    assert public_key.startswith("ssh-ed25519 ")
+    assert first.encrypted_private_key != public_key
+    private_key = service.cipher.decrypt(first.encrypted_private_key)
+    assert private_key.startswith("-----BEGIN OPENSSH PRIVATE KEY-----")
+
+    await service.connect(
+        workspace.id, workspace.owner_id, "git@gitlab.com:team/demo.git", auth_type="ssh_key"
+    )
+    assert session.credential.public_key == public_key
+    assert session.credential.provider == "gitlab"
+    assert session.credential.encrypted_token is None
+    assert workspace.repo_url == "ssh://git@gitlab.com/team/demo.git"
+
+    auth = await service._get_auth(workspace.id)
+    assert auth.kind == "ssh" and auth.private_key == private_key
+
+    rotated = await service.ensure_ssh_key(workspace.id, workspace.owner_id, rotate=True)
+    assert rotated.public_key != public_key
+
+
+async def test_connect_ssh_with_https_url_raises_invalid_url():
+    workspace = _demo_workspace()
+    service, _session = _service_with_credential_session(workspace)
+    with pytest.raises(InvalidRepositoryUrlError):
+        await service.connect(
+            workspace.id, workspace.owner_id, "https://gitlab.com/team/demo", auth_type="ssh_key"
+        )

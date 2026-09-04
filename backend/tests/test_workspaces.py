@@ -12,7 +12,10 @@ from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
 from app.models import User, Workspace, WorkspaceEnvVar
+from app.services.git_providers import sanitize_repository_url
+from app.services.templates import TemplateNotFoundError
 from app.services.users import DuplicateUserEmailError
+from app.services.workspace_init import WorkspaceInitializationError
 from app.services.workspaces import (
     InvalidEnvVarKeyError,
     SqlAlchemyWorkspaceService,
@@ -21,6 +24,8 @@ from app.services.workspaces import (
     WorkspaceSecretCipher,
     validate_env_key,
 )
+
+KNOWN_TEMPLATE_ID = UUID("00000000-0000-4000-8000-000000000001")
 
 
 class FakeUserStore:
@@ -60,12 +65,23 @@ class FakeWorkspaceService:
         self,
         owner_id: UUID,
         name: str,
-        repo_url: str,
+        repo_url: str | None,
         default_branch: str,
         snapshot: str | None = None,
+        *,
+        source: str = "repository",
+        template_id: UUID | None = None,
     ) -> Workspace:
         if await self.list_for_owner(owner_id):
             raise WorkspaceAlreadyExistsError
+        if source == "repository":
+            repo_url = sanitize_repository_url(repo_url or "")
+        elif source == "template":
+            if template_id != KNOWN_TEMPLATE_ID:
+                raise TemplateNotFoundError
+            repo_url = None
+        else:
+            repo_url = None
 
         now = datetime.now(UTC)
         workspace_id = uuid4()
@@ -75,6 +91,8 @@ class FakeWorkspaceService:
             name=name,
             slug=name.lower().replace(" ", "-"),
             repo_url=repo_url,
+            source=source,
+            template_id=template_id,
             default_branch=default_branch,
             runtime="daytona",
             daytona_sandbox_id=f"sandbox-{workspace_id}",
@@ -417,3 +435,179 @@ async def test_viewer_role_maps_team_membership_to_a_workspace_role():
 
     assert member.viewer_role == "team_viewer"
     assert owner.viewer_role == "owner"
+
+
+async def _login(client: AsyncClient) -> None:
+    await client.post("/auth/login", json={"email": "owner@example.com", "password": "password"})
+
+
+async def test_create_blank_workspace_has_no_repo_url(workspace_context):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post(
+            "/workspaces", json={"name": "Scratch", "source": "blank", "default_branch": "trunk"}
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["repo_url"] is None
+    assert payload["source"] == "blank"
+    assert payload["template_id"] is None
+    assert payload["default_branch"] == "trunk"
+
+
+async def test_create_workspace_from_template(workspace_context):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post(
+            "/workspaces",
+            json={"name": "Starter", "source": "template", "template_id": str(KNOWN_TEMPLATE_ID)},
+        )
+
+    assert response.status_code == 201
+    payload = response.json()
+    assert payload["repo_url"] is None
+    assert payload["source"] == "template"
+    assert payload["template_id"] == str(KNOWN_TEMPLATE_ID)
+
+
+async def test_create_workspace_unknown_template_is_404(workspace_context):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post(
+            "/workspaces",
+            json={"name": "Starter", "source": "template", "template_id": str(uuid4())},
+        )
+
+    assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"name": "A", "source": "repository"},  # repo_url missing
+        {"name": "A", "source": "template"},  # template_id missing
+        {"name": "A", "source": "blank", "repo_url": "https://github.com/e/d"},
+        {"name": "A", "source": "template", "template_id": str(uuid4()), "repo_url": "https://x.io/a/b"},
+        {"name": "A", "source": "zip"},
+    ],
+)
+async def test_create_workspace_source_validation(workspace_context, payload):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post("/workspaces", json=payload)
+
+    assert response.status_code == 422
+
+
+async def test_create_workspace_rejects_invalid_repo_url(workspace_context):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post(
+            "/workspaces", json={"name": "Demo", "repo_url": "http://localhost/example/demo"}
+        )
+
+    assert response.status_code == 400
+
+
+class _FakeCreateSession:
+    def __init__(self) -> None:
+        self.added: list[Workspace] = []
+        self.commits = 0
+
+    async def execute(self, statement):
+        return type("EmptyResult", (), {"scalar_one_or_none": lambda self: None})()
+
+    def add(self, workspace):
+        self.added.append(workspace)
+
+    async def flush(self):
+        self.added[-1].id = uuid4()
+
+    async def commit(self):
+        self.commits += 1
+
+    async def refresh(self, workspace):
+        now = datetime.now(UTC)
+        workspace.created_at = workspace.created_at or now
+        workspace.updated_at = now
+
+
+class _FakeProvisionRuntime:
+    def __init__(self, runtime_settings):
+        self.settings = runtime_settings
+
+    async def provision(self, workspace_id, owner_id, snapshot):
+        return type("Sandbox", (), {"id": f"sandbox-{workspace_id}"})()
+
+
+class _RecordingInitializer:
+    def __init__(self, fail: bool = False) -> None:
+        self.calls: list[str] = []
+        self.fail = fail
+
+    async def initialize_blank(self, workspace):
+        self.calls.append("blank")
+        if self.fail:
+            raise WorkspaceInitializationError("git init failed")
+
+    async def initialize_from_template(self, workspace, template):
+        self.calls.append(f"template:{template.slug}")
+
+
+async def test_sqlalchemy_create_blank_runs_initializer_then_marks_ready():
+    settings = Settings()
+    initializer = _RecordingInitializer()
+    service = SqlAlchemyWorkspaceService(
+        session=_FakeCreateSession(),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=initializer,  # type: ignore[arg-type]
+    )
+
+    workspace = await service.create(
+        owner_id=uuid4(), name="Scratch", repo_url=None, default_branch="main", source="blank"
+    )
+
+    assert initializer.calls == ["blank"]
+    assert workspace.status == "ready"
+    assert workspace.repo_url is None
+    assert workspace.source == "blank"
+
+
+async def test_sqlalchemy_create_marks_error_when_initializer_fails():
+    settings = Settings()
+    session = _FakeCreateSession()
+    service = SqlAlchemyWorkspaceService(
+        session=session,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=_RecordingInitializer(fail=True),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(WorkspaceInitializationError):
+        await service.create(
+            owner_id=uuid4(), name="Scratch", repo_url=None, default_branch="main", source="blank"
+        )
+
+    assert session.added[-1].status == "error"
+
+
+async def test_sqlalchemy_create_repository_sanitizes_url():
+    settings = Settings()
+    service = SqlAlchemyWorkspaceService(
+        session=_FakeCreateSession(),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=_RecordingInitializer(),  # type: ignore[arg-type]
+    )
+
+    workspace = await service.create(
+        owner_id=uuid4(),
+        name="Demo",
+        repo_url="https://token@gitlab.com/team/demo",
+        default_branch="main",
+    )
+
+    assert workspace.repo_url == "https://gitlab.com/team/demo.git"
+    assert workspace.source == "repository"

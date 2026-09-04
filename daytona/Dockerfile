@@ -15,6 +15,12 @@
 #
 # Base image already provides: Linux shell, Git, Python 3, and the process/network
 # utilities the backend relies on for commands and port detection.
+#
+# SSH deploy keys (backend/app/services/repositories.py, ``_run_ssh_git``) additionally
+# need an OpenSSH client on PATH. The backend reports "SSH client is not available in this
+# sandbox image" when ``ssh`` is missing; if the base snapshot ever drops it, install
+# ``openssh-client`` here (requires a root build stage) and optionally pre-seed
+# ~/.ssh/known_hosts for github.com / gitlab.com / bitbucket.org.
 ARG BASE_SNAPSHOT=daytonaio/sandbox:0.8.0
 FROM ${BASE_SNAPSHOT}
 

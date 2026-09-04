@@ -2,9 +2,11 @@
 
 ``GitHubClient`` is a thin async wrapper over the GitHub REST API (``httpx``);
 ``PullRequestService`` orchestrates token lookup, ``owner/repo`` parsing, the API call, and a
-lightweight DB cache in
-``pull_requests``. The stored PAT is used server-side only and is never returned to the client;
-all surfaced output is run through ``sanitize_git_output`` to redact credentials.
+lightweight DB cache in ``pull_requests``. Provider-native pull requests are GitHub-only for now:
+the workspace must be connected to a GitHub remote with an access token (an SSH deploy key
+cannot call the REST API), otherwise ``PullRequestsUnsupportedError`` is raised. The stored token
+is used server-side only and is never returned to the client; all surfaced output is run through
+``sanitize_git_output`` to redact credentials.
 """
 
 from dataclasses import dataclass
@@ -18,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.models import PullRequest, RepositoryCredential, Workspace
 from app.services.repositories import (
+    PullRequestsUnsupportedError,
     RepositoryCredentialNotFoundError,
     RepositoryTokenError,
     sanitize_git_output,
@@ -207,8 +210,8 @@ class PullRequestService:
         worktree_id: UUID | None = None,
     ) -> PullRequest:
         workspace = await self._get_workspace(workspace_id, owner_id)
-        token = await self._get_token(workspace_id)
-        owner, repo = parse_owner_repo(workspace.repo_url)
+        token = await self._require_github_token(workspace)
+        owner, repo = parse_owner_repo(workspace.repo_url or "")
         base_ref = base or workspace.default_branch
         payload = await self.client.create_pull_request(
             token, owner, repo, head=head, base=base_ref, title=title, body=body, draft=draft
@@ -217,8 +220,8 @@ class PullRequestService:
 
     async def get(self, workspace_id: UUID, owner_id: UUID, number: int) -> PullRequest:
         workspace = await self._get_workspace(workspace_id, owner_id)
-        token = await self._get_token(workspace_id)
-        owner, repo = parse_owner_repo(workspace.repo_url)
+        token = await self._require_github_token(workspace)
+        owner, repo = parse_owner_repo(workspace.repo_url or "")
         payload = await self.client.get_pull_request(token, owner, repo, number)
         cached = await self._find_cached(workspace_id, number)
         return await self._upsert(
@@ -271,16 +274,21 @@ class PullRequestService:
             raise WorkspaceNotFoundError
         return workspace
 
-    async def _get_token(self, workspace_id: UUID) -> str:
+    async def _require_github_token(self, workspace: Workspace) -> str:
+        """The GitHub access token for ``workspace``, or why PRs are unavailable for it."""
+        if not workspace.repo_url:
+            raise RepositoryCredentialNotFoundError
         result = await self.session.execute(
             select(RepositoryCredential).where(
-                RepositoryCredential.workspace_id == workspace_id,
+                RepositoryCredential.workspace_id == workspace.id,
             )
         )
         credential = result.scalar_one_or_none()
         if credential is None:
             raise RepositoryCredentialNotFoundError
-        token = self.cipher.decrypt(credential.encrypted_token)
+        if credential.provider != "github" or credential.auth_type != "personal_access_token":
+            raise PullRequestsUnsupportedError(credential.provider, credential.auth_type)
+        token = self.cipher.decrypt(credential.encrypted_token or "")
         if token is None:
             raise RepositoryTokenError
         return token

@@ -52,13 +52,13 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
   - Connection string must be `postgresql+asyncpg://…`
   - Session: `async_session_maker` with `expire_on_commit=False`
   - All DB access MUST use async/await
-- **Migrations**: Alembic with async engine, 17 migrations in `alembic/versions/`
+- **Migrations**: Alembic with async engine, 22 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0022_templates_and_git_providers`)
 - **Auth**: Cookie-based sessions (`execute_session` cookie), NOT JWT. Set-Cookie on login, cleared on logout.
 - **Logging**: `structlog` (configured in `core/logging.py`)
 - **Testing**: `pytest` with `pytest-asyncio` (auto mode), tests at `backend/tests/`
 
 ### Frontend (React 18 + Vite + Tailwind 3)
-- **No react-router** — custom `navigate()` in `src/lib/router.ts` using `window.history.pushState` + `PopStateEvent`
+- **Routing**: `react-router` v7 (`BrowserRouter`, `Routes`, `Outlet`); all routes declared in `src/App.tsx`
 - **No component library** — all UI built with Tailwind utility classes. Do NOT assume shadcn/ui, Radix, or any component kit.
 - **No state library** — React Context only. Main hook: `useAuth()` from `src/auth/context.ts`
 - **API client**: `src/lib/api.ts` (~1500 lines). All HTTP calls go through exported typed functions — never `fetch()` directly.
@@ -99,12 +99,14 @@ Then set `DAYTONA_DEFAULT_SNAPSHOT=enigma-mise-code` in `.env`. The stock `dayto
 ### Git Worktrees & Pull Requests
 
 - **Worktrees**: `services/worktrees.py` (`WorktreeService`) + `models/worktree.py` (`WorkspaceWorktree`). Each non-base worktree is an isolated checkout/branch. Terminals get a per-worktree PTY (pass `worktree_id` query param to the terminal socket); agent runs target the active worktree's branch.
-- **Pull requests**: `services/github_client.py` exposes `GitHubClient` (raw GitHub REST) + `PullRequestService` (create/get/list, cached in the `PullRequest` model). Requires a workspace GitHub token.
-- **Endpoints**: under `workspaces` — `POST /repo/pull`, `GET|POST /repo/worktrees`, `GET /repo/pull-requests`.
+- **Git providers**: `services/git_providers.py` is the pure provider abstraction (GitHub, GitLab, Bitbucket, generic; URL validation/canonicalisation, basic-auth usernames, redaction). Credentials are token **or** server-generated SSH deploy key (`services/ssh_keys.py`), one row per workspace. `RepositoryService` runs all clone/pull/fetch/push through the git CLI with per-command auth.
+- **Templates / blank workspaces**: `workspace_templates` (seeded by migration `0022`), `services/templates.py`, `services/workspace_init.py` (clone template → fresh `git init` → initial commit). `workspaces.repo_url` is nullable; `source` ∈ `repository|template|blank`.
+- **Pull requests**: `services/github_client.py` exposes `GitHubClient` (raw GitHub REST) + `PullRequestService` (create/get/list, cached in the `PullRequest` model). GitHub + token credentials only — other providers raise `PullRequestsUnsupportedError` (HTTP 409).
+- **Endpoints**: under `workspaces` — `POST /repo/connect`, `GET /repo/credential`, `POST /repo/ssh-key`, `POST /repo/pull`, `GET|POST /repo/worktrees`, `GET /repo/pull-requests`; catalog at `GET /workspace-templates`.
 
 ## CI/CD
 
-**Single workflow**: `.github/workflows/ai-code-review.yml` — runs `scripts/ai_code_review.py` on non-draft PRs. Posts an AI review comment. Uses LangChain + LangGraph + OpenAI. Requires `OPENAI_API_KEY` secret.
+**Two workflows**: `.github/workflows/ci.yml` (backend: postgres + redis services → `alembic upgrade head` → `ruff` → `pytest`; frontend: lint + test + build) and `.github/workflows/ai-code-review.yml` — runs `scripts/ai_code_review.py` on non-draft PRs. Posts an AI review comment. Uses LangChain + LangGraph + OpenAI. Requires `OPENAI_API_KEY` secret.
 
 **No pre-commit hooks, no lint-staged, no Makefile.**
 

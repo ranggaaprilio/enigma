@@ -19,12 +19,14 @@ from app.schemas.repositories import (
     RepositoryCommitDetailResponse,
     RepositoryCommitRequest,
     RepositoryConnectRequest,
+    RepositoryCredentialResponse,
     RepositoryDiffResponse,
     RepositoryDiscardRequest,
     RepositoryFileStatus,
     RepositoryLogResponse,
     RepositoryOperationResponse,
     RepositoryStatusResponse,
+    SshKeyRequest,
 )
 from app.schemas.workspaces import (
     DeleteResponse,
@@ -45,12 +47,14 @@ from app.schemas.worktrees import (
 )
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntimeError, get_daytona_runtime
+from app.services.git_providers import supports_pull_requests
 from app.services.github_client import GitHubApiError, PullRequestService
 from app.services.notifications import NotificationService
 from app.services.repositories import (
     GitCommandError,
     InvalidRepositoryUrlError,
     NoChangesToCommitError,
+    PullRequestsUnsupportedError,
     RepositoryAlreadyClonedError,
     RepositoryCredentialNotFoundError,
     RepositoryNotClonedError,
@@ -58,6 +62,8 @@ from app.services.repositories import (
     RepositoryService,
     RepositoryTokenError,
 )
+from app.services.templates import TemplateNotFoundError
+from app.services.workspace_init import WorkspaceInitializationError
 from app.services.workspaces import (
     SNAPSHOT_UNSET,
     InvalidEnvVarKeyError,
@@ -96,9 +102,12 @@ class WorkspaceService(Protocol):
         self,
         owner_id: UUID,
         name: str,
-        repo_url: str,
+        repo_url: str | None,
         default_branch: str,
         snapshot: str | None = None,
+        *,
+        source: str = "repository",
+        template_id: UUID | None = None,
     ) -> Workspace: ...
 
     async def update(
@@ -148,6 +157,7 @@ async def get_repository_service(
         session=session,
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
         runtime=get_daytona_runtime(),
+        settings=settings,
     )
 
 
@@ -200,6 +210,28 @@ def not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
 
 
+WORKSPACE_CREATE_ERRORS = (
+    WorkspaceRuntimeError,
+    InvalidRepositoryUrlError,
+    TemplateNotFoundError,
+    WorkspaceInitializationError,
+)
+
+
+def workspace_create_error(error: Exception) -> HTTPException:
+    """Map workspace-creation failures shared by the personal and team create routes."""
+    if isinstance(error, InvalidRepositoryUrlError):
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error.message)
+    if isinstance(error, TemplateNotFoundError):
+        return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found")
+    if isinstance(error, WorkspaceInitializationError):
+        return HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Workspace initialization failed: {error.message}",
+        )
+    return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(error))
+
+
 def repository_error(error: Exception) -> HTTPException:
     if isinstance(error, DaytonaRuntimeError):
         return HTTPException(
@@ -207,9 +239,14 @@ def repository_error(error: Exception) -> HTTPException:
             detail=str(error),
         )
     if isinstance(error, InvalidRepositoryUrlError):
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error.message)
+    if isinstance(error, PullRequestsUnsupportedError):
         return HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only GitHub HTTPS repository URLs are supported",
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Pull requests are only supported for GitHub repositories connected with an "
+                f"access token (connected provider: {error.provider})"
+            ),
         )
     if isinstance(error, RepositoryPathError):
         return HTTPException(
@@ -282,6 +319,23 @@ def repository_error(error: Exception) -> HTTPException:
     return HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Request failed")
 
 
+def credential_response(credential, workspace: Workspace) -> RepositoryCredentialResponse:
+    """Public view of a credential — never includes the token or private key."""
+    return RepositoryCredentialResponse(
+        provider=credential.provider,
+        auth_type=credential.auth_type,
+        username=credential.username,
+        public_key=credential.public_key,
+        supports_pull_requests=(
+            supports_pull_requests(credential.provider)
+            and credential.auth_type == "personal_access_token"
+        ),
+        repo_url=workspace.repo_url,
+        created_at=credential.created_at,
+        updated_at=credential.updated_at,
+    )
+
+
 def env_response(env_var: WorkspaceEnvVar) -> WorkspaceEnvVarResponse:
     return WorkspaceEnvVarResponse(
         id=env_var.id,
@@ -306,7 +360,10 @@ async def connect_repository(
             workspace_id=workspace_id,
             owner_id=current_user.id,
             repo_url=payload.repo_url,
+            provider=payload.provider,
+            auth_type=payload.auth_type,
             token=payload.token,
+            username=payload.username,
         )
     except WorkspaceNotFoundError:
         raise not_found() from None
@@ -329,9 +386,61 @@ async def connect_repository(
         action="repo_connect",
         target_type="repository",
         target_id=workspace.id,
-        metadata={"repo_url": workspace.repo_url},
+        metadata={
+            "repo_url": workspace.repo_url,
+            "provider": payload.provider,
+            "auth_type": payload.auth_type,
+        },
     )
     return await workspace_response(session, workspace, current_user.id)
+
+
+@router.get("/{workspace_id}/repo/credential", response_model=RepositoryCredentialResponse)
+async def get_repository_credential(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    workspace_service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+) -> RepositoryCredentialResponse:
+    try:
+        workspace = await workspace_service.get_for_owner(workspace_id, current_user.id)
+        credential = await service.get_credential(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except RepositoryCredentialNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No repository credential configured",
+        ) from None
+    return credential_response(credential, workspace)
+
+
+@router.post("/{workspace_id}/repo/ssh-key", response_model=RepositoryCredentialResponse)
+async def ensure_repository_ssh_key(
+    workspace_id: UUID,
+    payload: SshKeyRequest | None = None,
+    current_user: User = CURRENT_USER_DEP,
+    service: RepositoryService = REPOSITORY_SERVICE_DEP,
+    workspace_service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+) -> RepositoryCredentialResponse:
+    """Generate (or rotate) the workspace's SSH deploy key and return its public half."""
+    rotate = bool(payload and payload.rotate)
+    try:
+        workspace = await workspace_service.get_for_owner(workspace_id, current_user.id)
+        credential = await service.ensure_ssh_key(workspace_id, current_user.id, rotate=rotate)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=workspace.id,
+        action="repo_ssh_key_generate",
+        target_type="repository",
+        target_id=workspace.id,
+        metadata={"rotate": rotate},
+    )
+    return credential_response(credential, workspace)
 
 
 @router.post("/{workspace_id}/repo/clone", response_model=RepositoryOperationResponse)
@@ -773,6 +882,7 @@ WORKTREE_ERRORS = (
     MergeConflictError,
     GitWorktreeError,
     GitHubApiError,
+    PullRequestsUnsupportedError,
     InvalidRepositoryUrlError,
     RepositoryPathError,
     RepositoryCredentialNotFoundError,
@@ -991,7 +1101,7 @@ async def push_worktree(
         workspace_id=workspace_id,
         notification_type="worktree_pushed",
         title="Branch pushed",
-        message=f"Branch '{worktree.branch}' was pushed to GitHub.",
+        message=f"Branch '{worktree.branch}' was pushed to the remote.",
     )
     return RepositoryOperationResponse(ok=True, message="Changes pushed.")
 
@@ -1181,6 +1291,8 @@ async def create_workspace(
             name=payload.name,
             repo_url=payload.repo_url,
             default_branch=payload.default_branch,
+            source=payload.source,
+            template_id=payload.template_id,
         )
         if payload.snapshot is not None:
             create_values["snapshot"] = payload.snapshot
@@ -1190,11 +1302,8 @@ async def create_workspace(
             status_code=status.HTTP_409_CONFLICT,
             detail="User already has a workspace",
         ) from None
-    except WorkspaceRuntimeError as error:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(error),
-        ) from None
+    except WORKSPACE_CREATE_ERRORS as error:
+        raise workspace_create_error(error) from None
     await record_audit_safely(
         audit_log_service,
         user_id=current_user.id,
@@ -1202,7 +1311,11 @@ async def create_workspace(
         action="workspace_create",
         target_type="workspace",
         target_id=workspace.id,
-        metadata={"name": workspace.name},
+        metadata={
+            "name": workspace.name,
+            "source": workspace.source,
+            "template_id": str(workspace.template_id) if workspace.template_id else None,
+        },
     )
     return await workspace_response(session, workspace, current_user.id)
 
@@ -1253,6 +1366,10 @@ async def update_workspace(
         workspace = await service.update(**update_values)
     except WorkspaceNotFoundError:
         raise not_found() from None
+    except InvalidRepositoryUrlError as error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=error.message
+        ) from None
     except WorkspaceRuntimeError as error:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

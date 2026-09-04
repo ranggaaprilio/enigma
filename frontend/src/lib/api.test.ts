@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ApiError,
   cloneRepository,
+  ensureRepositorySshKey,
+  getRepositoryCredential,
+  listWorkspaceTemplates,
   commitRepository,
   connectRepository,
   createAgentRun,
@@ -241,6 +245,7 @@ describe("getHealth", () => {
 
     await connectRepository(workspaceId, {
       repo_url: "https://github.com/example/demo",
+      auth_type: "personal_access_token",
       token: "raw-secret",
     });
     await cloneRepository(workspaceId);
@@ -699,5 +704,54 @@ describe("getHealth", () => {
       expect.objectContaining({ credentials: "include" }),
     );
     expect(getNotificationStreamUrl()).toBe("ws://localhost:8000/notifications/stream");
+  });
+});
+
+describe("templates and credentials", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("lists templates and reads the credential summary", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await listWorkspaceTemplates();
+    await getRepositoryCredential(workspaceId);
+    await ensureRepositorySshKey(workspaceId, true);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://localhost:8000/workspace-templates",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/credential`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/ssh-key`,
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ rotate: true }) }),
+    );
+  });
+
+  it("surfaces a 404 credential as an ApiError with status", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => ({ detail: "No repository credential configured" }),
+      }),
+    );
+
+    await expect(getRepositoryCredential("ws")).rejects.toMatchObject({ status: 404 });
+    await expect(getRepositoryCredential("ws")).rejects.toBeInstanceOf(ApiError);
   });
 });

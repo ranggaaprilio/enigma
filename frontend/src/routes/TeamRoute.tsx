@@ -7,6 +7,7 @@ import {
   Clock,
   FolderGit2,
   GitBranch,
+  LayoutTemplate,
   Pencil,
   Plus,
   Users,
@@ -15,6 +16,7 @@ import {
 import { AppShell } from "../components/AppShell";
 import { BudgetConfig } from "../components/usage/BudgetConfig";
 import { UsagePanel } from "../components/usage/UsagePanel";
+import { CreateWorkspaceWizard } from "../components/workspace/CreateWorkspaceWizard";
 import {
   createTeamWorkspace,
   getProject,
@@ -55,8 +57,18 @@ const statusMeta: Record<WorkspaceStatus, { dot: string; pill: string }> = {
   },
 };
 
-function repoLabel(url: string) {
-  return url.replace(/^https?:\/\//, "").replace(/\.git$/, "");
+function repoLabel(ws: WorkspaceResponse) {
+  if (ws.repo_url) {
+    return ws.repo_url.replace(/^(https?|ssh):\/\/(git@)?/, "").replace(/\.git$/, "");
+  }
+  return ws.source === "template" ? "From template — no remote yet" : "Blank workspace";
+}
+
+function RepoIcon({ ws }: { ws: WorkspaceResponse }) {
+  const className = "h-3.5 w-3.5 shrink-0";
+  if (ws.repo_url) return <FolderGit2 className={className} aria-hidden="true" />;
+  if (ws.source === "template") return <LayoutTemplate className={className} aria-hidden="true" />;
+  return <Box className={className} aria-hidden="true" />;
 }
 
 function formatDate(value: string) {
@@ -79,10 +91,6 @@ export function TeamRoute() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [showCreate, setShowCreate] = useState(false);
-  const [creating, setCreating] = useState(false);
-  const [newName, setNewName] = useState("");
-  const [newRepo, setNewRepo] = useState("");
-  const [newBranch, setNewBranch] = useState("main");
   const [showEdit, setShowEdit] = useState(false);
   const [saving, setSaving] = useState(false);
   const [editName, setEditName] = useState("");
@@ -109,25 +117,6 @@ export function TeamRoute() {
       });
     return () => controller.abort();
   }, [projectId, teamId]);
-
-  async function handleCreateWorkspace(e: FormEvent) {
-    e.preventDefault();
-    if (!projectId || !teamId || !newName.trim() || !newRepo.trim()) return;
-    setCreating(true);
-    try {
-      const ws = await createTeamWorkspace(projectId, teamId, {
-        name: newName.trim(),
-        repo_url: newRepo.trim(),
-        default_branch: newBranch.trim() || "main",
-      });
-      navigate(`/projects/${projectId}/teams/${teamId}/workspaces/${ws.id}`);
-    } catch (err: unknown) {
-      setError(
-        err instanceof Error ? err.message : "Failed to create workspace",
-      );
-      setCreating(false);
-    }
-  }
 
   function openEdit() {
     setEditName(team?.name ?? "");
@@ -325,11 +314,8 @@ export function TeamRoute() {
 
                 <div className="mt-4 space-y-2 text-xs text-muted">
                   <p className="flex items-center gap-1.5">
-                    <FolderGit2
-                      className="h-3.5 w-3.5 shrink-0"
-                      aria-hidden="true"
-                    />
-                    <span className="truncate">{repoLabel(ws.repo_url)}</span>
+                    <RepoIcon ws={ws} />
+                    <span className="truncate">{repoLabel(ws)}</span>
                   </p>
                   <p className="flex items-center gap-1.5">
                     <GitBranch
@@ -363,76 +349,16 @@ export function TeamRoute() {
         )}
       </main>
 
-      {showCreate && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/30 px-4">
-          <div className="w-full max-w-md rounded-xl border border-line bg-panel p-6 shadow-lg">
-            <div className="mb-4 flex items-center gap-3">
-              <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary/10 text-primary">
-                <Box className="h-5 w-5" aria-hidden="true" />
-              </div>
-              <div>
-                <h2 className="text-lg font-semibold text-ink">
-                  New workspace
-                </h2>
-                <p className="text-xs text-muted">
-                  Provisions a Daytona sandbox.
-                </p>
-              </div>
-            </div>
-            <form onSubmit={handleCreateWorkspace} className="space-y-3">
-              <div>
-                <label className="mb-1 block text-sm font-medium text-body">
-                  Name
-                </label>
-                <input
-                  value={newName}
-                  onChange={(e) => setNewName(e.target.value)}
-                  className="w-full rounded-lg border border-line bg-canvas px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-primary/50"
-                  placeholder="My workspace"
-                  required
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium text-body">
-                  Repository URL
-                </label>
-                <input
-                  value={newRepo}
-                  onChange={(e) => setNewRepo(e.target.value)}
-                  className="w-full rounded-lg border border-line bg-canvas px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-primary/50"
-                  placeholder="https://github.com/org/repo"
-                  required
-                />
-              </div>
-              <div>
-                <label className="mb-1 block text-sm font-medium text-body">
-                  Default branch
-                </label>
-                <input
-                  value={newBranch}
-                  onChange={(e) => setNewBranch(e.target.value)}
-                  className="w-full rounded-lg border border-line bg-canvas px-3 py-2 text-sm text-ink focus:outline-none focus:ring-2 focus:ring-primary/50"
-                />
-              </div>
-              <div className="flex justify-end gap-2 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowCreate(false)}
-                  className="rounded-lg px-4 py-2 text-sm text-body hover:bg-line"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="submit"
-                  disabled={creating}
-                  className="inline-flex items-center gap-2 rounded-lg bg-primary px-4 py-2 text-sm font-medium text-white hover:bg-primary-active disabled:opacity-60"
-                >
-                  {creating ? "Creating…" : "Create"}
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
+      {projectId && teamId && (
+        <CreateWorkspaceWizard
+          open={showCreate}
+          onClose={() => setShowCreate(false)}
+          subtitle="Provisions a Daytona sandbox for this team."
+          createFn={(payload) => createTeamWorkspace(projectId, teamId, payload)}
+          onCreated={(ws) =>
+            navigate(`/projects/${projectId}/teams/${teamId}/workspaces/${ws.id}`)
+          }
+        />
       )}
 
       {showEdit && (

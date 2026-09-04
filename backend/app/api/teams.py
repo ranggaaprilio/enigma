@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.audit_support import AUDIT_LOG_SERVICE_DEP, record_audit_safely
 from app.api.auth import CURRENT_USER_DEP
 from app.api.workspace_support import workspace_response, workspace_responses
+from app.api.workspaces import WORKSPACE_CREATE_ERRORS, workspace_create_error
 from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.models import User
@@ -344,10 +345,14 @@ async def create_team_workspace(
             default_branch=payload.default_branch,
             snapshot=payload.snapshot,
             team_id=team_id,
+            source=payload.source,
+            template_id=payload.template_id,
         )
     except WorkspaceRuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Workspace runtime error: {exc}",
         ) from None
+    except WORKSPACE_CREATE_ERRORS as exc:
+        raise workspace_create_error(exc) from None
     return await workspace_response(session, workspace, current_user.id)

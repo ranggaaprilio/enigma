@@ -488,6 +488,7 @@ describe("App auth routing", () => {
   });
 
   it("renders repository controls and handles diff commit and push flows", async () => {
+    let connected = false;
     const fetchMock = vi.fn((url: string) => {
       if (url.endsWith("/auth/me")) {
         return Promise.resolve(jsonResponse(authUser));
@@ -517,8 +518,28 @@ describe("App auth routing", () => {
         );
       }
       if (url.endsWith(`/workspaces/${workspace.id}/repo/connect`)) {
+        connected = true;
         return Promise.resolve(
           jsonResponse({ ...workspace, repo_url: "https://github.com/example/demo.git" }),
+        );
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/repo/credential`)) {
+        if (!connected) {
+          return Promise.resolve(
+            jsonResponse({ detail: "No repository credential configured" }, false, 404),
+          );
+        }
+        return Promise.resolve(
+          jsonResponse({
+            provider: "github",
+            auth_type: "personal_access_token",
+            username: null,
+            public_key: null,
+            supports_pull_requests: true,
+            repo_url: "https://github.com/example/demo.git",
+            created_at: workspace.created_at,
+            updated_at: workspace.updated_at,
+          }),
         );
       }
       if (url.endsWith(`/workspaces/${workspace.id}/repo/commit`)) {
@@ -542,6 +563,14 @@ describe("App auth routing", () => {
     await userEvent.type(screen.getByLabelText("Personal access token"), "raw-secret");
     await userEvent.click(screen.getByRole("button", { name: "Connect repository" }));
     expect(await screen.findByText("Repository credentials saved.")).toBeInTheDocument();
+    const connectCall = (fetchMock.mock.calls as unknown as [string, RequestInit?][]).find(
+      ([url]) => url.endsWith(`/workspaces/${workspace.id}/repo/connect`),
+    );
+    expect(JSON.parse(String(connectCall?.[1]?.body))).toMatchObject({
+      repo_url: "https://github.com/example/demo",
+      auth_type: "personal_access_token",
+      token: "raw-secret",
+    });
 
     await userEvent.type(screen.getByLabelText("Commit message"), "Update README");
     await userEvent.click(screen.getByRole("button", { name: "Commit changes" }));

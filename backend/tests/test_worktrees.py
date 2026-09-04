@@ -20,6 +20,10 @@ from app.services.github_client import (
     PullRequestService,
     parse_owner_repo,
 )
+from app.services.repositories import (
+    PullRequestsUnsupportedError,
+    RepositoryCredentialNotFoundError,
+)
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 from app.services.worktrees import (
@@ -588,3 +592,95 @@ async def test_create_pull_request_github_error_maps_status(api_context):
             json={"head": "feat/login", "title": "Add login"},
         )
     assert response.status_code == 422
+
+
+async def test_create_pull_request_unsupported_provider_maps_to_409(api_context):
+    _user, workspace, _wt, pr_service = api_context
+    pr_service.error = PullRequestsUnsupportedError("gitlab", "personal_access_token")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post(
+            f"/workspaces/{workspace.id}/repo/pull-requests",
+            json={"head": "feat/login", "title": "Add login"},
+        )
+    assert response.status_code == 409
+    assert "gitlab" in response.json()["detail"]
+
+
+class _OneCredentialSession:
+    def __init__(self, credential) -> None:
+        self.credential = credential
+
+    async def execute(self, statement):
+        credential = self.credential
+        return SimpleNamespace(scalar_one_or_none=lambda: credential)
+
+
+def _pr_service_with_credential(credential) -> PullRequestService:
+    settings = Settings()
+    return PullRequestService(
+        session=_OneCredentialSession(credential),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        settings=settings,
+    )
+
+
+def _workspace_for(repo_url: str | None) -> Workspace:
+    return Workspace(
+        id=uuid4(),
+        owner_id=uuid4(),
+        name="Demo",
+        slug="demo",
+        repo_url=repo_url,
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-1",
+        workspace_path="/workspace",
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+
+
+async def test_pull_request_service_rejects_non_github_and_ssh_credentials():
+    settings = Settings()
+    cipher = WorkspaceSecretCipher(settings.workspace_env_encryption_key)
+    gitlab = RepositoryCredential(
+        workspace_id=uuid4(),
+        provider="gitlab",
+        auth_type="personal_access_token",
+        encrypted_token=cipher.encrypt("glpat"),
+    )
+    with pytest.raises(PullRequestsUnsupportedError) as excinfo:
+        await _pr_service_with_credential(gitlab)._require_github_token(
+            _workspace_for("https://gitlab.com/team/demo.git")
+        )
+    assert excinfo.value.provider == "gitlab"
+
+    github_ssh = RepositoryCredential(
+        workspace_id=uuid4(),
+        provider="github",
+        auth_type="ssh_key",
+        encrypted_private_key=cipher.encrypt("key"),
+        public_key="ssh-ed25519 AAAA test",
+    )
+    with pytest.raises(PullRequestsUnsupportedError):
+        await _pr_service_with_credential(github_ssh)._require_github_token(
+            _workspace_for("ssh://git@github.com/team/demo.git")
+        )
+
+    github_pat = RepositoryCredential(
+        workspace_id=uuid4(),
+        provider="github",
+        auth_type="personal_access_token",
+        encrypted_token=cipher.encrypt("ghp_token"),
+    )
+    token = await _pr_service_with_credential(github_pat)._require_github_token(
+        _workspace_for("https://github.com/team/demo.git")
+    )
+    assert token == "ghp_token"
+
+    with pytest.raises(RepositoryCredentialNotFoundError):
+        await _pr_service_with_credential(github_pat)._require_github_token(
+            _workspace_for(None)
+        )

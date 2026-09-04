@@ -17,6 +17,7 @@ from app.api.projects import router as projects_router
 from app.api.sessions import router as sessions_router
 from app.api.specs import router as specs_router
 from app.api.teams import router as teams_router
+from app.api.templates import router as templates_router
 from app.api.terminal import router as terminal_router
 from app.api.workspaces import router as workspaces_router
 
@@ -38,5 +39,6 @@ api_router.include_router(preview_router)
 api_router.include_router(projects_router)
 api_router.include_router(specs_router)
 api_router.include_router(teams_router)
+api_router.include_router(templates_router)
 api_router.include_router(terminal_router)
 api_router.include_router(workspaces_router)

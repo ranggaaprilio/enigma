@@ -9,6 +9,7 @@ from app.models.preview import PreviewSession
 from app.models.project import Project, ProjectMember, Team, TeamMember
 from app.models.repository import RepositoryCredential
 from app.models.speckit import SpecPhase, SpecWorkflow
+from app.models.template import WorkspaceTemplate
 from app.models.terminal import TerminalSession
 from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceEnvVar
@@ -39,5 +40,6 @@ __all__ = [
     "User",
     "Workspace",
     "WorkspaceEnvVar",
+    "WorkspaceTemplate",
     "WorkspaceWorktree",
 ]

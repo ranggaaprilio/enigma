@@ -1,20 +1,38 @@
 import base64
 import re
 import shlex
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from urllib.parse import urlparse, urlunparse
-from uuid import UUID
+from typing import Literal
+from uuid import UUID, uuid4
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import Settings, get_settings
 from app.models import RepositoryCredential, Workspace
-from app.services.daytona_runtime import DaytonaRuntime, DaytonaRuntimeError
+from app.services.daytona_runtime import DaytonaRuntime
+from app.services.git_providers import (
+    AUTO_PROVIDER,
+    InvalidRepositoryUrlError,
+    detect_provider,
+    http_basic_username,
+    parse_repository_url,
+    redact_secrets,
+)
+from app.services.git_providers import sanitize_repository_url as _sanitize_repository_url
+from app.services.ssh_keys import generate_ed25519_keypair
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
-GITHUB_REPO_PATTERN = re.compile(r"^/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?/?$")
 GIT_TIMEOUT_SECONDS = 60
+CLONE_TIMEOUT_SECONDS = 300
+# Private keys are materialised under here for the duration of one git command, then removed.
+SSH_TMP_ROOT = "/tmp/enigma-ssh"
+
+# Re-exported for callers that historically imported the URL error from this module.
+__all__ = ["InvalidRepositoryUrlError"]
 
 # Commit SHAs are hex; accept an abbreviated (>=4) or full (40) hash. ``shlex.quote`` already blocks
 # shell injection, but validating the shape keeps arbitrary refs/paths out of ``git show``.
@@ -34,10 +52,6 @@ COMMIT_META_FORMAT = "%H%x1f%h%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b"
 # name/email is preferred; this is shared with speckit so the fallback is consistent.
 DEFAULT_COMMIT_AUTHOR = "Enigma app"
 DEFAULT_COMMIT_EMAIL = "author@enigma.ai"
-
-
-class InvalidRepositoryUrlError(Exception):
-    pass
 
 
 class RepositoryCredentialNotFoundError(Exception):
@@ -68,6 +82,29 @@ class GitCommandError(Exception):
     def __init__(self, message: str) -> None:
         self.message = message
         super().__init__(message)
+
+
+class PullRequestsUnsupportedError(Exception):
+    """Provider-native pull requests need a GitHub repository connected with a token."""
+
+    def __init__(self, provider: str, auth_type: str | None = None) -> None:
+        self.provider = provider
+        self.auth_type = auth_type
+        super().__init__(provider)
+
+
+@dataclass(frozen=True)
+class GitAuth:
+    """Decrypted credential material for one git operation. Never logged or persisted."""
+
+    kind: Literal["token", "ssh"]
+    username: str | None = None
+    token: str | None = None
+    private_key: str | None = None
+
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        return tuple(secret for secret in (self.token, self.private_key) if secret)
 
 
 @dataclass(frozen=True)
@@ -106,26 +143,19 @@ class GitCommitDetail:
     diff: str
 
 
-def sanitize_repository_url(repo_url: str) -> str:
-    parsed = urlparse(repo_url.strip())
-    if parsed.scheme != "https" or parsed.hostname != "github.com":
-        raise InvalidRepositoryUrlError
-    if not GITHUB_REPO_PATTERN.fullmatch(parsed.path):
-        raise InvalidRepositoryUrlError
-
-    path = parsed.path.rstrip("/")
-    if not path.endswith(".git"):
-        path = f"{path}.git"
-
-    return urlunparse(("https", "github.com", path, "", "", ""))
+def sanitize_repository_url(
+    repo_url: str,
+    *,
+    provider: str = AUTO_PROVIDER,
+    auth_type: str | None = None,
+) -> str:
+    """Canonical, credential-free repository URL (see ``git_providers``)."""
+    return _sanitize_repository_url(repo_url, provider=provider, auth_type=auth_type)
 
 
-def sanitize_git_output(value: str, token: str | None = None) -> str:
-    sanitized = value
-    if token:
-        sanitized = sanitized.replace(token, "[redacted]")
-    sanitized = re.sub(r"https://[^@\s]+@github\.com", "https://[redacted]@github.com", sanitized)
-    return sanitized
+def sanitize_git_output(value: str, *secrets: str | None) -> str:
+    """Redact tokens/userinfo from git output regardless of the remote host."""
+    return redact_secrets(value, *secrets)
 
 
 def parse_porcelain_status(output: str) -> list[GitFileStatus]:
@@ -166,65 +196,131 @@ class RepositoryService:
         session: AsyncSession,
         cipher: WorkspaceSecretCipher,
         runtime: DaytonaRuntime,
+        settings: Settings | None = None,
     ) -> None:
         self.session = session
         self.cipher = cipher
         self.runtime = runtime
+        self.settings = settings or get_settings()
 
     async def connect(
         self,
         workspace_id: UUID,
         owner_id: UUID,
         repo_url: str,
-        token: str,
+        *,
+        provider: str = AUTO_PROVIDER,
+        auth_type: str = "personal_access_token",
+        token: str | None = None,
+        username: str | None = None,
     ) -> Workspace:
-        workspace = await self._get_workspace(workspace_id, owner_id)
-        sanitized_url = sanitize_repository_url(repo_url)
-        encrypted_token = self.cipher.encrypt(token)
+        """Point the workspace at a remote and store the credential used to reach it.
 
-        result = await self.session.execute(
-            select(RepositoryCredential).where(
-                RepositoryCredential.workspace_id == workspace.id,
-            )
-        )
-        credential = result.scalar_one_or_none()
+        Token auth stores the (encrypted) token; SSH auth reuses the workspace's deploy key pair
+        or generates one. Only the workspace row and the single credential row change — the
+        sandbox is untouched (``origin`` is reconciled lazily by push/pull/fetch).
+        """
+        workspace = await self._get_workspace(workspace_id, owner_id)
+        parsed = parse_repository_url(repo_url, provider=provider, auth_type=auth_type)
+
+        credential = await self._load_credential(workspace.id)
         if credential is None:
             credential = RepositoryCredential(
-                workspace_id=workspace.id,
-                provider="github",
-                auth_type="personal_access_token",
-                encrypted_token=encrypted_token,
+                workspace_id=workspace.id, provider=parsed.provider, auth_type=auth_type
             )
+        credential.provider = parsed.provider
+        credential.auth_type = auth_type
+        if auth_type == "ssh_key":
+            if not credential.encrypted_private_key or not credential.public_key:
+                self._assign_keypair(credential, workspace.id)
+            credential.encrypted_token = None
+            credential.username = None
         else:
-            credential.provider = "github"
-            credential.auth_type = "personal_access_token"
-            credential.encrypted_token = encrypted_token
+            if not token:
+                raise ValueError("token is required for personal_access_token authentication")
+            credential.encrypted_token = self.cipher.encrypt(token)
+            credential.username = (username or "").strip() or None
+            credential.encrypted_private_key = None
+            credential.public_key = None
 
-        workspace.repo_url = sanitized_url
+        workspace.repo_url = parsed.url
         self.session.add(workspace)
         self.session.add(credential)
         await self.session.commit()
         await self.session.refresh(workspace)
         return workspace
 
+    async def ensure_ssh_key(
+        self, workspace_id: UUID, owner_id: UUID, *, rotate: bool = False
+    ) -> RepositoryCredential:
+        """Make sure the workspace has an SSH deploy key pair and return its credential row.
+
+        Usable before a remote is connected (the wizard shows the public key first) — the
+        provider is then a best guess from ``repo_url`` and is corrected by ``connect``.
+        """
+        workspace = await self._get_workspace(workspace_id, owner_id)
+        credential = await self._load_credential(workspace.id)
+        if credential is None:
+            credential = RepositoryCredential(
+                workspace_id=workspace.id,
+                provider=detect_provider(workspace.repo_url),
+                auth_type="ssh_key",
+            )
+        needs_key = (
+            rotate
+            or credential.auth_type != "ssh_key"
+            or not credential.encrypted_private_key
+            or not credential.public_key
+        )
+        if needs_key:
+            self._assign_keypair(credential, workspace.id)
+        credential.auth_type = "ssh_key"
+        credential.encrypted_token = None
+        credential.username = None
+        self.session.add(credential)
+        await self.session.commit()
+        await self.session.refresh(credential)
+        return credential
+
+    async def get_credential(self, workspace_id: UUID, owner_id: UUID) -> RepositoryCredential:
+        workspace = await self._get_workspace(workspace_id, owner_id)
+        credential = await self._load_credential(workspace.id)
+        if credential is None:
+            raise RepositoryCredentialNotFoundError
+        return credential
+
+    def _assign_keypair(self, credential: RepositoryCredential, workspace_id: UUID) -> None:
+        pair = generate_ed25519_keypair(f"enigma-workspace-{workspace_id}")
+        credential.encrypted_private_key = self.cipher.encrypt(pair.private_key)
+        credential.public_key = pair.public_key
+
     async def clone(self, workspace_id: UUID, owner_id: UUID) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
-        token = await self._get_token(workspace.id)
+        if not workspace.repo_url:
+            raise RepositoryCredentialNotFoundError
+        auth = await self._get_auth(workspace.id)
         sandbox = await self.runtime.get_sandbox(workspace)
         if await self._is_cloned(sandbox, workspace.workspace_path):
             raise RepositoryAlreadyClonedError
         try:
-            await sandbox.git.clone(
-                workspace.repo_url,
-                workspace.workspace_path,
-                branch=workspace.default_branch,
-                username="x-access-token",
-                password=token,
+            await sandbox.fs.get_file_info(workspace.workspace_path)
+        except Exception:
+            await sandbox.fs.create_folder(workspace.workspace_path, "755")
+        # Clone with the git CLI (not the SDK's server-side go-git) so token and SSH auth share
+        # one code path — the same reason push/pull already run through the CLI.
+        result = await self._run_authenticated_git(
+            workspace,
+            ["clone", "--branch", workspace.default_branch, "--", workspace.repo_url, "."],
+            auth,
+            cwd=workspace.workspace_path,
+            timeout=CLONE_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            raise GitCommandError(
+                sanitize_git_output(
+                    result.stdout or result.stderr or "git clone failed", *auth.secrets
+                )
             )
-        except DaytonaRuntimeError as error:
-            raise GitCommandError(str(error)) from error
-        except Exception as error:
-            raise GitCommandError(sanitize_git_output(str(error), token)) from error
 
     async def status(
         self,
@@ -413,17 +509,18 @@ class RepositoryService:
         worktree_path: str | None = None,
     ) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
-        token = await self._get_token(workspace.id)
+        auth = await self._get_auth(workspace.id)
         repo_path = worktree_path or workspace.workspace_path
         sandbox = await self.runtime.get_sandbox(workspace)
         await self._ensure_cloned(sandbox, repo_path)
+        await self._ensure_origin(workspace, repo_path)
         result = await self._run_authenticated_git(
-            workspace, ["pull"], token, cwd=repo_path
+            workspace, ["pull"], auth, cwd=repo_path
         )
         if result.exit_code != 0:
             raise GitCommandError(
                 sanitize_git_output(
-                    result.stdout or result.stderr or "git pull failed", token
+                    result.stdout or result.stderr or "git pull failed", *auth.secrets
                 )
             )
 
@@ -435,19 +532,20 @@ class RepositoryService:
         worktree_path: str | None = None,
     ) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
-        token = await self._get_token(workspace.id)
+        auth = await self._get_auth(workspace.id)
         repo_path = worktree_path or workspace.workspace_path
         sandbox = await self.runtime.get_sandbox(workspace)
         await self._ensure_cloned(sandbox, repo_path)
+        await self._ensure_origin(workspace, repo_path)
         # A fetch updates the shared object store for every worktree in the clone, so ahead/behind
         # counts (WorktreeService._stats) become accurate afterward regardless of the cwd used.
         result = await self._run_authenticated_git(
-            workspace, ["fetch", "origin"], token, cwd=repo_path
+            workspace, ["fetch", "origin"], auth, cwd=repo_path
         )
         if result.exit_code != 0:
             raise GitCommandError(
                 sanitize_git_output(
-                    result.stdout or result.stderr or "git fetch failed", token
+                    result.stdout or result.stderr or "git fetch failed", *auth.secrets
                 )
             )
 
@@ -512,10 +610,11 @@ class RepositoryService:
         worktree_path: str | None = None,
     ) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
-        token = await self._get_token(workspace.id)
+        auth = await self._get_auth(workspace.id)
         repo_path = worktree_path or workspace.workspace_path
         sandbox = await self.runtime.get_sandbox(workspace)
         await self._ensure_cloned(sandbox, repo_path)
+        await self._ensure_origin(workspace, repo_path)
         # Push via the git CLI (not the Daytona SDK's server-side go-git). go-git cannot resolve
         # references through a linked worktree's ``.git`` pointer file — the same limitation that
         # forces ``status`` onto the CLI — so a new feature branch created in a worktree never
@@ -525,13 +624,13 @@ class RepositoryService:
         result = await self._run_authenticated_git(
             workspace,
             ["push", "--set-upstream", "origin", "HEAD"],
-            token,
+            auth,
             cwd=repo_path,
         )
         if result.exit_code != 0:
             raise GitCommandError(
                 sanitize_git_output(
-                    result.stdout or result.stderr or "git push failed", token
+                    result.stdout or result.stderr or "git push failed", *auth.secrets
                 )
             )
 
@@ -594,46 +693,155 @@ class RepositoryService:
             raise WorkspaceNotFoundError
         return workspace
 
+    async def _ensure_origin(self, workspace: Workspace, repo_path: str) -> None:
+        """Make ``origin`` point at ``workspace.repo_url`` (best effort).
+
+        Template and blank workspaces start with no remote, and a re-``connect`` may switch the
+        URL (e.g. HTTPS → SSH). Reconciling lazily here keeps ``connect`` DB-only; any failure is
+        left for the following push/pull/fetch to surface with git's own message.
+        """
+        if not workspace.repo_url:
+            return
+        current = await self.runtime.exec(
+            workspace, "git remote get-url origin", cwd=repo_path, timeout=GIT_TIMEOUT_SECONDS
+        )
+        if current.exit_code != 0:
+            args = ["remote", "add", "origin", workspace.repo_url]
+        elif current.stdout.strip() != workspace.repo_url:
+            args = ["remote", "set-url", "origin", workspace.repo_url]
+        else:
+            return
+        await self.runtime.exec(
+            workspace,
+            "git " + " ".join(shlex.quote(part) for part in args),
+            cwd=repo_path,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+
     async def _run_authenticated_git(
         self,
         workspace: Workspace,
         args: list[str],
-        token: str,
+        auth: GitAuth,
         *,
         cwd: str,
+        timeout: int = GIT_TIMEOUT_SECONDS,
     ):
-        """Run a git CLI command against the GitHub ``origin`` with a PAT.
+        """Run a git CLI command against ``origin`` with the workspace's credential.
 
-        Authentication rides on a per-command HTTP Basic ``Authorization`` header
-        (``http.extraHeader``) — the mechanism GitHub documents for token auth over
-        HTTPS. The username half is a fixed placeholder (``x-access-token``); GitHub
-        only checks the token in the password half, so this covers classic and
-        fine-grained personal access tokens (and app installation tokens) alike.
-        Passing the credential as a per-invocation ``-c`` value keeps it out of
-        ``.git/config`` and out of the remote URL, and it is never persisted.
+        Token auth rides on a per-command HTTP Basic ``Authorization`` header
+        (``http.extraHeader``) whose username half is provider-specific (``x-access-token`` for
+        GitHub, ``oauth2`` for GitLab, ``x-token-auth`` or the account name for Bitbucket).
+        Passing it as a per-invocation ``-c`` value keeps it out of ``.git/config`` and the
+        remote URL. SSH auth materialises the deploy key inside the sandbox for the duration of
+        the command and points ``GIT_SSH_COMMAND`` at it. Nothing is persisted either way.
         """
-        basic = base64.b64encode(f"x-access-token:{token}".encode()).decode()
+        if auth.kind == "ssh":
+            return await self._run_ssh_git(workspace, args, auth, cwd=cwd, timeout=timeout)
+        basic = base64.b64encode(f"{auth.username}:{auth.token}".encode()).decode()
         command = "git " + " ".join(
             shlex.quote(part)
             for part in ("-c", f"http.extraHeader=AUTHORIZATION: basic {basic}", *args)
         )
-        return await self.runtime.exec(
-            workspace, command, cwd=cwd, timeout=GIT_TIMEOUT_SECONDS
-        )
+        return await self.runtime.exec(workspace, command, cwd=cwd, timeout=timeout)
 
-    async def _get_token(self, workspace_id: UUID) -> str:
+    async def _run_ssh_git(
+        self,
+        workspace: Workspace,
+        args: list[str],
+        auth: GitAuth,
+        *,
+        cwd: str,
+        timeout: int,
+    ):
+        if not auth.private_key:
+            raise RepositoryTokenError
+        sandbox = await self.runtime.get_sandbox(workspace)
+        ssh_dir = f"{self.settings.daytona_sandbox_home.rstrip('/')}/.ssh"
+        async with self._ssh_identity(sandbox, auth.private_key) as key_path:
+            ssh_command = " ".join(
+                (
+                    "ssh",
+                    "-i",
+                    shlex.quote(key_path),
+                    "-o",
+                    "IdentitiesOnly=yes",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "StrictHostKeyChecking=accept-new",
+                    "-o",
+                    f"UserKnownHostsFile={shlex.quote(ssh_dir + '/known_hosts')}",
+                )
+            )
+            # ``accept-new`` needs a writable known_hosts location; create ~/.ssh on first use.
+            command = (
+                f"mkdir -p {shlex.quote(ssh_dir)} && git "
+                + " ".join(shlex.quote(part) for part in args)
+            )
+            result = await self.runtime.exec(
+                workspace,
+                command,
+                cwd=cwd,
+                env={"GIT_SSH_COMMAND": ssh_command, "GIT_TERMINAL_PROMPT": "0"},
+                timeout=timeout,
+            )
+        output = (result.stdout or "") + (result.stderr or "")
+        if result.exit_code != 0 and "cannot run ssh" in output.lower():
+            raise GitCommandError("SSH client is not available in this sandbox image")
+        return result
+
+    @asynccontextmanager
+    async def _ssh_identity(self, sandbox, private_key: str) -> AsyncIterator[str]:
+        """Write the private key to a private temp dir in the sandbox; always remove it."""
+        directory = f"{SSH_TMP_ROOT}/{uuid4().hex}"
+        key_path = f"{directory}/id_ed25519"
+        try:
+            await sandbox.fs.create_folder(directory, "700")
+            await sandbox.fs.upload_file(private_key.encode("utf-8"), key_path)
+            await sandbox.fs.set_file_permissions(key_path, mode="600")
+        except Exception as error:
+            await self._remove_quietly(sandbox, directory)
+            raise GitCommandError(
+                redact_secrets(f"Could not stage SSH key: {error}", private_key)
+            ) from error
+        try:
+            yield key_path
+        finally:
+            await self._remove_quietly(sandbox, directory)
+
+    @staticmethod
+    async def _remove_quietly(sandbox, path: str) -> None:
+        try:
+            await sandbox.fs.delete_file(path, recursive=True)
+        except Exception:
+            return
+
+    async def _load_credential(self, workspace_id: UUID) -> RepositoryCredential | None:
         result = await self.session.execute(
             select(RepositoryCredential).where(
                 RepositoryCredential.workspace_id == workspace_id,
             )
         )
-        credential = result.scalar_one_or_none()
+        return result.scalar_one_or_none()
+
+    async def _get_auth(self, workspace_id: UUID) -> GitAuth:
+        credential = await self._load_credential(workspace_id)
         if credential is None:
             raise RepositoryCredentialNotFoundError
-        token = self.cipher.decrypt(credential.encrypted_token)
+        if credential.auth_type == "ssh_key":
+            private_key = self.cipher.decrypt(credential.encrypted_private_key or "")
+            if private_key is None:
+                raise RepositoryTokenError
+            return GitAuth(kind="ssh", private_key=private_key)
+        token = self.cipher.decrypt(credential.encrypted_token or "")
         if token is None:
             raise RepositoryTokenError
-        return token
+        return GitAuth(
+            kind="token",
+            username=http_basic_username(credential.provider, credential.username),
+            token=token,
+        )
 
     async def _is_cloned(self, sandbox, repo_path: str) -> bool:
         # In the base clone ``.git`` is a directory; inside a linked worktree it is a file that
