@@ -369,7 +369,7 @@ async def test_run_launches_dev_task_and_marks_desired():
     assert state.status == "installing"  # "Starting app…" — dev server coming up
     launch = next(command for command in runtime.commands if "nohup" in command)
     assert "mise run dev" in launch
-    assert "mise run install" not in launch  # deps already installed by setup
+    assert "mise run install" in launch  # deps re-checked on every run (idempotent)
     # Running the app marks it desired so it auto-resumes after a sandbox wake.
     assert workspace.dev_autostart
 

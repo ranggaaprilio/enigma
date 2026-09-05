@@ -673,6 +673,7 @@ class AgentService:
                     working_dir=working_dir,
                     allowlist_enabled=self.settings.agent_command_allowlist_enabled,
                     allowed_commands=frozenset(self.settings.agent_command_allowlist),
+                    deny_dangerous=self.settings.agent_command_deny_dangerous,
                 )
 
                 # Read the baseline in the run's own working directory: a worktree-scoped run

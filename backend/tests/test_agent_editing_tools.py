@@ -92,6 +92,7 @@ def make_tools(
     exec_handler: Callable[[str], FakeExecResult] | None = None,
     allowlist_enabled: bool = False,
     allowed_commands: frozenset[str] | None = None,
+    deny_dangerous: bool = True,
 ) -> tuple[WorkspaceTools, FakeRuntime]:
     runtime = FakeRuntime(fs=fs, exec_handler=exec_handler)
     tools = WorkspaceTools(
@@ -101,6 +102,7 @@ def make_tools(
         max_command_output_chars=100_000,
         allowlist_enabled=allowlist_enabled,
         allowed_commands=allowed_commands,
+        deny_dangerous=deny_dangerous,
     )
     return tools, runtime
 
@@ -393,3 +395,16 @@ def test_validate_command_allowlist_supersedes_denylist():
         tools._validate_command("pytest && ls")
     with pytest.raises(DangerousCommandError):
         tools._validate_command("/bin/pytest")
+
+
+def test_validate_command_deny_dangerous_false_relaxes_denylist():
+    tools, _ = make_tools(deny_dangerous=False)
+
+    # npm is denylisted by default, but allowed when the denylist is relaxed.
+    assert tools._validate_command("npm install") == ["npm", "install"]
+    assert tools._validate_command("pnpm test") == ["pnpm", "test"]
+    # Shell operators and absolute paths are always rejected regardless.
+    with pytest.raises(DangerousCommandError):
+        tools._validate_command("npm install && npm test")
+    with pytest.raises(DangerousCommandError):
+        tools._validate_command("/usr/bin/npm install")

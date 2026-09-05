@@ -706,7 +706,12 @@ class SpecKitService:
         else:
             sections.append(
                 "Implement the tasks by editing files in this worktree using the available "
-                "tools. Do not run git; the platform will commit your changes."
+                "tools (read_file, write_file, apply_patch, search_code). Do NOT run git and do "
+                "NOT attempt to install dependencies, build, or run tests via shell commands — "
+                "package managers (`npm`, `pnpm`, `yarn`, `uv`), `git`, and shell control "
+                "operators (`;`, `&&`, `||`, `|`, redirections, backticks) are all blocked by the "
+                "sandbox and will fail. Only read and write files; the platform will handle "
+                "installing dependencies, running tests, and committing your changes."
             )
         return "\n\n---\n\n".join(sections)
 
@@ -748,7 +753,11 @@ class SpecKitService:
             '"spec.md:L20", "summary": "...", "recommendation": "..."}`. Category is one of '
             "Duplication, Ambiguity, Underspecification, Constitution, Coverage, Inconsistency. "
             "Severity is one of CRITICAL, HIGH, MEDIUM, LOW. Use the SAME ids as the report table. "
-            "Write `[]` (an empty array) if there are no open questions."
+            "Write `[]` (an empty array) if there are no open questions.\n"
+            "If you need to validate the JSON, run a SINGLE command with no shell control "
+            "operators (`;`, `&&`, `||`, `|`, redirections, or backticks) — e.g. `python -m "
+            f"json.tool {spec_dir}/open-questions.json`. Shell control operators "
+            "are blocked by the sandbox and will cause the run to fail."
         )
         if remediating:
             base += (

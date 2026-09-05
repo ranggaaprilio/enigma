@@ -19,6 +19,11 @@ def test_command_allowlist_defaults_to_disabled_and_empty():
     assert settings.agent_command_allowlist == []
 
 
+def test_command_deny_dangerous_defaults_to_true():
+    assert Settings().agent_command_deny_dangerous is True
+    assert Settings(agent_command_deny_dangerous=False).agent_command_deny_dangerous is False
+
+
 def test_command_allowlist_parses_comma_separated_string():
     settings = Settings(agent_command_allowlist="pytest, ls ,cat")
 
