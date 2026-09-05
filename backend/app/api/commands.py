@@ -167,7 +167,9 @@ async def create_custom_command(
             hotkey=payload.hotkey,
             requires_confirmation=payload.requires_confirmation,
             role=payload.role,
-            kind=payload.kind,
+            # Only an explicit `kind` overrides the role-based default (a `dev`-role command
+            # defaults to `service`); omit it entirely so the service applies that default.
+            kind=payload.kind if "kind" in payload.model_fields_set else None,
             cwd=payload.cwd,
             port=payload.port,
             enabled=payload.enabled,

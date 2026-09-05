@@ -70,7 +70,7 @@ class FakeCommandService:
         hotkey: str | None,
         requires_confirmation: bool,
         role: str = "custom",
-        kind: str = "task",
+        kind: str | None = None,
         cwd: str | None = None,
         port: int | None = None,
         enabled: bool = True,
@@ -78,6 +78,8 @@ class FakeCommandService:
     ) -> CustomCommand:
         self._ensure_workspace(workspace_id, user_id)
         now = datetime.now(UTC)
+        # Mirrors CommandService.create_command: a `dev`-role command defaults to a service.
+        effective_kind = kind if kind is not None else ("service" if role == "dev" else "task")
         custom_command = CustomCommand(
             id=uuid4(),
             workspace_id=workspace_id,
@@ -88,7 +90,7 @@ class FakeCommandService:
             hotkey=hotkey,
             requires_confirmation=requires_confirmation,
             role=role,
-            kind=kind,
+            kind=effective_kind,
             cwd=cwd,
             port=port,
             enabled=enabled,
@@ -634,7 +636,9 @@ async def test_create_command_accepts_registry_fields(command_context):
     assert created.status_code == 201
     body = created.json()
     assert body["role"] == "dev"
-    assert body["kind"] == "task"
+    # A `dev`-role command defaults to `service` (Epic 11) so it can run as a long-lived
+    # process; an explicit `kind` in the request would still override this.
+    assert body["kind"] == "service"
     assert body["cwd"] == "backend"
     assert body["port"] == 8000
     assert body["timeout_seconds"] == 1800

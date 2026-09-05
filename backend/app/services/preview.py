@@ -3,6 +3,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
@@ -66,12 +67,72 @@ class PreviewService:
             await self._attach_branch(workspace, preview)
         return sessions
 
-    async def detect(self, workspace_id: UUID, user_id: UUID) -> PreviewSession:
-        workspace = await self._get_workspace(workspace_id, user_id)
-        port = await self._first_open_port(workspace)
-        if port is None:
-            raise PreviewNotFoundError
+    async def upsert_for_service(
+        self,
+        workspace: Workspace,
+        *,
+        service_id: UUID,
+        port: int,
+        worktree_id: UUID | None,
+    ) -> PreviewSession:
+        """One active preview session per (workspace, port), owned by a running
+        `workspace_services` row (Epic 11). A partial unique index on active
+        (workspace_id, port) guards the race between two services claiming the same port
+        concurrently; losing that race just means re-reading the winner's row."""
         now = datetime.now(UTC)
+        preview = await self._active_session_for_port(workspace, port)
+        if preview is None:
+            preview = PreviewSession(
+                workspace_id=workspace.id,
+                port=port,
+                public_url="",
+                status="active",
+                created_at=now,
+                last_seen_at=now,
+                service_id=service_id,
+                worktree_id=worktree_id,
+            )
+            self.session.add(preview)
+            try:
+                await self.session.flush()
+            except IntegrityError:
+                await self.session.rollback()
+                preview = await self._active_session_for_port(workspace, port)
+                if preview is None:
+                    raise
+        preview.service_id = service_id
+        preview.worktree_id = worktree_id
+        preview.last_seen_at = now
+        preview.public_url = self._proxy_url(preview)
+        self.session.add(preview)
+        await self.session.commit()
+        await self.session.refresh(preview)
+        return preview
+
+    async def stop_for_service(self, workspace: Workspace, service_id: UUID) -> None:
+        """Mark every active preview session owned by a service as stopped, so its URL stops
+        resolving the moment the service stops — no separate proxy-side change needed since
+        the proxy already rejects a non-active session (`preview_proxy.py`)."""
+        result = await self.session.execute(
+            select(PreviewSession).where(
+                PreviewSession.workspace_id == workspace.id,
+                PreviewSession.service_id == service_id,
+                PreviewSession.status == "active",
+            )
+        )
+        now = datetime.now(UTC)
+        sessions = list(result.scalars().all())
+        for preview in sessions:
+            preview.status = "stopped"
+            preview.public_url = ""
+            preview.last_seen_at = now
+            self.session.add(preview)
+        if sessions:
+            await self.session.commit()
+
+    async def _active_session_for_port(
+        self, workspace: Workspace, port: int
+    ) -> PreviewSession | None:
         result = await self.session.execute(
             select(PreviewSession)
             .where(
@@ -81,7 +142,15 @@ class PreviewService:
             )
             .limit(1)
         )
-        preview = result.scalar_one_or_none()
+        return result.scalar_one_or_none()
+
+    async def detect(self, workspace_id: UUID, user_id: UUID) -> PreviewSession:
+        workspace = await self._get_workspace(workspace_id, user_id)
+        port = await self._first_open_port(workspace)
+        if port is None:
+            raise PreviewNotFoundError
+        now = datetime.now(UTC)
+        preview = await self._active_session_for_port(workspace, port)
         is_new = preview is None
         if preview is None:
             preview = PreviewSession(
@@ -93,7 +162,17 @@ class PreviewService:
                 last_seen_at=now,
             )
             self.session.add(preview)
-            await self.session.flush()
+            try:
+                await self.session.flush()
+            except IntegrityError:
+                # A workspace_services-driven upsert_for_service claimed this port
+                # concurrently — the partial unique index on active (workspace_id, port)
+                # rejects our insert; fall back to whichever row won.
+                await self.session.rollback()
+                preview = await self._active_session_for_port(workspace, port)
+                is_new = False
+                if preview is None:
+                    raise
         else:
             preview.last_seen_at = now
         # Tag the preview with whichever worktree the dev server is running in, so the

@@ -3,7 +3,6 @@ import {
   AlertTriangle,
   ArrowDown,
   ArrowUp,
-  CheckCircle2,
   Pencil,
   Play,
   Plus,
@@ -25,7 +24,6 @@ import {
   updateWorkspace,
   type CommandRole,
   type CommandRunResponse,
-  type CommandRunStatus,
   type CommandRunStreamMessage,
   type CustomCommandPayload,
   type CustomCommandResponse,
@@ -36,6 +34,7 @@ import { usePermissions } from "../auth/permissions";
 import { useActiveWorktree } from "../lib/activeWorktree";
 import { RunConfigurationTab } from "./RunConfigurationTab";
 import { hotkeyMatches, normalizeHotkey } from "../lib/hotkeys";
+import { StatusPill } from "./ui/StatusPill";
 
 type ModalMode = "create" | "edit";
 type CommandFormState = {
@@ -46,6 +45,8 @@ type CommandFormState = {
   hotkey: string;
   requiresConfirmation: boolean;
   role: CommandRole;
+  // Whether this runs as a long-lived service (Epic 11) instead of a one-shot task.
+  isService: boolean;
   cwd: string;
   port: string;
   timeoutSeconds: string;
@@ -60,6 +61,7 @@ const emptyForm: CommandFormState = {
   hotkey: "",
   requiresConfirmation: false,
   role: "custom",
+  isService: false,
   cwd: "",
   port: "",
   timeoutSeconds: "",
@@ -215,6 +217,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
       hotkey: command.hotkey ?? "",
       requiresConfirmation: command.requires_confirmation,
       role: command.role,
+      isService: command.kind === "service",
       cwd: command.cwd ?? "",
       port: command.port === null ? "" : String(command.port),
       timeoutSeconds: command.timeout_seconds === null ? "" : String(command.timeout_seconds),
@@ -559,6 +562,14 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                           off
                         </span>
                       )}
+                      {command.kind === "service" && (
+                        <span
+                          className="shrink-0 rounded-full bg-line px-2 py-0.5 text-xs font-semibold text-ink/60"
+                          title="Runs as a service in the Preview tab"
+                        >
+                          service
+                        </span>
+                      )}
                     </div>
                     <code className="mt-2 block truncate rounded-md bg-panel px-2 py-1 text-xs text-ink/75">
                       {command.command}
@@ -671,7 +682,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                 <div className="min-w-0">
                   <div className="mb-3 flex items-center justify-between gap-3">
                     <h5 className="font-semibold">Output</h5>
-                    <CommandStatusPill status={activeRun?.status ?? "idle"} />
+                    <StatusPill status={activeRun?.status ?? "idle"} />
                   </div>
                   <pre className="min-h-[360px] max-h-[520px] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-line bg-panel p-4 font-mono text-xs leading-5 text-ink">
                     {visibleOutput || "Run output will appear here."}
@@ -850,9 +861,10 @@ function CommandModal({
               <select
                 className="mt-1 w-full rounded-md border border-line bg-white px-3 py-2 outline-none transition focus:border-ink"
                 value={formState.role}
-                onChange={(event) =>
-                  onChange({ ...formState, role: event.target.value as CommandRole })
-                }
+                onChange={(event) => {
+                  const role = event.target.value as CommandRole;
+                  onChange({ ...formState, role, isService: role === "dev" });
+                }}
               >
                 {ROLE_ORDER.map((role) => (
                   <option key={role} value={role}>
@@ -905,6 +917,23 @@ function CommandModal({
               onChange={(event) => onChange({ ...formState, enabled: event.target.checked })}
             />
             Enabled
+          </label>
+          <label className="flex items-start gap-3 rounded-md border border-line bg-white p-3 text-sm font-medium">
+            <input
+              checked={formState.isService}
+              className="mt-0.5"
+              type="checkbox"
+              onChange={(event) =>
+                onChange({ ...formState, isService: event.target.checked })
+              }
+            />
+            <span>
+              Long-running service
+              <span className="mt-1 block text-xs font-normal text-ink/55">
+                Runs as a service in the Preview tab (Run/Stop/Restart, its own preview URL)
+                instead of a one-shot task.
+              </span>
+            </span>
           </label>
           <label className="flex items-start gap-3 rounded-md border border-line bg-white p-3 text-sm font-medium">
             <input
@@ -991,24 +1020,6 @@ function ConfirmationModal({
   );
 }
 
-function CommandStatusPill({ status }: { status: CommandRunStatus | "idle" }) {
-  const toneClass = {
-    idle: "bg-white text-muted ring-1 ring-line",
-    running: "bg-line text-warn",
-    completed: "bg-line text-signal",
-    failed: "bg-[#fff5f2] text-danger",
-    error: "bg-[#fff5f2] text-danger",
-  }[status];
-  const Icon = status === "completed" ? CheckCircle2 : status === "idle" ? TerminalSquare : XCircle;
-
-  return (
-    <span className={`inline-flex items-center gap-2 rounded-full px-3 py-1 text-sm font-semibold capitalize ${toneClass}`}>
-      <Icon className="h-4 w-4" aria-hidden="true" />
-      {status}
-    </span>
-  );
-}
-
 function formPayload(formState: CommandFormState): CustomCommandPayload {
   const port = Number.parseInt(formState.port, 10);
   const timeout = Number.parseInt(formState.timeoutSeconds, 10);
@@ -1020,6 +1031,7 @@ function formPayload(formState: CommandFormState): CustomCommandPayload {
     hotkey: formState.hotkey || null,
     requires_confirmation: formState.requiresConfirmation,
     role: formState.role,
+    kind: formState.isService ? "service" : "task",
     cwd: formState.cwd.trim() || null,
     port: Number.isNaN(port) ? null : port,
     timeout_seconds: Number.isNaN(timeout) ? null : timeout,

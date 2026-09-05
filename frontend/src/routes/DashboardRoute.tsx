@@ -91,8 +91,9 @@ type DashboardViewId =
   | "usage"
   | "audit";
 type PreviewStatusSnapshot = {
-  status: "inactive" | "active" | "stopped" | "error";
-  port: number | null;
+  /** Count of currently-running services (Epic 11); a single legacy dev server counts as 1. */
+  running: number;
+  total: number;
 };
 
 type DashboardOutletContext = {
@@ -115,8 +116,8 @@ export function DashboardRoute() {
   const [health, setHealth] = useState<HealthState>({ status: "loading" });
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>({ status: "loading" });
   const [previewStatus, setPreviewStatus] = useState<PreviewStatusSnapshot>({
-    status: "inactive",
-    port: null,
+    running: 0,
+    total: 0,
   });
 
   useEffect(() => {
@@ -185,9 +186,9 @@ export function DashboardRoute() {
   const workspaceStatus =
     workspaceState.status === "loading" ? "loading" : workspace?.status ?? "none";
   const previewStatusLabel =
-    previewStatus.port === null
-      ? previewStatus.status
-      : `${previewStatus.status} :${previewStatus.port}`;
+    previewStatus.total === 0
+      ? "inactive"
+      : `${previewStatus.running}/${previewStatus.total} running`;
 
   const handlePreviewStatusChange = useCallback((snapshot: PreviewStatusSnapshot) => {
     setPreviewStatus(snapshot);

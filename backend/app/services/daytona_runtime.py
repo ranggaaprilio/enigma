@@ -213,7 +213,7 @@ class DaytonaRuntime:
         *,
         cwd: str | None,
         env: dict[str, str] | None,
-        timeout: int,
+        timeout: int | None,
         on_stdout: Callable[[str], Awaitable[None]],
         on_stderr: Callable[[str], Awaitable[None]],
     ) -> int:

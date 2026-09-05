@@ -1,3 +1,4 @@
+import re
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -9,7 +10,7 @@ from app.api import dev_server as dev_server_module
 from app.core.config import get_settings
 from app.core.security import hash_password
 from app.main import app
-from app.models import CustomCommand, User, Workspace, WorkspaceWorktree
+from app.models import CustomCommand, User, Workspace, WorkspaceService, WorkspaceWorktree
 from app.services.daytona_runtime import RuntimeCommandResult
 from app.services.dev_server import (
     DevServerNotClonedError,
@@ -88,6 +89,10 @@ class FakeRuntime:
     async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
         self.commands.append(command)
         self.cwds.append(cwd)
+        if "ENIGMA_PROBE_EOF" in command:
+            return self._probe_response(command)
+        if "ENIGMA_PORTS_EOF" in command:
+            return self._port_scan_response(command)
         if command.startswith("cat "):
             return RuntimeCommandResult(exit_code=0, stdout=f"{self.status_value}\n", stderr="")
         if "pgrep" in command:
@@ -103,6 +108,37 @@ class FakeRuntime:
                     return RuntimeCommandResult(exit_code=0, stdout="", stderr="")
             return RuntimeCommandResult(exit_code=1, stdout="", stderr="")
         return RuntimeCommandResult(exit_code=0, stdout="", stderr="")
+
+    def _probe_response(self, command: str) -> RuntimeCommandResult:
+        """`service_scripts.build_probe_script` embeds one `probe(id, status_path, pid_path,
+        grep_token, port)` call per row it wants a status for. This fake answers every row
+        identically from its own `status_value`/`dev_process_alive`/`open_ports` knobs, which is
+        enough because these tests only ever probe a single (the primary) row at a time."""
+        lines = []
+        for row_id, port_token in re.findall(
+            r"probe\('([^']*)', '[^']*', '[^']*', '[^']*', (None|\d+)\)", command
+        ):
+            pid_alive = 1 if self.dev_process_alive else 0
+            if port_token == "None":
+                port_open = 0
+            else:
+                port_open = 1 if int(port_token) in self.open_ports else 0
+            lines.append(f"{row_id} {self.status_value} {pid_alive} {port_open}")
+        stdout = ("\n".join(lines) + "\n") if lines else ""
+        return RuntimeCommandResult(exit_code=0, stdout=stdout, stderr="")
+
+    def _port_scan_response(self, command: str) -> RuntimeCommandResult:
+        """`sandbox_probe._build_port_scan_script`'s heredoc, used by port discovery."""
+        match = re.search(r"ports = \[([^\]]*)\]", command)
+        candidates = (
+            [int(token) for token in match.group(1).split(",") if token.strip()]
+            if match
+            else []
+        )
+        matched = [port for port in candidates if port in self.open_ports]
+        return RuntimeCommandResult(
+            exit_code=0, stdout=" ".join(str(port) for port in matched) + "\n", stderr=""
+        )
 
 
 class FakeScalars:
@@ -123,6 +159,9 @@ class FakeResult:
     def scalars(self) -> FakeScalars:
         return FakeScalars(self._rows)
 
+    def scalar_one_or_none(self):
+        return self._rows[0] if self._rows else None
+
 
 class FakeSession:
     def __init__(
@@ -133,22 +172,72 @@ class FakeSession:
     ) -> None:
         self.workspace = workspace
         self.worktree = worktree
-        # Registry entries keyed by lifecycle role, as DevServerService._registry_entry looks
-        # them up. Empty (the default) means "no run configuration" — the mise path.
+        # Registry entries keyed by lifecycle role, as DevServerService._registry_entry (and
+        # WorkspaceServiceManager._registry_command) look them up. Empty (the default) means
+        # "no run configuration" — the mise path.
         self.registry = registry or {}
+        # WorkspaceService rows created by WorkspaceServiceManager during a test, keyed by id.
+        self.services: dict[UUID, WorkspaceService] = {}
 
     async def get(self, model, pk):
         if self.workspace.id == pk:
             return self.workspace
         if self.worktree is not None and self.worktree.id == pk:
             return self.worktree
+        if pk in self.services:
+            return self.services[pk]
+        for entry in self.registry.values():
+            if entry.id == pk:
+                return entry
         return None
 
     async def execute(self, statement):
-        """Serve DevServerService._registry_entry by reading the role off the query."""
-        role = statement.compile().params.get("role_1")
-        entry = self.registry.get(role)
-        return FakeResult([entry] if entry is not None else [])
+        compiled = statement.compile()
+        params = compiled.params
+        froms = statement.get_final_froms()
+        table_name = froms[0].name if froms else None
+
+        if table_name == "custom_commands":
+            role = params.get("role_1")
+            entry = self.registry.get(role) if role is not None else None
+            return FakeResult([entry] if entry is not None else [])
+
+        if table_name == "workspace_services":
+            rows = list(self.services.values())
+            if "workspace_id_1" in params:
+                rows = [r for r in rows if r.workspace_id == params["workspace_id_1"]]
+            if "custom_command_id_1" in params:
+                rows = [r for r in rows if r.custom_command_id == params["custom_command_id_1"]]
+            elif "custom_command_id IS NULL" in str(compiled):
+                rows = [r for r in rows if r.custom_command_id is None]
+            if "id_1" in params:
+                rows = [r for r in rows if r.id != params["id_1"]]
+            if "worktree_id_1" in params:
+                rows = [r for r in rows if r.worktree_id == params["worktree_id_1"]]
+            if "status_1" in params:
+                allowed = params["status_1"]
+                rows = [r for r in rows if r.status in allowed]
+            rows.sort(key=lambda r: r.created_at or datetime.min.replace(tzinfo=UTC))
+            return FakeResult(rows)
+
+        return FakeResult([])
+
+    def add(self, obj: object) -> None:
+        if isinstance(obj, WorkspaceService):
+            self.services[obj.id] = obj
+
+    async def flush(self) -> None:
+        pass
+
+    async def commit(self) -> None:
+        pass
+
+    async def refresh(self, obj: object) -> None:
+        pass
+
+    async def delete(self, obj: object) -> None:
+        if isinstance(obj, WorkspaceService):
+            self.services.pop(obj.id, None)
 
 
 def _worktree(workspace: Workspace, *, branch: str = "feature-x") -> WorkspaceWorktree:
@@ -850,11 +939,11 @@ async def test_liveness_check_reads_the_pid_file_before_the_legacy_pgrep():
     state = await service.ensure_running(workspace.id, user.id)
 
     assert state.status == "starting"
-    probe = next(command for command in runtime.commands if "pgrep" in command)
-    assert "cat /tmp/enigma-dev.pid" in probe
-    assert "kill -0" in probe
-    # A recycled PID that now belongs to something else must not count as our server.
-    assert "grep -q '[e]nigma-dev'" in probe
+    probe = next(command for command in runtime.commands if "ENIGMA_PROBE_EOF" in command)
+    assert "/tmp/enigma-dev.pid" in probe
+    # A recycled PID that now belongs to something else must not count as our server — the
+    # probe script only counts a pid alive when its own argv mentions this token.
+    assert "'enigma-dev'" in probe
     assert not any("nohup" in command for command in runtime.commands)
 
 

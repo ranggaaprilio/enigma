@@ -52,7 +52,7 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
   - Connection string must be `postgresql+asyncpg://…`
   - Session: `async_session_maker` with `expire_on_commit=False`
   - All DB access MUST use async/await
-- **Migrations**: Alembic with async engine, 24 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0024_run_configuration`)
+- **Migrations**: Alembic with async engine, 25 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0025_workspace_services`)
 - **Auth**: Cookie-based sessions (`execute_session` cookie), NOT JWT. Set-Cookie on login, cleared on logout.
 - **Logging**: `structlog` (configured in `core/logging.py`)
 - **Testing**: `pytest` with `pytest-asyncio` (auto mode), tests at `backend/tests/`
@@ -74,7 +74,7 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
 ### Domain Organization
 
 Backend follows domain-driven layout. Each domain has its own: `api/` (route), `models/` (ORM), `schemas/` (Pydantic), `services/` (logic).
-Domains: `auth`, `workspaces`, `repositories`, `worktrees`, `agents`, `terminal`, `editor`, `preview`, `commands`, `notifications`, `files`, `dev_server`, `specs`, `projects`, `teams`, `dashboard`.
+Domains: `auth`, `workspaces`, `repositories`, `worktrees`, `agents`, `terminal`, `editor`, `preview`, `commands`, `notifications`, `files`, `dev_server`, `workspace_services`, `specs`, `projects`, `teams`, `dashboard`.
 
 Some domains live in the service layer without their own top-level router — `repositories`, `worktrees`, and the GitHub PR client (`github_client.py`) are exposed through `workspaces` routes under `/{workspace_id}/repo/*` (e.g. `/repo/pull`, `/repo/worktrees`, `/repo/pull-requests`).
 

@@ -25,7 +25,7 @@ add migrations + tests, keep changes scoped.
 | 08 | [Real-Time Collaboration](./08-realtime-collaboration.md) | P3 | Collaboration |
 | 09 | [Workspace Templates & Multi-Provider Git](./09-templates-and-git-providers.md) | P3 | Onboarding / growth |
 | 10 | [Run Configuration & Unified Command Registry](./10-run-configuration-and-commands.md) | **P1** ✅ shipped | Full-stack preview |
-| 11 | [Long-Running Services & Multi-Port Preview](./11-multi-service-preview.md) | **P1** | Full-stack preview |
+| 11 | [Long-Running Services & Multi-Port Preview](./11-multi-service-preview.md) | **P1** ✅ shipped | Full-stack preview |
 | 12 | [Environment Variables: Injection, Bulk Editing & Scoping](./12-environment-variables-ux.md) | **P1** | Full-stack preview |
 | 13 | [Service Wiring & Preview Composition](./13-service-wiring-and-preview-composition.md) | P2 | Full-stack preview |
 
@@ -60,8 +60,9 @@ backend-only API cannot be previewed without them.
    `0024_run_configuration`). Defines `app_root`, and turns `custom_commands` into the single
    registry of runnable things (role, working directory, port, ordering, per-command timeout).
    Everything else builds on this schema.
-3. **11 — Services & multi-port preview.** Replaces one-dev-server-per-sandbox with N services,
-   each with its own lifecycle, logs, and preview URL.
+3. **11 — Services & multi-port preview.** ✅ **Shipped** (migration `0025_workspace_services`).
+   Replaces one-dev-server-per-sandbox with N tracked `workspace_services` rows, each with its own
+   lifecycle (start/stop/restart), log stream, and preview session.
 4. **12 (remainder)** — bulk `.env` editing, per-service scoping, `.env` materialisation.
 5. **13 — Service wiring.** Stable preview aliases, `${ENIGMA_PREVIEW_URL:api}` templates,
    dev-proxy detection, CORS diagnosis, health probes.
@@ -125,15 +126,23 @@ Verified against the codebase so epics target real gaps, not assumptions:
 ## Grounding: Full-Stack Preview Snapshot (September 2026)
 
 Verified against the codebase for Epics 10-13. This is a point-in-time record of *why* these
-epics exist — it is deliberately **not** rewritten as they land. **Epic 10 has since shipped**, so
-the following bullets no longer describe the code (see that epic's "Implementation Notes"):
+epics exist — it is deliberately **not** rewritten as they land. **Epics 10 and 11 have since
+shipped**, so the following bullets no longer describe the code (see each epic's "Implementation
+Notes"):
 
 - *Dev server* — `mise run dev` is now the default, not the hard-coded behaviour. A workspace with
   an enabled `role='dev'` registry entry runs that instead, in its own working directory, and no
   root `mise` config is required. Everything else in the bullet (single status-file set, `pkill`,
   single-valued desired state) still stands and is Epic 11's problem.
-- *Preview* — `_first_open_port` is still first-match, but a `dev` command's declared `port` is now
-  preferred over it. Serving several ports at once remains Epic 11.
+- *Preview* — `PreviewSession` rows are now upserted per running `workspace_services` row with a
+  confirmed port, so a frontend on 5173 and an API on 8000 both get their own preview URL. The
+  legacy single-port scan (`_first_open_port`) survives only as the manual-detect fallback for a
+  workspace with no service rows yet.
+- *Dev server (continued)* — the single-slot constraint is gone: `workspace_services` tracks N
+  running instances, each with its own `/tmp/enigma-svc-<id>.*` state files (the *primary* row —
+  whichever `DevServerService`'s `/dev/*` facade controls — keeps the legacy `/tmp/enigma-dev.*`
+  paths for byte-for-byte compatibility). Stop targets a recorded pid tree, not a `pkill` pattern,
+  except for the primary row's legacy fallback.
 - *Custom commands* — the listed gaps are closed: working directory, worktree awareness, role,
   port, ordering and a real timeout (`command_run_timeout_seconds`, 900s) all exist, and the
   denylist no longer applies to owner-authored commands.

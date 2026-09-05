@@ -76,6 +76,18 @@ class Settings(BaseSettings):
     command_run_max_timeout_seconds: int = 3600
     command_run_rate_limit_attempts: int = 30
     command_run_rate_limit_window_seconds: int = 60
+    # Epic 11: multi-service preview. A sandbox is a shared, sized resource, so the number of
+    # concurrently running services per workspace is capped.
+    max_running_services_per_workspace: int = 4
+    # Auto-resume never relaunches a "desired but down" service more often than this, so a
+    # crash-looping process is not restarted every poll tick.
+    service_relaunch_min_interval_seconds: int = 60
+    # A service that has bound no port yet is reported "starting"; past this grace period since
+    # launch it is reported "running" with an unknown port instead of "starting" forever.
+    service_start_grace_seconds: int = 90
+    # Upper bound on how long a single log-stream WebSocket keeps its sandbox `tail -F` alive;
+    # the client reconnects (with replay) when it expires.
+    service_log_stream_timeout_seconds: int = 3600
     github_api_base_url: str = "https://api.github.com"
     github_api_timeout_seconds: int = 30
     max_worktrees_per_workspace: int = 5

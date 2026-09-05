@@ -198,6 +198,8 @@ class ImportCommandItem(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     command: str = Field(min_length=1, max_length=4000)
     role: CommandRole = "custom"
+    # None => the service defaults it from role (a `dev`-role candidate becomes `service`).
+    kind: CommandKind | None = None
     cwd: str | None = Field(default=None, max_length=512)
     port: int | None = Field(default=None, ge=1, le=65535)
 

@@ -495,6 +495,8 @@ export type ImportCommandItem = {
   name: string;
   command: string;
   role?: CommandRole;
+  // Omit to let the server default it from role (a `dev`-role candidate becomes `service`).
+  kind?: CommandKind;
   cwd?: string | null;
   port?: number | null;
 };
@@ -557,6 +559,9 @@ export type PreviewSessionResponse = {
   // The worktree this preview belongs to (null = base clone) and its branch.
   worktree_id: string | null;
   branch: string | null;
+  // Which workspace service this preview was detected for (Epic 11); null for a session
+  // detected via the legacy single-port scan.
+  service_id: string | null;
 };
 
 export type PreviewDetectResponse = {
@@ -588,6 +593,59 @@ export type DevServerActionResponse = {
   ok: boolean;
   status: DevServerStatus;
   message: string | null;
+};
+
+/** A running (or desired-to-run) instance of a workspace's service command (Epic 11). */
+export type WorkspaceServiceStatus =
+  | "installing"
+  | "starting"
+  | "running"
+  | "stopped"
+  | "exited"
+  | "error";
+
+export type WorkspaceServiceResponse = {
+  id: string;
+  workspace_id: string;
+  // null = the built-in mise `dev` service (no registry command owns it).
+  custom_command_id: string | null;
+  name: string;
+  role: CommandRole;
+  kind: CommandKind;
+  command: string | null;
+  port: number | null;
+  status: WorkspaceServiceStatus;
+  desired: boolean;
+  worktree_id: string | null;
+  branch: string | null;
+  last_error: string | null;
+  exit_code: number | null;
+  started_at: string | null;
+  last_seen_at: string | null;
+  preview_session_id: string | null;
+  public_url: string | null;
+};
+
+/** The workspace-wide mise environment (install/mise-trust), separate from any one
+ * service's run status — the pre-Epic-11 `/dev/setup` concept. */
+export type WorkspaceEnvironmentState = {
+  status: string;
+  message: string | null;
+};
+
+export type WorkspaceServicesResponse = {
+  services: WorkspaceServiceResponse[];
+  environment: WorkspaceEnvironmentState;
+  limit: number;
+};
+
+export type ServiceActionResponse = {
+  service: WorkspaceServiceResponse;
+  warning: string | null;
+};
+
+export type ServiceLogsResponse = {
+  content: string;
 };
 
 export type LoginPayload = {
@@ -639,6 +697,14 @@ export function getCommandRunStreamUrl(workspaceId: string, runId: string) {
   const baseUrl = new URL(getApiBaseUrl());
   baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
   baseUrl.pathname = `/workspaces/${workspaceId}/command-runs/${runId}/stream`;
+  baseUrl.search = "";
+  return baseUrl.toString();
+}
+
+export function getServiceLogStreamUrl(workspaceId: string, serviceId: string) {
+  const baseUrl = new URL(getApiBaseUrl());
+  baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+  baseUrl.pathname = `/workspaces/${workspaceId}/services/${serviceId}/logs/stream`;
   baseUrl.search = "";
   return baseUrl.toString();
 }
@@ -1608,6 +1674,81 @@ export function stopDevServer(workspaceId: string): Promise<DevServerActionRespo
   return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/stop`, {
     method: "POST",
   });
+}
+
+// ── Workspace services (Epic 11: multi-service preview) ──────────────────────
+
+export function listWorkspaceServices(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<WorkspaceServicesResponse> {
+  return requestJson<WorkspaceServicesResponse>(`/workspaces/${workspaceId}/services`, {
+    signal,
+  });
+}
+
+/**
+ * Reconciles every service marked desired against the sandbox, restarting any that were
+ * running before the sandbox slept. Safe to poll — mirrors `ensureDevServer` for the whole
+ * service list.
+ */
+export function ensureWorkspaceServices(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<WorkspaceServicesResponse> {
+  return requestJson<WorkspaceServicesResponse>(`/workspaces/${workspaceId}/services/ensure`, {
+    method: "POST",
+    signal,
+  });
+}
+
+export function startWorkspaceService(
+  workspaceId: string,
+  serviceId: string,
+  worktreeId?: string | null,
+): Promise<ServiceActionResponse> {
+  return requestJson<ServiceActionResponse>(
+    `/workspaces/${workspaceId}/services/${serviceId}/start`,
+    {
+      method: "POST",
+      body: JSON.stringify({ worktree_id: worktreeId ?? null }),
+    },
+  );
+}
+
+export function stopWorkspaceService(
+  workspaceId: string,
+  serviceId: string,
+): Promise<ServiceActionResponse> {
+  return requestJson<ServiceActionResponse>(
+    `/workspaces/${workspaceId}/services/${serviceId}/stop`,
+    { method: "POST" },
+  );
+}
+
+export function restartWorkspaceService(
+  workspaceId: string,
+  serviceId: string,
+  worktreeId?: string | null,
+): Promise<ServiceActionResponse> {
+  return requestJson<ServiceActionResponse>(
+    `/workspaces/${workspaceId}/services/${serviceId}/restart`,
+    {
+      method: "POST",
+      body: JSON.stringify({ worktree_id: worktreeId ?? null }),
+    },
+  );
+}
+
+export function getWorkspaceServiceLogs(
+  workspaceId: string,
+  serviceId: string,
+  signal?: AbortSignal,
+): Promise<ServiceLogsResponse> {
+  return requestJson<ServiceLogsResponse>(
+    `/workspaces/${workspaceId}/services/${serviceId}/logs`,
+    { signal },
+  );
 }
 
 // ── Projects & Teams ──────────────────────────────────────────────────────────

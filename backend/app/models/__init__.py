@@ -13,6 +13,7 @@ from app.models.template import WorkspaceTemplate
 from app.models.terminal import TerminalSession
 from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceEnvVar
+from app.models.workspace_service import WorkspaceService
 from app.models.worktree import PullRequest, WorkspaceWorktree
 
 __all__ = [
@@ -40,6 +41,7 @@ __all__ = [
     "User",
     "Workspace",
     "WorkspaceEnvVar",
+    "WorkspaceService",
     "WorkspaceTemplate",
     "WorkspaceWorktree",
 ]

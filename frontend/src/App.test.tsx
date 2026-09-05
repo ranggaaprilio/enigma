@@ -266,6 +266,11 @@ function fallbackResponse(url: string) {
       }),
     );
   }
+  if (url.includes("/services")) {
+    return Promise.resolve(
+      jsonResponse({ services: [], environment: { status: "idle", message: null }, limit: 4 }),
+    );
+  }
   return Promise.resolve(jsonResponse(healthResponse));
 }
 
@@ -1205,20 +1210,33 @@ describe("App auth routing", () => {
     expect(openSpy).toHaveBeenCalledWith(editorUrl, "_blank", "noopener,noreferrer");
   });
 
-  it("opens the preview tab, detects a preview, and controls the iframe", async () => {
+  it("opens the preview tab, shows a running service, and controls the iframe", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     Object.defineProperty(navigator, "clipboard", {
       configurable: true,
       value: { writeText },
     });
-    const previewSession = {
-      id: "6f9d15db-19e2-4c04-95ad-a4e4508ef80d",
+    const publicUrl = "http://signed-capability.localhost:8001/";
+    const serviceId = "6f9d15db-19e2-4c04-95ad-a4e4508ef80d";
+    let currentService = {
+      id: serviceId,
       workspace_id: workspace.id,
+      custom_command_id: "cmd-web",
+      name: "Web",
+      role: "dev",
+      kind: "service",
+      command: "pnpm dev",
       port: 5173,
-      public_url: "http://signed-capability.localhost:8001/",
-      status: "active",
-      created_at: "2026-05-25T00:00:00Z",
+      status: "running",
+      desired: true,
+      worktree_id: null,
+      branch: "main",
+      last_error: null,
+      exit_code: null,
+      started_at: "2026-05-25T00:00:00Z",
       last_seen_at: "2026-05-25T00:00:00Z",
+      preview_session_id: "prev-1",
+      public_url: publicUrl as string | null,
     };
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith("/auth/me")) {
@@ -1233,23 +1251,21 @@ describe("App auth routing", () => {
       if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
         return Promise.resolve(jsonResponse([]));
       }
-      if (url.endsWith(`/workspaces/${workspace.id}/preview/sessions`)) {
-        return Promise.resolve(jsonResponse([]));
-      }
-      if (url.endsWith(`/workspaces/${workspace.id}/preview/detect`) && init?.method === "POST") {
-        return Promise.resolve(jsonResponse({ status: "active", session: previewSession }));
-      }
-      if (
-        url.endsWith(`/workspaces/${workspace.id}/preview/sessions/${previewSession.id}/refresh`) &&
-        init?.method === "POST"
-      ) {
-        return Promise.resolve(jsonResponse({ ...previewSession, last_seen_at: "2026-05-25T00:00:01Z" }));
+      if (url.endsWith(`/workspaces/${workspace.id}/services/ensure`) && init?.method === "POST") {
+        return Promise.resolve(
+          jsonResponse({
+            services: [currentService],
+            environment: { status: "idle", message: null },
+            limit: 4,
+          }),
+        );
       }
       if (
-        url.endsWith(`/workspaces/${workspace.id}/preview/sessions/${previewSession.id}/stop`) &&
+        url.endsWith(`/workspaces/${workspace.id}/services/${serviceId}/stop`) &&
         init?.method === "POST"
       ) {
-        return Promise.resolve(jsonResponse({ ...previewSession, status: "stopped" }));
+        currentService = { ...currentService, status: "stopped", public_url: null };
+        return Promise.resolve(jsonResponse({ service: currentService, warning: null }));
       }
       return fallbackResponse(url);
     });
@@ -1259,28 +1275,18 @@ describe("App auth routing", () => {
     render(<App />);
 
     await userEvent.click(await screen.findByRole("link", { name: "Preview" }));
-    expect(await screen.findByText("Preview is not running.")).toBeInTheDocument();
-    // Preview follows the active worktree; with none selected it shows the base clone.
-    expect(screen.getByText(/Branch:/)).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Detect/Open" }));
-
-    const frame = await screen.findByTitle("Demo preview");
-    expect(frame).toHaveAttribute(
-      "src",
-      previewSession.public_url,
-    );
+    // The running service auto-opens once the poll finds it.
+    const frame = await screen.findByTitle("Web preview");
+    expect(frame).toHaveAttribute("src", publicUrl);
 
     await userEvent.click(screen.getByRole("button", { name: "Mobile" }));
     expect(frame).toHaveClass("max-w-[390px]");
 
     await userEvent.click(screen.getByRole("button", { name: "Copy URL" }));
-    expect(writeText).toHaveBeenCalledWith(previewSession.public_url);
+    expect(writeText).toHaveBeenCalledWith(publicUrl);
 
-    await userEvent.click(screen.getByRole("button", { name: "Refresh" }));
-    expect(await screen.findByTitle("Demo preview")).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: "Stop preview" }));
-    expect(await screen.findByText(/Preview: stopped :5173/)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Stop" }));
+    expect(await screen.findByText(/Preview: 0\/1 running/)).toBeInTheDocument();
   });
 });

@@ -6,14 +6,17 @@ import {
   createPullRequest,
   createWorktree,
   listPullRequests,
+  listWorkspaceServices,
   listWorktrees,
   pullWorktree,
   pushWorktree,
   removeWorktree,
+  restartWorkspaceService,
   syncWorktree,
   type PullRequestResponse,
   type RepositoryCredentialResponse,
   type WorkspaceResponse,
+  type WorkspaceServiceResponse,
   type WorktreeResponse,
 } from "../lib/api";
 import {
@@ -23,6 +26,7 @@ import {
 } from "../lib/activeWorktree";
 import { detectProvider, prNoun, providerHost, providerLabel } from "../lib/gitProviders";
 import { CommentThread } from "./comments/CommentThread";
+import { ConfirmModal } from "./ui/ConfirmModal";
 import { Spinner } from "./ui/Spinner";
 
 type LoadState =
@@ -51,6 +55,13 @@ export function WorktreesPanel({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [active, setActive] = useActiveWorktree(workspace.id);
+  // Set when switching would leave a service running on the worktree being left; offers
+  // "restart on the new branch" vs. "leave them running" before actually switching.
+  const [pendingSwitch, setPendingSwitch] = useState<{
+    tree: WorktreeResponse;
+    runningElsewhere: WorkspaceServiceResponse[];
+  } | null>(null);
+  const [switchBusy, setSwitchBusy] = useState(false);
 
   // New-worktree form.
   const [newBranch, setNewBranch] = useState("");
@@ -119,9 +130,74 @@ export function WorktreesPanel({
     }
   }
 
-  function selectWorktree(tree: WorktreeResponse) {
+  async function selectWorktree(tree: WorktreeResponse) {
+    const next: ActiveWorktree | null = tree.is_base ? null : { id: tree.id, branch: tree.branch };
+    const targetId = next?.id ?? null;
+    try {
+      const { services } = await listWorkspaceServices(workspace.id);
+      const runningElsewhere = services.filter(
+        (service) =>
+          (service.status === "running" ||
+            service.status === "starting" ||
+            service.status === "installing") &&
+          service.worktree_id !== targetId,
+      );
+      if (runningElsewhere.length > 0) {
+        setPendingSwitch({ tree, runningElsewhere });
+        return;
+      }
+    } catch {
+      // Best-effort check — if it fails, don't block the switch itself.
+    }
+    setActive(next);
+  }
+
+  async function confirmSwitchAndRestart() {
+    if (!pendingSwitch) return;
+    const { tree, runningElsewhere } = pendingSwitch;
+    const next: ActiveWorktree | null = tree.is_base ? null : { id: tree.id, branch: tree.branch };
+    setSwitchBusy(true);
+    try {
+      await Promise.all(
+        runningElsewhere.map((service) =>
+          restartWorkspaceService(workspace.id, service.id, next?.id ?? null),
+        ),
+      );
+    } catch {
+      // Best-effort — still switch even if a restart failed; the Preview tab surfaces it.
+    } finally {
+      setSwitchBusy(false);
+      setActive(next);
+      setPendingSwitch(null);
+    }
+  }
+
+  function switchAndLeaveRunning() {
+    if (!pendingSwitch) return;
+    const { tree } = pendingSwitch;
     const next: ActiveWorktree | null = tree.is_base ? null : { id: tree.id, branch: tree.branch };
     setActive(next);
+    setPendingSwitch(null);
+  }
+
+  function describePendingSwitch(pending: {
+    tree: WorktreeResponse;
+    runningElsewhere: WorkspaceServiceResponse[];
+  }): string {
+    const count = pending.runningElsewhere.length;
+    const plural = count !== 1;
+    // Services in `runningElsewhere` can each be running on a *different* branch (not
+    // necessarily the one being left) — name it only when they all agree on one.
+    const branches = Array.from(
+      new Set(pending.runningElsewhere.map((service) => service.branch).filter(Boolean)),
+    );
+    const location = branches.length === 1 ? branches[0] : "elsewhere";
+    const pronoun = plural ? "them" : "it";
+    return (
+      `${count} service${plural ? "s" : ""} ${plural ? "are" : "is"} running on ${location}. ` +
+      `Restart ${pronoun} on ${pending.tree.branch}, or leave ${pronoun} running there while ` +
+      "you switch?"
+    );
   }
 
   async function handleCreate(event: FormEvent<HTMLFormElement>) {
@@ -208,7 +284,19 @@ export function WorktreesPanel({
   }
 
   return (
-    <section className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+    <>
+      {pendingSwitch && (
+        <ConfirmModal
+          title="Services are running elsewhere"
+          body={describePendingSwitch(pendingSwitch)}
+          confirmLabel={switchBusy ? "Restarting…" : `Restart on ${pendingSwitch.tree.branch}`}
+          cancelLabel="Leave them running"
+          busy={switchBusy}
+          onCancel={switchAndLeaveRunning}
+          onConfirm={() => void confirmSwitchAndRestart()}
+        />
+      )}
+      <section className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
       <div className="rounded-md border border-line bg-white p-5 shadow-soft">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
@@ -249,7 +337,7 @@ export function WorktreesPanel({
                   <button
                     type="button"
                     className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                    onClick={() => selectWorktree(tree)}
+                    onClick={() => void selectWorktree(tree)}
                   >
                     <span
                       className={`h-2.5 w-2.5 shrink-0 rounded-full ${
@@ -478,7 +566,8 @@ export function WorktreesPanel({
           )}
         </div>
       </div>
-    </section>
+      </section>
+    </>
   );
 }
 

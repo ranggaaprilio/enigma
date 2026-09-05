@@ -194,3 +194,86 @@ sessions only for log tailing — either way `ensure_running` reconciliation sta
 - Service dependency ordering (start the API before the web app).
 - Resource usage per service, feeding Epic 06's usage analytics.
 - One preview host per service with stable subdomains instead of rotating capability tokens.
+
+## Implementation Notes (shipped)
+
+**Spike outcome, decided upfront (no code spike run):** kept `nohup` + per-service status/pid/log
+files, no Daytona sessions for supervision. A session dies with sandbox auto-stop and its SDK-side
+log follower dies with a backend restart, so `ensure_running` reconciliation is needed either way —
+sessions would have added a second failure mode without removing the first. Sessions are used only
+for the log-stream WebSocket, where that lifetime (tied to one client connection) is exactly right.
+
+**Definition vs. instance, exactly as designed:** `workspace_services` (migration
+`0025_workspace_services`) tracks one row per running/desired instance —
+`id`, `workspace_id`, `custom_command_id` (nullable FK, cascade), `worktree_id` (nullable FK, set
+null), `port`, `status` (CHECK `installing|starting|running|stopped|exited|error`), `desired`,
+`pid`, `exit_code`, `last_error`, `started_at`, `last_seen_at`. No `session_id` column — supervision
+never uses sessions, so there was nothing to store. A partial unique index enforces at most one
+built-in (`custom_command_id IS NULL`) row per workspace; `preview_sessions.service_id` (nullable,
+set null) links a preview session to the service that owns it, with a partial unique index on
+`(workspace_id, port) WHERE status='active'` so two services can never race onto the same port.
+
+**The primary/service split — the key to a clean migration.** Epic 10 dropped seeding a `dev`
+registry entry, so a mise-only repository still runs through the legacy single-slot path. Rather
+than migrate that path onto brand-new per-service state files, the *primary* service — the
+workspace's enabled `role='dev'` command if one exists, else the built-in mise service — keeps
+using the legacy `/tmp/enigma-dev.*` paths untouched (`service_scripts.builtin_paths()`). Every
+other service gets its own `/tmp/enigma-svc-<id>.*` files. `DevServerService` (`services/dev_server.py`)
+is now a thin facade: `setup()` stays self-contained (it never touches `desired`/`workspace_services`,
+matching its pre-epic behaviour exactly); `run`/`status`/`ensure_running`/`stop` delegate to
+`WorkspaceServiceManager`'s primary-row operations and translate the row back to the pre-Epic-11
+`DevServerStatus` vocabulary. A migrated workspace's `dev_autostart=true` seeds one row —
+`custom_command_id` set to its first enabled `role='dev'` command if any, else the built-in row —
+so `ensure_running` never double-launches a registry command next to a still-running mise task.
+
+**Status mapping is probe-driven, not cached.** A single sandbox exec
+(`service_scripts.build_probe_script`) reports every row's status file, pid liveness, and (for a
+declared/inferred port) whether that port is open, in one round-trip. A row with no declared port
+(the built-in mise service, or a registry command with neither `port` nor an inferable one) falls
+back to a `COMMON_PREVIEW_PORTS` scan, exactly like the pre-Epic-11 `_resolved_port` — every status
+read re-derives the port rather than trusting a cached value. `_apply_probe` deliberately does not
+demote a `running` file status to `stopped` just because the pid looks dead — a confirmed-open port
+is definitive on its own, matching the old dev server, which never checked pid liveness for a plain
+status read. That liveness check is reserved for `ensure_running`'s relaunch decision
+(`_should_relaunch`), with a crash-loop backoff (`service_relaunch_min_interval_seconds`, default
+60s) before it ever restarts a "stopped" row.
+
+**Kind defaulting, not a schema change.** `kind='service'` already existed (Epic 10); Epic 11 makes
+it mean something. `CommandService.create_command`/`import_commands` default a `role='dev'` command
+to `kind='service'` when the caller doesn't specify one — the migration applies the same rule
+retroactively (`UPDATE custom_commands SET kind='service' WHERE role='dev'`). A workspace's other
+services (any `role`, `kind='service'`) get synced into their own rows by
+`WorkspaceServiceManager._sync_definitions`, independent of the primary-row selection.
+
+**Log streaming reuses the sandbox log file as the buffer — no in-process ring buffer.** The
+WebSocket endpoint (`/workspaces/{id}/services/{id}/logs/stream`) runs one `stream_command`:
+`timeout <service_log_stream_timeout_seconds> tail -c 20000 -F <log>`, which replays the last 20k
+chars then follows with no gap between replay and follow (a two-step replay-then-follow would have
+one). The WS handler races the stream task against `websocket.receive()` so a closed tab cancels the
+tail immediately rather than leaking it until the sandbox-side `timeout` expires.
+
+**Security:** log chunks are redacted with `redact_secrets` + `commands.redactable_env_values`
+(hoisted to a module-level `load_workspace_env`, shared with command runs) before they reach the
+WebSocket. Ports are never client-supplied for capability minting — `preview_capability.py` is
+unchanged, and `PreviewService.upsert_for_service` only ever binds a port a service row already
+confirmed open. `max_running_services_per_workspace` (default 4) is enforced before a start, with an
+actionable 409 naming the count; a port conflict names the service already holding the port.
+
+**What's deliberately deferred:** `dev_autostart`/`dev_worktree_id` on `workspaces` stay for one
+release (write-through from the primary row on every start/stop) — dropping them is a follow-up
+migration once nothing reads them directly. Health/readiness probes, dependency ordering, and stable
+alias hostnames are unchanged Future Enhancements, now explicitly Epic 13's problem.
+
+### Verification
+
+`ruff` clean; **558 backend tests pass** (was 537 before this epic — 40 new/updated in
+`test_dev_server.py`, 13 in `test_workspace_services.py`, 8 in `test_workspace_services_api.py`).
+Migration verified reversible (`upgrade → downgrade -1 → upgrade`) against local Postgres. Frontend:
+eslint clean (4 pre-existing warnings), **tsc -b** and **vite build** succeed, **199 tests pass**
+(1 pre-existing skip).
+
+Not covered by automated tests, and still worth a manual pass against a real Daytona sandbox: a Vite
+frontend and FastAPI backend running simultaneously end-to-end through the proxy, a sandbox
+auto-stop/wake cycle actually relaunching only desired services, and the log stream's behaviour
+against a genuinely long-running process (the fakes exercise the wire format, not real `tail -F`
+timing).

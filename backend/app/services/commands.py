@@ -98,7 +98,7 @@ class CommandService:
         hotkey: str | None,
         requires_confirmation: bool,
         role: str = "custom",
-        kind: str = "task",
+        kind: str | None = None,
         cwd: str | None = None,
         port: int | None = None,
         enabled: bool = True,
@@ -106,6 +106,9 @@ class CommandService:
         sort_order: int | None = None,
     ) -> CustomCommand:
         workspace = await self._get_workspace(workspace_id, user_id)
+        # A `dev`-role command is, by default, a long-running service (Epic 11) — that is what
+        # lets it appear in the multi-service preview at all. An explicit `kind` always wins.
+        effective_kind = kind if kind is not None else ("service" if role == "dev" else "task")
         custom_command = CustomCommand(
             workspace_id=workspace.id,
             name=name,
@@ -115,7 +118,7 @@ class CommandService:
             hotkey=hotkey,
             requires_confirmation=requires_confirmation,
             role=role,
-            kind=kind,
+            kind=effective_kind,
             cwd=cwd,
             port=port,
             enabled=enabled,
@@ -161,12 +164,18 @@ class CommandService:
         values: dict,
     ) -> CustomCommand:
         custom_command = await self._get_command(workspace_id, command_id, user_id)
+        was_runnable_service = custom_command.enabled and custom_command.kind == "service"
         for key, value in values.items():
             setattr(custom_command, key, value)
         self.session.add(custom_command)
         await self.session.flush()
         await self.session.commit()
         await self.session.refresh(custom_command)
+        # A service that was disabled, or demoted to a plain task, must not keep running
+        # unnoticed — best-effort, a sandbox error here must not fail the edit itself.
+        now_runnable_service = custom_command.enabled and custom_command.kind == "service"
+        if was_runnable_service and not now_runnable_service:
+            await self._stop_service_for_command(workspace_id, user_id, custom_command.id)
         await AuditLogService(self.session).record(
             user_id=user_id,
             workspace_id=workspace_id,
@@ -186,6 +195,10 @@ class CommandService:
     async def delete_command(self, workspace_id: UUID, command_id: UUID, user_id: UUID) -> None:
         custom_command = await self._get_command(workspace_id, command_id, user_id)
         command_name = custom_command.name
+        # Stop a running service *before* the cascade delete removes its workspace_services
+        # row along with the command, or there is nothing left to look up afterwards.
+        if custom_command.kind == "service":
+            await self._stop_service_for_command(workspace_id, user_id, custom_command.id)
         await self.session.delete(custom_command)
         await self.session.commit()
         await AuditLogService(self.session).record(
@@ -218,6 +231,10 @@ class CommandService:
         sort_order = await self._next_sort_order(workspace.id)
         created: list[CustomCommand] = []
         for item in items:
+            item_role = item.get("role", "custom")
+            item_kind = item.get("kind")
+            if item_kind is None:
+                item_kind = "service" if item_role == "dev" else "task"
             custom_command = CustomCommand(
                 workspace_id=workspace.id,
                 name=item["name"],
@@ -226,8 +243,8 @@ class CommandService:
                 icon=item.get("icon"),
                 hotkey=item.get("hotkey"),
                 requires_confirmation=bool(item.get("requires_confirmation", False)),
-                role=item.get("role", "custom"),
-                kind=item.get("kind", "task"),
+                role=item_role,
+                kind=item_kind,
                 cwd=item.get("cwd"),
                 port=item.get("port"),
                 enabled=True,
@@ -384,6 +401,27 @@ class CommandService:
         if workspace is None or workspace.owner_id != user_id:
             raise WorkspaceNotFoundError
         return workspace
+
+    async def _stop_service_for_command(
+        self, workspace_id: UUID, user_id: UUID, command_id: UUID
+    ) -> None:
+        # Lazy import: workspace_services.py doesn't import commands.py, so this is not a
+        # true cycle, but keeping the dependency import-time-local matches the pattern used
+        # everywhere else a domain reaches into workspace_services.py for a side effect.
+        from app.services.workspace_services import (
+            WorkspaceServiceManager,
+            WorkspaceServiceRuntimeError,
+        )
+
+        try:
+            workspace = await self._get_workspace(workspace_id, user_id)
+        except WorkspaceNotFoundError:
+            return
+        manager = WorkspaceServiceManager(self.session, self.settings, self.daytona_runtime)
+        try:
+            await manager.stop_for_command(workspace, command_id)
+        except WorkspaceServiceRuntimeError:
+            pass
 
     async def _get_command(
         self,
@@ -546,16 +584,26 @@ class CommandService:
         session: AsyncSession,
         workspace_id: UUID,
     ) -> dict[str, str]:
-        result = await session.execute(
-            select(WorkspaceEnvVar).where(WorkspaceEnvVar.workspace_id == workspace_id)
-        )
-        cipher = WorkspaceSecretCipher(self.settings.workspace_env_encryption_key)
-        values: dict[str, str] = {}
-        for item in result.scalars().all():
-            decrypted = cipher.decrypt(item.encrypted_value)
-            if decrypted is not None:
-                values[item.key] = decrypted
-        return values
+        return await load_workspace_env(session, self.settings, workspace_id)
+
+
+async def load_workspace_env(
+    session: AsyncSession,
+    settings: Settings,
+    workspace_id: UUID,
+) -> dict[str, str]:
+    """Decrypt every env var saved for a workspace. Shared by command runs and, from Epic 11,
+    per-service log redaction — the one place that touches ``WorkspaceSecretCipher``."""
+    result = await session.execute(
+        select(WorkspaceEnvVar).where(WorkspaceEnvVar.workspace_id == workspace_id)
+    )
+    cipher = WorkspaceSecretCipher(settings.workspace_env_encryption_key)
+    values: dict[str, str] = {}
+    for item in result.scalars().all():
+        decrypted = cipher.decrypt(item.encrypted_value)
+        if decrypted is not None:
+            values[item.key] = decrypted
+    return values
 
 
 # Env keys whose values are credential material whatever their length.

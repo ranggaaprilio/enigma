@@ -224,6 +224,14 @@ class WorktreeService:
             if not is_clean:
                 raise WorktreeDirtyError
 
+        # A service still running in this worktree must not survive detached from a
+        # now-unlinked working directory. Lazy import: workspace_services.py -> run_paths.py
+        # -> worktrees.py would otherwise be a module-load cycle.
+        from app.services.workspace_services import WorkspaceServiceManager
+
+        manager = WorkspaceServiceManager(self.session, self.settings, self.runtime)
+        await manager.on_worktree_removed(workspace, row.id)
+
         args = ["worktree", "remove"]
         if force:
             args.append("--force")
@@ -401,10 +409,27 @@ class WorktreeService:
         known_paths = {row.path for row in rows}
         changed = False
 
+        removed_ids: list[UUID] = []
         for row in rows:
             if not row.is_base and row.path not in on_disk:
-                await self.session.delete(row)
+                removed_ids.append(row.id)
                 changed = True
+
+        if removed_ids:
+            # A service still running in a worktree that vanished from disk must not survive
+            # detached from an unlinked directory. Runs *before* the rows are deleted, since
+            # `workspace_services.worktree_id` is `ON DELETE SET NULL` — deleting first would
+            # leave nothing for this lookup to find. Lazy import: workspace_services.py ->
+            # run_paths.py -> worktrees.py would otherwise be a module-load cycle.
+            from app.services.workspace_services import WorkspaceServiceManager
+
+            manager = WorkspaceServiceManager(self.session, self.settings, self.runtime)
+            for worktree_id in removed_ids:
+                await manager.on_worktree_removed(workspace, worktree_id)
+
+        for row in rows:
+            if row.id in removed_ids:
+                await self.session.delete(row)
 
         for rel, branch in on_disk.items():
             if rel == workspace.workspace_path or rel in known_paths:
