@@ -559,7 +559,7 @@ class WorkspaceServiceManager:
             await self.session.commit()
             return row
 
-        install_deps = resolved_worktree_id is not None
+        install_deps = True
         paths = self._paths_for(row, is_primary)
         gen = uuid4().hex
         declared_port: int | None = None

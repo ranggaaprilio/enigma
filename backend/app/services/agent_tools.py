@@ -118,6 +118,7 @@ class WorkspaceTools:
         working_dir: str | None = None,
         allowlist_enabled: bool = False,
         allowed_commands: frozenset[str] | None = None,
+        deny_dangerous: bool = True,
     ) -> None:
         self.workspace = workspace
         self.runtime = runtime
@@ -133,6 +134,7 @@ class WorkspaceTools:
         # absolute-path checks always apply in both modes.
         self.allowlist_enabled = allowlist_enabled
         self.allowed_commands = frozenset(allowed_commands or ())
+        self.deny_dangerous = deny_dangerous
 
     def resolve_path(self, path: str | None = None) -> str:
         candidate = (path or "").strip().strip("/")
@@ -483,7 +485,7 @@ class WorkspaceTools:
             if program not in self.allowed_commands:
                 self._log_rejected("not_in_allowlist", program)
                 raise DangerousCommandError("Command is not allowed")
-        elif program in DANGEROUS_COMMANDS:
+        elif self.deny_dangerous and program in DANGEROUS_COMMANDS:
             self._log_rejected("denylisted", program)
             raise DangerousCommandError("Command is not allowed")
         return argv
