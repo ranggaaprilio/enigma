@@ -182,6 +182,9 @@ class TerminalPtyBridge:
         workspace: Workspace,
         terminal_session: TerminalSession,
         env: dict[str, str],
+        *,
+        cwd: str | None = None,
+        pty_session_id: str | None = None,
     ) -> None:
         async def on_data(data: bytes) -> None:
             await websocket.send_bytes(data)
@@ -189,11 +192,12 @@ class TerminalPtyBridge:
         try:
             handle = await self.runtime.create_or_connect_pty(
                 workspace,
-                terminal_session.pty_session_id,
+                pty_session_id or terminal_session.pty_session_id,
                 on_data,
                 env=env,
                 cols=self.default_cols,
                 rows=self.default_rows,
+                cwd=cwd,
             )
         except DaytonaRuntimeError as error:
             await websocket.send_json({"type": "error", "message": str(error)})

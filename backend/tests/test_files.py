@@ -11,7 +11,7 @@ from app.api import files as files_module
 from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
-from app.models import User, Workspace
+from app.models import User, Workspace, WorkspaceWorktree
 from app.services.files import FileService, FileTooLargeError
 from app.services.users import DuplicateUserEmailError
 
@@ -39,12 +39,17 @@ class FakeRateLimiter:
 
 
 class FakeSession:
-    def __init__(self, workspace: Workspace) -> None:
+    def __init__(
+        self, workspace: Workspace, worktrees: list[WorkspaceWorktree] | None = None
+    ) -> None:
         self.workspace = workspace
+        self.worktrees = {worktree.id: worktree for worktree in (worktrees or [])}
 
     async def get(self, model, item_id):
         if model is Workspace and self.workspace.id == item_id:
             return self.workspace
+        if model is WorkspaceWorktree:
+            return self.worktrees.get(item_id)
         return None
 
     def add(self, value) -> None:
@@ -382,3 +387,144 @@ async def test_search_prunes_ignored_directories(file_context):
     service = app.dependency_overrides[files_module.get_file_service]()
     results = await service.search(workspace.id, workspace.owner_id, "index")
     assert results == []
+
+
+@pytest.fixture
+def worktree_context(tmp_path):
+    """A workspace whose base clone and a feature worktree hold distinct files, so tests can
+    assert file operations target the directory of the active worktree (``worktree_id``)."""
+    user = User(
+        id=uuid4(),
+        email="owner@example.com",
+        password_hash=hash_password("password"),
+        role="owner",
+        is_active=True,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    base_path = tmp_path / "workspace"
+    base_path.mkdir()
+    (base_path / "base.txt").write_text("base", encoding="utf-8")
+    worktree_dir = base_path / "wt-feat"
+    worktree_dir.mkdir()
+    (worktree_dir / "feat.txt").write_text("feat", encoding="utf-8")
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=user.id,
+        name="Demo",
+        slug="demo",
+        repo_url="https://github.com/example/demo",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-1",
+        workspace_path="/workspace",
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    worktree = WorkspaceWorktree(
+        id=uuid4(),
+        workspace_id=workspace.id,
+        branch="feat",
+        path="/workspace/wt-feat",
+        base_ref="main",
+        is_base=False,
+        status="active",
+    )
+    service = FileService(
+        session=FakeSession(workspace, worktrees=[worktree]),
+        settings=Settings(
+            file_max_read_bytes=32,
+            file_max_upload_bytes=64,
+            file_tree_max_entries=20,
+        ),
+        runtime=FakeRuntime(base_path),  # type: ignore[arg-type]
+    )
+
+    app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
+    app.dependency_overrides[auth_module.get_login_rate_limiter] = lambda: FakeRateLimiter()
+    app.dependency_overrides[files_module.get_file_service] = lambda: service
+    yield user, workspace, worktree, base_path, worktree_dir
+    app.dependency_overrides.clear()
+
+
+async def test_tree_and_read_follow_active_worktree(worktree_context):
+    _user, workspace, worktree, _base_path, _worktree_dir = worktree_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        base_tree = await client.get(f"/workspaces/{workspace.id}/files/tree")
+        worktree_tree = await client.get(
+            f"/workspaces/{workspace.id}/files/tree?worktree_id={worktree.id}"
+        )
+        worktree_read = await client.get(
+            f"/workspaces/{workspace.id}/files/read?path=feat.txt&worktree_id={worktree.id}"
+        )
+        base_read_missing = await client.get(
+            f"/workspaces/{workspace.id}/files/read?path=feat.txt"
+        )
+
+    base_names = {child["name"] for child in base_tree.json()["children"]}
+    worktree_names = {child["name"] for child in worktree_tree.json()["children"]}
+    assert "base.txt" in base_names
+    assert "feat.txt" not in base_names
+    assert worktree_names == {"feat.txt"}
+    assert worktree_read.status_code == 200
+    assert worktree_read.json()["content"] == "feat"
+    assert base_read_missing.status_code == 404
+
+
+async def test_mutations_target_active_worktree_directory(worktree_context):
+    _user, workspace, worktree, base_path, worktree_dir = worktree_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        uploaded = await client.post(
+            f"/workspaces/{workspace.id}/files/upload"
+            f"?path=&filename=note.txt&worktree_id={worktree.id}",
+            content=b"scoped",
+            headers={"content-type": "application/octet-stream"},
+        )
+
+    assert uploaded.status_code == 200
+    assert uploaded.json()["path"] == "note.txt"
+    # Written into the worktree directory, not the base clone.
+    assert (worktree_dir / "note.txt").read_text(encoding="utf-8") == "scoped"
+    assert not (base_path / "note.txt").exists()
+
+
+async def test_unknown_worktree_returns_404(worktree_context):
+    _user, workspace, _worktree, _base_path, _worktree_dir = worktree_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        response = await client.get(
+            f"/workspaces/{workspace.id}/files/tree?worktree_id={uuid4()}"
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Worktree not found"
+
+
+async def test_worktree_from_another_workspace_returns_404(worktree_context):
+    _user, workspace, _worktree, _base_path, _worktree_dir = worktree_context
+    service = app.dependency_overrides[files_module.get_file_service]()
+    foreign = WorkspaceWorktree(
+        id=uuid4(),
+        workspace_id=uuid4(),
+        branch="feat",
+        path="/workspace/wt-feat",
+        base_ref="main",
+        is_base=False,
+        status="active",
+    )
+    service.session.worktrees[foreign.id] = foreign
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        response = await client.get(
+            f"/workspaces/{workspace.id}/files/tree?worktree_id={foreign.id}"
+        )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Worktree not found"

@@ -1,23 +1,46 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 import { Outlet, useOutletContext, useParams } from "react-router";
 
-import { useAuth } from "../auth/context";
+import { useAuth, WorkspaceRoleContext } from "../auth/context";
 import { AgentTab } from "../components/AgentTab";
+import { DiffView } from "../components/AgentTab/DiffView";
 import { DashboardShell } from "../components/DashboardShell";
 import { CustomCommandsPanel } from "../components/CustomCommandsPanel";
 import { EditorPanel } from "../components/EditorPanel";
 import { FileManagementPanel } from "../components/FileManagementPanel";
 import { PreviewPanel } from "../components/PreviewPanel";
+import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
+import { WorktreesPanel } from "../components/WorktreesPanel";
+import { ConfirmModal } from "../components/ui/ConfirmModal";
+import { Spinner } from "../components/ui/Spinner";
+import { TextInput } from "../components/ui/TextInput";
+import { BudgetConfig } from "../components/usage/BudgetConfig";
+import { UsagePanel } from "../components/usage/UsagePanel";
+import { CreateWorkspaceWizard } from "../components/workspace/CreateWorkspaceWizard";
+import { ProviderAuthSelector } from "../components/workspace/ProviderAuthSelector";
+import { useActiveWorktree } from "../lib/activeWorktree";
+import {
+  PROVIDER_HELP,
+  authTypeLabel,
+  providerLabel,
+  resolveProvider,
+} from "../lib/gitProviders";
+import { useRepositoryCredential } from "../lib/useRepositoryCredential";
 import {
   ApiError,
   cloneRepository,
   commitRepository,
+  commitWorktree,
   connectRepository,
   createWorkspace,
   deleteWorkspaceEnvVar,
-  startDevServer,
+  discardRepositoryChanges,
+  fetchRepository,
+  setupDevServer,
+  getCommitDetail,
   getRepositoryDiff,
+  getRepositoryLog,
   getRepositoryStatus,
   getHealth,
   getWorkspace,
@@ -25,11 +48,20 @@ import {
   listWorkspaceEnvVars,
   listWorkspaces,
   pullRepository,
+  pullWorktree,
   pushRepository,
+  pushWorktree,
+  getWorkspaceStatus,
+  reprovisionWorkspace,
   updateWorkspace,
   upsertWorkspaceEnvVar,
   type AuditLogResponse,
+  type GitCommitResponse,
+  type GitProviderChoice,
   type HealthResponse,
+  type RepositoryAuthType,
+  type RepositoryCommitDetailResponse,
+  type RepositoryCredentialResponse,
   type RepositoryStatusResponse,
   type WorkspaceEnvVarResponse,
   type WorkspaceResponse,
@@ -54,11 +86,14 @@ type DashboardViewId =
   | "editor"
   | "terminal"
   | "preview"
+  | "spec"
   | "agent"
+  | "usage"
   | "audit";
 type PreviewStatusSnapshot = {
-  status: "inactive" | "active" | "stopped" | "error";
-  port: number | null;
+  /** Count of currently-running services (Epic 11); a single legacy dev server counts as 1. */
+  running: number;
+  total: number;
 };
 
 type DashboardOutletContext = {
@@ -81,8 +116,8 @@ export function DashboardRoute() {
   const [health, setHealth] = useState<HealthState>({ status: "loading" });
   const [workspaceState, setWorkspaceState] = useState<WorkspaceState>({ status: "loading" });
   const [previewStatus, setPreviewStatus] = useState<PreviewStatusSnapshot>({
-    status: "inactive",
-    port: null,
+    running: 0,
+    total: 0,
   });
 
   useEffect(() => {
@@ -151,9 +186,9 @@ export function DashboardRoute() {
   const workspaceStatus =
     workspaceState.status === "loading" ? "loading" : workspace?.status ?? "none";
   const previewStatusLabel =
-    previewStatus.port === null
-      ? previewStatus.status
-      : `${previewStatus.status} :${previewStatus.port}`;
+    previewStatus.total === 0
+      ? "inactive"
+      : `${previewStatus.running}/${previewStatus.total} running`;
 
   const handlePreviewStatusChange = useCallback((snapshot: PreviewStatusSnapshot) => {
     setPreviewStatus(snapshot);
@@ -184,30 +219,33 @@ export function DashboardRoute() {
       : "/";
 
   return (
-    <DashboardShell
-      healthLabel={shellStatus.label}
-      healthTone={shellStatus.tone}
-      workspace={workspace}
-      workspaceStatus={workspaceStatus}
-      previewStatusLabel={previewStatusLabel}
-      user={user}
-      onLogout={logout}
-      basePath={basePath}
-      projectId={projectId}
-      teamId={teamId}
-    >
-      <Outlet
-        context={{
-          health,
-          workspaceState,
-          workspaceStatus,
-          onWorkspaceCreated: loadWorkspaceAfterCreate,
-          onWorkspaceChanged: handleWorkspaceChanged,
-          onEnvVarsChanged: handleEnvVarsChanged,
-          onPreviewStatusChange: handlePreviewStatusChange,
-        } satisfies DashboardOutletContext}
-      />
-    </DashboardShell>
+    // Everything below gates its actions on the caller's role in this workspace.
+    <WorkspaceRoleContext.Provider value={workspace?.viewer_role ?? null}>
+      <DashboardShell
+        healthLabel={shellStatus.label}
+        healthTone={shellStatus.tone}
+        workspace={workspace}
+        workspaceStatus={workspaceStatus}
+        previewStatusLabel={previewStatusLabel}
+        user={user}
+        onLogout={logout}
+        basePath={basePath}
+        projectId={projectId}
+        teamId={teamId}
+      >
+        <Outlet
+          context={{
+            health,
+            workspaceState,
+            workspaceStatus,
+            onWorkspaceCreated: loadWorkspaceAfterCreate,
+            onWorkspaceChanged: handleWorkspaceChanged,
+            onEnvVarsChanged: handleEnvVarsChanged,
+            onPreviewStatusChange: handlePreviewStatusChange,
+          } satisfies DashboardOutletContext}
+        />
+      </DashboardShell>
+    </WorkspaceRoleContext.Provider>
   );
 }
 
@@ -242,12 +280,7 @@ export function DashboardView({ view }: { view: DashboardViewId }) {
   const workspace = workspaceState.workspace;
 
   if (view === "repository") {
-    return (
-      <RepositoryPanel
-        workspace={workspace}
-        onWorkspaceChanged={onWorkspaceChanged}
-      />
-    );
+    return <RepositoryView workspace={workspace} onWorkspaceChanged={onWorkspaceChanged} />;
   }
 
   if (view === "files") {
@@ -275,11 +308,30 @@ export function DashboardView({ view }: { view: DashboardViewId }) {
     );
   }
 
+  if (view === "spec") {
+    return <SpecPanel workspace={workspace} />;
+  }
+
   if (view === "agent") {
     return <AgentTab workspaceId={workspace.id} />;
   }
 
+  if (view === "usage") {
+    return <WorkspaceUsageView workspace={workspace} />;
+  }
+
   return <AuditLogPanel workspace={workspace} />;
+}
+
+function WorkspaceUsageView({ workspace }: { workspace: WorkspaceResponse }) {
+  const { user } = useAuth();
+  const canManage = user?.id === workspace.owner_id;
+  return (
+    <div className="flex flex-col gap-4">
+      <UsagePanel scope="workspace" scopeId={workspace.id} title="Workspace usage" />
+      <BudgetConfig scope="workspace" scopeId={workspace.id} canManage={canManage} />
+    </div>
+  );
 }
 
 function DashboardOverview({
@@ -494,76 +546,47 @@ function ErrorState({ message }: { message: string }) {
 }
 
 function CreateWorkspacePanel({ onCreated }: { onCreated: (workspace: WorkspaceResponse) => void }) {
-  const [name, setName] = useState("");
-  const [repoUrl, setRepoUrl] = useState("");
-  const [defaultBranch, setDefaultBranch] = useState("main");
-  const [snapshot, setSnapshot] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setError(null);
-
-    if (!name.trim() || !repoUrl.trim() || !defaultBranch.trim()) {
-      setError("Enter a workspace name, repository URL, and default branch.");
-      return;
-    }
-
-    setIsSubmitting(true);
-    try {
-      const workspace = await createWorkspace({
-        name,
-        repo_url: repoUrl,
-        default_branch: defaultBranch,
-        snapshot: snapshot.trim() || null,
-      });
-      onCreated(workspace);
-    } catch (caughtError) {
-      setError(
-        caughtError instanceof ApiError ? caughtError.message : "Unable to create workspace.",
-      );
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
+  const [open, setOpen] = useState(false);
 
   return (
-    <form className="space-y-4" onSubmit={handleSubmit}>
+    <div className="space-y-4">
       <div className="rounded-md border border-dashed border-line bg-white p-5 text-ink/72">
-        No workspace has been created yet.
+        No workspace has been created yet. Start from a template, begin blank, or connect an
+        existing repository on GitHub, GitLab, Bitbucket, or any git host.
       </div>
-
-      <div className="grid gap-4 md:grid-cols-2">
-        <TextInput label="Workspace name" value={name} onChange={setName} />
-        <TextInput label="Default branch" value={defaultBranch} onChange={setDefaultBranch} />
-      </div>
-      <TextInput label="Repository URL" value={repoUrl} onChange={setRepoUrl} />
-      <TextInput
-        label="Daytona snapshot (optional)"
-        value={snapshot}
-        onChange={setSnapshot}
-      />
-
-      {error && <ErrorState message={error} />}
-
       <button
-        className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
-        type="submit"
-        disabled={isSubmitting}
+        className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active"
+        type="button"
+        onClick={() => setOpen(true)}
       >
-        {isSubmitting ? "Creating..." : "Create workspace"}
+        Create workspace
       </button>
-    </form>
+      <CreateWorkspaceWizard
+        open={open}
+        onClose={() => setOpen(false)}
+        createFn={createWorkspace}
+        onCreated={(workspace) => {
+          setOpen(false);
+          onCreated(workspace);
+        }}
+      />
+    </div>
   );
+}
+
+function sourceLabel(workspace: WorkspaceResponse): string {
+  if (workspace.source === "template") return "template";
+  if (workspace.source === "blank") return "blank";
+  return "repository";
 }
 
 function WorkspaceOverview({ workspace }: { workspace: WorkspaceResponse }) {
   return (
     <div className="space-y-4">
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-4">
         <Metric label="Status" value={workspace.status} />
         <Metric label="Branch" value={workspace.default_branch} />
+        <Metric label="Source" value={sourceLabel(workspace)} />
         <Metric label="Slug" value={workspace.slug} />
       </div>
 
@@ -601,15 +624,62 @@ type RepositoryState =
   | { status: "ready"; data: RepositoryStatusResponse }
   | { status: "error"; message: string };
 
-function RepositoryPanel({
+function formatCommitTime(iso: string): string {
+  const then = new Date(iso).getTime();
+  const diffMs = Date.now() - then;
+  if (Number.isNaN(diffMs)) return "";
+  const seconds = Math.floor(diffMs / 1000);
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return new Date(iso).toLocaleDateString();
+}
+
+function RepositoryView({
   workspace,
   onWorkspaceChanged,
 }: {
   workspace: WorkspaceResponse;
   onWorkspaceChanged: (workspace: WorkspaceResponse) => void;
 }) {
-  const [repoUrl, setRepoUrl] = useState(workspace.repo_url);
+  // One credential fetch shared by both panels: the connection card shows it, the worktrees
+  // panel uses it to decide whether provider-native pull requests are available.
+  const { credential, refresh } = useRepositoryCredential(workspace.id, workspace.repo_url);
+  return (
+    <>
+      <RepositoryPanel
+        workspace={workspace}
+        credential={credential}
+        onCredentialChanged={() => void refresh()}
+        onWorkspaceChanged={onWorkspaceChanged}
+      />
+      <WorktreesPanel workspace={workspace} credential={credential} />
+    </>
+  );
+}
+
+function RepositoryPanel({
+  workspace,
+  credential,
+  onCredentialChanged,
+  onWorkspaceChanged,
+}: {
+  workspace: WorkspaceResponse;
+  credential: RepositoryCredentialResponse | null;
+  onCredentialChanged: () => void;
+  onWorkspaceChanged: (workspace: WorkspaceResponse) => void;
+}) {
+  const [repoUrl, setRepoUrl] = useState(workspace.repo_url ?? "");
   const [token, setToken] = useState("");
+  const [username, setUsername] = useState("");
+  const [provider, setProvider] = useState<GitProviderChoice>("auto");
+  const [authType, setAuthType] = useState<RepositoryAuthType>("personal_access_token");
+  const [showConnectForm, setShowConnectForm] = useState(false);
+  const [copyLabel, setCopyLabel] = useState("Copy");
   const [commitMessage, setCommitMessage] = useState("");
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [diff, setDiff] = useState("");
@@ -617,16 +687,30 @@ function RepositoryPanel({
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busyAction, setBusyAction] = useState<string | null>(null);
+  // The Changes view follows the worktree selected in the Worktrees panel. The selection is
+  // broadcast via useActiveWorktree, so picking a branch there refreshes this panel live.
+  // null => the base clone.
+  const [active] = useActiveWorktree(workspace.id);
+  const worktreeId = active?.id;
+  // The right-hand panel toggles between the working-tree diff (Changes) and commit history.
+  const [rightTab, setRightTab] = useState<"changes" | "history">("changes");
+  const [history, setHistory] = useState<GitCommitResponse[]>([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [selectedCommit, setSelectedCommit] = useState<string | null>(null);
+  const [commitDetail, setCommitDetail] = useState<RepositoryCommitDetailResponse | null>(null);
+  // A pending discard awaiting confirmation. `path === null` means discard every change.
+  const [pendingDiscard, setPendingDiscard] = useState<{ path: string | null } | null>(null);
 
   useEffect(() => {
-    setRepoUrl(workspace.repo_url);
+    setRepoUrl(workspace.repo_url ?? "");
   }, [workspace.repo_url]);
 
   const loadRepositoryStatus = useCallback(
     async (signal?: AbortSignal) => {
       setRepoState({ status: "loading" });
       try {
-        const data = await getRepositoryStatus(workspace.id, signal);
+        const data = await getRepositoryStatus(workspace.id, worktreeId, signal);
         setRepoState({ status: "ready", data });
         setSelectedPath((currentPath) => {
           if (currentPath && data.files.some((file) => file.path === currentPath)) {
@@ -645,7 +729,7 @@ function RepositoryPanel({
         });
       }
     },
-    [workspace.id],
+    [workspace.id, worktreeId],
   );
 
   useEffect(() => {
@@ -667,7 +751,7 @@ function RepositoryPanel({
     }
 
     const controller = new AbortController();
-    getRepositoryDiff(workspace.id, selectedPath, controller.signal)
+    getRepositoryDiff(workspace.id, selectedPath, worktreeId, controller.signal)
       .then((response) => setDiff(response.diff))
       .catch((caughtError: unknown) => {
         if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
@@ -678,7 +762,56 @@ function RepositoryPanel({
       });
 
     return () => controller.abort();
-  }, [selectedPath, workspace.id]);
+  }, [selectedPath, workspace.id, worktreeId]);
+
+  const loadHistory = useCallback(
+    async (signal?: AbortSignal) => {
+      setHistoryLoading(true);
+      setHistoryError(null);
+      try {
+        const response = await getRepositoryLog(workspace.id, worktreeId, 50, 0, signal);
+        setHistory(response.commits);
+        setSelectedCommit((current) => {
+          if (current && response.commits.some((commit) => commit.hash === current)) {
+            return current;
+          }
+          return response.commits[0]?.hash ?? null;
+        });
+        setHistoryLoading(false);
+      } catch (caughtError) {
+        if (caughtError instanceof DOMException && caughtError.name === "AbortError") return;
+        setHistory([]);
+        setHistoryError(
+          caughtError instanceof ApiError ? caughtError.message : "Unable to load history.",
+        );
+        setHistoryLoading(false);
+      }
+    },
+    [workspace.id, worktreeId],
+  );
+
+  // Load history lazily — only when the History tab is active — and reload when the branch changes.
+  useEffect(() => {
+    if (rightTab !== "history") return;
+    const controller = new AbortController();
+    void loadHistory(controller.signal);
+    return () => controller.abort();
+  }, [rightTab, loadHistory]);
+
+  useEffect(() => {
+    if (rightTab !== "history" || !selectedCommit) {
+      setCommitDetail(null);
+      return;
+    }
+    const controller = new AbortController();
+    getCommitDetail(workspace.id, selectedCommit, worktreeId, controller.signal)
+      .then(setCommitDetail)
+      .catch((caughtError: unknown) => {
+        if (caughtError instanceof DOMException && caughtError.name === "AbortError") return;
+        setCommitDetail(null);
+      });
+    return () => controller.abort();
+  }, [rightTab, selectedCommit, workspace.id, worktreeId]);
 
   async function runAction(actionName: string, action: () => Promise<string>) {
     setBusyAction(actionName);
@@ -695,21 +828,59 @@ function RepositoryPanel({
     }
   }
 
+  const resolvedProvider = resolveProvider(repoUrl, provider);
+  const providerHelp = PROVIDER_HELP[resolvedProvider];
+  const connectFormVisible = credential === null || showConnectForm;
+
   async function handleConnect(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!repoUrl.trim() || !token.trim()) {
-      setError("Enter a GitHub repository URL and personal access token.");
+    if (!repoUrl.trim()) {
+      setError("Enter a repository URL.");
       return;
+    }
+    if (authType === "personal_access_token") {
+      if (!token.trim()) {
+        setError(`Enter your ${providerHelp.tokenLabel.toLowerCase()}.`);
+        return;
+      }
+      if (providerHelp.requiresUsername && !username.trim()) {
+        setError("Enter your username.");
+        return;
+      }
     }
     await runAction("connect", async () => {
       const updated = await connectRepository(workspace.id, {
         repo_url: repoUrl,
-        token,
+        provider,
+        auth_type: authType,
+        ...(authType === "personal_access_token"
+          ? { token, ...(username.trim() ? { username: username.trim() } : {}) }
+          : {}),
       });
       onWorkspaceChanged(updated);
+      onCredentialChanged();
       setToken("");
-      return "Repository credentials saved.";
+      setShowConnectForm(false);
+      return authType === "ssh_key"
+        ? "Deploy key ready. Add the public key on your git host, then clone."
+        : "Repository credentials saved.";
     });
+  }
+
+  async function copyPublicKey() {
+    if (!credential?.public_key) return;
+    await navigator.clipboard?.writeText(credential.public_key);
+    setCopyLabel("Copied");
+    window.setTimeout(() => setCopyLabel("Copy"), 1200);
+  }
+
+  async function handleDiscard(path: string | null) {
+    await runAction("discard", async () => {
+      const response = await discardRepositoryChanges(workspace.id, path ?? undefined, worktreeId);
+      if (path === null || path === selectedPath) setSelectedPath(null);
+      return response.message;
+    });
+    setPendingDiscard(null);
   }
 
   async function handleCommit(event: FormEvent<HTMLFormElement>) {
@@ -719,7 +890,11 @@ function RepositoryPanel({
       return;
     }
     await runAction("commit", async () => {
-      const response = await commitRepository(workspace.id, { message: commitMessage });
+      // Commit to whichever worktree the Changes view is showing, so what you see is
+      // what you commit. With no worktree selected this targets the base clone.
+      const response = active
+        ? await commitWorktree(workspace.id, active.id, { message: commitMessage })
+        : await commitRepository(workspace.id, { message: commitMessage });
       setCommitMessage("");
       return response.message;
     });
@@ -736,52 +911,144 @@ function RepositoryPanel({
             <h3 className="mt-1 text-base font-semibold">Connection</h3>
           </div>
           <span className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-ink/65">
-            {statusData?.cloned ? statusData.branch ?? "Detached" : "Not cloned"}
+            {statusData?.cloned
+              ? statusData.branch ?? "Detached"
+              : workspace.repo_url
+                ? "Not cloned"
+                : "No remote"}
           </span>
         </div>
 
-        <form className="mt-4 space-y-3" onSubmit={handleConnect}>
-          <TextInput label="GitHub repository URL" value={repoUrl} onChange={setRepoUrl} />
-          <TextInput label="Personal access token" type="password" value={token} onChange={setToken} />
-          <button
-            className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
-            type="submit"
-            disabled={busyAction === "connect"}
-          >
-            {busyAction === "connect" ? "Saving..." : "Connect repository"}
-          </button>
-        </form>
+        {!workspace.repo_url && credential === null && (
+          <div className="mt-4 rounded-md border border-dashed border-line bg-canvas p-4 text-sm text-body">
+            <p className="font-semibold text-ink">Connect a remote</p>
+            <p className="mt-1">
+              This workspace was {workspace.source === "template" ? "created from a template" : "started blank"}.
+              Add a remote below to push, pull, and open pull requests.
+            </p>
+          </div>
+        )}
 
-        <div className="mt-5 grid grid-cols-3 gap-2">
+        {credential && (
+          <div className="mt-4 rounded-md border border-line bg-canvas p-4 text-sm">
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="rounded-full bg-line px-2 py-0.5 text-xs font-semibold text-ink">
+                {providerLabel(credential.provider)}
+              </span>
+              <span className="text-body">{authTypeLabel(credential.auth_type)}</span>
+              {credential.username && (
+                <span className="font-mono text-xs text-muted">as {credential.username}</span>
+              )}
+              <button
+                type="button"
+                onClick={() => setShowConnectForm((value) => !value)}
+                className="ml-auto text-xs font-medium text-primary hover:underline"
+              >
+                {showConnectForm ? "Cancel" : "Change credentials"}
+              </button>
+            </div>
+            {credential.public_key && (
+              <div className="mt-3">
+                <p className="text-xs text-body">{PROVIDER_HELP[credential.provider].sshHelp}</p>
+                <pre className="mt-2 max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-md bg-white p-2 font-mono text-xs text-ink">
+                  {credential.public_key}
+                </pre>
+                <button
+                  type="button"
+                  onClick={() => void copyPublicKey()}
+                  className="mt-2 rounded-md border border-line bg-white px-3 py-1 text-xs font-semibold text-ink hover:bg-panel"
+                >
+                  {copyLabel}
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {connectFormVisible && (
+          <form className="mt-4 space-y-3" onSubmit={handleConnect}>
+            <TextInput
+              label="Repository URL"
+              value={repoUrl}
+              onChange={setRepoUrl}
+              placeholder={providerHelp.urlPlaceholder}
+              mono
+            />
+            <ProviderAuthSelector
+              repoUrl={repoUrl}
+              provider={provider}
+              onProviderChange={setProvider}
+              authType={authType}
+              onAuthTypeChange={setAuthType}
+              token={token}
+              onTokenChange={setToken}
+              username={username}
+              onUsernameChange={setUsername}
+              disabled={busyAction === "connect"}
+            />
+            <button
+              className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
+              type="submit"
+              disabled={busyAction === "connect"}
+              aria-busy={busyAction === "connect"}
+            >
+              {busyAction === "connect" && <Spinner className="h-4 w-4" />}
+              {busyAction === "connect" ? "Saving..." : "Connect repository"}
+            </button>
+          </form>
+        )}
+
+        <div className="mt-5 grid grid-cols-2 gap-2">
           <RepoActionButton
             label="Clone"
-            disabled={busyAction !== null || statusData?.cloned === true}
+            busy={busyAction === "clone"}
+            disabled={busyAction !== null || statusData?.cloned === true || !workspace.repo_url}
             onClick={() =>
               void runAction("clone", async () => {
                 const response = await cloneRepository(workspace.id);
-                // Auto-setup the environment from mise.toml and start dev mode.
-                // Fire-and-forget — the Preview tab polls progress and opens the preview.
-                void startDevServer(workspace.id).catch(() => undefined);
-                return `${response.message} Setting up the environment…`;
+                // Prepare the environment (toolchain + dependencies) from mise.toml.
+                // Fire-and-forget — the Preview tab polls progress. The app itself is
+                // started on demand from the Preview "Run App" button.
+                void setupDevServer(workspace.id).catch(() => undefined);
+                return `${response.message} Preparing the environment…`;
+              })
+            }
+          />
+          <RepoActionButton
+            label="Fetch"
+            busy={busyAction === "fetch"}
+            disabled={busyAction !== null || statusData?.cloned !== true}
+            onClick={() =>
+              void runAction("fetch", async () => {
+                const response = await fetchRepository(workspace.id, worktreeId);
+                return response.message;
               })
             }
           />
           <RepoActionButton
             label="Pull"
+            busy={busyAction === "pull"}
             disabled={busyAction !== null || statusData?.cloned !== true}
             onClick={() =>
               void runAction("pull", async () => {
-                const response = await pullRepository(workspace.id);
+                // Pull the branch the Changes view is showing — a worktree when one is active,
+                // otherwise the base clone.
+                const response = active
+                  ? await pullWorktree(workspace.id, active.id)
+                  : await pullRepository(workspace.id);
                 return response.message;
               })
             }
           />
           <RepoActionButton
             label="Push"
+            busy={busyAction === "push"}
             disabled={busyAction !== null || statusData?.cloned !== true}
             onClick={() =>
               void runAction("push", async () => {
-                const response = await pushRepository(workspace.id);
+                const response = active
+                  ? await pushWorktree(workspace.id, active.id)
+                  : await pushRepository(workspace.id);
                 return response.message;
               })
             }
@@ -791,10 +1058,12 @@ function RepositoryPanel({
         <form className="mt-5 space-y-3" onSubmit={handleCommit}>
           <TextInput label="Commit message" value={commitMessage} onChange={setCommitMessage} />
           <button
-            className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
+            className="inline-flex items-center gap-2 rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="submit"
             disabled={busyAction === "commit" || statusData?.cloned !== true}
+            aria-busy={busyAction === "commit"}
           >
+            {busyAction === "commit" && <Spinner className="h-4 w-4" />}
             {busyAction === "commit" ? "Committing..." : "Commit changes"}
           </button>
         </form>
@@ -814,76 +1083,233 @@ function RepositoryPanel({
       <div className="rounded-md border border-line bg-white p-5 shadow-soft">
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div>
-            <h3 className="text-base font-semibold">Changes</h3>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="inline-flex rounded-md border border-line bg-panel p-0.5 text-sm font-medium">
+                {(["changes", "history"] as const).map((tab) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    className={`rounded px-3 py-1 capitalize transition ${
+                      rightTab === tab
+                        ? "bg-white text-ink shadow-soft"
+                        : "text-ink/55 hover:text-ink"
+                    }`}
+                    onClick={() => setRightTab(tab)}
+                  >
+                    {tab}
+                  </button>
+                ))}
+              </div>
+              <span className="rounded-full bg-line px-2 py-0.5 font-mono text-xs text-ink/65">
+                {active?.branch ?? statusData?.branch ?? workspace.default_branch}
+                {!active && <span className="ml-1 font-sans text-ink/45">base</span>}
+              </span>
+            </div>
             <p className="mt-1 text-sm text-ink/60">
-              {repoState.status === "ready"
-                ? statusData?.is_clean
-                  ? "Working tree clean"
-                  : `${statusData?.files.length ?? 0} changed file${
-                      statusData?.files.length === 1 ? "" : "s"
-                    }`
-                : "Checking repository"}
+              {rightTab === "history"
+                ? historyLoading
+                  ? "Loading history"
+                  : `${history.length} commit${history.length === 1 ? "" : "s"}`
+                : repoState.status === "ready"
+                  ? statusData?.is_clean
+                    ? "Working tree clean"
+                    : `${statusData?.files.length ?? 0} changed file${
+                        statusData?.files.length === 1 ? "" : "s"
+                      }`
+                  : "Checking repository"}
             </p>
           </div>
           <button
             className="rounded-md border border-line bg-white px-3 py-2 text-sm font-medium transition hover:bg-panel"
             type="button"
-            onClick={() => void loadRepositoryStatus()}
+            onClick={() =>
+              void (rightTab === "history" ? loadHistory() : loadRepositoryStatus())
+            }
           >
             Refresh
           </button>
         </div>
 
-        {repoState.status === "loading" && (
-          <div className="mt-4">
-            <LoadingState message="Loading repository status..." />
-          </div>
-        )}
-        {repoState.status === "error" && (
-          <div className="mt-4">
-            <ErrorState message={repoState.message} />
-          </div>
-        )}
-        {repoState.status === "ready" && (
-          <div className="mt-4 grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
-            <div className="space-y-2">
-              {repoState.data.files.length === 0 && (
-                <div className="rounded-md border border-dashed border-line bg-white p-4 text-sm text-ink/65">
-                  No changed files.
-                </div>
-              )}
-              {repoState.data.files.map((file) => (
-                <button
-                  className={`flex w-full items-center justify-between gap-3 rounded-md border px-3 py-2 text-left transition ${
-                    file.path === selectedPath
-                      ? "border-ink bg-white"
-                      : "border-line bg-white hover:bg-panel"
-                  }`}
-                  key={`${file.status}-${file.path}`}
-                  type="button"
-                  onClick={() => setSelectedPath(file.path)}
-                >
-                  <span className="min-w-0 truncate font-mono text-sm">{file.path}</span>
-                  <span className="shrink-0 rounded bg-line px-2 py-1 font-mono text-xs">
-                    {file.status}
-                  </span>
-                </button>
-              ))}
-            </div>
-
-            <div className="min-w-0 rounded-md border border-line bg-white">
-              <div className="border-b border-line px-3 py-2">
-                <p className="truncate font-mono text-sm font-semibold">
-                  {selectedFile?.path ?? "No file selected"}
-                </p>
+        {rightTab === "changes" && (
+          <>
+            {repoState.status === "loading" && (
+              <div className="mt-4">
+                <LoadingState message="Loading repository status..." />
               </div>
-              <pre className="max-h-[460px] overflow-auto whitespace-pre-wrap break-words p-4 font-mono text-xs leading-5 text-ink/80">
-                {diff || "Select a changed file to view its diff."}
-              </pre>
-            </div>
-          </div>
+            )}
+            {repoState.status === "error" && (
+              <div className="mt-4">
+                <ErrorState message={repoState.message} />
+              </div>
+            )}
+            {repoState.status === "ready" && (
+              <div className="mt-4 grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+                <div className="space-y-2">
+                  {repoState.data.files.length === 0 && (
+                    <div className="rounded-md border border-dashed border-line bg-white p-4 text-sm text-ink/65">
+                      No changed files.
+                    </div>
+                  )}
+                  {repoState.data.files.length > 0 && (
+                    <div className="flex justify-end">
+                      <button
+                        type="button"
+                        disabled={busyAction !== null}
+                        onClick={() => setPendingDiscard({ path: null })}
+                        className="text-xs font-medium text-danger/80 transition hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Discard all
+                      </button>
+                    </div>
+                  )}
+                  {repoState.data.files.map((file) => (
+                    <div
+                      key={`${file.status}-${file.path}`}
+                      className={`flex items-center gap-1 rounded-md border pr-1 transition ${
+                        file.path === selectedPath
+                          ? "border-ink bg-white"
+                          : "border-line bg-white hover:bg-panel"
+                      }`}
+                    >
+                      <button
+                        className="flex min-w-0 flex-1 items-center justify-between gap-3 px-3 py-2 text-left"
+                        type="button"
+                        onClick={() => setSelectedPath(file.path)}
+                      >
+                        <span className="min-w-0 truncate font-mono text-sm">{file.path}</span>
+                        <span className="shrink-0 rounded bg-line px-2 py-1 font-mono text-xs">
+                          {file.status}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        title="Discard changes"
+                        disabled={busyAction !== null}
+                        onClick={() => setPendingDiscard({ path: file.path })}
+                        className="shrink-0 rounded border border-line px-2 py-1 text-xs font-medium text-ink/70 transition hover:border-danger/40 hover:bg-danger/10 hover:text-danger disabled:cursor-not-allowed disabled:opacity-40"
+                      >
+                        Discard
+                      </button>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="min-w-0 rounded-md border border-line bg-white">
+                  <div className="border-b border-line px-3 py-2">
+                    <p className="truncate font-mono text-sm font-semibold">
+                      {selectedFile?.path ?? "No file selected"}
+                    </p>
+                  </div>
+                  <div className="p-3">
+                    {selectedPath && diff ? (
+                      <DiffView diff={diff} />
+                    ) : (
+                      <p className="p-1 text-xs text-ink/60">
+                        Select a changed file to view its diff.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {rightTab === "history" && (
+          <>
+            {historyLoading && (
+              <div className="mt-4">
+                <LoadingState message="Loading history..." />
+              </div>
+            )}
+            {historyError && (
+              <div className="mt-4">
+                <ErrorState message={historyError} />
+              </div>
+            )}
+            {!historyLoading && !historyError && (
+              <div className="mt-4 grid gap-4 lg:grid-cols-[280px_minmax(0,1fr)]">
+                <div className="max-h-[460px] space-y-2 overflow-auto">
+                  {history.length === 0 && (
+                    <div className="rounded-md border border-dashed border-line bg-white p-4 text-sm text-ink/65">
+                      No commits on this branch yet.
+                    </div>
+                  )}
+                  {history.map((commit) => (
+                    <button
+                      key={commit.hash}
+                      type="button"
+                      className={`flex w-full flex-col gap-1 rounded-md border px-3 py-2 text-left transition ${
+                        commit.hash === selectedCommit
+                          ? "border-ink bg-white"
+                          : "border-line bg-white hover:bg-panel"
+                      }`}
+                      onClick={() => setSelectedCommit(commit.hash)}
+                    >
+                      <span className="truncate text-sm font-medium text-ink">
+                        {commit.subject}
+                      </span>
+                      <span className="flex items-center gap-2 text-xs text-ink/55">
+                        <span className="rounded bg-line px-1.5 py-0.5 font-mono">
+                          {commit.short_hash}
+                        </span>
+                        <span className="min-w-0 truncate">{commit.author_name}</span>
+                        <span className="shrink-0">{formatCommitTime(commit.date)}</span>
+                      </span>
+                    </button>
+                  ))}
+                </div>
+
+                <div className="min-w-0 rounded-md border border-line bg-white">
+                  <div className="border-b border-line px-3 py-2">
+                    <p className="truncate font-mono text-sm font-semibold">
+                      {commitDetail
+                        ? `${commitDetail.short_hash} · ${commitDetail.subject}`
+                        : "No commit selected"}
+                    </p>
+                    {commitDetail && (
+                      <p className="mt-0.5 truncate text-xs text-ink/55">
+                        {commitDetail.author_name} · {commitDetail.date}
+                      </p>
+                    )}
+                  </div>
+                  <div className="p-3">
+                    {commitDetail ? (
+                      <>
+                        {commitDetail.body && (
+                          <pre className="mb-3 whitespace-pre-wrap break-words font-mono text-xs text-ink/70">
+                            {commitDetail.body}
+                          </pre>
+                        )}
+                        <DiffView diff={commitDetail.diff} />
+                      </>
+                    ) : (
+                      <p className="p-1 text-xs text-ink/60">
+                        Select a commit to view its changes.
+                      </p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            )}
+          </>
         )}
       </div>
+
+      {pendingDiscard && (
+        <ConfirmModal
+          title={pendingDiscard.path ? "Discard file changes?" : "Discard all changes?"}
+          body={
+            pendingDiscard.path
+              ? `Uncommitted changes to "${pendingDiscard.path}" will be permanently lost.`
+              : "All uncommitted changes on this branch will be permanently lost."
+          }
+          confirmLabel="Discard"
+          busy={busyAction === "discard"}
+          onCancel={() => setPendingDiscard(null)}
+          onConfirm={() => void handleDiscard(pendingDiscard.path)}
+        />
+      )}
     </section>
   );
 }
@@ -891,19 +1317,23 @@ function RepositoryPanel({
 function RepoActionButton({
   label,
   disabled,
+  busy = false,
   onClick,
 }: {
   label: string;
   disabled: boolean;
+  busy?: boolean;
   onClick: () => void;
 }) {
   return (
     <button
-      className="rounded-md border border-line bg-white px-3 py-2 text-sm font-semibold transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
+      className="inline-flex items-center justify-center gap-2 rounded-md border border-line bg-white px-3 py-2 text-sm font-semibold transition hover:bg-panel disabled:cursor-not-allowed disabled:opacity-50"
       type="button"
       disabled={disabled}
+      aria-busy={busy}
       onClick={onClick}
     >
+      {busy && <Spinner />}
       {label}
     </button>
   );
@@ -917,19 +1347,50 @@ function WorkspaceMetadataForm({
   onWorkspaceChanged: (workspace: WorkspaceResponse) => void;
 }) {
   const [name, setName] = useState(workspace.name);
-  const [repoUrl, setRepoUrl] = useState(workspace.repo_url);
+  const [repoUrl, setRepoUrl] = useState(workspace.repo_url ?? "");
   const [defaultBranch, setDefaultBranch] = useState(workspace.default_branch);
   const [snapshot, setSnapshot] = useState(workspace.snapshot ?? "");
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isChecking, setIsChecking] = useState(false);
 
   useEffect(() => {
     setName(workspace.name);
-    setRepoUrl(workspace.repo_url);
+    setRepoUrl(workspace.repo_url ?? "");
     setDefaultBranch(workspace.default_branch);
     setSnapshot(workspace.snapshot ?? "");
   }, [workspace]);
+
+  /**
+   * Re-check the sandbox after a save so the page reflects reality instead of the status the
+   * row was left with. A workspace with no sandbox (a create that failed at the runtime step)
+   * cannot be recovered by a status read — there is nothing to query — so it is re-provisioned
+   * instead. That is idempotent, and saving corrected settings is the moment the retry is
+   * most likely to succeed.
+   */
+  async function refreshSandbox(saved: WorkspaceResponse) {
+    setIsChecking(true);
+    try {
+      if (saved.status === "error" || !saved.sandbox_id) {
+        const provisioned = await reprovisionWorkspace(saved.id);
+        onWorkspaceChanged(provisioned);
+        setMessage(`Workspace settings saved. Sandbox is ${provisioned.status}.`);
+      } else {
+        const checked = await getWorkspaceStatus(saved.id);
+        onWorkspaceChanged({ ...saved, ...checked });
+        setMessage(`Workspace settings saved. Sandbox is ${checked.status}.`);
+      }
+    } catch (caughtError) {
+      setError(
+        `Settings saved, but the sandbox is still unavailable: ${
+          caughtError instanceof ApiError ? caughtError.message : "check failed"
+        }`,
+      );
+    } finally {
+      setIsChecking(false);
+    }
+  }
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -937,20 +1398,25 @@ function WorkspaceMetadataForm({
     setMessage(null);
     setIsSubmitting(true);
 
+    let updated: WorkspaceResponse;
     try {
-      const updated = await updateWorkspace(workspace.id, {
+      // Blank/template workspaces have no remote; sending "" would be rejected, so omit it.
+      updated = await updateWorkspace(workspace.id, {
         name,
-        repo_url: repoUrl,
         default_branch: defaultBranch,
         snapshot: snapshot.trim() || null,
+        ...(repoUrl.trim() ? { repo_url: repoUrl.trim() } : {}),
       });
-      onWorkspaceChanged(updated);
-      setMessage("Workspace settings saved.");
     } catch (caughtError) {
       setError(caughtError instanceof ApiError ? caughtError.message : "Unable to save workspace.");
+      return;
     } finally {
       setIsSubmitting(false);
     }
+
+    onWorkspaceChanged(updated);
+    setMessage("Workspace settings saved.");
+    await refreshSandbox(updated);
   }
 
   return (
@@ -961,7 +1427,12 @@ function WorkspaceMetadataForm({
         <TextInput label="Default branch" value={defaultBranch} onChange={setDefaultBranch} />
       </div>
       <div className="mt-4">
-        <TextInput label="Repository URL" value={repoUrl} onChange={setRepoUrl} />
+        <TextInput
+          label="Repository URL (optional)"
+          value={repoUrl}
+          onChange={setRepoUrl}
+          hint="Connecting credentials from the Repository tab also sets this."
+        />
       </div>
       <div className="mt-4">
         <TextInput
@@ -985,9 +1456,9 @@ function WorkspaceMetadataForm({
       <button
         className="mt-4 rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
         type="submit"
-        disabled={isSubmitting}
+        disabled={isSubmitting || isChecking}
       >
-        {isSubmitting ? "Saving..." : "Save settings"}
+        {isSubmitting ? "Saving..." : isChecking ? "Checking sandbox..." : "Save settings"}
       </button>
     </form>
   );
@@ -1090,29 +1561,5 @@ function Metric({ label, value }: { label: string; value: string }) {
       <p className="text-sm text-ink/60">{label}</p>
       <p className="mt-2 break-words text-xl font-semibold capitalize">{value}</p>
     </div>
-  );
-}
-
-function TextInput({
-  label,
-  value,
-  onChange,
-  type = "text",
-}: {
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  type?: "text" | "password";
-}) {
-  return (
-    <label className="block text-sm font-medium">
-      {label}
-      <input
-        className="mt-2 w-full rounded-md border border-line bg-white px-3 py-2 outline-none transition focus:border-ink"
-        type={type}
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </label>
   );
 }

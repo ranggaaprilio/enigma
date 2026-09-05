@@ -114,6 +114,7 @@ class DaytonaRuntime:
             async for existing in client.list(ListSandboxesQuery(name=name, limit=1)):
                 if existing.name == name:
                     return await self._ensure_started(existing)
+            block_all, allow_list = self._desired_network_settings()
             params = CreateSandboxFromSnapshotParams(
                 name=name,
                 snapshot=snapshot or self.settings.daytona_default_snapshot,
@@ -127,6 +128,8 @@ class DaytonaRuntime:
                 auto_archive_interval=0,
                 auto_delete_interval=-1,
                 ephemeral=False,
+                network_block_all=block_all,
+                network_allow_list=allow_list,
             )
             sandbox = await client.create(
                 params,
@@ -210,7 +213,7 @@ class DaytonaRuntime:
         *,
         cwd: str | None,
         env: dict[str, str] | None,
-        timeout: int,
+        timeout: int | None,
         on_stdout: Callable[[str], Awaitable[None]],
         on_stderr: Callable[[str], Awaitable[None]],
     ) -> int:
@@ -263,6 +266,7 @@ class DaytonaRuntime:
         env: dict[str, str] | None,
         cols: int,
         rows: int,
+        cwd: str | None = None,
     ) -> Any:
         sandbox = await self.get_sandbox(workspace)
         try:
@@ -272,7 +276,7 @@ class DaytonaRuntime:
             return await sandbox.process.create_pty_session(
                 session_id,
                 on_data,
-                cwd=workspace.workspace_path,
+                cwd=cwd or workspace.workspace_path,
                 envs=env,
                 pty_size=PtySize(cols=cols, rows=rows),
             )
@@ -311,7 +315,40 @@ class DaytonaRuntime:
         await sandbox.refresh_data()
         if str(sandbox.state or "").lower() != "started":
             await sandbox.start(timeout=self.settings.daytona_provision_timeout_seconds)
+        await self._apply_network_settings(sandbox)
         return sandbox
+
+    def _desired_network_settings(self) -> tuple[bool, str | None]:
+        """The egress policy every sandbox should carry, derived from settings.
+
+        Returns ``(block_all, allow_list)`` where ``allow_list`` is the SDK's
+        comma-separated CIDR string (``None`` when unrestricted). Defaults open
+        (``block_all=False``, no allow list) so sandboxes can reach external
+        services; set ``DAYTONA_NETWORK_BLOCK_ALL`` / ``DAYTONA_NETWORK_ALLOW_LIST``
+        to isolate or narrow.
+        """
+        return (
+            self.settings.daytona_network_block_all,
+            ",".join(self.settings.daytona_network_allow_list) or None,
+        )
+
+    async def _apply_network_settings(self, sandbox: Any) -> None:
+        """Reconcile a reused/restarted sandbox to the desired egress policy.
+
+        New sandboxes get the policy via create params; sandboxes returned from
+        the ``client.list`` early-return in ``provision`` and from ``get_sandbox``
+        bypass that, so apply it here. Skip the API call when already in the
+        desired state (``refresh_data`` in ``_ensure_started`` populates the
+        current ``network_*`` attributes)."""
+        block_all, allow_list = self._desired_network_settings()
+        current_block_all = getattr(sandbox, "network_block_all", None)
+        current_allow_list = getattr(sandbox, "network_allow_list", None) or None
+        if current_block_all == block_all and current_allow_list == allow_list:
+            return
+        await sandbox.update_network_settings(
+            network_block_all=block_all,
+            network_allow_list=allow_list,
+        )
 
 
 @lru_cache

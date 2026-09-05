@@ -159,6 +159,10 @@ class OpenHandsAgentProvider(AgentProvider):
                         Tool(name="read_file", params={"bridge_id": bridge_id}),
                         Tool(name="write_file", params={"bridge_id": bridge_id}),
                         Tool(name="run_command", params={"bridge_id": bridge_id}),
+                        Tool(name="apply_patch", params={"bridge_id": bridge_id}),
+                        Tool(name="search_code", params={"bridge_id": bridge_id}),
+                        Tool(name="git_status", params={"bridge_id": bridge_id}),
+                        Tool(name="git_diff", params={"bridge_id": bridge_id}),
                     ],
                 )
                 with tempfile.TemporaryDirectory(prefix="enigma-openhands-") as workspace:
@@ -195,6 +199,8 @@ class OpenHandsAgentProvider(AgentProvider):
                             {
                                 "status": "completed",
                                 "tokens_used": tokens_used,
+                                "input_tokens": usage.prompt_tokens,
+                                "output_tokens": usage.completion_tokens,
                                 "openhands_status": status,
                             },
                         )
@@ -284,7 +290,16 @@ class OpenHandsAgentProvider(AgentProvider):
                 "tool_call_id": str(event.tool_call_id),
                 "ok": not observation.is_error,
             }
-            for field_name in ("path", "exit_code", "truncated"):
+            for field_name in (
+                "path",
+                "exit_code",
+                "truncated",
+                "diff",
+                "matches",
+                "branch",
+                "is_clean",
+                "files",
+            ):
                 value = getattr(observation, field_name, None)
                 if value is not None:
                     metadata[field_name] = value

@@ -2,6 +2,7 @@
   "name": "execute-dashboard",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@9.15.0",
   "scripts": {
     "dev": "podman compose up --build",
     "dev:docker": "docker compose up --build",

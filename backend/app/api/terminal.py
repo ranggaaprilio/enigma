@@ -12,6 +12,7 @@ from app.models import TerminalSession, User
 from app.schemas.terminal import TerminalSessionCreateRequest, TerminalSessionResponse
 from app.schemas.workspaces import DeleteResponse
 from app.services.daytona_runtime import get_daytona_runtime
+from app.services.run_paths import join_subpath, validate_relative_subpath
 from app.services.terminal import (
     TerminalPtyBridge,
     TerminalRuntimeError,
@@ -20,6 +21,7 @@ from app.services.terminal import (
     TerminalWorkspacePathError,
 )
 from app.services.workspaces import WorkspaceNotFoundError
+from app.services.worktrees import WorktreeNotFoundError, WorktreeService
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/terminal", tags=["terminal"])
 
@@ -157,13 +159,49 @@ async def connect_terminal_session(
         await service.touch(terminal_session)
         env = await service.environment(workspace.id)
 
+        # An optional ``worktree_id`` query param points the terminal at a feature worktree.
+        # Each non-base worktree gets its own PTY (keyed by worktree) so terminals are isolated.
+        cwd: str | None = None
+        pty_session_id: str | None = None
+        worktree_raw = websocket.query_params.get("worktree_id")
+        if worktree_raw:
+            try:
+                worktree_uuid = UUID(worktree_raw)
+            except ValueError:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            worktree_service = WorktreeService(
+                session=session, runtime=get_daytona_runtime(), settings=settings
+            )
+            try:
+                resolved = await worktree_service.resolve_path(workspace, worktree_uuid)
+            except WorktreeNotFoundError:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            if resolved != workspace.workspace_path:
+                cwd = resolved
+                pty_session_id = f"{terminal_session.pty_session_id}:{worktree_uuid.hex}"
+
+        # A configured app root drops the terminal straight into the directory the workspace's
+        # commands run in, so what the user types by hand matches what the Run buttons do.
+        app_root = validate_relative_subpath(workspace.app_root)
+        if app_root:
+            cwd = join_subpath(cwd or workspace.workspace_path, app_root)
+
     await websocket.accept()
     bridge = TerminalPtyBridge(
         runtime=get_daytona_runtime(),
         default_cols=settings.terminal_default_cols,
         default_rows=settings.terminal_default_rows,
     )
-    await bridge.bridge(websocket, workspace, terminal_session, env)
+    await bridge.bridge(
+        websocket,
+        workspace,
+        terminal_session,
+        env,
+        cwd=cwd,
+        pty_session_id=pty_session_id,
+    )
 
 
 async def websocket_user(

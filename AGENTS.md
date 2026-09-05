@@ -46,33 +46,37 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
 
 ### Backend (FastAPI + SQLAlchemy)
 - **Entrypoint**: `backend/app/main.py` → `app:app` (FastAPI with CORS + lifespan)
-- **Router**: `backend/app/api/router.py` aggregates 12 sub-routers
+- **Router**: `backend/app/api/router.py` aggregates 15 sub-routers
 - **Config**: `backend/app/core/config.py` via `pydantic-settings` (reads `.env` from CWD, `extra="ignore"`)
 - **Database**: PostgreSQL via SQLAlchemy 2.0 async + `asyncpg` driver (NOT psycopg2)
   - Connection string must be `postgresql+asyncpg://…`
   - Session: `async_session_maker` with `expire_on_commit=False`
   - All DB access MUST use async/await
-- **Migrations**: Alembic with async engine, 11 migrations in `alembic/versions/`
+- **Migrations**: Alembic with async engine, 25 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0025_workspace_services`)
 - **Auth**: Cookie-based sessions (`execute_session` cookie), NOT JWT. Set-Cookie on login, cleared on logout.
 - **Logging**: `structlog` (configured in `core/logging.py`)
 - **Testing**: `pytest` with `pytest-asyncio` (auto mode), tests at `backend/tests/`
 
 ### Frontend (React 18 + Vite + Tailwind 3)
-- **No react-router** — custom `navigate()` in `src/lib/router.ts` using `window.history.pushState` + `PopStateEvent`
+- **Routing**: `react-router` v7 (`BrowserRouter`, `Routes`, `Outlet`); all routes declared in `src/App.tsx`
 - **No component library** — all UI built with Tailwind utility classes. Do NOT assume shadcn/ui, Radix, or any component kit.
 - **No state library** — React Context only. Main hook: `useAuth()` from `src/auth/context.ts`
-- **API client**: `src/lib/api.ts` (875 lines). All HTTP calls go through exported typed functions — never `fetch()` directly.
+- **API client**: `src/lib/api.ts` (~1500 lines). All HTTP calls go through exported typed functions — never `fetch()` directly.
   - Auth uses `credentials: "include"` for cookie-based sessions
   - WebSocket helpers: `getAgentStreamUrl()`, `getTerminalSessionSocketUrl()`, `getCommandRunStreamUrl()`, `getNotificationStreamUrl()`
 - **Styling**: Tailwind CSS 3 with a custom Cursor-inspired palette (`canvas`, `panel`, `ink`, `primary` #f54e00, etc.). Fonts: Inter (UI), JetBrains Mono (code/terminal).
 - **Terminal**: `@xterm/xterm` + `@xterm/addon-fit` in `TerminalPanel.tsx`
+- **Panels**: domain UIs live in `src/components/` — `AgentTab/`, `SpecPanel/`, `WorktreesPanel.tsx`, `EditorPanel.tsx`, `PreviewPanel.tsx`, `TerminalPanel.tsx`, `FileManagementPanel.tsx`, `CustomCommandsPanel.tsx`
+- **Active worktree**: `src/lib/activeWorktree.ts` persists the selected worktree per workspace in `localStorage` and broadcasts an `enigma:active-worktree` window event. The selection drives which branch the agent and terminal target.
 - **Icons**: `lucide-react` (only)
 - **Testing**: Vitest + jsdom + `@testing-library/react`. Setup file: `src/test/setup.ts`
 
 ### Domain Organization
 
 Backend follows domain-driven layout. Each domain has its own: `api/` (route), `models/` (ORM), `schemas/` (Pydantic), `services/` (logic).
-Domains: `auth`, `workspaces`, `repositories`, `agents`, `terminal`, `editor`, `preview`, `commands`, `notifications`, `files`, `dev_server`.
+Domains: `auth`, `workspaces`, `repositories`, `worktrees`, `agents`, `terminal`, `editor`, `preview`, `commands`, `notifications`, `files`, `dev_server`, `workspace_services`, `specs`, `projects`, `teams`, `dashboard`.
+
+Some domains live in the service layer without their own top-level router — `repositories`, `worktrees`, and the GitHub PR client (`github_client.py`) are exposed through `workspaces` routes under `/{workspace_id}/repo/*` (e.g. `/repo/pull`, `/repo/worktrees`, `/repo/pull-requests`).
 
 ### Daytona Sandbox Integration
 
@@ -84,9 +88,25 @@ The backend manages ephemeral sandboxes via the Daytona API (`backend/app/servic
 ```
 Then set `DAYTONA_DEFAULT_SNAPSHOT=enigma-mise-code` in `.env`. The stock `daytonaio/sandbox` image will fail because runtime `curl | sh` installs are blocked by the sandbox network.
 
+### Spec-Driven Development (GitHub Spec Kit)
+
+`backend/app/services/speckit.py` (`SpecKitService`) drives the Spec Kit pipeline on top of the agent infrastructure. Models: `SpecWorkflow` + `SpecPhase` in `models/speckit.py`. API: `api/specs.py` (prefix `/workspaces/{workspace_id}/spec`). Frontend: `SpecPanel/`.
+
+- **Phases (in order)**: `constitution → specify → clarify → plan → analyze → tasks → implement`. Each phase is one agent run.
+- **Human-in-the-loop**: each phase halts at `awaiting_review` until a human approves. `implement` is **hard-blocked** until both `plan` and `tasks` are approved.
+- Each feature runs in its own **git worktree**. Scaffolding and git (`specify init`, `git worktree`, commits) run directly through `DaytonaRuntime.exec`, NOT the agent tool sandbox (which blocks `git`/`uv`/scripts). Artifact *content* (files under `specs/` and `.specify/`) is written by the agent.
+
+### Git Worktrees & Pull Requests
+
+- **Worktrees**: `services/worktrees.py` (`WorktreeService`) + `models/worktree.py` (`WorkspaceWorktree`). Each non-base worktree is an isolated checkout/branch. Terminals get a per-worktree PTY (pass `worktree_id` query param to the terminal socket); agent runs target the active worktree's branch.
+- **Git providers**: `services/git_providers.py` is the pure provider abstraction (GitHub, GitLab, Bitbucket, generic; URL validation/canonicalisation, basic-auth usernames, redaction). Credentials are token **or** server-generated SSH deploy key (`services/ssh_keys.py`), one row per workspace. `RepositoryService` runs all clone/pull/fetch/push through the git CLI with per-command auth.
+- **Templates / blank workspaces**: `workspace_templates` (seeded by migration `0022`), `services/templates.py`, `services/workspace_init.py` (clone template → fresh `git init` → initial commit). `workspaces.repo_url` is nullable; `source` ∈ `repository|template|blank`.
+- **Pull requests**: `services/github_client.py` exposes `GitHubClient` (raw GitHub REST) + `PullRequestService` (create/get/list, cached in the `PullRequest` model). GitHub + token credentials only — other providers raise `PullRequestsUnsupportedError` (HTTP 409).
+- **Endpoints**: under `workspaces` — `POST /repo/connect`, `GET /repo/credential`, `POST /repo/ssh-key`, `POST /repo/pull`, `GET|POST /repo/worktrees`, `GET /repo/pull-requests`; catalog at `GET /workspace-templates`.
+
 ## CI/CD
 
-**Single workflow**: `.github/workflows/ai-code-review.yml` — runs `scripts/ai_code_review.py` on non-draft PRs. Posts an AI review comment. Uses LangChain + LangGraph + OpenAI. Requires `OPENAI_API_KEY` secret.
+**Two workflows**: `.github/workflows/ci.yml` (backend: postgres + redis services → `alembic upgrade head` → `ruff` → `pytest`; frontend: lint + test + build) and `.github/workflows/ai-code-review.yml` — runs `scripts/ai_code_review.py` on non-draft PRs. Posts an AI review comment. Uses LangChain + LangGraph + OpenAI. Requires `OPENAI_API_KEY` secret.
 
 **No pre-commit hooks, no lint-staged, no Makefile.**
 
@@ -102,10 +122,15 @@ Then set `DAYTONA_DEFAULT_SNAPSHOT=enigma-mise-code` in `.env`. The stock `dayto
 8. **Docker Compose mounts source as volumes** (`./backend:/app`, `./frontend:/app`) for hot reload. The backend command also runs `git config safe.directory '*'` before starting.
 9. **`pnpm-workspace.yaml` exists in both root AND frontend/** — the frontend has its own workspace config. Modify the correct one.
 10. **No runtime type checking in Python** — mypy is not configured. Type hints are documentation only.
+11. **Git/uv/scripts run via `DaytonaRuntime.exec`, not the agent tool sandbox** — the agent tool sandbox blocks them. Spec Kit and worktree operations shell out through `DaytonaRuntime.exec` directly; only file *content* goes through agent tools.
+12. **Spec Kit `implement` is hard-gated** — it cannot run until the `plan` and `tasks` phases are approved. Don't bypass the `awaiting_review` halts.
+13. **Worktree-aware operations** — agent runs and terminals target the active worktree's branch. The frontend tracks it in `localStorage` (`activeWorktree.ts`); the backend resolves it server-side from `worktree_id`. PR creation needs a workspace GitHub token.
 
 ## Implementation Plan Reference
 
 Detailed implementation plans live in `docs/implementation-plan/` (14 docs covering project foundation through production hardening). See `00-index.md` for build order and MVP boundary.
+
+Post-MVP improvement epics are tracked in `docs/improvement-epics/` (e.g. spec-driven development, VCS/PR & branch workflow, agent editing tools, an Anthropic Claude provider, multi-turn sessions, cost/usage analytics). See `00-index.md` for the epic list. Note: the Anthropic provider is *planned* — current agent providers are `openai` (`OpenAIResponsesProvider`), `openhands` (`openhands_provider.py`), and `mock`.
 
 ## Design System (Frontend)
 

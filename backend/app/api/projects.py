@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.audit_support import AUDIT_LOG_SERVICE_DEP, record_audit_safely
 from app.api.auth import CURRENT_USER_DEP
 from app.db.session import get_db_session
 from app.models import User
@@ -14,6 +15,7 @@ from app.schemas.projects import (
     ProjectUpdateRequest,
     UpdateProjectMemberRoleRequest,
 )
+from app.services.audit import AuditLogService
 from app.services.projects import (
     ProjectMemberNotFoundError,
     ProjectNotFoundError,
@@ -65,7 +67,9 @@ async def get_project(
     try:
         project = await svc.get_accessible(project_id, current_user.id)
     except ProjectNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from None
     return ProjectResponse.model_validate(project)
 
 
@@ -84,9 +88,13 @@ async def update_project(
             description=payload.description,
         )
     except ProjectNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from None
     except ProjectPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
     return ProjectResponse.model_validate(project)
 
 
@@ -95,13 +103,27 @@ async def delete_project(
     project_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     svc: SqlAlchemyProjectService = PROJECT_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> None:
     try:
         await svc.delete(project_id, current_user.id)
     except ProjectNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from None
     except ProjectPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=None,
+        action="project_delete",
+        target_type="project",
+        target_id=project_id,
+        metadata={},
+    )
 
 
 @router.get("/{project_id}/members", response_model=list[ProjectMemberResponse])
@@ -113,7 +135,9 @@ async def list_project_members(
     try:
         members = await svc.list_members(project_id, current_user.id)
     except ProjectNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from None
     return [ProjectMemberResponse.model_validate(m) for m in members]
 
 
@@ -136,9 +160,13 @@ async def add_project_member(
             role=payload.role,
         )
     except ProjectNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from None
     except ProjectPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
     return ProjectMemberResponse.model_validate(member)
 
 
@@ -158,11 +186,17 @@ async def update_project_member_role(
             role=payload.role,
         )
     except ProjectNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from None
     except ProjectPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
     except ProjectMemberNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Member not found"
+        ) from None
     return ProjectMemberResponse.model_validate(member)
 
 
@@ -172,6 +206,7 @@ async def remove_project_member(
     user_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     svc: SqlAlchemyProjectService = PROJECT_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> None:
     try:
         await svc.remove_member(
@@ -180,8 +215,23 @@ async def remove_project_member(
             target_user_id=user_id,
         )
     except ProjectNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from None
     except ProjectPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
     except ProjectMemberNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Member not found"
+        ) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=None,
+        action="project_member_remove",
+        target_type="project_member",
+        target_id=user_id,
+        metadata={"project_id": project_id},
+    )
