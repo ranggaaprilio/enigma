@@ -3,11 +3,13 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.audit_support import AUDIT_LOG_SERVICE_DEP, record_audit_safely
 from app.api.auth import CURRENT_USER_DEP
+from app.api.workspace_support import workspace_response, workspace_responses
+from app.api.workspaces import WORKSPACE_CREATE_ERRORS, workspace_create_error
 from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.models import User
-from app.services.workspaces import WorkspaceNotFoundError
 from app.schemas.projects import (
     AddTeamMemberRequest,
     TeamCreateRequest,
@@ -17,6 +19,7 @@ from app.schemas.projects import (
     UpdateTeamMemberRoleRequest,
 )
 from app.schemas.workspaces import WorkspaceCreateRequest, WorkspaceResponse
+from app.services.audit import AuditLogService
 from app.services.daytona_runtime import get_daytona_runtime
 from app.services.projects import (
     ProjectNotFoundError,
@@ -27,6 +30,7 @@ from app.services.projects import (
 )
 from app.services.workspaces import (
     SqlAlchemyWorkspaceService,
+    WorkspaceNotFoundError,
     WorkspaceRuntimeError,
     WorkspaceSecretCipher,
 )
@@ -62,9 +66,13 @@ async def create_team(
             description=payload.description,
         )
     except ProjectNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from None
     except TeamPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
     return TeamResponse.model_validate(team)
 
 
@@ -77,7 +85,9 @@ async def list_teams(
     try:
         teams = await svc.list_teams(project_id, current_user.id)
     except ProjectNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Project not found"
+        ) from None
     return [TeamResponse.model_validate(t) for t in teams]
 
 
@@ -91,7 +101,9 @@ async def get_team(
     try:
         team = await svc.get_team(team_id, current_user.id)
     except TeamNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from None
     if team.project_id != project_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
     return TeamResponse.model_validate(team)
@@ -113,9 +125,13 @@ async def update_team(
             description=payload.description,
         )
     except TeamNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from None
     except TeamPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
     return TeamResponse.model_validate(team)
 
 
@@ -125,13 +141,27 @@ async def delete_team(
     team_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     svc: SqlAlchemyProjectService = PROJECT_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> None:
     try:
         await svc.delete_team(team_id, current_user.id)
     except TeamNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from None
     except (TeamPermissionError, ProjectNotFoundError):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=None,
+        action="team_delete",
+        target_type="team",
+        target_id=team_id,
+        metadata={"project_id": project_id},
+    )
 
 
 # ── team members ──────────────────────────────────────────────────────────────
@@ -147,7 +177,9 @@ async def list_team_members(
     try:
         members = await svc.list_team_members(team_id, current_user.id)
     except TeamNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from None
     return [TeamMemberResponse.model_validate(m) for m in members]
 
 
@@ -171,9 +203,13 @@ async def add_team_member(
             role=payload.role,
         )
     except TeamNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from None
     except TeamPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
     return TeamMemberResponse.model_validate(member)
 
 
@@ -194,11 +230,17 @@ async def update_team_member_role(
             role=payload.role,
         )
     except TeamNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from None
     except TeamPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
     except TeamMemberNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Member not found"
+        ) from None
     return TeamMemberResponse.model_validate(member)
 
 
@@ -209,6 +251,7 @@ async def remove_team_member(
     user_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     svc: SqlAlchemyProjectService = PROJECT_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> None:
     try:
         await svc.remove_team_member(
@@ -217,11 +260,26 @@ async def remove_team_member(
             target_user_id=user_id,
         )
     except TeamNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from None
     except TeamPermissionError:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Insufficient permissions"
+        ) from None
     except TeamMemberNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Member not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Member not found"
+        ) from None
+    await record_audit_safely(
+        audit_log_service,
+        user_id=current_user.id,
+        workspace_id=None,
+        action="team_member_remove",
+        target_type="team_member",
+        target_id=user_id,
+        metadata={"project_id": project_id, "team_id": team_id},
+    )
 
 
 # ── team workspaces ───────────────────────────────────────────────────────────
@@ -245,14 +303,17 @@ WORKSPACE_SERVICE_DEP = Depends(get_workspace_service)
 async def list_team_workspaces(
     project_id: UUID,
     team_id: UUID,
+    session: AsyncSession = DB_SESSION_DEP,
     current_user: User = CURRENT_USER_DEP,
     workspace_svc: SqlAlchemyWorkspaceService = WORKSPACE_SERVICE_DEP,
 ) -> list[WorkspaceResponse]:
     try:
         workspaces = await workspace_svc.list_for_team(team_id, current_user.id)
     except WorkspaceNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
-    return [WorkspaceResponse.model_validate(w) for w in workspaces]
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from None
+    return await workspace_responses(session, workspaces, current_user.id)
 
 
 @router.post(
@@ -264,6 +325,7 @@ async def create_team_workspace(
     project_id: UUID,
     team_id: UUID,
     payload: WorkspaceCreateRequest,
+    session: AsyncSession = DB_SESSION_DEP,
     current_user: User = CURRENT_USER_DEP,
     svc: SqlAlchemyProjectService = PROJECT_SERVICE_DEP,
     workspace_svc: SqlAlchemyWorkspaceService = WORKSPACE_SERVICE_DEP,
@@ -271,7 +333,9 @@ async def create_team_workspace(
     try:
         await svc.get_team(team_id, current_user.id)
     except TeamNotFoundError:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Team not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Team not found"
+        ) from None
 
     try:
         workspace = await workspace_svc.create(
@@ -281,10 +345,14 @@ async def create_team_workspace(
             default_branch=payload.default_branch,
             snapshot=payload.snapshot,
             team_id=team_id,
+            source=payload.source,
+            template_id=payload.template_id,
         )
     except WorkspaceRuntimeError as exc:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Workspace runtime error: {exc}",
-        )
-    return WorkspaceResponse.model_validate(workspace)
+        ) from None
+    except WORKSPACE_CREATE_ERRORS as exc:
+        raise workspace_create_error(exc) from None
+    return await workspace_response(session, workspace, current_user.id)

@@ -55,6 +55,8 @@ class FakeSandbox:
         sandbox_id: str = "sandbox-1",
         state: str = "started",
         name: str = "sandbox",
+        network_block_all: bool | None = None,
+        network_allow_list: str | None = None,
     ) -> None:
         self.id = sandbox_id
         self.name = name
@@ -62,6 +64,9 @@ class FakeSandbox:
         self.fs = FakeFileSystem()
         self.process = FakeProcess()
         self.started = False
+        self.network_block_all = network_block_all
+        self.network_allow_list = network_allow_list
+        self.network_updates: list[dict] = []
 
     async def refresh_data(self) -> None:
         return None
@@ -69,6 +74,18 @@ class FakeSandbox:
     async def start(self, timeout: int) -> None:
         self.state = "started"
         self.started = True
+
+    async def update_network_settings(
+        self,
+        *,
+        network_block_all: bool | None = None,
+        network_allow_list: str | None = None,
+    ) -> None:
+        self.network_updates.append(
+            {"network_block_all": network_block_all, "network_allow_list": network_allow_list}
+        )
+        self.network_block_all = network_block_all
+        self.network_allow_list = network_allow_list
 
     async def create_signed_preview_url(self, port: int, expires_in_seconds: int):
         return SimpleNamespace(url=f"https://{port}-{self.id}.example/?token=signed")
@@ -140,6 +157,25 @@ async def test_provision_uses_snapshot_labels_and_auto_stop() -> None:
     assert client.created_params.public is False
     assert client.created_params.labels["execute-workspace-id"] == str(workspace_id)
     assert sandbox.fs.created == [("workspace", "755")]
+    # Default posture: open egress, no allow list.
+    assert client.created_params.network_block_all is False
+    assert client.created_params.network_allow_list is None
+
+
+async def test_provision_passes_network_allow_list() -> None:
+    runtime = DaytonaRuntime(
+        Settings(
+            daytona_api_key="test",
+            daytona_network_allow_list="10.0.0.0/16, 10.1.0.0/16",
+        )
+    )
+    client = FakeClient()
+    runtime._client = client  # type: ignore[assignment]
+
+    await runtime.provision(uuid4(), uuid4(), None)
+
+    assert client.created_params.network_block_all is False
+    assert client.created_params.network_allow_list == "10.0.0.0/16,10.1.0.0/16"
 
 
 async def test_existing_stopped_sandbox_is_reused_and_started() -> None:
@@ -156,6 +192,27 @@ async def test_existing_stopped_sandbox_is_reused_and_started() -> None:
 
     assert result is existing
     assert existing.started is True
+    # Reused sandbox predates the policy (network_* is None) → reconcile to default.
+    assert existing.network_updates == [
+        {"network_block_all": False, "network_allow_list": None}
+    ]
+
+
+async def test_reused_sandbox_skips_network_update_when_already_in_desired_state() -> None:
+    workspace_id = uuid4()
+    existing = FakeSandbox(
+        "sandbox-existing",
+        state="started",
+        name=f"execute-{workspace_id.hex}",
+        network_block_all=False,
+        network_allow_list=None,
+    )
+    runtime = DaytonaRuntime(Settings(daytona_api_key="test"))
+    runtime._client = FakeClient([existing])  # type: ignore[assignment]
+
+    await runtime.provision(workspace_id, uuid4(), "snapshot")
+
+    assert existing.network_updates == []
 
 
 async def test_missing_workspace_sandbox_is_not_recreated() -> None:

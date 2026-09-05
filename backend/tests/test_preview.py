@@ -246,6 +246,60 @@ async def test_refresh_marks_unreachable_session_error(preview_context):
     assert response.json()["status"] == "error"
 
 
+async def test_preview_branch_resolution():
+    """A preview's branch is resolved from its worktree; base/unknown → default branch."""
+    from app.models import WorkspaceWorktree
+
+    class _Session:
+        def __init__(self, workspace, worktree):
+            self.workspace = workspace
+            self.worktree = worktree
+
+        async def get(self, model, pk):
+            if self.workspace.id == pk:
+                return self.workspace
+            if self.worktree is not None and self.worktree.id == pk:
+                return self.worktree
+            return None
+
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=uuid4(),
+        name="Demo",
+        slug="demo",
+        repo_url="https://github.com/example/demo",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        workspace_path="workspace",
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    worktree = WorkspaceWorktree(
+        id=uuid4(),
+        workspace_id=workspace.id,
+        branch="feature-x",
+        path="worktrees/feature-x",
+        base_ref="main",
+        is_base=False,
+        status="active",
+    )
+    service = PreviewService(
+        session=_Session(workspace, worktree),  # type: ignore[arg-type]
+        settings=Settings(
+            auth_secret_key="preview-secret",
+            daytona_preview_proxy_base_url="http://localhost:8001",
+        ),
+        runtime=object(),  # type: ignore[arg-type]
+    )
+
+    assert await service._branch_for(workspace, None) == "main"
+    assert await service._branch_for(workspace, worktree.id) == "feature-x"
+    # A worktree that no longer exists falls back to the base clone's branch.
+    assert await service._branch_for(workspace, uuid4()) == "main"
+
+
 def test_preview_service_reuses_a_valid_proxy_url(preview_context):
     _user, _workspace, fake_service = preview_context
     preview = fake_service._session("active")

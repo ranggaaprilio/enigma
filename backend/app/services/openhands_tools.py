@@ -108,12 +108,60 @@ class RunCommandAction(Action):
     )
 
 
+class ApplyPatchAction(Action):
+    path: str = Field(description="Relative path of the file to edit.")
+    patch: str = Field(
+        description=(
+            "One or more SEARCH/REPLACE blocks to apply to the file. Each block "
+            "has the exact form:\n"
+            "<<<<<<< SEARCH\n"
+            "<exact existing text to find>\n"
+            "=======\n"
+            "<replacement text>\n"
+            ">>>>>>> REPLACE\n"
+            "The SEARCH text must match the current file content exactly and "
+            "uniquely; otherwise the edit is rejected with no changes made."
+        ),
+        min_length=1,
+        max_length=200_000,
+    )
+
+
+class SearchCodeAction(Action):
+    query: str = Field(
+        description="Regular-expression pattern to search for (ripgrep syntax).",
+        min_length=1,
+        max_length=1000,
+    )
+    path_glob: str | None = Field(
+        default=None,
+        description="Optional glob to scope the search, e.g. '*.py'.",
+    )
+    max_results: int = Field(default=200, ge=1, le=1000)
+
+
+class GitStatusAction(Action):
+    pass
+
+
+class GitDiffAction(Action):
+    path: str | None = Field(
+        default=None,
+        description="Optional relative path to diff a single file.",
+    )
+
+
 class DaytonaToolObservation(Observation):
     path: str | None = None
     exit_code: int | None = None
     stdout: str | None = None
     stderr: str | None = None
     truncated: bool = False
+    diff: str | None = None
+    matches: list[dict[str, Any]] | None = None
+    branch: str | None = None
+    is_clean: bool | None = None
+    files: list[dict[str, str]] | None = None
 
 
 class DaytonaToolExecutor(ToolExecutor[Action, DaytonaToolObservation]):
@@ -166,6 +214,60 @@ class DaytonaToolExecutor(ToolExecutor[Action, DaytonaToolObservation]):
                     stderr=result.stderr,
                     truncated=result.truncated,
                     is_error=result.exit_code != 0,
+                )
+            if self.operation == "apply_patch":
+                assert isinstance(action, ApplyPatchAction)
+                result = bridge.execute(bridge.tools.apply_patch(action.path, action.patch))
+                return DaytonaToolObservation.from_text(
+                    text=(
+                        f"Applied {result.blocks_applied} block(s) to {result.path}\n\n"
+                        f"{result.diff}"
+                    ),
+                    path=result.path,
+                    diff=result.diff,
+                )
+            if self.operation == "search_code":
+                assert isinstance(action, SearchCodeAction)
+                result = bridge.execute(
+                    bridge.tools.search_code(
+                        action.query, action.path_glob, action.max_results
+                    )
+                )
+                matches = [
+                    {"path": m.path, "line_number": m.line_number, "text": m.text}
+                    for m in result.matches
+                ]
+                text = (
+                    "\n".join(f"{m['path']}:{m['line_number']}: {m['text']}" for m in matches)
+                    or "No matches found."
+                )
+                return DaytonaToolObservation.from_text(
+                    text=text,
+                    matches=matches,
+                    truncated=result.truncated,
+                )
+            if self.operation == "git_status":
+                assert isinstance(action, GitStatusAction)
+                result = bridge.execute(bridge.tools.git_status())
+                files = [{"path": f.path, "status": f.status} for f in result.files]
+                if result.is_clean:
+                    body = "working tree clean"
+                else:
+                    body = "\n".join(f"{f['status']} {f['path']}" for f in files)
+                text = f"On branch {result.branch or '(detached)'}\n{body}"
+                return DaytonaToolObservation.from_text(
+                    text=text,
+                    branch=result.branch,
+                    is_clean=result.is_clean,
+                    files=files,
+                )
+            if self.operation == "git_diff":
+                assert isinstance(action, GitDiffAction)
+                diff = bridge.execute(bridge.tools.git_diff(action.path))
+                return DaytonaToolObservation.from_text(
+                    text=diff or "No changes.",
+                    path=action.path,
+                    diff=diff,
                 )
             raise RuntimeError(f"Unsupported Daytona tool operation: {self.operation}")
         except Exception as error:
@@ -289,7 +391,130 @@ class RunCommandTool(ToolDefinition[RunCommandAction, DaytonaToolObservation]):
         ]
 
 
+class ApplyPatchTool(ToolDefinition[ApplyPatchAction, DaytonaToolObservation]):
+    name = "apply_patch"
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: Any,
+        bridge_id: str,
+    ) -> Sequence["ApplyPatchTool"]:
+        del conv_state
+        return [
+            cls(
+                description=(
+                    "Edit a file in place by applying SEARCH/REPLACE blocks. "
+                    "Prefer this over write_file for targeted edits: it avoids "
+                    "rewriting the whole file and fails loudly (no overwrite) "
+                    "when the search context does not match exactly."
+                ),
+                action_type=ApplyPatchAction,
+                observation_type=DaytonaToolObservation,
+                annotations=ToolAnnotations(
+                    title="apply_patch",
+                    readOnlyHint=False,
+                    destructiveHint=True,
+                    idempotentHint=False,
+                    openWorldHint=False,
+                ),
+                executor=DaytonaToolExecutor(bridge_id, "apply_patch"),
+            )
+        ]
+
+
+class SearchCodeTool(ToolDefinition[SearchCodeAction, DaytonaToolObservation]):
+    name = "search_code"
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: Any,
+        bridge_id: str,
+    ) -> Sequence["SearchCodeTool"]:
+        del conv_state
+        return [
+            cls(
+                description=(
+                    "Search file contents in the workspace with a ripgrep-style "
+                    "regex. Use this to locate symbols or text before editing."
+                ),
+                action_type=SearchCodeAction,
+                observation_type=DaytonaToolObservation,
+                annotations=ToolAnnotations(
+                    title="search_code",
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+                executor=DaytonaToolExecutor(bridge_id, "search_code"),
+            )
+        ]
+
+
+class GitStatusTool(ToolDefinition[GitStatusAction, DaytonaToolObservation]):
+    name = "git_status"
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: Any,
+        bridge_id: str,
+    ) -> Sequence["GitStatusTool"]:
+        del conv_state
+        return [
+            cls(
+                description="Show the git status (branch and changed files) of the workspace.",
+                action_type=GitStatusAction,
+                observation_type=DaytonaToolObservation,
+                annotations=ToolAnnotations(
+                    title="git_status",
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+                executor=DaytonaToolExecutor(bridge_id, "git_status"),
+            )
+        ]
+
+
+class GitDiffTool(ToolDefinition[GitDiffAction, DaytonaToolObservation]):
+    name = "git_diff"
+
+    @classmethod
+    def create(
+        cls,
+        conv_state: Any,
+        bridge_id: str,
+    ) -> Sequence["GitDiffTool"]:
+        del conv_state
+        return [
+            cls(
+                description=(
+                    "Show the git diff of unstaged changes in the workspace, "
+                    "optionally scoped to a single relative path."
+                ),
+                action_type=GitDiffAction,
+                observation_type=DaytonaToolObservation,
+                annotations=ToolAnnotations(
+                    title="git_diff",
+                    readOnlyHint=True,
+                    destructiveHint=False,
+                    idempotentHint=True,
+                    openWorldHint=False,
+                ),
+                executor=DaytonaToolExecutor(bridge_id, "git_diff"),
+            )
+        ]
+
+
 register_tool(ListFilesTool.name, ListFilesTool)
 register_tool(ReadFileTool.name, ReadFileTool)
 register_tool(WriteFileTool.name, WriteFileTool)
 register_tool(RunCommandTool.name, RunCommandTool)
+register_tool(ApplyPatchTool.name, ApplyPatchTool)
+register_tool(SearchCodeTool.name, SearchCodeTool)
+register_tool(GitStatusTool.name, GitStatusTool)
+register_tool(GitDiffTool.name, GitDiffTool)

@@ -2,6 +2,7 @@
 
 import asyncio
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import PurePosixPath
 from uuid import UUID, uuid4
 
@@ -12,11 +13,12 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api import agents as agents_module
 from app.api import auth as auth_module
+from app.api import sessions as sessions_module
 from app.core.config import Settings, get_settings
 from app.core.security import hash_password
 from app.db.session import get_db_session
 from app.main import app
-from app.models import AgentEvent, AgentFileChange, AgentRun, User, Workspace
+from app.models import AgentEvent, AgentFileChange, AgentRun, AgentSession, User, Workspace
 from app.services.agent_providers import MockAgentProvider
 from app.services.agent_tools import DangerousCommandError, WorkspaceToolError, WorkspaceTools
 from app.services.agents import (
@@ -61,7 +63,14 @@ class FakeAgentService:
         self.events: dict[UUID, list[AgentEvent]] = {}
         self.has_active_run = False
 
-    async def create_run(self, workspace_id: UUID, user_id: UUID, prompt: str) -> AgentRun:
+    async def create_run(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        prompt: str,
+        working_dir: str | None = None,
+        worktree_id: UUID | None = None,
+    ) -> AgentRun:
         self._ensure_workspace(workspace_id, user_id)
         if self.has_active_run:
             raise AgentRunAlreadyActiveError
@@ -173,6 +182,8 @@ def agent_context(tmp_path):
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
     app.dependency_overrides[auth_module.get_login_rate_limiter] = lambda: FakeRateLimiter()
     app.dependency_overrides[agents_module.get_agent_service] = lambda: service
+    # Agent-run creation is rate-limited via Redis; no-op it so tests don't need a live Redis.
+    app.dependency_overrides[agents_module.enforce_agent_run_rate_limit] = lambda: None
     yield user, workspace, service
     app.dependency_overrides.clear()
 
@@ -723,6 +734,44 @@ def override_get_agent_service(session, session_maker):
         return AgentService(session=session, session_maker=session_maker, settings=Settings())
 
     return _override
+
+
+def override_get_agent_session_service(session, session_maker, settings=None):
+    """Factory for a get_agent_session_service override that uses the test session."""
+
+    async def _override() -> AgentService:
+        return AgentService(
+            session=session,
+            session_maker=session_maker,
+            settings=settings or Settings(),
+        )
+
+    return _override
+
+
+async def _noop_execute_run(self, run_id, stop_event, working_dir=None):
+    """No-op replacement for AgentService._execute_run.
+
+    Session turns delegate to create_run, which spawns _execute_run as a background task
+    that would touch the Daytona runtime / shared connection. Patching it out lets tests
+    exercise the create_run/append_turn DB effects (session_id, auto-title) without that.
+    """
+    return None
+
+
+class _ImmediateTask:
+    def add_done_callback(self, callback):
+        return None
+
+
+def _fake_create_task(coro, *args, **kwargs):
+    """Neutralize asyncio.create_task so create_run spawns no background task.
+
+    Only safe in tests that do NOT drive the app over HTTP (httpx/anyio also use
+    create_task); use it for direct AgentService calls against the shared test session.
+    """
+    coro.close()
+    return _ImmediateTask()
 
 
 class TestFileChangesAPI:
@@ -1310,7 +1359,7 @@ class TestFileChangeComputation:
 
         service = AgentService(session, session_maker, Settings())
 
-        async def mock_status(self, workspace_id, owner_id):
+        async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(
                 cloned=True,
                 branch="main",
@@ -1326,7 +1375,7 @@ class TestFileChangeComputation:
             mock_status,
         )
 
-        baseline = await service._capture_baseline(workspace.id, workspace.owner_id, session)
+        baseline = await service._capture_baseline(workspace.id, session)
         assert len(baseline) == 2
         assert baseline[0].path == "a.py"
         assert baseline[1].path == "b.py"
@@ -1363,7 +1412,7 @@ class TestFileChangeComputation:
 
         service = AgentService(session, session_maker, Settings())
 
-        async def mock_status(self, workspace_id, owner_id):
+        async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(cloned=False, branch=None, is_clean=True, files=[])
 
         monkeypatch.setattr(
@@ -1371,7 +1420,7 @@ class TestFileChangeComputation:
             mock_status,
         )
 
-        baseline = await service._capture_baseline(workspace.id, workspace.owner_id, session)
+        baseline = await service._capture_baseline(workspace.id, session)
         assert baseline == []
 
     async def test_compute_file_changes_returns_diff(self, db_session, monkeypatch):
@@ -1419,7 +1468,7 @@ class TestFileChangeComputation:
 
         baseline = [GitFileStatus(path="a.py", status="Added")]
 
-        async def mock_status(self, workspace_id, owner_id):
+        async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(
                 cloned=True,
                 branch="main",
@@ -1437,7 +1486,7 @@ class TestFileChangeComputation:
         )
 
         changes = await service._compute_file_changes(
-            workspace.id, baseline, workspace.owner_id, run.id, session
+            workspace.id, baseline, run.id, session
         )
         paths = {c.path for c in changes}
         assert "b.py" in paths
@@ -1489,7 +1538,7 @@ class TestFileChangeComputation:
 
         baseline = []
 
-        async def mock_status(self, workspace_id, owner_id):
+        async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(
                 cloned=True,
                 branch="main",
@@ -1505,7 +1554,7 @@ class TestFileChangeComputation:
         )
 
         changes = await service._compute_file_changes(
-            workspace.id, baseline, workspace.owner_id, run.id, session
+            workspace.id, baseline, run.id, session
         )
         assert len(changes) == 1
         assert changes[0].path == "old.py -> new.py"
@@ -1847,7 +1896,7 @@ class TestAgentRunLifecycle:
 
         try:
 
-            async def mock_status(self, workspace_id, owner_id):
+            async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
                 return GitStatus(cloned=False, branch=None, is_clean=True, files=[])
 
             monkeypatch.setattr(
@@ -1857,7 +1906,7 @@ class TestAgentRunLifecycle:
 
             service = AgentService(session, session_maker, Settings())
 
-            baseline = await service._capture_baseline(workspace.id, workspace.owner_id, session)
+            baseline = await service._capture_baseline(workspace.id, session)
             assert baseline == []
 
             run = AgentRun(
@@ -1872,7 +1921,7 @@ class TestAgentRunLifecycle:
             await session.flush()
 
             changes = await service._compute_file_changes(
-                workspace.id, baseline, workspace.owner_id, run.id, session
+                workspace.id, baseline, run.id, session
             )
             assert changes == []
         finally:
@@ -2050,3 +2099,664 @@ class TestAgentRunLifecycle:
                 assert by_tool["__none__"][0]["path"] == "README.md"
         finally:
             self._teardown_overrides()
+
+
+class TestAgentSessions:
+    """Multi-turn agent sessions: CRUD endpoints, turns, and context assembly."""
+
+    async def _setup(self, session, session_maker, label="session", settings=None):
+        uid = uuid4()
+        user = User(
+            id=uuid4(),
+            email=f"{label}-{uid}@example.com",
+            password_hash=hash_password("password"),
+            role="owner",
+            is_active=True,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        workspace = Workspace(
+            id=uuid4(),
+            owner_id=user.id,
+            name=f"{label.capitalize()}-{uid}",
+            slug=f"{label}-{uid}",
+            repo_url=f"https://github.com/example/{label}",
+            default_branch="main",
+            runtime="daytona",
+            daytona_sandbox_id=f"sandbox-{label}-{uid}",
+            workspace_path="/workspace",
+            status="ready",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        session.add(user)
+        session.add(workspace)
+        await session.flush()
+
+        app.dependency_overrides[auth_module.get_current_user] = await override_get_current_user(
+            user
+        )
+        app.dependency_overrides[get_db_session] = override_get_db_session(session)
+        app.dependency_overrides[agents_module.get_agent_service] = override_get_agent_service(
+            session, session_maker
+        )
+        app.dependency_overrides[sessions_module.get_agent_session_service] = (
+            override_get_agent_session_service(session, session_maker, settings)
+        )
+        return user, workspace
+
+    def _teardown(self):
+        app.dependency_overrides.clear()
+
+    async def test_session_endpoints_require_auth(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessauth")
+        # Drop the authenticated user so requests are unauthenticated.
+        app.dependency_overrides.pop(auth_module.get_current_user, None)
+        app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(None)
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.get(f"/workspaces/{workspace.id}/agent/sessions")
+            assert response.status_code == 401
+        finally:
+            self._teardown()
+
+    async def test_create_and_list_sessions(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sesslist")
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                titled = await client.post(
+                    f"/workspaces/{workspace.id}/agent/sessions",
+                    json={"title": "Fix the parser"},
+                )
+                untitled = await client.post(
+                    f"/workspaces/{workspace.id}/agent/sessions",
+                    json={},
+                )
+                listed = await client.get(f"/workspaces/{workspace.id}/agent/sessions")
+
+            assert titled.status_code == 201
+            assert titled.json()["title"] == "Fix the parser"
+            assert titled.json()["status"] == "active"
+            assert untitled.status_code == 201
+            assert untitled.json()["title"] is None
+
+            assert listed.status_code == 200
+            ids = {s["id"] for s in listed.json()}
+            # Both sessions are listed. (Strict updated_at ordering isn't asserted here: the
+            # test fixture's nested transaction makes Postgres now() constant across both
+            # inserts, so their timestamps tie. Ordering by recency is exercised in production
+            # where each create is its own transaction.)
+            assert ids == {titled.json()["id"], untitled.json()["id"]}
+        finally:
+            self._teardown()
+
+    async def test_list_sessions_status_filter(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessfilter")
+        try:
+            active = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title="a", status="active"
+            )
+            archived = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title="b", status="archived"
+            )
+            session.add_all([active, archived])
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                active_only = await client.get(
+                    f"/workspaces/{workspace.id}/agent/sessions?status=active"
+                )
+                archived_only = await client.get(
+                    f"/workspaces/{workspace.id}/agent/sessions?status=archived"
+                )
+
+            assert {s["id"] for s in active_only.json()} == {str(active.id)}
+            assert {s["id"] for s in archived_only.json()} == {str(archived.id)}
+        finally:
+            self._teardown()
+
+    async def test_get_session_detail_with_ordered_turns(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessdetail")
+        try:
+            agent_session = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title="conv", status="active"
+            )
+            session.add(agent_session)
+            await session.flush()
+
+            earlier = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                session_id=agent_session.id,
+                prompt="turn one",
+                status="completed",
+                provider="mock",
+                model="mock-model",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                completed_at=datetime.now(UTC),
+            )
+            later = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                session_id=agent_session.id,
+                prompt="turn two",
+                status="completed",
+                provider="mock",
+                model="mock-model",
+                started_at=datetime(2026, 1, 2, tzinfo=UTC),
+                completed_at=datetime.now(UTC),
+            )
+            session.add_all([earlier, later])
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                detail = await client.get(
+                    f"/workspaces/{workspace.id}/agent/sessions/{agent_session.id}"
+                )
+
+            assert detail.status_code == 200
+            data = detail.json()
+            assert data["title"] == "conv"
+            prompts = [t["prompt"] for t in data["turns"]]
+            assert prompts == ["turn one", "turn two"]  # chronological
+            assert all(t["session_id"] == str(agent_session.id) for t in data["turns"])
+        finally:
+            self._teardown()
+
+    async def test_get_missing_session_returns_404(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sess404")
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.get(
+                    f"/workspaces/{workspace.id}/agent/sessions/{uuid4()}"
+                )
+            assert response.status_code == 404
+            assert response.json()["detail"] == "Session not found"
+        finally:
+            self._teardown()
+
+    async def test_rename_and_archive_session(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sesspatch")
+        try:
+            agent_session = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title="old", status="active"
+            )
+            session.add(agent_session)
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                renamed = await client.patch(
+                    f"/workspaces/{workspace.id}/agent/sessions/{agent_session.id}",
+                    json={"title": "new name"},
+                )
+                archived = await client.patch(
+                    f"/workspaces/{workspace.id}/agent/sessions/{agent_session.id}",
+                    json={"status": "archived"},
+                )
+
+            assert renamed.status_code == 200
+            assert renamed.json()["title"] == "new name"
+            assert renamed.json()["status"] == "active"  # status untouched by title-only patch
+            assert archived.status_code == 200
+            assert archived.json()["status"] == "archived"
+            assert archived.json()["title"] == "new name"  # title untouched by status-only patch
+        finally:
+            self._teardown()
+
+    async def test_delete_session_detaches_runs(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessdel")
+        try:
+            agent_session = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title="doomed", status="active"
+            )
+            session.add(agent_session)
+            await session.flush()
+
+            run = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                session_id=agent_session.id,
+                prompt="a turn",
+                status="completed",
+                provider="mock",
+                model="mock-model",
+                completed_at=datetime.now(UTC),
+            )
+            session.add(run)
+            await session.commit()
+            run_id = run.id
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                deleted = await client.delete(
+                    f"/workspaces/{workspace.id}/agent/sessions/{agent_session.id}"
+                )
+
+            assert deleted.status_code == 200
+            assert deleted.json() == {"ok": True}
+
+            # The run survives with session_id set to NULL (ON DELETE SET NULL).
+            session.expire_all()
+            surviving = await session.get(AgentRun, run_id)
+            assert surviving is not None
+            assert surviving.session_id is None
+
+            gone = await session.get(AgentSession, agent_session.id)
+            assert gone is None
+        finally:
+            self._teardown()
+
+    async def test_append_turn_endpoint_returns_run_with_session_id(self, db_session, monkeypatch):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessturn")
+        # _execute_run is patched to a no-op so the turn does not kick off real agent work.
+        monkeypatch.setattr(AgentService, "_execute_run", _noop_execute_run)
+        try:
+            agent_session = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title=None, status="active"
+            )
+            session.add(agent_session)
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    f"/workspaces/{workspace.id}/agent/sessions/{agent_session.id}/turns",
+                    json={"prompt": "Create a parser for CSV files"},
+                )
+
+            assert response.status_code == 201
+            body = response.json()
+            assert body["session_id"] == str(agent_session.id)
+            assert body["status"] == "thinking"
+            assert body["prompt"] == "Create a parser for CSV files"
+        finally:
+            self._teardown()
+
+    async def test_append_turn_auto_titles_from_first_prompt(self, db_session, monkeypatch):
+        # Exercised at the service layer (no HTTP client) so asyncio.create_task can be
+        # neutralized, keeping create_run's background scheduling out of the shared connection.
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessautotitle")
+        monkeypatch.setattr("app.services.agents.asyncio.create_task", _fake_create_task)
+        try:
+            service = AgentService(session, session_maker, Settings())
+            agent_session = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title=None, status="active"
+            )
+            session.add(agent_session)
+            await session.commit()
+
+            first_run = await service.append_turn(
+                workspace.id, agent_session.id, user.id, "Create a parser for CSV files"
+            )
+            assert first_run.session_id == agent_session.id
+            assert agent_session.title == "Create a parser for CSV files"
+
+            # Free the one-active-run slot, then a second turn must not overwrite the title.
+            first_run.status = "completed"
+            session.add(first_run)
+            await session.commit()
+
+            await service.append_turn(
+                workspace.id, agent_session.id, user.id, "Now add JSON support too"
+            )
+            assert agent_session.title == "Create a parser for CSV files"  # unchanged
+        finally:
+            self._teardown()
+
+    async def test_turn_on_archived_session_returns_409(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessarch")
+        try:
+            agent_session = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title="done", status="archived"
+            )
+            session.add(agent_session)
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    f"/workspaces/{workspace.id}/agent/sessions/{agent_session.id}/turns",
+                    json={"prompt": "another turn"},
+                )
+
+            assert response.status_code == 409
+            assert response.json()["detail"] == "Session is archived"
+        finally:
+            self._teardown()
+
+    async def test_turn_on_missing_session_returns_404(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessturn404")
+        try:
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    f"/workspaces/{workspace.id}/agent/sessions/{uuid4()}/turns",
+                    json={"prompt": "hi"},
+                )
+            assert response.status_code == 404
+            assert response.json()["detail"] == "Session not found"
+        finally:
+            self._teardown()
+
+    async def test_turn_while_run_active_returns_409(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessbusy")
+        try:
+            agent_session = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title="busy", status="active"
+            )
+            session.add(agent_session)
+            await session.flush()
+            # An already-active run in the workspace should block a new turn.
+            active_run = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                session_id=agent_session.id,
+                prompt="still running",
+                status="executing",
+                provider="mock",
+                model="mock-model",
+            )
+            session.add(active_run)
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                response = await client.post(
+                    f"/workspaces/{workspace.id}/agent/sessions/{agent_session.id}/turns",
+                    json={"prompt": "queue me"},
+                )
+
+            assert response.status_code == 409
+            assert response.json()["detail"] == "Workspace already has an active agent run"
+        finally:
+            self._teardown()
+
+    async def test_one_shot_run_detail_has_null_session_id(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessoneshot")
+        try:
+            run = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                prompt="one shot",
+                status="completed",
+                provider="mock",
+                model="mock-model",
+                completed_at=datetime.now(UTC),
+            )
+            session.add(run)
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                detail = await client.get(
+                    f"/workspaces/{workspace.id}/agent/runs/{run.id}"
+                )
+
+            assert detail.status_code == 200
+            assert detail.json()["session_id"] is None
+        finally:
+            self._teardown()
+
+    async def test_build_session_context_transcript(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessctx")
+        try:
+            service = AgentService(session, session_maker, Settings())
+            agent_session = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title="ctx", status="active"
+            )
+            session.add(agent_session)
+            await session.flush()
+
+            prior = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                session_id=agent_session.id,
+                prompt="Create notes.txt with hello",
+                status="completed",
+                provider="mock",
+                model="mock-model",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                completed_at=datetime.now(UTC),
+            )
+            session.add(prior)
+            await session.flush()
+
+            # output_text arrives as streamed fragments that must be concatenated.
+            for i, fragment in enumerate(["I ", "created ", "notes.txt"]):
+                session.add(
+                    AgentEvent(
+                        id=uuid4(),
+                        agent_run_id=prior.id,
+                        event_type="output_text",
+                        content=fragment,
+                        event_metadata={},
+                        created_at=datetime(2026, 1, 1, 0, 0, i, tzinfo=UTC),
+                    )
+                )
+            await service.create_file_change(prior.id, "notes.txt", "created", None)
+
+            current = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                session_id=agent_session.id,
+                prompt="Append a second line",
+                status="thinking",
+                provider="mock",
+                model="mock-model",
+                started_at=datetime(2026, 1, 2, tzinfo=UTC),
+            )
+            session.add(current)
+            await session.flush()
+
+            context = await service._build_session_context(session, current)
+            assert context is not None
+            assert "User: Create notes.txt with hello" in context
+            assert "Assistant: I created notes.txt" in context
+            assert "Files changed: notes.txt (created)" in context
+
+            # A one-shot run (no session) gets no context.
+            one_shot = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                prompt="standalone",
+                status="thinking",
+                provider="mock",
+                model="mock-model",
+            )
+            session.add(one_shot)
+            await session.flush()
+            assert await service._build_session_context(session, one_shot) is None
+        finally:
+            self._teardown()
+
+    async def test_build_session_context_respects_budget(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "sessbudget")
+        try:
+            # Tiny budget so only the most recent prior turn survives.
+            settings = Settings(
+                agent_session_context_char_budget=10,
+                agent_session_context_per_turn_char_cap=8_000,
+            )
+            service = AgentService(session, session_maker, settings)
+            agent_session = AgentSession(
+                workspace_id=workspace.id, user_id=user.id, title="b", status="active"
+            )
+            session.add(agent_session)
+            await session.flush()
+
+            oldest = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                session_id=agent_session.id,
+                prompt="OLDEST_TURN_PROMPT",
+                status="completed",
+                provider="mock",
+                model="mock-model",
+                started_at=datetime(2026, 1, 1, tzinfo=UTC),
+                completed_at=datetime.now(UTC),
+            )
+            newest = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                session_id=agent_session.id,
+                prompt="NEWEST_TURN_PROMPT",
+                status="completed",
+                provider="mock",
+                model="mock-model",
+                started_at=datetime(2026, 1, 2, tzinfo=UTC),
+                completed_at=datetime.now(UTC),
+            )
+            session.add_all([oldest, newest])
+            await session.flush()
+
+            current = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                session_id=agent_session.id,
+                prompt="current",
+                status="thinking",
+                provider="mock",
+                model="mock-model",
+                started_at=datetime(2026, 1, 3, tzinfo=UTC),
+            )
+            session.add(current)
+            await session.flush()
+
+            context = await service._build_session_context(session, current)
+            assert context is not None
+            assert "NEWEST_TURN_PROMPT" in context
+            assert "OLDEST_TURN_PROMPT" not in context
+        finally:
+            self._teardown()
+
+
+class TestAgentRunCostFields:
+    """AgentRunResponse surfaces input/output tokens and estimated cost."""
+
+    async def _setup(self, session, session_maker, label):
+        uid = uuid4()
+        user = User(
+            id=uuid4(),
+            email=f"{label}-{uid}@example.com",
+            password_hash=hash_password("password"),
+            role="owner",
+            is_active=True,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        workspace = Workspace(
+            id=uuid4(),
+            owner_id=user.id,
+            name=f"{label}-{uid}",
+            slug=f"{label}-{uid}",
+            repo_url="https://github.com/example/cost",
+            default_branch="main",
+            runtime="daytona",
+            workspace_path="/workspace",
+            status="ready",
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        session.add_all([user, workspace])
+        await session.flush()
+        app.dependency_overrides[auth_module.get_current_user] = await override_get_current_user(
+            user
+        )
+        app.dependency_overrides[get_db_session] = override_get_db_session(session)
+        app.dependency_overrides[agents_module.get_agent_service] = override_get_agent_service(
+            session, session_maker
+        )
+        return user, workspace
+
+    async def test_detail_includes_stored_cost_fields(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "cost-stored")
+        try:
+            run = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                prompt="do the thing",
+                status="completed",
+                provider="openai",
+                model="gpt-4.1-mini",
+                tokens_used=300,
+                input_tokens=100,
+                output_tokens=200,
+                estimated_cost=Decimal("0.00034"),
+                completed_at=datetime.now(UTC),
+            )
+            session.add(run)
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get(f"/workspaces/{workspace.id}/agent/runs/{run.id}")
+            assert resp.status_code == 200
+            body = resp.json()
+            assert body["input_tokens"] == 100
+            assert body["output_tokens"] == 200
+            assert body["estimated_cost"] == pytest.approx(0.00034)
+        finally:
+            app.dependency_overrides.clear()
+
+    async def test_estimated_cost_fallback_computed_on_read(self, db_session):
+        session, session_maker = db_session
+        user, workspace = await self._setup(session, session_maker, "cost-fallback")
+        try:
+            # No stored estimated_cost, but tokens are present -> computed on read.
+            run = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user.id,
+                prompt="legacy run",
+                status="completed",
+                provider="openai",
+                model="gpt-4.1-mini",
+                tokens_used=1_000_000,
+                completed_at=datetime.now(UTC),
+            )
+            session.add(run)
+            await session.commit()
+
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                resp = await client.get(f"/workspaces/{workspace.id}/agent/runs/{run.id}")
+            assert resp.status_code == 200
+            # Total-only fallback applies the output rate (1.60 / 1M tokens).
+            assert resp.json()["estimated_cost"] == pytest.approx(1.60)
+        finally:
+            app.dependency_overrides.clear()

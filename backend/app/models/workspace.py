@@ -19,6 +19,10 @@ from sqlalchemy.orm import Mapped, mapped_column
 from app.db.base import Base
 
 WORKSPACE_STATUSES = ("creating", "ready", "busy", "error", "stopped")
+# How the workspace's repository came to be: cloned from an existing remote, scaffolded from a
+# ``workspace_templates`` row, or ``git init``-ed empty. Template/blank workspaces have no
+# ``repo_url`` until the user connects a remote.
+WORKSPACE_SOURCES = ("repository", "template", "blank")
 
 
 class Workspace(Base):
@@ -28,7 +32,12 @@ class Workspace(Base):
             "status in ('creating', 'ready', 'busy', 'error', 'stopped')",
             name="ck_workspaces_status",
         ),
+        CheckConstraint(
+            "source in ('repository', 'template', 'blank')",
+            name="ck_workspaces_source",
+        ),
         Index("ix_workspaces_owner_id", "owner_id"),
+        Index("ix_workspaces_template_id", "template_id"),
         Index("ix_workspaces_slug", "slug"),
         Index("ix_workspaces_status", "status"),
         Index("ix_workspaces_team_id", "team_id"),
@@ -47,18 +56,35 @@ class Workspace(Base):
     )
     name: Mapped[str] = mapped_column(String(160), nullable=False)
     slug: Mapped[str] = mapped_column(String(180), nullable=False)
-    repo_url: Mapped[str] = mapped_column(Text, nullable=False)
+    repo_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="repository", server_default="repository"
+    )
+    template_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspace_templates.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     default_branch: Mapped[str] = mapped_column(String(120), nullable=False, default="main")
     runtime: Mapped[str] = mapped_column(String(32), nullable=False, default="daytona")
     daytona_sandbox_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
     snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     workspace_path: Mapped[str] = mapped_column(Text, nullable=False, default="workspace")
+    # Repo-relative subdirectory the workspace's commands and dev server run in (e.g.
+    # "apps/api"); ``None`` => the checkout root. Validated server-side, never absolute.
+    app_root: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="creating")
     dev_autostart: Mapped[bool] = mapped_column(
         Boolean,
         nullable=False,
         default=False,
         server_default=text("false"),
+    )
+    # Which worktree the current dev server was launched in (NULL = base clone).
+    dev_worktree_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspace_worktrees.id", ondelete="SET NULL"),
+        nullable=True,
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
