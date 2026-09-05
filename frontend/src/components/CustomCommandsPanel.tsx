@@ -1,6 +1,8 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertTriangle,
+  ArrowDown,
+  ArrowUp,
   CheckCircle2,
   Pencil,
   Play,
@@ -19,6 +21,9 @@ import {
   listCustomCommands,
   runCustomCommand,
   updateCustomCommand,
+  reorderCustomCommands,
+  updateWorkspace,
+  type CommandRole,
   type CommandRunResponse,
   type CommandRunStatus,
   type CommandRunStreamMessage,
@@ -28,6 +33,9 @@ import {
 } from "../lib/api";
 import { useReconnectingWebSocket } from "../lib/useReconnectingWebSocket";
 import { usePermissions } from "../auth/permissions";
+import { useActiveWorktree } from "../lib/activeWorktree";
+import { RunConfigurationTab } from "./RunConfigurationTab";
+import { hotkeyMatches, normalizeHotkey } from "../lib/hotkeys";
 
 type ModalMode = "create" | "edit";
 type CommandFormState = {
@@ -37,6 +45,11 @@ type CommandFormState = {
   icon: string;
   hotkey: string;
   requiresConfirmation: boolean;
+  role: CommandRole;
+  cwd: string;
+  port: string;
+  timeoutSeconds: string;
+  enabled: boolean;
 };
 
 const emptyForm: CommandFormState = {
@@ -46,6 +59,32 @@ const emptyForm: CommandFormState = {
   icon: "",
   hotkey: "",
   requiresConfirmation: false,
+  role: "custom",
+  cwd: "",
+  port: "",
+  timeoutSeconds: "",
+  enabled: true,
+};
+
+/** Registry entries are shown grouped by lifecycle, in the order you would actually run them. */
+const ROLE_ORDER: CommandRole[] = [
+  "install",
+  "migrate",
+  "seed",
+  "dev",
+  "test",
+  "lint",
+  "custom",
+];
+
+const ROLE_LABEL: Record<CommandRole, string> = {
+  install: "Install",
+  migrate: "Migrate",
+  seed: "Seed",
+  dev: "Run",
+  test: "Test",
+  lint: "Lint",
+  custom: "Other",
 };
 
 export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceResponse }) {
@@ -68,10 +107,28 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
   // run being streamed is still the one on screen.
   const activeRunIdRef = useRef<string | null>(null);
   activeRunIdRef.current = activeRun?.id ?? null;
+  // Lets the hotkey listener call the latest `requestRun` without re-binding on every render.
+  const requestRunRef = useRef<(command: CustomCommandResponse) => void>(() => {});
+
+  const [tab, setTab] = useState<"registry" | "configuration">("registry");
+  const [activeWorktree] = useActiveWorktree(workspace.id);
+  const [appRoot, setAppRoot] = useState(workspace.app_root ?? "");
 
   const { can } = usePermissions();
   const canRunCommand = can("command.run");
   const canManageCommand = can("command.manage");
+
+  // Grouped by lifecycle so `install` → `migrate` → `dev` reads in the order you run them,
+  // and ordered by the user's own sort_order inside each group.
+  const groupedCommands = useMemo(() => {
+    const ordered = [...commands].sort(
+      (a, b) => a.sort_order - b.sort_order || a.created_at.localeCompare(b.created_at),
+    );
+    return ROLE_ORDER.map((role) => ({
+      role,
+      items: ordered.filter((command) => command.role === role),
+    })).filter((group) => group.items.length > 0);
+  }, [commands]);
 
   const selectedCommand = useMemo(
     () => commands.find((command) => command.id === selectedCommandId) ?? null,
@@ -111,17 +168,22 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
     };
   }, [workspace.id]);
 
+  // Keyed on `selectedCommandId`, not `selectedCommand`: the latter is re-derived by `useMemo`
+  // from `commands`, so it gets a new object identity every time `commands` is replaced (a
+  // reorder, an edit, importing presets) even when the selected command itself hasn't changed.
+  // Depending on the object tore down a live run stream — `setStreamingRunId(null)` below — on
+  // every such unrelated update.
   useEffect(() => {
     setStreamingRunId(null);
     setRuns([]);
     setActiveRun(null);
     setStreamOutput("");
-    if (!selectedCommand) {
+    if (!selectedCommandId) {
       return;
     }
 
     const controller = new AbortController();
-    listCustomCommandRuns(workspace.id, selectedCommand.id, controller.signal)
+    listCustomCommandRuns(workspace.id, selectedCommandId, controller.signal)
       .then((items) => {
         setRuns(items);
         setActiveRun(items[0] ?? null);
@@ -136,7 +198,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
       });
 
     return () => controller.abort();
-  }, [workspace.id, selectedCommand]);
+  }, [workspace.id, selectedCommandId]);
 
   function openCreateModal() {
     setFormState(emptyForm);
@@ -152,6 +214,11 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
       icon: command.icon ?? "",
       hotkey: command.hotkey ?? "",
       requiresConfirmation: command.requires_confirmation,
+      role: command.role,
+      cwd: command.cwd ?? "",
+      port: command.port === null ? "" : String(command.port),
+      timeoutSeconds: command.timeout_seconds === null ? "" : String(command.timeout_seconds),
+      enabled: command.enabled,
     });
     setModalMode("edit");
     setError(null);
@@ -203,6 +270,54 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
     }
   }
 
+  /**
+   * Swap a command with its neighbour *in its role group* and persist the whole registry's new
+   * order. The list is rendered grouped by role, so the neighbour in the flat sort_order list
+   * may belong to another group; swapping with it would change nothing visible while still
+   * rewriting every sort_order (and possibly which `dev` entry the dev server launches).
+   */
+  async function moveCommand(command: CustomCommandResponse, direction: -1 | 1) {
+    const ordered = [...commands].sort(
+      (a, b) => a.sort_order - b.sort_order || a.created_at.localeCompare(b.created_at),
+    );
+    const index = ordered.findIndex((item) => item.id === command.id);
+    if (index < 0) {
+      return;
+    }
+    let target = index + direction;
+    while (target >= 0 && target < ordered.length && ordered[target].role !== command.role) {
+      target += direction;
+    }
+    if (target < 0 || target >= ordered.length) {
+      return;
+    }
+    [ordered[index], ordered[target]] = [ordered[target], ordered[index]];
+    setError(null);
+    try {
+      const updated = await reorderCustomCommands(workspace.id, {
+        items: ordered.map((item, position) => ({ id: item.id, sort_order: (position + 1) * 10 })),
+      });
+      setCommands(updated);
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof ApiError ? caughtError.message : "Unable to reorder commands.",
+      );
+    }
+  }
+
+  async function saveAppRoot(value: string) {
+    setError(null);
+    try {
+      const updated = await updateWorkspace(workspace.id, { app_root: value.trim() || "" });
+      setAppRoot(updated.app_root ?? "");
+    } catch (caughtError) {
+      setError(
+        caughtError instanceof ApiError ? caughtError.message : "Unable to save the app root.",
+      );
+      throw caughtError;
+    }
+  }
+
   function requestRun(command: CustomCommandResponse) {
     if (command.requires_confirmation) {
       setPendingConfirmation(command);
@@ -210,6 +325,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
     }
     void startRun(command, false);
   }
+  requestRunRef.current = requestRun;
 
   async function startRun(command: CustomCommandResponse, confirmed: boolean) {
     setIsRunning(true);
@@ -218,7 +334,11 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
     setStreamOutput("");
     setStreamingRunId(null);
     try {
-      const run = await runCustomCommand(workspace.id, command.id, { confirmed });
+      const run = await runCustomCommand(workspace.id, command.id, {
+        confirmed,
+        // Run where the user is working, matching the terminal and agent.
+        worktree_id: activeWorktree?.id ?? null,
+      });
       setActiveRun(run);
       setRuns((current) => [run, ...current.filter((item) => item.id !== run.id)]);
       // Drive the reconnecting stream off state; the hook opens/closes the socket.
@@ -303,6 +423,30 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
     }
   }, [connectionState]);
 
+  // The `hotkey` field has always been stored but never bound. Ctrl/Cmd+Alt+<key> keeps
+  // `install` / `migrate` / `dev` one keystroke away without stealing browser shortcuts.
+  useEffect(() => {
+    if (!canRunCommand) {
+      return;
+    }
+    function onKeyDown(event: KeyboardEvent) {
+      if (!(event.ctrlKey || event.metaKey) || !event.altKey) {
+        return;
+      }
+      const match = commands.find(
+        (command) => command.enabled && hotkeyMatches(command.hotkey, event),
+      );
+      if (!match) {
+        return;
+      }
+      event.preventDefault();
+      setSelectedCommandId(match.id);
+      requestRunRef.current(match);
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [commands, canRunCommand]);
+
   return (
     <section className="rounded-md border border-line bg-white p-5 shadow-soft">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -312,17 +456,44 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
           </p>
           <h3 className="mt-1 text-base font-semibold">{workspace.name}</h3>
         </div>
-        {canManageCommand && (
-          <button
-            className="flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-white transition hover:bg-primary-active"
-            type="button"
-            onClick={openCreateModal}
-          >
-            <Plus className="h-4 w-4" aria-hidden="true" />
-            New command
-          </button>
-        )}
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex rounded-md border border-line bg-panel p-0.5">
+            {(
+              [
+                ["registry", "Registry"],
+                ["configuration", "Run configuration"],
+              ] as const
+            ).map(([id, label]) => (
+              <button
+                key={id}
+                className={`rounded px-3 py-1.5 text-sm font-semibold capitalize transition ${
+                  tab === id ? "bg-white text-ink shadow-soft" : "text-ink/60 hover:text-ink"
+                }`}
+                type="button"
+                onClick={() => setTab(id)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {canManageCommand && tab === "registry" && (
+            <button
+              className="flex items-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-white transition hover:bg-primary-active"
+              type="button"
+              onClick={openCreateModal}
+            >
+              <Plus className="h-4 w-4" aria-hidden="true" />
+              New command
+            </button>
+          )}
+        </div>
       </div>
+
+      {activeWorktree && tab === "registry" && (
+        <p className="mb-4 rounded-md border border-line bg-panel px-3 py-2 text-xs text-ink/70">
+          Commands run on <span className="font-semibold">{activeWorktree.branch}</span>.
+        </p>
+      )}
 
       {error && (
         <div className="mb-4 rounded-md border border-danger/30 bg-[#fff5f2] p-3 text-sm text-danger">
@@ -330,49 +501,120 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
         </div>
       )}
 
-      <div className="grid gap-4 xl:grid-cols-[340px_minmax(0,1fr)]">
-        <div className="space-y-3">
+      {tab === "configuration" && (
+        <RunConfigurationTab
+          workspace={workspace}
+          appRoot={appRoot}
+          canManage={canManageCommand}
+          worktreeId={activeWorktree?.id ?? null}
+          onSaveAppRoot={saveAppRoot}
+          onCommandsImported={(created) => {
+            setCommands((current) => [...current, ...created]);
+            setTab("registry");
+          }}
+        />
+      )}
+
+      <div
+        className={`grid gap-4 xl:grid-cols-[340px_minmax(0,1fr)] ${
+          tab === "registry" ? "" : "hidden"
+        }`}
+      >
+        <div className="space-y-4">
           {commands.length === 0 && (
             <div className="rounded-md border border-dashed border-line bg-white p-4 text-sm text-ink/60">
-              No commands yet.
+              No commands yet. Use <span className="font-semibold">Run configuration</span> to
+              detect them from your repository.
             </div>
           )}
-          {commands.map((command) => (
-            <button
+          {groupedCommands.map((group) => (
+            <div key={group.role} className="space-y-2">
+              <p className="text-xs font-semibold uppercase tracking-[0.16em] text-ink/45">
+                {ROLE_LABEL[group.role]}
+              </p>
+              {group.items.map((command, position) => (
+            <div
               key={command.id}
-              className={`w-full rounded-md border p-4 text-left transition ${
+              className={`rounded-md border transition ${
                 selectedCommandId === command.id
                   ? "border-ink bg-white shadow-soft"
                   : "border-line bg-white hover:border-ink/45"
-              }`}
-              type="button"
-              onClick={() => setSelectedCommandId(command.id)}
+              } ${command.enabled ? "" : "opacity-60"}`}
             >
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <TerminalSquare className="h-4 w-4 shrink-0 text-ink/55" aria-hidden="true" />
-                    <span className="truncate font-semibold">{command.name}</span>
+              <button
+                className="w-full p-4 text-left"
+                type="button"
+                onClick={() => setSelectedCommandId(command.id)}
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex items-center gap-2">
+                      <TerminalSquare
+                        className="h-4 w-4 shrink-0 text-ink/55"
+                        aria-hidden="true"
+                      />
+                      <span className="truncate font-semibold">{command.name}</span>
+                      {!command.enabled && (
+                        <span className="shrink-0 rounded-full bg-line px-2 py-0.5 text-xs font-semibold text-ink/60">
+                          off
+                        </span>
+                      )}
+                    </div>
+                    <code className="mt-2 block truncate rounded-md bg-panel px-2 py-1 text-xs text-ink/75">
+                      {command.command}
+                    </code>
                   </div>
-                  <code className="mt-2 block truncate rounded-md bg-panel px-2 py-1 text-xs text-ink/75">
-                    {command.command}
-                  </code>
+                  {command.requires_confirmation && (
+                    <AlertTriangle
+                      className="h-4 w-4 shrink-0 text-warn"
+                      aria-label="Asks before running"
+                    />
+                  )}
                 </div>
-                {command.requires_confirmation && (
-                  <AlertTriangle className="h-4 w-4 shrink-0 text-warn" aria-label="Requires confirmation" />
-                )}
-              </div>
-              {(command.description || command.hotkey) && (
                 <div className="mt-3 flex items-center justify-between gap-2 text-xs text-ink/60">
-                  <span className="truncate">{command.description}</span>
+                  <span className="truncate">
+                    {command.description ||
+                      [command.cwd, command.port ? `port ${command.port}` : null]
+                        .filter(Boolean)
+                        .join(" · ")}
+                  </span>
                   {command.hotkey && (
-                    <kbd className="rounded border border-line bg-white px-2 py-1 font-mono">
-                      {command.hotkey}
+                    <kbd
+                      className="rounded border border-line bg-white px-2 py-1 font-mono"
+                      title="Ctrl/Cmd + Alt + key"
+                    >
+                      {command.hotkey.toUpperCase()}
                     </kbd>
                   )}
                 </div>
+              </button>
+              {canManageCommand && (
+                <div className="flex justify-end gap-1 border-t border-line px-2 py-1">
+                  <button
+                    aria-label={`Move ${command.name} up`}
+                    className="flex h-7 w-7 items-center justify-center rounded text-ink/50 transition hover:bg-panel hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent"
+                    type="button"
+                    title="Move up"
+                    disabled={position === 0}
+                    onClick={() => void moveCommand(command, -1)}
+                  >
+                    <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                  <button
+                    aria-label={`Move ${command.name} down`}
+                    className="flex h-7 w-7 items-center justify-center rounded text-ink/50 transition hover:bg-panel hover:text-ink disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:bg-transparent"
+                    type="button"
+                    title="Move down"
+                    disabled={position === group.items.length - 1}
+                    onClick={() => void moveCommand(command, 1)}
+                  >
+                    <ArrowDown className="h-3.5 w-3.5" aria-hidden="true" />
+                  </button>
+                </div>
               )}
-            </button>
+            </div>
+          ))}
+            </div>
           ))}
         </div>
 
@@ -465,6 +707,22 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                       <time className="mt-2 block text-xs text-ink/55">
                         {new Date(run.started_at).toLocaleString()}
                       </time>
+                      {(run.worktree_id || run.cwd) && (
+                        <div className="mt-1 flex flex-wrap gap-1 text-xs text-ink/50">
+                          {run.worktree_id && (
+                            <span className="rounded-full bg-line px-2 py-0.5">
+                              {run.worktree_id === activeWorktree?.id
+                                ? activeWorktree.branch
+                                : "worktree"}
+                            </span>
+                          )}
+                          {run.cwd && (
+                            <span className="rounded-full bg-line px-2 py-0.5 font-mono">
+                              {run.cwd}
+                            </span>
+                          )}
+                        </div>
+                      )}
                     </button>
                   ))}
                 </div>
@@ -567,24 +825,103 @@ function CommandModal({
                 onChange={(event) => onChange({ ...formState, icon: event.target.value })}
               />
             </label>
+            <div>
+              <label className="text-sm font-medium">
+                Hotkey
+                <input
+                  className="mt-1 w-full rounded-md border border-line bg-white px-3 py-2 font-mono outline-none transition focus:border-ink"
+                  value={formState.hotkey}
+                  maxLength={1}
+                  placeholder="d"
+                  aria-describedby="hotkey-help"
+                  onChange={(event) =>
+                    onChange({ ...formState, hotkey: normalizeHotkey(event.target.value) })
+                  }
+                />
+              </label>
+              <p id="hotkey-help" className="mt-1 text-xs text-ink/55">
+                One letter or digit, pressed with Ctrl/Cmd + Alt.
+              </p>
+            </div>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
             <label className="text-sm font-medium">
-              Hotkey
+              Role
+              <select
+                className="mt-1 w-full rounded-md border border-line bg-white px-3 py-2 outline-none transition focus:border-ink"
+                value={formState.role}
+                onChange={(event) =>
+                  onChange({ ...formState, role: event.target.value as CommandRole })
+                }
+              >
+                {ROLE_ORDER.map((role) => (
+                  <option key={role} value={role}>
+                    {ROLE_LABEL[role]}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="text-sm font-medium">
+              Working directory
+              <input
+                className="mt-1 w-full rounded-md border border-line bg-white px-3 py-2 font-mono text-sm outline-none transition focus:border-ink"
+                placeholder="backend"
+                value={formState.cwd}
+                onChange={(event) => onChange({ ...formState, cwd: event.target.value })}
+              />
+              <span className="mt-1 block text-xs font-normal text-ink/55">
+                Relative to the app root. Leave empty to use it directly.
+              </span>
+            </label>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2">
+            <label className="text-sm font-medium">
+              Port
               <input
                 className="mt-1 w-full rounded-md border border-line bg-white px-3 py-2 outline-none transition focus:border-ink"
-                value={formState.hotkey}
-                onChange={(event) => onChange({ ...formState, hotkey: event.target.value })}
+                inputMode="numeric"
+                placeholder="8000"
+                value={formState.port}
+                onChange={(event) => onChange({ ...formState, port: event.target.value })}
+              />
+            </label>
+            <label className="text-sm font-medium">
+              Timeout (seconds)
+              <input
+                className="mt-1 w-full rounded-md border border-line bg-white px-3 py-2 outline-none transition focus:border-ink"
+                inputMode="numeric"
+                placeholder="900"
+                value={formState.timeoutSeconds}
+                onChange={(event) =>
+                  onChange({ ...formState, timeoutSeconds: event.target.value })
+                }
               />
             </label>
           </div>
           <label className="flex items-center gap-3 rounded-md border border-line bg-white p-3 text-sm font-medium">
             <input
+              checked={formState.enabled}
+              type="checkbox"
+              onChange={(event) => onChange({ ...formState, enabled: event.target.checked })}
+            />
+            Enabled
+          </label>
+          <label className="flex items-start gap-3 rounded-md border border-line bg-white p-3 text-sm font-medium">
+            <input
               checked={formState.requiresConfirmation}
+              className="mt-0.5"
               type="checkbox"
               onChange={(event) =>
                 onChange({ ...formState, requiresConfirmation: event.target.checked })
               }
             />
-            Requires confirmation
+            <span>
+              Ask me first
+              <span className="mt-1 block text-xs font-normal text-ink/55">
+                Prompts before running. This is about intent, not permission — every command you
+                save is allowed to run.
+              </span>
+            </span>
           </label>
         </div>
 
@@ -673,6 +1010,8 @@ function CommandStatusPill({ status }: { status: CommandRunStatus | "idle" }) {
 }
 
 function formPayload(formState: CommandFormState): CustomCommandPayload {
+  const port = Number.parseInt(formState.port, 10);
+  const timeout = Number.parseInt(formState.timeoutSeconds, 10);
   return {
     name: formState.name,
     command: formState.command,
@@ -680,5 +1019,10 @@ function formPayload(formState: CommandFormState): CustomCommandPayload {
     icon: formState.icon || null,
     hotkey: formState.hotkey || null,
     requires_confirmation: formState.requiresConfirmation,
+    role: formState.role,
+    cwd: formState.cwd.trim() || null,
+    port: Number.isNaN(port) ? null : port,
+    timeout_seconds: Number.isNaN(timeout) ? null : timeout,
+    enabled: formState.enabled,
   };
 }

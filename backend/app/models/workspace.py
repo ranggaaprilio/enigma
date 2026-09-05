@@ -70,6 +70,9 @@ class Workspace(Base):
     daytona_sandbox_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
     snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     workspace_path: Mapped[str] = mapped_column(Text, nullable=False, default="workspace")
+    # Repo-relative subdirectory the workspace's commands and dev server run in (e.g.
+    # "apps/api"); ``None`` => the checkout root. Validated server-side, never absolute.
+    app_root: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="creating")
     dev_autostart: Mapped[bool] = mapped_column(
         Boolean,

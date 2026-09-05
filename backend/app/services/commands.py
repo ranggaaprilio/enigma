@@ -1,24 +1,29 @@
 import asyncio
+import re
 import shlex
 from collections import defaultdict
 from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.models import CommandRun, CustomCommand, Workspace, WorkspaceEnvVar
-from app.services.agent_tools import DANGEROUS_COMMANDS, DANGEROUS_TOKENS, DangerousCommandError
+from app.services.agent_tools import DangerousCommandError
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
+from app.services.git_providers import redact_secrets
 from app.services.notifications import NotificationService
+from app.services.run_paths import RunPathError, resolve_run_cwd
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 logger = structlog.get_logger(__name__)
 
-PRACTICAL_CONFIRMED_COMMANDS = {"git", "npm", "pnpm", "uv", "yarn"}
+# New registry entries are appended with this gap so a later insert can be slotted between
+# two commands without renumbering the whole workspace.
+SORT_ORDER_STEP = 10
 
 
 class CustomCommandNotFoundError(Exception):
@@ -92,6 +97,13 @@ class CommandService:
         icon: str | None,
         hotkey: str | None,
         requires_confirmation: bool,
+        role: str = "custom",
+        kind: str = "task",
+        cwd: str | None = None,
+        port: int | None = None,
+        enabled: bool = True,
+        timeout_seconds: int | None = None,
+        sort_order: int | None = None,
     ) -> CustomCommand:
         workspace = await self._get_workspace(workspace_id, user_id)
         custom_command = CustomCommand(
@@ -102,6 +114,15 @@ class CommandService:
             icon=icon,
             hotkey=hotkey,
             requires_confirmation=requires_confirmation,
+            role=role,
+            kind=kind,
+            cwd=cwd,
+            port=port,
+            enabled=enabled,
+            timeout_seconds=timeout_seconds,
+            sort_order=(
+                await self._next_sort_order(workspace.id) if sort_order is None else sort_order
+            ),
         )
         self.session.add(custom_command)
         await self.session.flush()
@@ -128,7 +149,7 @@ class CommandService:
         result = await self.session.execute(
             select(CustomCommand)
             .where(CustomCommand.workspace_id == workspace.id)
-            .order_by(CustomCommand.created_at.asc())
+            .order_by(CustomCommand.sort_order.asc(), CustomCommand.created_at.asc())
         )
         return list(result.scalars().all())
 
@@ -182,21 +203,121 @@ class CommandService:
             user_id=str(user_id),
         )
 
+    async def import_commands(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        items: list[dict],
+    ) -> list[CustomCommand]:
+        """Bulk-create registry entries from detection candidates or a preset.
+
+        Each entry is created exactly as a hand-authored one would be — same validation, same
+        audit trail — so an imported command carries no special status afterwards.
+        """
+        workspace = await self._get_workspace(workspace_id, user_id)
+        sort_order = await self._next_sort_order(workspace.id)
+        created: list[CustomCommand] = []
+        for item in items:
+            custom_command = CustomCommand(
+                workspace_id=workspace.id,
+                name=item["name"],
+                command=item["command"],
+                description=item.get("description"),
+                icon=item.get("icon"),
+                hotkey=item.get("hotkey"),
+                requires_confirmation=bool(item.get("requires_confirmation", False)),
+                role=item.get("role", "custom"),
+                kind=item.get("kind", "task"),
+                cwd=item.get("cwd"),
+                port=item.get("port"),
+                enabled=True,
+                timeout_seconds=item.get("timeout_seconds"),
+                sort_order=sort_order,
+            )
+            sort_order += SORT_ORDER_STEP
+            self.session.add(custom_command)
+            created.append(custom_command)
+        await self.session.flush()
+        await self.session.commit()
+        for custom_command in created:
+            await self.session.refresh(custom_command)
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace.id,
+            action="custom_command_import",
+            target_type="workspace",
+            target_id=workspace.id,
+            metadata={"count": len(created), "names": [row.name for row in created][:20]},
+        )
+        logger.info(
+            "custom_command_import",
+            workspace_id=str(workspace.id),
+            user_id=str(user_id),
+            count=len(created),
+        )
+        return created
+
+    async def reorder_commands(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        order: dict[UUID, int],
+    ) -> list[CustomCommand]:
+        """Bulk ``sort_order`` update. Ids outside this workspace are ignored, not an error."""
+        workspace = await self._get_workspace(workspace_id, user_id)
+        result = await self.session.execute(
+            select(CustomCommand).where(CustomCommand.workspace_id == workspace.id)
+        )
+        rows = list(result.scalars().all())
+        for row in rows:
+            if row.id in order:
+                row.sort_order = order[row.id]
+                self.session.add(row)
+        await self.session.flush()
+        await self.session.commit()
+        await AuditLogService(self.session).record(
+            user_id=user_id,
+            workspace_id=workspace.id,
+            action="custom_command_reorder",
+            target_type="workspace",
+            target_id=workspace.id,
+            metadata={"count": len(order)},
+        )
+        return sorted(rows, key=lambda row: (row.sort_order, row.created_at))
+
     async def create_run(
         self,
         workspace_id: UUID,
         command_id: UUID,
         user_id: UUID,
         confirmed: bool,
+        worktree_id: UUID | None = None,
     ) -> CommandRun:
+        workspace = await self._get_workspace(workspace_id, user_id)
         custom_command = await self._get_command(workspace_id, command_id, user_id)
         if custom_command.requires_confirmation and not confirmed:
             raise CommandConfirmationRequiredError
+        if not workspace.daytona_sandbox_id:
+            raise CommandWorkspacePathError
+
+        # Resolve up front so an unusable worktree or working directory fails the request with a
+        # real status code instead of surfacing asynchronously as a run in status "error".
+        try:
+            _, relative_cwd, resolved_worktree_id, _ = await resolve_run_cwd(
+                self.session,
+                workspace,
+                worktree_id=worktree_id,
+                command_cwd=custom_command.cwd,
+            )
+        except RunPathError as error:
+            raise CommandWorkspacePathError(str(error)) from error
 
         run = CommandRun(
             custom_command_id=custom_command.id,
             workspace_id=custom_command.workspace_id,
             user_id=user_id,
+            worktree_id=resolved_worktree_id,
+            cwd=relative_cwd or None,
             status="running",
             output="",
         )
@@ -210,7 +331,12 @@ class CommandService:
             action="command_run_start",
             target_type="command_run",
             target_id=run.id,
-            metadata={"custom_command_id": custom_command.id, "name": custom_command.name},
+            metadata={
+                "custom_command_id": custom_command.id,
+                "name": custom_command.name,
+                "worktree_id": str(resolved_worktree_id) if resolved_worktree_id else None,
+                "cwd": relative_cwd or None,
+            },
         )
 
         task = asyncio.create_task(self._execute_run(run.id, confirmed))
@@ -288,24 +414,30 @@ class CommandService:
                 return
 
             try:
-                argv = validate_custom_command(
-                    custom_command.command,
-                    requires_confirmation=custom_command.requires_confirmation,
-                    confirmed=confirmed,
-                )
+                argv = validate_user_command(custom_command.command)
                 command = " ".join(shlex.quote(value) for value in argv)
                 env = await self._workspace_env(session, workspace.id)
+                cwd, _, _, _ = await resolve_run_cwd(
+                    session,
+                    workspace,
+                    worktree_id=run.worktree_id,
+                    command_cwd=custom_command.cwd,
+                )
+                # Workspace env values are decrypted into the sandbox, so anything that echoes the
+                # environment would otherwise persist plaintext secrets to CommandRun.output and
+                # broadcast them over the run WebSocket.
+                secrets = redactable_env_values(env)
 
                 async def on_output(content: str) -> None:
-                    await self._append_output(session, run, content)
+                    await self._append_output(session, run, redact_secrets(content, *secrets))
 
                 exit_code = await self.daytona_runtime.stream_command(
                     workspace,
                     session_id=f"command-{run.id.hex}",
                     command=command,
-                    cwd=workspace.workspace_path,
+                    cwd=cwd,
                     env=env,
-                    timeout=self.settings.agent_command_timeout_seconds,
+                    timeout=self._run_timeout(custom_command),
                     on_stdout=on_output,
                     on_stderr=on_output,
                 )
@@ -314,6 +446,21 @@ class CommandService:
             except Exception as error:
                 await self._append_output(session, run, f"{error}\n")
                 await self._mark_finished(session, run, "error", None)
+
+    def _run_timeout(self, custom_command: CustomCommand) -> int:
+        """Per-command override, bounded by the platform maximum."""
+        configured = getattr(custom_command, "timeout_seconds", None)
+        default = self.settings.command_run_timeout_seconds
+        return min(configured or default, self.settings.command_run_max_timeout_seconds)
+
+    async def _next_sort_order(self, workspace_id: UUID) -> int:
+        result = await self.session.execute(
+            select(func.max(CustomCommand.sort_order)).where(
+                CustomCommand.workspace_id == workspace_id
+            )
+        )
+        current = result.scalar_one_or_none()
+        return (current or 0) + SORT_ORDER_STEP
 
     async def _append_output(self, session: AsyncSession, run: CommandRun, content: str) -> None:
         if not content:
@@ -411,30 +558,50 @@ class CommandService:
         return values
 
 
-def validate_custom_command(
-    command: str,
-    *,
-    requires_confirmation: bool,
-    confirmed: bool,
-) -> list[str]:
-    has_shell_operator = any(token in command for token in DANGEROUS_TOKENS)
-    if has_shell_operator:
-        if requires_confirmation and confirmed:
-            return ["sh", "-lc", command]
-        raise DangerousCommandError("Shell control operators require confirmation")
-    try:
-        argv = shlex.split(command)
-    except ValueError as error:
-        raise DangerousCommandError("Command could not be parsed") from error
-    if not argv:
+# Env keys whose values are credential material whatever their length.
+_SECRET_KEY = re.compile(
+    r"(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|CREDENTIAL|API_?KEY|ACCESS_?KEY|AUTH|DSN|_URL|_URI)",
+    re.IGNORECASE,
+)
+# A value this long is unlikely to be an ordinary word that legitimately shows up in output.
+_REDACT_MIN_LENGTH = 16
+
+
+def redactable_env_values(env: dict[str, str]) -> tuple[str, ...]:
+    """The env values worth masking in run output.
+
+    ``redact_secrets`` is a plain substring replace, so feeding it *every* value turned
+    ``DEBUG=1`` into ``[redacted]0 passed in [redacted].23s`` and blanked every line mentioning
+    ``development``. A value is masked when its key looks like a credential (``DATABASE_PASSWORD``,
+    ``API_TOKEN``, a connection ``_URL`` that may embed one) or when it is long enough that it
+    cannot be an incidental word. Short values under plain keys (``PORT=3000``, ``NODE_ENV``)
+    stay visible.
+    """
+    return tuple(
+        value
+        for key, value in env.items()
+        if value and (_SECRET_KEY.search(key) or len(value) >= _REDACT_MIN_LENGTH)
+    )
+
+
+def validate_user_command(command: str) -> list[str]:
+    """Build the argv for an **owner-authored** registry command.
+
+    Unlike ``WorkspaceTools._validate_command`` — which constrains an *agent's* command choice,
+    because that is model output — this applies no denylist. The workspace owner already has an
+    unrestricted interactive PTY into the very same sandbox (``services/terminal.py``, whose
+    ``_get_workspace`` performs the identical owner-only check as ``CommandService``), so a
+    denylist here protects nothing while making ordinary commands such as ``cd api && pnpm dev``
+    unusable without ticking a confirmation box.
+
+    ``requires_confirmation`` therefore stays a pure *user intent* flag ("ask me first" before
+    something destructive), never an authorisation mechanism.
+
+    NOTE: this reasoning holds only while command CRUD and runs are owner-only. The frontend
+    already models ``command.run`` / ``command.manage`` roles that the backend does not honour;
+    if those are ever wired up, this policy must be revisited in the same change.
+    """
+    candidate = command.strip()
+    if not candidate:
         raise DangerousCommandError("Command cannot be empty")
-    executable = argv[0]
-    if "/" in executable:
-        raise DangerousCommandError("Command is not allowed")
-    if executable in DANGEROUS_COMMANDS:
-        if executable in PRACTICAL_CONFIRMED_COMMANDS and requires_confirmation and confirmed:
-            return argv
-        if requires_confirmation and confirmed:
-            return ["sh", "-lc", command]
-        raise DangerousCommandError("Command is not allowed")
-    return argv
+    return ["sh", "-lc", candidate]

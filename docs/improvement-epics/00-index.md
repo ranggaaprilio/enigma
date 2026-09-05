@@ -24,7 +24,7 @@ add migrations + tests, keep changes scoped.
 | 07 | [Observability, Production Hardening & CI](./07-observability-and-hardening.md) | P2 | Reliability |
 | 08 | [Real-Time Collaboration](./08-realtime-collaboration.md) | P3 | Collaboration |
 | 09 | [Workspace Templates & Multi-Provider Git](./09-templates-and-git-providers.md) | P3 | Onboarding / growth |
-| 10 | [Run Configuration & Unified Command Registry](./10-run-configuration-and-commands.md) | **P1** | Full-stack preview |
+| 10 | [Run Configuration & Unified Command Registry](./10-run-configuration-and-commands.md) | **P1** ✅ shipped | Full-stack preview |
 | 11 | [Long-Running Services & Multi-Port Preview](./11-multi-service-preview.md) | **P1** | Full-stack preview |
 | 12 | [Environment Variables: Injection, Bulk Editing & Scoping](./12-environment-variables-ux.md) | **P1** | Full-stack preview |
 | 13 | [Service Wiring & Preview Composition](./13-service-wiring-and-preview-composition.md) | P2 | Full-stack preview |
@@ -56,9 +56,10 @@ backend-only API cannot be previewed without them.
    workspace environment variables actually reach the running app. Without it, a backend preview
    starts and immediately fails on its first database call. Independent of 10 and 11, so it can
    land on its own in a day.
-2. **10 — Run configuration & command registry.** Defines `app_root`, and turns
-   `custom_commands` into the single registry of runnable things (role, working directory, port,
-   ordering, per-command timeout). Everything else builds on this schema.
+2. **10 — Run configuration & command registry.** ✅ **Shipped** (migration
+   `0024_run_configuration`). Defines `app_root`, and turns `custom_commands` into the single
+   registry of runnable things (role, working directory, port, ordering, per-command timeout).
+   Everything else builds on this schema.
 3. **11 — Services & multi-port preview.** Replaces one-dev-server-per-sandbox with N services,
    each with its own lifecycle, logs, and preview URL.
 4. **12 (remainder)** — bulk `.env` editing, per-service scoping, `.env` materialisation.
@@ -123,7 +124,23 @@ Verified against the codebase so epics target real gaps, not assumptions:
 
 ## Grounding: Full-Stack Preview Snapshot (September 2026)
 
-Verified against the codebase for Epics 10-13:
+Verified against the codebase for Epics 10-13. This is a point-in-time record of *why* these
+epics exist — it is deliberately **not** rewritten as they land. **Epic 10 has since shipped**, so
+the following bullets no longer describe the code (see that epic's "Implementation Notes"):
+
+- *Dev server* — `mise run dev` is now the default, not the hard-coded behaviour. A workspace with
+  an enabled `role='dev'` registry entry runs that instead, in its own working directory, and no
+  root `mise` config is required. Everything else in the bullet (single status-file set, `pkill`,
+  single-valued desired state) still stands and is Epic 11's problem.
+- *Preview* — `_first_open_port` is still first-match, but a `dev` command's declared `port` is now
+  preferred over it. Serving several ports at once remains Epic 11.
+- *Custom commands* — the listed gaps are closed: working directory, worktree awareness, role,
+  port, ordering and a real timeout (`command_run_timeout_seconds`, 900s) all exist, and the
+  denylist no longer applies to owner-authored commands.
+- *Environment variables* — command-run output is now redacted with `redact_secrets`. The
+  dev-server `env=` gap is untouched and remains Epic 12's first slice.
+
+The snapshot as originally written follows.
 
 - **Dev server**: `services/dev_server.py` runs exactly `mise run dev` (and `mise run install`),
   requires a `mise` config at the checkout root (`MISE_CONFIG_FILES`), and tracks state in three

@@ -17,6 +17,7 @@ const workspace: WorkspaceResponse = {
   sandbox_id: "sandbox-1",
   snapshot: null,
   workspace_path: "/workspace",
+  app_root: null,
   status: "ready",
   created_at: "2026-09-04T00:00:00Z",
   updated_at: "2026-09-04T00:00:00Z",

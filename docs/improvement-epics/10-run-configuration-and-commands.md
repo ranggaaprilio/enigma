@@ -202,3 +202,149 @@ and no assumption that the app is a single process at the repo root.
 - Dependency graph between commands (`migrate` depends on `install`) with a single **Prepare**
   button.
 - Let the agent read the registry so "run the tests" uses the user's own command.
+
+---
+
+## Implementation Notes (shipped)
+
+Landed in three stages; migration head is now `0024_run_configuration`.
+
+### Corrections to this document, found while implementing
+
+1. **There is no `validate_agent_command`.** The agent-side check is the private method
+   `WorkspaceTools._validate_command` (`services/agent_tools.py`); the command-side one was the
+   module-level `validate_custom_command` (`services/commands.py`). The former is untouched — an
+   agent's command choice is model output and stays constrained — and only the latter was replaced,
+   by `validate_user_command`.
+2. **`CommandWorkspacePathError` was dead code**: defined, imported by `api/commands.py` and mapped
+   to a 409, but never raised, so a run against a sandbox-less workspace failed asynchronously into
+   status `error`. `create_run` now raises it, matching `DevServerService._get_workspace`.
+3. **Detection does not run `mise task ls`.** That executes `mise` (and implies `mise trust`)
+   against an unvetted repository, contradicting this epic's own "detection must not execute
+   repository code" rule. `mise.toml` `[tasks.*]` is parsed with stdlib `tomllib` instead.
+
+### Stage 1 — schema, execution, safety policy
+
+- Migration `0024_run_configuration`: `workspaces.app_root`; `custom_commands` + `role`, `kind`,
+  `cwd`, `port`, `sort_order`, `enabled`, `timeout_seconds` with CHECK constraints;
+  `command_runs.worktree_id` (FK `ON DELETE SET NULL`) + `cwd`; index
+  `ix_custom_commands_workspace_sort`. `sort_order` is backfilled from `created_at` in steps of 10,
+  so existing lists keep their order and a later insert can be slotted between two rows. Verified
+  reversible (`upgrade` → `downgrade -1` → `upgrade`).
+- **New `services/run_paths.py`** owns the composition
+  `<worktree | workspace_path>/<app_root>/<command.cwd>`. It is stricter than
+  `FileService._normalize_relative`, which strips a leading `/` and treats the rest as relative:
+  these values are typed by a user, so `/etc` is **rejected** rather than silently becoming
+  `workspace/etc`.
+- Adopted by `commands`, `dev_server` and `terminal`. **`editor.py` deliberately keeps the
+  repository root** — code-server rooted at `apps/api` would hide the rest of a monorepo.
+- `validate_user_command` applies no denylist. This is safe *because*
+  `CommandService._get_workspace` and `TerminalService._get_workspace` are the identical
+  owner-only check: the user who can save a command already has an unrestricted PTY into the same
+  sandbox. **If command CRUD/run is ever widened to team roles** (the frontend already models
+  `command.run` / `command.manage`, which the backend does not honour), this must be revisited.
+- `command_run_timeout_seconds` (900) replaces the shared 20s `agent_command_timeout_seconds`, with
+  a per-command override clamped by `command_run_max_timeout_seconds` (3600).
+- **Fixed a real secret leak**: `_workspace_env` decrypts Fernet values into the sandbox, and raw
+  stdout was persisted to `CommandRun.output` and broadcast over the WebSocket verbatim, so an
+  `env`-style command stored plaintext secrets in the database. Output now goes through
+  `redact_secrets` with the injected values.
+- Added a per-(user, workspace) run rate limit — commands previously had none and no concurrency
+  cap, `create_run` being a fire-and-forget `asyncio.create_task`.
+
+### Stage 1 — dev server
+
+`DevServerService` keeps its entire public API. `run()`/`setup()` look up the enabled registry entry
+for `dev`/`install`; when one exists it drives a non-mise launch script with the same log file,
+generation-token guard and status vocabulary, so status polling, worktree switching and
+`ensure_running` are unchanged. With no registry entry the mise script runs byte-for-byte as before.
+
+Two deviations from the plan, both deliberate:
+
+- **The plan's "seed a `mise run dev` entry" was dropped.** Seeding would have routed mise
+  repositories through the registry script, which skips `mise trust`/`mise install` — a regression
+  for exactly the workspaces the epic promises not to disturb. A repository with a mise config and
+  an empty registry still takes the original path.
+- **`port` is consumed a little already.** `_resolved_port` prefers the port the `dev` entry
+  declares before falling back to `COMMON_PREVIEW_PORTS` first-match probing (which reports 5173 and
+  hides an API on 8000). Serving *several* ports at once remains Epic 11.
+
+### Stage 2 — detection and presets
+
+- `services/run_detection.py`. The interesting half is `candidates_from_manifests`, a **pure
+  function** over `{path: content}`, so detection is tested without a sandbox. IO is at most two
+  round trips: one delimited bundle read for the root manifests, and a second only when the root
+  declares monorepo workspace globs. Reads are bounded (64 KB/file, 40 packages, 60 candidates).
+- Sources: `mise.toml` tasks, `package.json` scripts (+ `pnpm-workspace.yaml` / `package.json`
+  workspaces), `pyproject.toml` / `requirements.txt` / `manage.py` / `alembic.ini`, `Makefile`
+  targets (scanned by regex, never evaluated), `go.mod`, `Cargo.toml`, `composer.json` / `artisan`,
+  `pom.xml`, `build.gradle`. Every candidate carries `source_file` + `reason`.
+- `services/run_presets.py` ships the six named presets as module constants. **Not implemented:**
+  `workspace_templates.run_config` — no acceptance criterion needs it and Epics 11/12 do not consume
+  it.
+- Endpoints: `POST /commands/detect`, `POST /commands/import`, `GET /commands/presets`,
+  `POST /commands/presets/{slug}/apply`, plus `POST /commands/reorder` from Stage 1.
+
+### Stage 3 — frontend
+
+The Commands view gained a segmented control (`Registry` / `Run configuration`), reusing the
+`rightTab` pattern from `RepositoryPanel` — **no new route and no new sidebar entry**.
+
+- Registry: grouped by role in run order (install → migrate → seed → dev → test → lint → other),
+  ordered by `sort_order` inside each group, with **move up/down buttons**. No drag-and-drop
+  dependency was added; the repo ships no DnD library and `AGENTS.md` forbids component kits.
+- `CommandModal` gained role, working directory, port, timeout and enabled;
+  `requires_confirmation` is relabelled **"Ask me first"** with copy making clear it is about
+  intent, not permission.
+- `CustomCommandsPanel` was the only major panel not consuming `useActiveWorktree`; it now runs
+  against the active worktree and shows the branch and directory on each run in history.
+- The `hotkey` field, stored since the feature shipped but never bound, is now live on
+  Ctrl/Cmd+Alt+`<key>`. A hotkey is a single letter or digit (`lib/hotkeys.ts`), matched on
+  `event.code` first: with Option held, macOS reports the composed character (`∂` for D) in
+  `event.key`, so a `key`-only match never fired there.
+- Move up/down reorders within the command's role group (the list is rendered grouped), and is
+  disabled at a group's edges; swapping with the flat-list neighbour in another group produced a
+  reorder request with no visible change.
+
+### Review fixes (2026-09-05)
+
+- **Process tracking.** Every launch script (mise default and registry command, `run` and `setup`)
+  records its wrapper PID in `/tmp/enigma-dev.pid` / `/tmp/enigma-dev-setup.pid`. Stop and
+  worktree switches kill that process tree children-first (`_KILL_SCRIPT`) and the liveness check
+  reads the PID file (verifying the process is still one of our wrappers), falling back to the
+  legacy `pgrep -f 'mise run dev'` only for servers started before PID files existed. Before, a
+  registry launch (`sh -lc 'pnpm dev'`) could neither be stopped nor detected as alive, so Stop
+  orphaned the server and `ensure_running` started a second one.
+- **Working directories.** The mise default now honours `app_root` (config may live at the app
+  root or the checkout root, since mise resolves upward), and a worktree run executes the
+  `install` entry in *its own* directory rather than the `dev` entry's.
+- **Detection.** Workspace globs are validated against an allowlist and passed to `ls -d`
+  unquoted so they expand (quoting disabled the `*`, so no monorepo package was ever found);
+  packages inherit the root lockfile's package manager; the Python installer is chosen from
+  `uv.lock`/`[tool.uv]` or `poetry.lock`/`[tool.poetry]` rather than a substring test that
+  matched `uvicorn`.
+- **Redaction.** Only env values under credential-looking keys, or at least 16 characters long,
+  are masked in run output (`commands.redactable_env_values`); `DEBUG=1` no longer rewrites
+  `10 passed` as `[redacted]0 passed`.
+- **PATCH validation.** `CustomCommandUpdateRequest` rejects an explicit `null` on `name`,
+  `command`, `requires_confirmation`, `role`, `kind`, or `enabled` with a 422 instead of letting
+  it reach `setattr` and fail as an unhandled `IntegrityError` (500) against the NOT
+  NULL/CHECK-constrained column. Omitting a field is unaffected.
+- **Test isolation.** `enforce_command_run_rate_limit` talks to Redis directly, like the agents
+  endpoint's equivalent dependency; `test_commands.py`'s fixture now overrides it the same way
+  `test_agents.py` already did, so the command-run tests no longer need a live Redis.
+- **Run stream stability.** The run-history effect in `CustomCommandsPanel` keyed on
+  `selectedCommand`, an object `useMemo` re-derives on every `commands` update (a reorder, an
+  edit) even when the selection itself didn't change; it now keys on `selectedCommandId`, so an
+  unrelated reorder no longer tears down a live-streaming run.
+- New `RunConfigurationTab.tsx`: app-root editor, **Detect commands** with a per-candidate checkbox
+  and its source file, and preset cards.
+
+### Verification
+
+`ruff` clean; **503 backend tests pass** (was 433 before this epic). Frontend: eslint clean
+(4 pre-existing warnings), **188 tests pass**, `tsc -b` and `vite build` succeed.
+
+Not covered by automated tests, and still worth a manual pass against a live Daytona sandbox: the
+end-to-end split-repo and monorepo flows, and that `pnpm install` genuinely completes without the
+old 20-second timeout.

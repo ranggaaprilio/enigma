@@ -52,7 +52,7 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
   - Connection string must be `postgresql+asyncpg://…`
   - Session: `async_session_maker` with `expire_on_commit=False`
   - All DB access MUST use async/await
-- **Migrations**: Alembic with async engine, 22 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0022_templates_and_git_providers`)
+- **Migrations**: Alembic with async engine, 24 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0024_run_configuration`)
 - **Auth**: Cookie-based sessions (`execute_session` cookie), NOT JWT. Set-Cookie on login, cleared on logout.
 - **Logging**: `structlog` (configured in `core/logging.py`)
 - **Testing**: `pytest` with `pytest-asyncio` (auto mode), tests at `backend/tests/`

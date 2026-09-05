@@ -12,6 +12,7 @@ from app.models import TerminalSession, User
 from app.schemas.terminal import TerminalSessionCreateRequest, TerminalSessionResponse
 from app.schemas.workspaces import DeleteResponse
 from app.services.daytona_runtime import get_daytona_runtime
+from app.services.run_paths import join_subpath, validate_relative_subpath
 from app.services.terminal import (
     TerminalPtyBridge,
     TerminalRuntimeError,
@@ -180,6 +181,12 @@ async def connect_terminal_session(
             if resolved != workspace.workspace_path:
                 cwd = resolved
                 pty_session_id = f"{terminal_session.pty_session_id}:{worktree_uuid.hex}"
+
+        # A configured app root drops the terminal straight into the directory the workspace's
+        # commands run in, so what the user types by hand matches what the Run buttons do.
+        app_root = validate_relative_subpath(workspace.app_root)
+        if app_root:
+            cwd = join_subpath(cwd or workspace.workspace_path, app_root)
 
     await websocket.accept()
     bridge = TerminalPtyBridge(

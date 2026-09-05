@@ -122,6 +122,8 @@ export type WorkspaceResponse = {
   sandbox_id: string | null;
   snapshot: string | null;
   workspace_path: string;
+  /** Repo-relative subdirectory commands and the dev server run in; null = checkout root. */
+  app_root: string | null;
   status: WorkspaceStatus;
   created_at: string;
   updated_at: string;
@@ -153,7 +155,10 @@ export type WorkspaceCreatePayload = {
 
 export type WorkspaceUpdatePayload = Partial<
   Pick<WorkspaceCreatePayload, "name" | "repo_url" | "default_branch" | "snapshot">
->;
+> & {
+  /** Send `""` to clear it back to the checkout root. Validated server-side. */
+  app_root?: string | null;
+};
 
 export type WorkspaceEnvVarResponse = {
   id: string;
@@ -384,6 +389,29 @@ export type AgentTurnCreatePayload = {
   worktree_id?: string | null;
 };
 
+/** Lifecycle role of a registry entry. Drives grouping and what the dev server runs. */
+export type CommandRole =
+  | "install"
+  | "migrate"
+  | "dev"
+  | "test"
+  | "lint"
+  | "seed"
+  | "custom";
+
+/** `service` (a long-running process with a port) is executed from Epic 11 onwards. */
+export type CommandKind = "task" | "service";
+
+export const COMMAND_ROLES: CommandRole[] = [
+  "install",
+  "migrate",
+  "dev",
+  "test",
+  "lint",
+  "seed",
+  "custom",
+];
+
 export type CustomCommandResponse = {
   id: string;
   workspace_id: string;
@@ -393,6 +421,15 @@ export type CustomCommandResponse = {
   icon: string | null;
   hotkey: string | null;
   requires_confirmation: boolean;
+  role: CommandRole;
+  kind: CommandKind;
+  /** Relative to the workspace's app root; `null` means the app root itself. */
+  cwd: string | null;
+  port: number | null;
+  sort_order: number;
+  enabled: boolean;
+  /** `null` falls back to the platform default (15 minutes). */
+  timeout_seconds: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -404,15 +441,28 @@ export type CustomCommandPayload = {
   icon?: string | null;
   hotkey?: string | null;
   requires_confirmation: boolean;
+  role?: CommandRole;
+  kind?: CommandKind;
+  cwd?: string | null;
+  port?: number | null;
+  enabled?: boolean;
+  timeout_seconds?: number | null;
 };
 
 export type CustomCommandUpdatePayload = Partial<CustomCommandPayload>;
+
+export type CommandReorderPayload = {
+  items: { id: string; sort_order: number }[];
+};
 
 export type CommandRunResponse = {
   id: string;
   custom_command_id: string;
   workspace_id: string;
   user_id: string;
+  /** Which worktree the run targeted; `null` means the base clone. */
+  worktree_id: string | null;
+  cwd: string | null;
   status: CommandRunStatus;
   exit_code: number | null;
   output: string;
@@ -422,6 +472,44 @@ export type CommandRunResponse = {
 
 export type CommandRunCreatePayload = {
   confirmed?: boolean;
+  worktree_id?: string | null;
+};
+
+/** A detection *proposal*. Nothing is persisted until the user imports it. */
+export type DetectedCommand = {
+  name: string;
+  command: string;
+  role: CommandRole;
+  cwd: string | null;
+  port: number | null;
+  /** The manifest this was derived from, so the UI can explain the suggestion. */
+  source_file: string;
+  reason: string;
+};
+
+export type DetectCommandsResponse = {
+  candidates: DetectedCommand[];
+};
+
+export type ImportCommandItem = {
+  name: string;
+  command: string;
+  role?: CommandRole;
+  cwd?: string | null;
+  port?: number | null;
+};
+
+export type RunPresetResponse = {
+  slug: string;
+  name: string;
+  description: string;
+  commands: {
+    name: string;
+    command: string;
+    role: CommandRole;
+    cwd: string | null;
+    port: number | null;
+  }[];
 };
 
 export type CommandRunStreamMessage =
@@ -1308,8 +1396,63 @@ export function runCustomCommand(
 ): Promise<CommandRunResponse> {
   return requestJson<CommandRunResponse>(`/workspaces/${workspaceId}/commands/${commandId}/run`, {
     method: "POST",
-    body: JSON.stringify({ confirmed: payload.confirmed ?? false }),
+    body: JSON.stringify({
+      confirmed: payload.confirmed ?? false,
+      worktree_id: payload.worktree_id ?? null,
+    }),
   });
+}
+
+/** Bulk `sort_order` update; returns the whole registry in its new order. */
+export function reorderCustomCommands(
+  workspaceId: string,
+  payload: CommandReorderPayload,
+): Promise<CustomCommandResponse[]> {
+  return requestJson<CustomCommandResponse[]>(`/workspaces/${workspaceId}/commands/reorder`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Read-only: proposes entries from the repo's manifests without persisting anything. */
+export function detectRunCommands(
+  workspaceId: string,
+  worktreeId?: string | null,
+): Promise<DetectCommandsResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<DetectCommandsResponse>(
+    `/workspaces/${workspaceId}/commands/detect${query}`,
+    { method: "POST" },
+  );
+}
+
+export function importRunCommands(
+  workspaceId: string,
+  items: ImportCommandItem[],
+): Promise<CustomCommandResponse[]> {
+  return requestJson<CustomCommandResponse[]>(`/workspaces/${workspaceId}/commands/import`, {
+    method: "POST",
+    body: JSON.stringify({ items }),
+  });
+}
+
+export function listRunPresets(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<RunPresetResponse[]> {
+  return requestJson<RunPresetResponse[]>(`/workspaces/${workspaceId}/commands/presets`, {
+    signal,
+  });
+}
+
+export function applyRunPreset(
+  workspaceId: string,
+  slug: string,
+): Promise<CustomCommandResponse[]> {
+  return requestJson<CustomCommandResponse[]>(
+    `/workspaces/${workspaceId}/commands/presets/${encodeURIComponent(slug)}/apply`,
+    { method: "POST" },
+  );
 }
 
 export function listCustomCommandRuns(

@@ -4,6 +4,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from app.services.run_paths import RunPathError, validate_relative_subpath
+
 WorkspaceStatus = Literal["creating", "ready", "busy", "error", "stopped"]
 # Where the workspace's repository comes from. ``repository`` clones an existing remote (needs
 # ``repo_url``), ``template`` scaffolds from a ``workspace_templates`` row (needs ``template_id``),
@@ -64,6 +66,16 @@ class WorkspaceUpdateRequest(BaseModel):
     repo_url: str | None = Field(default=None, min_length=1, max_length=2048)
     default_branch: str | None = Field(default=None, min_length=1, max_length=120)
     snapshot: str | None = Field(default=None, max_length=255)
+    # Repo-relative subdirectory the workspace's commands and dev server run in.
+    app_root: str | None = Field(default=None, max_length=512)
+
+    @field_validator("app_root")
+    @classmethod
+    def normalize_app_root(cls, value: str | None) -> str | None:
+        try:
+            return validate_relative_subpath(value)
+        except RunPathError as error:
+            raise ValueError(str(error)) from error
 
     @field_validator("name", "repo_url", "default_branch")
     @classmethod
@@ -96,6 +108,7 @@ class WorkspaceResponse(BaseModel):
     sandbox_id: str | None
     snapshot: str | None
     workspace_path: str
+    app_root: str | None = None
     status: WorkspaceStatus
     created_at: datetime
     updated_at: datetime

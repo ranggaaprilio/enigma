@@ -962,7 +962,8 @@ describe("App auth routing", () => {
     await userEvent.type(screen.getByLabelText("Command"), "pnpm test");
     await userEvent.type(screen.getByLabelText("Description"), "Run frontend tests");
     await userEvent.type(screen.getByLabelText("Hotkey"), "T");
-    await userEvent.click(screen.getByLabelText("Requires confirmation"));
+    // Renamed in Epic 10: the flag is about intent ("ask me first"), not permission.
+    await userEvent.click(screen.getByLabelText(/Ask me first/));
     await userEvent.click(screen.getByRole("button", { name: "Save" }));
 
     expect(await screen.findAllByText("pnpm test")).not.toHaveLength(0);

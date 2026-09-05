@@ -65,6 +65,7 @@ from app.services.repositories import (
 from app.services.templates import TemplateNotFoundError
 from app.services.workspace_init import WorkspaceInitializationError
 from app.services.workspaces import (
+    APP_ROOT_UNSET,
     SNAPSHOT_UNSET,
     InvalidEnvVarKeyError,
     SqlAlchemyWorkspaceService,
@@ -118,6 +119,7 @@ class WorkspaceService(Protocol):
         repo_url: str | None = None,
         default_branch: str | None = None,
         snapshot: str | None | object = SNAPSHOT_UNSET,
+        app_root: str | None | object = APP_ROOT_UNSET,
     ) -> Workspace: ...
 
     async def reprovision(self, workspace_id: UUID, owner_id: UUID) -> Workspace: ...
@@ -1365,6 +1367,8 @@ async def update_workspace(
         )
         if "snapshot" in payload.model_fields_set:
             update_values["snapshot"] = payload.snapshot
+        if "app_root" in payload.model_fields_set:
+            update_values["app_root"] = payload.app_root
         workspace = await service.update(**update_values)
     except WorkspaceNotFoundError:
         raise not_found() from None

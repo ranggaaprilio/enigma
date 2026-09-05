@@ -70,6 +70,12 @@ class Settings(BaseSettings):
     mise_auto_install: bool = True
     mise_install_url: str = "https://mise.run"
     dev_server_command_timeout_seconds: int = 30
+    # User-authored registry commands get their own budget: `pnpm install` and
+    # `alembic upgrade head` cannot finish inside agent_command_timeout_seconds (20s).
+    command_run_timeout_seconds: int = 900
+    command_run_max_timeout_seconds: int = 3600
+    command_run_rate_limit_attempts: int = 30
+    command_run_rate_limit_window_seconds: int = 60
     github_api_base_url: str = "https://api.github.com"
     github_api_timeout_seconds: int = 30
     max_worktrees_per_workspace: int = 5

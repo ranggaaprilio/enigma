@@ -9,7 +9,7 @@ from app.api import dev_server as dev_server_module
 from app.core.config import get_settings
 from app.core.security import hash_password
 from app.main import app
-from app.models import User, Workspace, WorkspaceWorktree
+from app.models import CustomCommand, User, Workspace, WorkspaceWorktree
 from app.services.daytona_runtime import RuntimeCommandResult
 from app.services.dev_server import (
     DevServerNotClonedError,
@@ -105,12 +105,37 @@ class FakeRuntime:
         return RuntimeCommandResult(exit_code=0, stdout="", stderr="")
 
 
+class FakeScalars:
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    def first(self):
+        return self._rows[0] if self._rows else None
+
+    def all(self):
+        return list(self._rows)
+
+
+class FakeResult:
+    def __init__(self, rows: list) -> None:
+        self._rows = rows
+
+    def scalars(self) -> FakeScalars:
+        return FakeScalars(self._rows)
+
+
 class FakeSession:
     def __init__(
-        self, workspace: Workspace, worktree: WorkspaceWorktree | None = None
+        self,
+        workspace: Workspace,
+        worktree: WorkspaceWorktree | None = None,
+        registry: dict[str, CustomCommand] | None = None,
     ) -> None:
         self.workspace = workspace
         self.worktree = worktree
+        # Registry entries keyed by lifecycle role, as DevServerService._registry_entry looks
+        # them up. Empty (the default) means "no run configuration" — the mise path.
+        self.registry = registry or {}
 
     async def get(self, model, pk):
         if self.workspace.id == pk:
@@ -118,6 +143,12 @@ class FakeSession:
         if self.worktree is not None and self.worktree.id == pk:
             return self.worktree
         return None
+
+    async def execute(self, statement):
+        """Serve DevServerService._registry_entry by reading the role off the query."""
+        role = statement.compile().params.get("role_1")
+        entry = self.registry.get(role)
+        return FakeResult([entry] if entry is not None else [])
 
 
 def _worktree(workspace: Workspace, *, branch: str = "feature-x") -> WorkspaceWorktree:
@@ -647,3 +678,273 @@ async def test_dev_ensure_endpoint(dev_server_context):
     assert response.status_code == 200
     body = response.json()
     assert "status" in body and "port" in body
+
+
+# --- Epic 10: the registry drives what runs ------------------------------
+
+
+def _registry_command(
+    workspace: Workspace,
+    *,
+    role: str,
+    command: str,
+    cwd: str | None = None,
+    port: int | None = None,
+) -> CustomCommand:
+    now = datetime.now(UTC)
+    return CustomCommand(
+        id=uuid4(),
+        workspace_id=workspace.id,
+        name=role,
+        command=command,
+        role=role,
+        kind="task",
+        cwd=cwd,
+        port=port,
+        enabled=True,
+        sort_order=0,
+        requires_confirmation=False,
+        created_at=now,
+        updated_at=now,
+    )
+
+
+async def test_run_uses_the_registry_dev_command_without_a_mise_config():
+    """The acceptance criterion: a repo with no mise.toml can still be served."""
+    user = _user()
+    workspace = _workspace(user)
+    # Note: no mise.toml anywhere in the sandbox.
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}))
+    entry = _registry_command(
+        workspace, role="dev", command="uvicorn app.main:app --port 8000", cwd="backend"
+    )
+    service = DevServerService(
+        FakeSession(workspace, registry={"dev": entry}), get_settings(), runtime
+    )
+
+    state = await service.run(workspace.id, user.id)
+
+    assert state.status == "installing"
+    launch = next(command for command in runtime.commands if "nohup" in command)
+    assert "uvicorn app.main:app --port 8000" in launch
+    assert "mise run dev" not in launch
+    # The command runs in its own working directory, not the checkout root.
+    assert runtime.cwds[-1] == "workspace/backend"
+
+
+async def test_run_composes_app_root_with_the_command_cwd():
+    user = _user()
+    workspace = _workspace(user)
+    workspace.app_root = "apps"
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}))
+    entry = _registry_command(workspace, role="dev", command="pnpm dev", cwd="web")
+    service = DevServerService(
+        FakeSession(workspace, registry={"dev": entry}), get_settings(), runtime
+    )
+
+    await service.run(workspace.id, user.id)
+
+    assert runtime.cwds[-1] == "workspace/apps/web"
+
+
+async def test_run_without_a_registry_entry_still_uses_mise():
+    """Existing workspaces must behave exactly as they did before the migration."""
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git", "workspace/mise.toml"}))
+    service = DevServerService(FakeSession(workspace), get_settings(), runtime)
+
+    state = await service.run(workspace.id, user.id)
+
+    assert state.status == "installing"
+    launch = next(command for command in runtime.commands if "nohup" in command)
+    assert "mise run dev" in launch
+    assert runtime.cwds[-1] == "workspace"
+
+
+async def test_setup_uses_the_registry_install_command():
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}))
+    entry = _registry_command(workspace, role="install", command="pnpm install", cwd="frontend")
+    service = DevServerService(
+        FakeSession(workspace, registry={"install": entry}), get_settings(), runtime
+    )
+
+    state = await service.setup(workspace.id, user.id)
+
+    assert state.status == "installing"
+    launch = next(command for command in runtime.commands if "nohup" in command)
+    assert "pnpm install" in launch
+    assert runtime.cwds[-1] == "workspace/frontend"
+
+
+async def test_status_prefers_the_port_the_dev_command_declares():
+    """First-match probing would report 5173 and hide an API on 8000."""
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git"}), status_value="running", open_ports={5173, 8000}
+    )
+    entry = _registry_command(workspace, role="dev", command="uvicorn app.main:app", port=8000)
+    service = DevServerService(
+        FakeSession(workspace, registry={"dev": entry}), get_settings(), runtime
+    )
+
+    state = await service.status(workspace.id, user.id)
+
+    assert state.status == "running"
+    assert state.port == 8000
+
+
+# --- process tracking: registry launches must be stoppable and detectable ----------------
+
+
+async def test_registry_dev_launch_records_its_pid_and_stop_kills_that_tree():
+    """`pkill -f 'mise run dev'` never matched a `sh -lc 'pnpm dev'` launch, so Stop orphaned
+    the server and `ensure_running` then started a second one on top of it."""
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}))
+    entry = _registry_command(workspace, role="dev", command="pnpm dev")
+    service = DevServerService(
+        FakeSession(workspace, registry={"dev": entry}), get_settings(), runtime
+    )
+
+    await service.run(workspace.id, user.id)
+    launch = next(command for command in runtime.commands if "nohup" in command)
+    assert "echo $$ > /tmp/enigma-dev.pid" in launch
+
+    await service.stop(workspace.id, user.id)
+    stop = runtime.commands[-1]
+    # Children first, then the wrapper — a killed `sh -c` must not leave its server behind.
+    assert "killtree" in stop and "pgrep -P" in stop
+    assert "/tmp/enigma-dev.pid" in stop and "/tmp/enigma-dev-setup.pid" in stop
+    assert stop.rstrip().endswith("echo stopped > /tmp/enigma-dev.status")
+
+
+async def test_setup_records_a_separate_pid_so_liveness_ignores_it():
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git", "workspace/mise.toml"}))
+    service = _service(runtime, workspace)
+
+    await service.setup(workspace.id, user.id)
+
+    launch = next(command for command in runtime.commands if "nohup" in command)
+    assert "echo $$ > /tmp/enigma-dev-setup.pid" in launch
+    assert "/tmp/enigma-dev.pid" not in launch
+
+
+async def test_liveness_check_reads_the_pid_file_before_the_legacy_pgrep():
+    user = _user()
+    workspace = _workspace(user)
+    workspace.dev_autostart = True
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git", "workspace/mise.toml"}),
+        status_value="running",
+        dev_process_alive=True,
+    )
+    service = _service(runtime, workspace)
+
+    state = await service.ensure_running(workspace.id, user.id)
+
+    assert state.status == "starting"
+    probe = next(command for command in runtime.commands if "pgrep" in command)
+    assert "cat /tmp/enigma-dev.pid" in probe
+    assert "kill -0" in probe
+    # A recycled PID that now belongs to something else must not count as our server.
+    assert "grep -q '[e]nigma-dev'" in probe
+    assert not any("nohup" in command for command in runtime.commands)
+
+
+# --- working directories: app_root and the install entry's own cwd -------------------
+
+
+async def test_mise_run_honours_app_root_when_the_config_lives_in_the_app_package():
+    """A monorepo with `apps/api/mise.toml` and no root config: the terminal and command runs
+    already start in apps/api, so the mise default must run (and look for config) there too."""
+    user = _user()
+    workspace = _workspace(user)
+    workspace.app_root = "apps/api"
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git", "workspace/apps/api/mise.toml"}))
+    service = _service(runtime, workspace)
+
+    state = await service.run(workspace.id, user.id)
+
+    assert state.status == "installing"
+    launch = next(command for command in runtime.commands if "nohup" in command)
+    assert "mise run dev" in launch
+    assert runtime.cwds[-1] == "workspace/apps/api"
+
+
+async def test_mise_run_with_app_root_still_accepts_a_root_config():
+    """mise resolves config upward from the cwd, so a root mise.toml serves an app_root too."""
+    user = _user()
+    workspace = _workspace(user)
+    workspace.app_root = "apps/api"
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git", "workspace/mise.toml"}))
+    service = _service(runtime, workspace)
+
+    state = await service.run(workspace.id, user.id)
+
+    assert state.status == "installing"
+    assert runtime.cwds[-1] == "workspace/apps/api"
+
+
+async def test_mise_setup_honours_app_root():
+    user = _user()
+    workspace = _workspace(user)
+    workspace.app_root = "apps/api"
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git", "workspace/apps/api/mise.toml"}))
+    service = _service(runtime, workspace)
+
+    state = await service.setup(workspace.id, user.id)
+
+    assert state.status == "installing"
+    assert runtime.cwds[-1] == "workspace/apps/api"
+
+
+async def test_worktree_run_installs_in_the_install_entrys_own_directory():
+    """install=`pnpm install` at the repo root + dev=`pnpm dev` in apps/web: the install must
+    run at the root (as Setup runs it), not inside apps/web."""
+    user = _user()
+    workspace = _workspace(user)
+    worktree = _worktree(workspace)
+    runtime = FakeRuntime(FakeSandbox({"worktrees/feature-x/.git"}))
+    dev = _registry_command(workspace, role="dev", command="pnpm dev", cwd="apps/web")
+    install = _registry_command(workspace, role="install", command="pnpm install")
+    service = DevServerService(
+        FakeSession(workspace, worktree, registry={"dev": dev, "install": install}),
+        get_settings(),
+        runtime,
+    )
+
+    await service.run(workspace.id, user.id, worktree.id)
+
+    launch = next(command for command in runtime.commands if "nohup" in command)
+    assert runtime.cwds[-1] == "worktrees/feature-x/apps/web"
+    # The whole script is single-quoted for `nohup sh -c`, so inner quotes are escaped; check
+    # the shape rather than the literal quoting.
+    assert "( cd " in launch and "worktrees/feature-x'" in launch
+    assert launch.index("( cd ") < launch.index("pnpm install") < launch.index("pnpm dev")
+
+
+async def test_worktree_run_skips_the_cd_when_install_and_dev_share_a_directory():
+    user = _user()
+    workspace = _workspace(user)
+    worktree = _worktree(workspace)
+    runtime = FakeRuntime(FakeSandbox({"worktrees/feature-x/.git"}))
+    dev = _registry_command(workspace, role="dev", command="pnpm dev", cwd="web")
+    install = _registry_command(workspace, role="install", command="pnpm install", cwd="web")
+    service = DevServerService(
+        FakeSession(workspace, worktree, registry={"dev": dev, "install": install}),
+        get_settings(),
+        runtime,
+    )
+
+    await service.run(workspace.id, user.id, worktree.id)
+
+    launch = next(command for command in runtime.commands if "nohup" in command)
+    assert "( cd " not in launch
+    assert "pnpm install" in launch

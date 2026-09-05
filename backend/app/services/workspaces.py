@@ -15,6 +15,8 @@ from app.services.workspace_init import WorkspaceInitializationError, WorkspaceI
 
 ENV_KEY_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 SNAPSHOT_UNSET = object()
+# Distinguishes "leave app_root alone" from "clear it back to the checkout root".
+APP_ROOT_UNSET = object()
 
 
 class WorkspaceAlreadyExistsError(Exception):
@@ -243,6 +245,7 @@ class SqlAlchemyWorkspaceService:
         repo_url: str | None = None,
         default_branch: str | None = None,
         snapshot: str | None | object = SNAPSHOT_UNSET,
+        app_root: str | None | object = APP_ROOT_UNSET,
     ) -> Workspace:
         workspace = await self.get_for_owner(workspace_id, owner_id)
         if name is not None:
@@ -254,6 +257,8 @@ class SqlAlchemyWorkspaceService:
             workspace.default_branch = default_branch
         if snapshot is not SNAPSHOT_UNSET:
             workspace.snapshot = snapshot
+        if app_root is not APP_ROOT_UNSET:
+            workspace.app_root = app_root or None
         self.session.add(workspace)
         await self.session.commit()
         await self.session.refresh(workspace)
