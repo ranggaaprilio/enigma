@@ -10,8 +10,9 @@
 # (falling back to docker-compose.yml defaults).
 #
 # Usage:
-#   ./scripts/clean_data.sh           # prompts for confirmation
-#   ./scripts/clean_data.sh --yes     # skip the confirmation prompt
+#   ./scripts/clean_data.sh                           # prompts for confirmation, defaults to podman
+#   ./scripts/clean_data.sh --yes                     # skip the confirmation prompt
+#   ./scripts/clean_data.sh --runtime docker --yes    # use docker instead of podman
 #
 set -euo pipefail
 
@@ -19,6 +20,62 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${ROOT_DIR}"
+
+# --- parse --runtime param (default: podman) -------------------------------
+CONTAINER_RUNTIME="podman"
+RUNTIME_SET=""
+CONFIRM_YES=""
+for arg in "$@"; do
+  case "$arg" in
+    --runtime|--runtime=*)
+      if [[ "$arg" == "--runtime" ]]; then
+        echo "ERROR: --runtime requires a value. Use --runtime=podman or --runtime=docker."
+        exit 1
+      fi
+      RUNTIME_SET="${arg#*=}"
+      ;;
+    -r|--runtime)
+      # handled by the next shift-friendly iteration
+      :
+      ;;
+    --yes|-y)
+      CONFIRM_YES="1"
+      ;;
+  esac
+done
+
+# Re-parse with shift for --runtime <value> style
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --runtime)
+      RUNTIME_SET="${2:?ERROR: --runtime requires a value (podman or docker)}"
+      shift 2
+      ;;
+    -r)
+      RUNTIME_SET="${2:?ERROR: -r requires a value (podman or docker)}"
+      shift 2
+      ;;
+    --runtime=*)
+      shift
+      ;;
+    --yes|-y)
+      shift
+      ;;
+    *)
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "$RUNTIME_SET" ]]; then
+  CONTAINER_RUNTIME="$RUNTIME_SET"
+fi
+
+if ! command -v "${CONTAINER_RUNTIME}" &>/dev/null; then
+  echo "ERROR: '${CONTAINER_RUNTIME}' not found in PATH."
+  exit 1
+fi
+echo "Using container runtime: ${CONTAINER_RUNTIME}"
 
 # --- container names --------------------------------------------------------
 REDIS_CONTAINER="${REDIS_CONTAINER:-enigma-redis-1}"
@@ -34,7 +91,7 @@ POSTGRES_USER="${POSTGRES_USER:-execute}"
 POSTGRES_DB="${POSTGRES_DB:-execute_dashboard}"
 
 # --- confirmation -----------------------------------------------------------
-if [[ "${1:-}" != "--yes" && "${1:-}" != "-y" ]]; then
+if [[ -z "$CONFIRM_YES" ]]; then
   echo "This will PERMANENTLY DELETE all data in:"
   echo "  - Redis:    ${REDIS_CONTAINER} (FLUSHALL)"
   echo "  - Postgres: ${POSTGRES_CONTAINER} / db '${POSTGRES_DB}' (drop schema + re-migrate)"
@@ -44,12 +101,12 @@ fi
 
 # --- redis ------------------------------------------------------------------
 echo "==> Flushing Redis (${REDIS_CONTAINER})..."
-podman exec "${REDIS_CONTAINER}" redis-cli FLUSHALL
-echo "    DBSIZE now: $(podman exec "${REDIS_CONTAINER}" redis-cli DBSIZE)"
+${CONTAINER_RUNTIME} exec "${REDIS_CONTAINER}" redis-cli FLUSHALL
+echo "    DBSIZE now: $(${CONTAINER_RUNTIME} exec "${REDIS_CONTAINER}" redis-cli DBSIZE)"
 
 # --- postgres ---------------------------------------------------------------
 echo "==> Dropping & recreating public schema (${POSTGRES_CONTAINER} / ${POSTGRES_DB})..."
-podman exec "${POSTGRES_CONTAINER}" psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -c "
+${CONTAINER_RUNTIME} exec "${POSTGRES_CONTAINER}" psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB}" -v ON_ERROR_STOP=1 -c "
   DROP SCHEMA public CASCADE;
   CREATE SCHEMA public;
   GRANT ALL ON SCHEMA public TO ${POSTGRES_USER};
@@ -58,6 +115,6 @@ podman exec "${POSTGRES_CONTAINER}" psql -U "${POSTGRES_USER}" -d "${POSTGRES_DB
 
 # --- re-run migrations ------------------------------------------------------
 echo "==> Re-applying Alembic migrations (${BACKEND_CONTAINER})..."
-podman exec "${BACKEND_CONTAINER}" sh -lc "cd /app && uv run alembic upgrade head"
+${CONTAINER_RUNTIME} exec "${BACKEND_CONTAINER}" sh -lc "cd /app && uv run alembic upgrade head"
 
 echo "==> Done. Redis flushed; Postgres reset to a clean, migrated schema."
