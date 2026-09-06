@@ -130,8 +130,8 @@ class WorkspaceTools:
         self.root = working_dir if working_dir is not None else workspace.workspace_path
         # When allowlist mode is enabled, run_command accepts only programs in
         # ``allowed_commands`` (the denylist is superseded). When disabled the
-        # legacy DANGEROUS_COMMANDS denylist applies. Shell-operator and
-        # absolute-path checks always apply in both modes.
+        # legacy DANGEROUS_COMMANDS denylist applies. Disabling ``deny_dangerous``
+        # without enabling the allowlist is an explicit unrestricted mode.
         self.allowlist_enabled = allowlist_enabled
         self.allowed_commands = frozenset(allowed_commands or ())
         self.deny_dangerous = deny_dangerous
@@ -446,11 +446,17 @@ class WorkspaceTools:
         return capped
 
     async def run_command(self, command: str) -> CommandResult:
-        argv = self._validate_command(command)
+        if not self.allowlist_enabled and not self.deny_dangerous:
+            if not command.strip():
+                raise DangerousCommandError("Command cannot be empty")
+            executable = command
+        else:
+            argv = self._validate_command(command)
+            executable = " ".join(shlex.quote(value) for value in argv)
         try:
             response = await self.runtime.exec(
                 self.workspace,
-                " ".join(shlex.quote(value) for value in argv),
+                executable,
                 cwd=self.root,
                 timeout=self.command_timeout_seconds,
             )

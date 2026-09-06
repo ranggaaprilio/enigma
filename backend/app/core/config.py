@@ -51,9 +51,8 @@ class Settings(BaseSettings):
     agent_max_command_output_chars: int = 20_000
     agent_command_allowlist_enabled: bool = False
     agent_command_allowlist: str | list[str] = Field(default_factory=list)
-    # When False, the DANGEROUS_COMMANDS denylist (npm, pnpm, yarn, uv, git, …) is relaxed so
-    # the agent can install dependencies and run build/test commands during development. The
-    # shell-operator and absolute-path checks always remain enforced in both modes.
+    # When False, agent commands run unrestricted, including shell operators, absolute paths,
+    # and programs in DANGEROUS_COMMANDS. Only use this for trusted agents in isolated sandboxes.
     agent_command_deny_dangerous: bool = True
     # Multi-turn session context: total char budget for the prior-turn transcript prepended to
     # a session turn's prompt, and a per-turn cap on how much of a single turn's assistant text

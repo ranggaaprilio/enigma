@@ -403,8 +403,16 @@ def test_validate_command_deny_dangerous_false_relaxes_denylist():
     # npm is denylisted by default, but allowed when the denylist is relaxed.
     assert tools._validate_command("npm install") == ["npm", "install"]
     assert tools._validate_command("pnpm test") == ["pnpm", "test"]
-    # Shell operators and absolute paths are always rejected regardless.
+    # Direct validation remains strict; run_command bypasses it in explicit unrestricted mode.
     with pytest.raises(DangerousCommandError):
         tools._validate_command("npm install && npm test")
     with pytest.raises(DangerousCommandError):
         tools._validate_command("/usr/bin/npm install")
+
+
+async def test_run_command_deny_dangerous_false_passes_raw_shell_command():
+    tools, runtime = make_tools(deny_dangerous=False)
+
+    await tools.run_command("/usr/bin/npm install && npm test > result.log")
+
+    assert runtime.exec_calls[0]["command"] == "/usr/bin/npm install && npm test > result.log"

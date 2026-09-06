@@ -76,7 +76,10 @@ SPECIFY_INIT_COMMAND = (
 
 GIT_TIMEOUT_SECONDS = 120
 # Upper bound for how long a phase's agent run may take before the finalizer gives up.
-PHASE_FINALIZE_TIMEOUT_SECONDS = 1800
+# Implementation runs can legitimately spend well over 30 minutes editing and validating a
+# project. Keep the finalizer alive long enough for those runs instead of orphaning them while
+# the provider is still producing events.
+PHASE_FINALIZE_TIMEOUT_SECONDS = 7200
 PHASE_POLL_INTERVAL_SECONDS = 2.0
 
 # Spec Kit's constitution template ships with bracketed UPPER_SNAKE placeholder tokens
@@ -704,15 +707,23 @@ class SpecKitService:
                 "scripts; only read and write files. Output only the artifact content to the file."
             )
         else:
-            sections.append(
-                "Implement the tasks by editing files in this worktree using the available "
-                "tools (read_file, write_file, apply_patch, search_code). Do NOT run git and do "
-                "NOT attempt to install dependencies, build, or run tests via shell commands — "
-                "package managers (`npm`, `pnpm`, `yarn`, `uv`), `git`, and shell control "
-                "operators (`;`, `&&`, `||`, `|`, redirections, backticks) are all blocked by the "
-                "sandbox and will fail. Only read and write files; the platform will handle "
-                "installing dependencies, running tests, and committing your changes."
-            )
+            if self.settings.agent_command_deny_dangerous:
+                sections.append(
+                    "Implement the tasks by editing files in this worktree using the available "
+                    "tools (read_file, write_file, apply_patch, search_code). Do NOT run git and "
+                    "do NOT attempt to install dependencies, build, or run tests via shell "
+                    "commands — package managers (`npm`, `pnpm`, `yarn`, `uv`), `git`, and shell "
+                    "control operators (`;`, `&&`, `||`, `|`, redirections, backticks) are all "
+                    "blocked by the sandbox and will fail. Only read and write files; the platform "
+                    "will handle installing dependencies, running tests, and committing changes."
+                )
+            else:
+                sections.append(
+                    "Implement the tasks by editing files in this worktree. You may use "
+                    "run_command without command restrictions to install dependencies and run "
+                    "focused builds or tests. Do not commit changes; the platform commits them "
+                    "after the run completes."
+                )
         return "\n\n---\n\n".join(sections)
 
     @staticmethod
