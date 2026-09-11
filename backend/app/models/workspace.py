@@ -75,6 +75,12 @@ class Workspace(Base):
     # Repo-relative path (below app_root) where the resolved env vars are materialised as a
     # .env file before each service launch. ``None`` => no file is written.
     env_file_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Epic 13: opt-in stable preview aliases (workspace_preview_aliases). The capability-host
+    # scheme stays the default and always works; enabling this adds a second, weaker-posture
+    # hostname per service that survives capability rotation.
+    preview_alias_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="creating")
     dev_autostart: Mapped[bool] = mapped_column(
         Boolean,

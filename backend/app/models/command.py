@@ -41,9 +41,27 @@ class CustomCommand(Base):
             "timeout_seconds is null or (timeout_seconds between 1 and 86400)",
             name="ck_custom_commands_timeout",
         ),
+        # Epic 13: only a service command may be the workspace's entry point.
+        CheckConstraint(
+            "is_entry_point = false or kind = 'service'",
+            name="ck_custom_commands_entry_point_kind",
+        ),
+        # Epic 13: a health-check path is always root-relative, like a URL path.
+        CheckConstraint(
+            "health_path is null or health_path like '/%'",
+            name="ck_custom_commands_health_path",
+        ),
         Index("ix_custom_commands_workspace_id", "workspace_id"),
         Index("ix_custom_commands_created_at", "created_at"),
         Index("ix_custom_commands_workspace_sort", "workspace_id", "sort_order"),
+        # At most one entry point per workspace (partial unique index -- NULL/false rows are
+        # not indexed, so this only ever constrains the row(s) where is_entry_point is true).
+        Index(
+            "uq_custom_commands_entry_point",
+            "workspace_id",
+            unique=True,
+            postgresql_where=text("is_entry_point"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -75,6 +93,16 @@ class CustomCommand(Base):
     )
     # ``None`` falls back to Settings.command_run_timeout_seconds.
     timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Epic 13: the workspace's primary "Open app" service. Configuration lives here (not on
+    # ``workspace_services``) because ``_sync_definitions`` deletes and recreates instance rows,
+    # which have no stable identity to hang user-editable settings off of.
+    is_entry_point: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    # Epic 13: root-relative path probed over HTTP for readiness, instead of a bare TCP connect.
+    # ``None`` means only the TCP check applies. Same rationale as ``is_entry_point`` for living
+    # here rather than on the instance row.
+    health_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

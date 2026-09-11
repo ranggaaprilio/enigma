@@ -85,7 +85,9 @@ class FakeRuntime:
                 raise DaytonaRuntimeError("sandbox unreachable")
             lines = []
             for row_id, port_token in re.findall(
-                r"probe\('([^']*)', '[^']*', '[^']*', '[^']*', (None|\d+)\)", command
+                r"probe\('([^']*)', '[^']*', '[^']*', '[^']*', "
+                r"(None|\d+), (?:None|'[^']*')\)",
+                command,
             ):
                 status = self.statuses.get(row_id, "none")
                 pid_alive = 1 if row_id in self.pids_alive else 0
@@ -569,8 +571,43 @@ async def test_launch_passes_env_to_runtime_exec(db_session):
 
     await manager.start(workspace.id, row.id, user.id)
 
-    assert runtime.envs[-1] == {"API_KEY": secret_value}
+    # Epic 13: every launch also carries ENIGMA_* exports (workspace id, branch, this row's own
+    # name/port) -- assert the user's own value survives untouched rather than pinning the
+    # exact dict.
+    assert runtime.envs[-1]["API_KEY"] == secret_value
     assert all(secret_value not in command for command in runtime.commands)
+
+
+async def test_launch_resolves_templates_but_never_leaks_the_resolved_value_into_the_script(
+    db_session,
+):
+    """The same invariant as above, for a *resolved template* value rather than a plain
+    secret: substitution feeds the runtime's `env` parameter only, never the script body."""
+    user, workspace = await make_workspace(db_session)
+    cmd = await make_service_command(db_session, workspace, port=8000)
+    db_session.add(
+        WorkspaceEnvVar(
+            id=uuid4(),
+            workspace_id=workspace.id,
+            key="WORKSPACE_ID_ECHO",
+            encrypted_value=WorkspaceSecretCipher(
+                get_settings().workspace_env_encryption_key
+            ).encrypt("${ENIGMA_WORKSPACE_ID}"),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}))
+    manager = WorkspaceServiceManager(db_session, get_settings(), runtime)
+    await manager.list(workspace.id, user.id)
+    row = await _row_for_command(db_session, workspace.id, cmd.id)
+
+    await manager.start(workspace.id, row.id, user.id)
+
+    resolved_value = str(workspace.id)
+    assert runtime.envs[-1]["WORKSPACE_ID_ECHO"] == resolved_value
+    assert all(resolved_value not in command for command in runtime.commands)
 
 
 async def test_ensure_running_does_not_relaunch_on_a_transient_probe_failure(db_session):

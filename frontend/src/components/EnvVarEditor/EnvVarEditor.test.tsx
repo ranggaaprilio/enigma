@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -68,6 +68,8 @@ const SERVICE_COMMAND: CustomCommandResponse = {
   sort_order: 10,
   enabled: true,
   timeout_seconds: null,
+  health_path: null,
+  is_entry_point: false,
   created_at: "2026-09-05T00:00:00Z",
   updated_at: "2026-09-05T00:00:00Z",
 };
@@ -91,6 +93,10 @@ const SERVICE: WorkspaceServiceResponse = {
   last_seen_at: null,
   preview_session_id: null,
   public_url: null,
+  health_status: "unknown",
+  health_checked_at: null,
+  health_path: null,
+  is_entry_point: false,
 };
 
 function jsonResponse(body: unknown, status = 200) {
@@ -354,5 +360,83 @@ describe("EnvVarEditor", () => {
         fetchMock.mock.calls.some(([url]) => String(url).includes("/services/svc-1/restart")),
       ).toBe(true),
     );
+  });
+
+  it("offers a template-suggestion chip per service command and inserts it into the bulk text on click", async () => {
+    stubFetch(() => undefined);
+
+    render(
+      <EnvVarEditor
+        workspace={workspace}
+        envVars={[envVar({})]}
+        onEnvVarsChanged={() => undefined}
+        onWorkspaceChanged={() => undefined}
+      />,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Bulk edit" }));
+
+    const chip = await screen.findByText("${ENIGMA_PREVIEW_URL:web}");
+    await userEvent.click(chip);
+
+    expect(screen.getByLabelText("Paste .env text")).toHaveValue("${ENIGMA_PREVIEW_URL:web}");
+  });
+
+  it("lists one datalist option per service command for the replace-value input", async () => {
+    stubFetch(() => undefined);
+
+    render(
+      <EnvVarEditor
+        workspace={workspace}
+        envVars={[envVar({})]}
+        onEnvVarsChanged={() => undefined}
+        onWorkspaceChanged={() => undefined}
+      />,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Replace value" }));
+
+    const options = document.querySelectorAll(
+      "#enigma-preview-template-suggestions option",
+    );
+    expect(options).toHaveLength(1);
+    expect((options[0] as HTMLOptionElement).value).toBe("${ENIGMA_PREVIEW_URL:web}");
+  });
+
+  it("renders a server-reported template warning in the existing warnings list", async () => {
+    stubFetch((url) => {
+      if (url.includes("/env-vars/bulk") && !url.includes("bulk-delete")) {
+        return jsonResponse({
+          items: [{ key: "API_BASE", status: "created", line: 1, message: null }],
+          created: 1,
+          updated: 0,
+          unchanged: 0,
+          invalid: 0,
+          dry_run: true,
+          affected_services: [],
+          warnings: [
+            'API_BASE references unknown service "worker" in ${ENIGMA_PREVIEW_URL:worker}.',
+          ],
+        });
+      }
+      return undefined;
+    });
+
+    render(
+      <EnvVarEditor
+        workspace={workspace}
+        envVars={[envVar({})]}
+        onEnvVarsChanged={() => undefined}
+        onWorkspaceChanged={() => undefined}
+      />,
+    );
+
+    await userEvent.click(await screen.findByRole("button", { name: "Bulk edit" }));
+    fireEvent.change(screen.getByLabelText("Paste .env text"), {
+      target: { value: "API_BASE=${ENIGMA_PREVIEW_URL:worker}" },
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Preview" }));
+
+    expect(await screen.findByText(/references unknown service "worker"/)).toBeInTheDocument();
   });
 });

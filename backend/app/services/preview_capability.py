@@ -1,6 +1,7 @@
 import base64
 import hashlib
 import hmac
+import re
 import struct
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -41,7 +42,7 @@ def create_preview_proxy_url(
         expires_at=expires_at,
         secret_key=secret_key,
     )
-    parsed = _parse_proxy_base_url(base_url)
+    parsed = parse_proxy_base_url(base_url)
     host = f"{capability}.{parsed.hostname}"
     if parsed.port is not None:
         host = f"{host}:{parsed.port}"
@@ -104,19 +105,44 @@ def decode_preview_capability(
     )
 
 
-def capability_from_host(host: str, *, base_url: str) -> str:
-    parsed = _parse_proxy_base_url(base_url)
+def proxy_host_label(host: str, *, base_url: str) -> str:
+    """The single DNS label directly under the proxy's own hostname -- e.g. ``capability`` (or,
+    from Epic 13 onward, an alias) out of ``capability.preview.example.com``.
+
+    Hardens against trailing-dot, uppercase and multi-label tricks: the ``Host`` header is
+    lowercased and its trailing dot stripped before the suffix check, and a remainder containing
+    a dot (a second, nested subdomain) is rejected outright. Epic 13's alias resolution reuses
+    this exact function -- unmodified -- rather than duplicating the hardening.
+    """
+    parsed = parse_proxy_base_url(base_url)
     hostname = host.split(":", 1)[0].rstrip(".").lower()
     suffix = f".{parsed.hostname.lower()}"
     if not hostname.endswith(suffix):
         raise InvalidPreviewCapabilityError("Invalid preview proxy host")
-    capability = hostname[: -len(suffix)]
-    if not capability or "." in capability:
+    label = hostname[: -len(suffix)]
+    if not label or "." in label:
         raise InvalidPreviewCapabilityError("Invalid preview proxy host")
-    return capability
+    return label
 
 
-def _parse_proxy_base_url(base_url: str) -> SplitResult:
+# A capability label is exactly 63 base32 characters: a 23-byte payload (1-byte version +
+# 16-byte session UUID + uint16 port + uint32 expiry) plus a 16-byte truncated HMAC, base32
+# encoded over [A-Z2-7] and lowercased. `-` (used by every alias, Epic 13) is not in that
+# alphabet, and no alias can reach 63 characters (its format caps it at 62) -- so the two label
+# shapes are mutually exclusive by construction, not by checking one first.
+CAPABILITY_LABEL_LENGTH = 63
+_CAPABILITY_LABEL_PATTERN = re.compile(r"^[a-z2-7]{63}$")
+
+
+def is_capability_label(label: str) -> bool:
+    return bool(_CAPABILITY_LABEL_PATTERN.match(label))
+
+
+def capability_from_host(host: str, *, base_url: str) -> str:
+    return proxy_host_label(host, base_url=base_url)
+
+
+def parse_proxy_base_url(base_url: str) -> SplitResult:
     parsed = urlsplit(base_url)
     if (
         parsed.scheme not in {"http", "https"}

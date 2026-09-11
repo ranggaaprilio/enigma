@@ -296,6 +296,18 @@ function fallbackResponse(url: string) {
       }),
     );
   }
+  if (url.includes("/preview/composition")) {
+    return Promise.resolve(
+      jsonResponse({
+        workspace_id: workspace.id,
+        preview_alias_enabled: false,
+        proxy_base_url: "http://localhost:8001",
+        entry_point_service_id: null,
+        services: [],
+        advisories: [],
+      }),
+    );
+  }
   if (url.includes("/services")) {
     return Promise.resolve(
       jsonResponse({ services: [], environment: { status: "idle", message: null }, limit: 4 }),
@@ -1267,6 +1279,10 @@ describe("App auth routing", () => {
       last_seen_at: "2026-05-25T00:00:00Z",
       preview_session_id: "prev-1",
       public_url: publicUrl as string | null,
+      health_status: "healthy" as string,
+      health_checked_at: "2026-05-25T00:00:00Z" as string | null,
+      health_path: "/healthz",
+      is_entry_point: true,
     };
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith("/auth/me")) {
@@ -1290,6 +1306,44 @@ describe("App auth routing", () => {
           }),
         );
       }
+      if (url.includes(`/workspaces/${workspace.id}/preview/composition`)) {
+        return Promise.resolve(
+          jsonResponse({
+            workspace_id: workspace.id,
+            preview_alias_enabled: false,
+            proxy_base_url: "http://localhost:8001",
+            entry_point_service_id: currentService.is_entry_point ? currentService.id : null,
+            services: [
+              {
+                service_id: currentService.id,
+                custom_command_id: currentService.custom_command_id,
+                name: currentService.name,
+                role: currentService.role,
+                kind: currentService.kind,
+                port: currentService.port,
+                status: currentService.status,
+                health_status: currentService.health_status,
+                health_checked_at: currentService.health_checked_at,
+                is_entry_point: currentService.is_entry_point,
+                entry_point_source: "explicit",
+                branch: currentService.branch,
+                worktree_id: currentService.worktree_id,
+                preview_session_id: currentService.preview_session_id,
+                capability_url: currentService.public_url,
+                capability_url_rotates: true,
+                alias: null,
+                alias_url: null,
+                alias_prime_url: null,
+                localhost_url: currentService.port
+                  ? `http://127.0.0.1:${currentService.port}`
+                  : null,
+                diagnoses: [],
+              },
+            ],
+            advisories: [],
+          }),
+        );
+      }
       if (
         url.endsWith(`/workspaces/${workspace.id}/services/${serviceId}/stop`) &&
         init?.method === "POST"
@@ -1309,6 +1363,14 @@ describe("App auth routing", () => {
     // The running service auto-opens once the poll finds it.
     const frame = await screen.findByTitle("Web preview");
     expect(frame).toHaveAttribute("src", publicUrl);
+
+    // Epic 13: the entry-point card (its own "Copy app URL" button, distinct from
+    // ServiceRow's "Copy URL") and the healthy badge -- rendered once in the entry-point
+    // card and once in the service row below it.
+    expect(await screen.findByRole("button", { name: "Copy app URL" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getAllByText("Healthy").length).toBeGreaterThan(0);
+    });
 
     await userEvent.click(screen.getByRole("button", { name: "Mobile" }));
     expect(frame).toHaveClass("max-w-[390px]");

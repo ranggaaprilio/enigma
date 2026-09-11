@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
@@ -13,10 +13,11 @@ from app.models import CommandRun, CustomCommand, Workspace
 from app.services.agent_tools import DangerousCommandError
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
+from app.services.env_templates import enigma_exports, substitute
 from app.services.git_providers import redact_secrets
 from app.services.notifications import NotificationService
 from app.services.run_paths import RunPathError, resolve_run_cwd
-from app.services.workspace_env import redactable_env_values
+from app.services.workspace_env import build_template_context, redactable_env_values
 from app.services.workspace_env import resolve as _resolve_env
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -41,6 +42,15 @@ class CommandConfirmationRequiredError(Exception):
 
 class CommandWorkspacePathError(Exception):
     pass
+
+
+class CustomCommandInvalidError(Exception):
+    """A command payload is well-formed JSON but violates a domain rule -- e.g. marking a
+    `task`-kind command as the entry point."""
+
+    def __init__(self, message: str) -> None:
+        self.message = message
+        super().__init__(message)
 
 
 class CommandRuntime:
@@ -105,11 +115,22 @@ class CommandService:
         enabled: bool = True,
         timeout_seconds: int | None = None,
         sort_order: int | None = None,
+        health_path: str | None = None,
+        is_entry_point: bool = False,
     ) -> CustomCommand:
         workspace = await self._get_workspace(workspace_id, user_id)
         # A `dev`-role command is, by default, a long-running service (Epic 11) — that is what
         # lets it appear in the multi-service preview at all. An explicit `kind` always wins.
         effective_kind = kind if kind is not None else ("service" if role == "dev" else "task")
+        if is_entry_point and effective_kind != "service":
+            raise CustomCommandInvalidError(
+                "Only a long-running service command can be the entry point."
+            )
+        if is_entry_point:
+            # Clear any existing entry point in this workspace first -- the partial unique
+            # index (`uq_custom_commands_entry_point`) allows at most one `true` row, so
+            # inserting a second one without this raises an unhandled IntegrityError.
+            await self._clear_entry_point(workspace.id, exclude_command_id=None)
         custom_command = CustomCommand(
             workspace_id=workspace.id,
             name=name,
@@ -127,6 +148,8 @@ class CommandService:
             sort_order=(
                 await self._next_sort_order(workspace.id) if sort_order is None else sort_order
             ),
+            health_path=health_path,
+            is_entry_point=is_entry_point,
         )
         self.session.add(custom_command)
         await self.session.flush()
@@ -148,6 +171,20 @@ class CommandService:
         )
         return custom_command
 
+    async def _clear_entry_point(
+        self, workspace_id: UUID, *, exclude_command_id: UUID | None
+    ) -> None:
+        """Flip off `is_entry_point` on every other command in the workspace, in the same
+        transaction as the caller's own insert/update -- never a separate commit, so a crash
+        between the two can never leave two commands (or zero, then a stale one) marked."""
+        stmt = update(CustomCommand).where(
+            CustomCommand.workspace_id == workspace_id,
+            CustomCommand.is_entry_point.is_(True),
+        )
+        if exclude_command_id is not None:
+            stmt = stmt.where(CustomCommand.id != exclude_command_id)
+        await self.session.execute(stmt.values(is_entry_point=False))
+
     async def list_commands(self, workspace_id: UUID, user_id: UUID) -> list[CustomCommand]:
         workspace = await self._get_workspace(workspace_id, user_id)
         result = await self.session.execute(
@@ -166,6 +203,14 @@ class CommandService:
     ) -> CustomCommand:
         custom_command = await self._get_command(workspace_id, command_id, user_id)
         was_runnable_service = custom_command.enabled and custom_command.kind == "service"
+        if values.get("is_entry_point") is True:
+            effective_kind = values.get("kind", custom_command.kind)
+            if effective_kind != "service":
+                raise CustomCommandInvalidError(
+                    "Only a long-running service command can be the entry point."
+                )
+            # Clear before setting, in the same transaction -- same reasoning as create_command.
+            await self._clear_entry_point(workspace_id, exclude_command_id=custom_command.id)
         for key, value in values.items():
             setattr(custom_command, key, value)
         self.session.add(custom_command)
@@ -459,6 +504,18 @@ class CommandService:
                 argv = validate_user_command(custom_command.command)
                 command = " ".join(shlex.quote(value) for value in argv)
                 env = await self._workspace_env(session, workspace.id)
+                # Epic 13: command runs get the same strict `${ENIGMA_*}` substitution as a
+                # service launch -- a resolution failure surfaces as a failed run (caught by
+                # the `except Exception` below), never a silently empty value.
+                template_context = await build_template_context(
+                    session,
+                    self.settings,
+                    workspace,
+                    branch=workspace.default_branch,
+                    self_service_id=None,
+                )
+                env = {**enigma_exports(template_context), **env}
+                env, _template_problems = substitute(env, template_context, strict=True)
                 cwd, _, _, _ = await resolve_run_cwd(
                     session,
                     workspace,
@@ -467,8 +524,13 @@ class CommandService:
                 )
                 # Workspace env values are decrypted into the sandbox, so anything that echoes the
                 # environment would otherwise persist plaintext secrets to CommandRun.output and
-                # broadcast them over the run WebSocket.
-                secrets = redactable_env_values(env)
+                # broadcast them over the run WebSocket. Enigma-derived exports (workspace id,
+                # branch, sibling ports/URLs) are excluded -- none of them is a secret, and a
+                # resolved preview URL would otherwise match both the `_URL` key rule and the
+                # length rule.
+                secrets = redactable_env_values(
+                    env, exclude=set(enigma_exports(template_context).values())
+                )
 
                 async def on_output(content: str) -> None:
                     await self._append_output(session, run, redact_secrets(content, *secrets))

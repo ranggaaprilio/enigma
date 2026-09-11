@@ -15,6 +15,8 @@ from app.services.daytona_runtime import (
     DaytonaRuntimeError,
     get_daytona_runtime,
 )
+from app.services.env_templates import TemplateProblem, enigma_exports, substitute
+from app.services.workspace_env import build_template_context
 from app.services.workspace_env import resolve as _resolve_env
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -144,8 +146,23 @@ class TerminalService:
         self.session.add(terminal_session)
         await self.session.commit()
 
-    async def environment(self, workspace_id: UUID) -> dict[str, str]:
-        return await _resolve_env(self.session, self.settings, workspace_id)
+    async def environment(
+        self, workspace_id: UUID, workspace: Workspace
+    ) -> tuple[dict[str, str], list[TemplateProblem]]:
+        """Unlike every other caller of the template engine, a terminal is *non-strict*: it is
+        where you go to debug a bad template, so an unresolvable one is omitted from the
+        environment (never emptied) rather than killing the session outright. The caller
+        surfaces `problems` as a one-line notice per entry before the PTY attaches."""
+        env = await _resolve_env(self.session, self.settings, workspace_id)
+        context = await build_template_context(
+            self.session,
+            self.settings,
+            workspace,
+            branch=workspace.default_branch,
+            self_service_id=None,
+        )
+        merged = {**enigma_exports(context), **env}
+        return substitute(merged, context, strict=False)
 
     async def _get_workspace(self, workspace_id: UUID, user_id: UUID) -> Workspace:
         workspace = await self.session.get(Workspace, workspace_id)

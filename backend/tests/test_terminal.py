@@ -177,3 +177,102 @@ def test_terminal_websocket_rejects_unauthenticated_connections():
     with pytest.raises(WebSocketDisconnect):
         with client.websocket_connect(f"/workspaces/{uuid4()}/terminal/sessions/{uuid4()}"):
             pass
+
+
+# ---------------------------------------------------------------------------
+# Real-DB: TerminalService.environment() is non-strict -- the one Epic 13 exception where an
+# unresolvable ${ENIGMA_*} template is omitted (not emptied) and reported, never fatal.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def db_session():
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+    async with engine.connect() as conn:
+        await conn.begin()
+        session_maker = async_sessionmaker(bind=conn, expire_on_commit=False)
+        async with session_maker() as session:
+            await session.begin_nested()
+            yield session
+            await session.rollback()
+    await engine.dispose()
+
+
+async def _make_workspace_for_env_test(session) -> Workspace:
+    user = User(
+        id=uuid4(),
+        email=f"owner-{uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("password"),
+        role="owner",
+        is_active=True,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=user.id,
+        name="Demo",
+        slug=f"demo-{uuid4().hex[:8]}",
+        repo_url="https://github.com/example/demo",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id=f"sandbox-{uuid4().hex[:8]}",
+        workspace_path="/workspace",
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    session.add(user)
+    session.add(workspace)
+    await session.flush()
+    return workspace
+
+
+async def test_terminal_environment_omits_an_unresolvable_template_and_reports_it(db_session):
+    from app.core.config import get_settings
+    from app.models import WorkspaceEnvVar
+    from app.services.terminal import TerminalService
+    from app.services.workspaces import WorkspaceSecretCipher
+
+    workspace = await _make_workspace_for_env_test(db_session)
+    cipher = WorkspaceSecretCipher(get_settings().workspace_env_encryption_key)
+    db_session.add(
+        WorkspaceEnvVar(
+            id=uuid4(),
+            workspace_id=workspace.id,
+            custom_command_id=None,
+            scope="workspace",
+            key="GOOD",
+            encrypted_value=cipher.encrypt("plain-value"),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    db_session.add(
+        WorkspaceEnvVar(
+            id=uuid4(),
+            workspace_id=workspace.id,
+            custom_command_id=None,
+            scope="workspace",
+            key="BAD",
+            encrypted_value=cipher.encrypt("${ENIGMA_PREVIEW_URL:nonexistent}"),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    service = TerminalService(db_session, get_settings())
+    env, problems = await service.environment(workspace.id, workspace)
+
+    assert env["GOOD"] == "plain-value"
+    assert "BAD" not in env  # omitted, never emptied
+    assert env["ENIGMA_WORKSPACE_ID"] == str(workspace.id)
+    assert len(problems) == 1
+    assert problems[0].reason == "unknown_service"
+    assert "nonexistent" in problems[0].message

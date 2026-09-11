@@ -1,4 +1,5 @@
 from functools import lru_cache
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -91,6 +92,24 @@ class Settings(BaseSettings):
     # Upper bound on how long a single log-stream WebSocket keeps its sandbox `tail -F` alive;
     # the client reconnects (with replay) when it expires.
     service_log_stream_timeout_seconds: int = 3600
+    # Epic 13: per-service HTTP health probe. With the 4-service cap this is at most ~6s serial
+    # inside the existing dev_server_command_timeout_seconds exec budget; raising the cap would
+    # need the probes threaded, not just this timeout raised.
+    service_health_timeout_seconds: float = 1.5
+    # Epic 13: preview aliases (stable per-service hostnames, opt-in per workspace).
+    preview_alias_cookie_name: str = "enigma_preview_alias"
+    preview_alias_cookie_ttl_seconds: int = Field(default=900, gt=0)
+    preview_alias_grant_max_lifetime_seconds: int = Field(default=60 * 60 * 12, gt=0)
+    preview_alias_capability_query_param: str = "__enigma_cap"
+    # CSRF guard: for a non-safe method on an alias host, require Origin to be another host
+    # under the proxy suffix belonging to the *same* workspace. SameSite=None is mandatory for
+    # the alias grant cookie (it must ride along on a cross-site request), which otherwise
+    # leaves the previewed app CSRF-reachable from anywhere.
+    preview_alias_strict_origin: bool = True
+    # Epic 13: CORS diagnosis storage (service_diagnostics), recorded by the preview proxy.
+    service_diagnostic_throttle_seconds: int = Field(default=60, ge=0)
+    service_diagnostic_retention_days: int = Field(default=7, gt=0)
+    service_diagnostic_queue_maxsize: int = Field(default=256, gt=0)
     github_api_base_url: str = "https://api.github.com"
     github_api_timeout_seconds: int = 30
     max_worktrees_per_workspace: int = 5
@@ -163,6 +182,22 @@ class Settings(BaseSettings):
 
         # Harden cookie handling in non-local environments regardless of the configured value.
         self.auth_cookie_secure = True
+
+        # Epic 13: the preview-alias grant cookie must be `SameSite=None; Secure` (it has to
+        # ride along on a cross-site request between two sibling preview hostnames), and
+        # `SameSite=None` without `Secure` is rejected by every current browser. `Secure`
+        # requires HTTPS, except for the browser's own `localhost` exemption -- so a plain
+        # `http://` proxy base URL on any other host makes every alias grant unsettable.
+        proxy_host = (urlsplit(self.daytona_preview_proxy_base_url).hostname or "").lower()
+        proxy_is_loopback = proxy_host in {"localhost", "127.0.0.1", "::1"} or proxy_host.endswith(
+            ".localhost"
+        )
+        if self.daytona_preview_proxy_base_url.startswith("http://") and not proxy_is_loopback:
+            raise ValueError(
+                "daytona_preview_proxy_base_url must be an https:// origin (or localhost) when "
+                f"environment={self.environment!r} -- preview-alias grant cookies require "
+                "SameSite=None; Secure, which cannot be set over plain HTTP on a non-loopback host."
+            )
         return self
 
 

@@ -124,12 +124,15 @@ class FakeRuntime:
 
     def _probe_response(self, command: str) -> RuntimeCommandResult:
         """`service_scripts.build_probe_script` embeds one `probe(id, status_path, pid_path,
-        grep_token, port)` call per row it wants a status for. This fake answers every row
-        identically from its own `status_value`/`dev_process_alive`/`open_ports` knobs, which is
-        enough because these tests only ever probe a single (the primary) row at a time."""
+        grep_token, port, health_path)` call per row it wants a status for. This fake answers
+        every row identically from its own `status_value`/`dev_process_alive`/`open_ports`
+        knobs, which is enough because these tests only ever probe a single (the primary) row
+        at a time. `health_path` is captured but ignored -- these tests emit 4-field lines
+        (health defaults to "unknown"), since none of them exercise the health probe itself
+        (see test_service_health.py for that)."""
         lines = []
         for row_id, port_token in re.findall(
-            r"probe\('([^']*)', '[^']*', '[^']*', '[^']*', (None|\d+)\)", command
+            r"probe\('([^']*)', '[^']*', '[^']*', '[^']*', (None|\d+), (?:None|'[^']*')\)", command
         ):
             pid_alive = 1 if self.dev_process_alive else 0
             if port_token == "None":
@@ -175,6 +178,12 @@ class FakeResult:
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
+    def all(self) -> list:
+        # Epic 13's build_template_context does a multi-column select (WorkspaceService,
+        # CustomCommand); these tests never populate that joined query (see `execute` above),
+        # so this is always `[]` here -- present only so `.all()` doesn't raise.
+        return self._rows
+
 
 class FakeSession:
     def __init__(
@@ -210,7 +219,11 @@ class FakeSession:
         compiled = statement.compile()
         params = compiled.params
         froms = statement.get_final_froms()
-        table_name = froms[0].name if froms else None
+        # A joined FROM (Epic 13's build_template_context: workspace_services outerjoin
+        # custom_commands) has no single `.name` -- these tests exercise the dev-server
+        # facade's script/pid behaviour, not sibling-service template context, so an empty
+        # result is the correct answer (no services -> no per-service ENIGMA_* exports).
+        table_name = getattr(froms[0], "name", None) if froms else None
 
         if table_name == "custom_commands":
             role = params.get("role_1")
@@ -1091,7 +1104,9 @@ async def test_setup_passes_env_to_runtime_exec():
 
     await service.setup(workspace.id, user.id)
 
-    assert runtime.envs[-1] == {"API_KEY": secret_value}
+    # Epic 13: every launch also carries ENIGMA_WORKSPACE_ID/ENIGMA_BRANCH -- assert the
+    # user's own value survives untouched rather than pinning the exact dict.
+    assert runtime.envs[-1]["API_KEY"] == secret_value
     assert all(secret_value not in command for command in runtime.commands)
 
 

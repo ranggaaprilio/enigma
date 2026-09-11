@@ -157,7 +157,7 @@ async def connect_terminal_session(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
         await service.touch(terminal_session)
-        env = await service.environment(workspace.id)
+        env, template_problems = await service.environment(workspace.id, workspace)
 
         # An optional ``worktree_id`` query param points the terminal at a feature worktree.
         # Each non-base worktree gets its own PTY (keyed by worktree) so terminals are isolated.
@@ -189,6 +189,13 @@ async def connect_terminal_session(
             cwd = join_subpath(cwd or workspace.workspace_path, app_root)
 
     await websocket.accept()
+    # Epic 13: a terminal is the one place unresolvable ${ENIGMA_*} templates are non-fatal --
+    # the offending keys were already dropped from `env` above; this just tells the user why.
+    for problem in template_problems:
+        try:
+            await websocket.send_json({"type": "notice", "message": problem.message})
+        except RuntimeError:
+            break
     bridge = TerminalPtyBridge(
         runtime=get_daytona_runtime(),
         default_cols=settings.terminal_default_cols,

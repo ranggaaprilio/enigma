@@ -22,6 +22,11 @@ import { ConfirmModal } from "../ui/ConfirmModal";
 import { TextArea } from "../ui/TextArea";
 import { TextInput } from "../ui/TextInput";
 import { AffectedServicesBanner } from "./AffectedServicesBanner";
+import {
+  TEMPLATE_SUGGESTIONS_DATALIST_ID,
+  TemplateSuggestionChips,
+  TemplateSuggestionsDatalist,
+} from "./TemplateSuggestions";
 
 const WORKSPACE_SCOPE_VALUE = "workspace";
 
@@ -307,6 +312,7 @@ export function EnvVarEditor({
 
   return (
     <section className="mt-4 rounded-md border border-line bg-white p-5 shadow-soft">
+      <TemplateSuggestionsDatalist serviceCommands={serviceCommands} />
       <div className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">Workspace</p>
@@ -406,6 +412,14 @@ export function EnvVarEditor({
                 setPreviewedText(null);
               }}
               placeholder={"KEY=value\nOTHER_KEY=value"}
+            />
+            <TemplateSuggestionChips
+              serviceCommands={serviceCommands}
+              onInsert={(text) => {
+                setBulkText((current) => `${current}${text}`);
+                setBulkPreview(null);
+                setPreviewedText(null);
+              }}
             />
             <div className="flex flex-wrap items-center gap-2">
               <button
@@ -508,6 +522,7 @@ export function EnvVarEditor({
                               value={editingValue}
                               onChange={setEditingValue}
                               autoFocus
+                              listId={TEMPLATE_SUGGESTIONS_DATALIST_ID}
                             />
                           </div>
                           <button

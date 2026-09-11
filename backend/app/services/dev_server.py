@@ -38,7 +38,7 @@ from app.services.service_scripts import (
     builtin_paths,
 )
 from app.services.workspace_env import (
-    EnvFileError,
+    EnvPrepareError,
     load_all_values,
     prepare_launch_env,
     redactable_env_values,
@@ -289,6 +289,7 @@ class DevServerService:
         if workspace.dev_worktree_id != worktree_id:
             await self._manager.kill_primary(workspace)
 
+        primary_row = await self._manager.primary_service(workspace)
         try:
             env = await prepare_launch_env(
                 self.session,
@@ -298,8 +299,10 @@ class DevServerService:
                 checkout=cwd,
                 custom_command_id=entry.id if entry else None,
                 timeout=self.settings.dev_server_command_timeout_seconds,
+                service_id=primary_row.id,
+                branch=branch,
             )
-        except EnvFileError as error:
+        except EnvPrepareError as error:
             return DevServerState(status="error", message=str(error))
 
         paths = builtin_paths()

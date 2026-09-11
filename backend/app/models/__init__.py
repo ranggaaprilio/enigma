@@ -8,11 +8,13 @@ from app.models.notification import AuditLog, Notification
 from app.models.preview import PreviewSession
 from app.models.project import Project, ProjectMember, Team, TeamMember
 from app.models.repository import RepositoryCredential
+from app.models.service_diagnostic import ServiceDiagnostic
 from app.models.speckit import SpecPhase, SpecWorkflow
 from app.models.template import WorkspaceTemplate
 from app.models.terminal import TerminalSession
 from app.models.user import User
 from app.models.workspace import Workspace, WorkspaceEnvVar
+from app.models.workspace_preview_alias import WorkspacePreviewAlias
 from app.models.workspace_service import WorkspaceService
 from app.models.worktree import PullRequest, WorkspaceWorktree
 
@@ -32,6 +34,7 @@ __all__ = [
     "ProjectMember",
     "PullRequest",
     "RepositoryCredential",
+    "ServiceDiagnostic",
     "SpecPhase",
     "SpecWorkflow",
     "Team",
@@ -41,6 +44,7 @@ __all__ = [
     "User",
     "Workspace",
     "WorkspaceEnvVar",
+    "WorkspacePreviewAlias",
     "WorkspaceService",
     "WorkspaceTemplate",
     "WorkspaceWorktree",

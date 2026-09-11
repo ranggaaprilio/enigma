@@ -29,6 +29,11 @@ WORKSPACE_SERVICE_STATUSES = ("installing", "starting", "running", "stopped", "e
 # ``services/workspace_env.py``) so ``workspace_env.py`` can use it without a circular import.
 WORKSPACE_SERVICE_ACTIVE_STATUSES = ("installing", "starting", "running")
 
+# Epic 13: readiness, orthogonal to ``status``. A row can be ``status="running"`` (port bound)
+# and ``health_status="unhealthy"`` (returning 500) at the same time -- deliberately never folded
+# into ``status``, so the preview session (and the ability to see the failure) survives.
+WORKSPACE_SERVICE_HEALTH_STATUSES = ("unknown", "starting", "healthy", "unhealthy")
+
 
 class WorkspaceService(Base):
     """A running (or desired-to-run) instance of a workspace's `dev`/service command.
@@ -43,6 +48,10 @@ class WorkspaceService(Base):
         CheckConstraint(
             "status in ('installing', 'starting', 'running', 'stopped', 'exited', 'error')",
             name="ck_workspace_services_status",
+        ),
+        CheckConstraint(
+            "health_status in ('unknown', 'starting', 'healthy', 'unhealthy')",
+            name="ck_workspace_services_health_status",
         ),
         UniqueConstraint(
             "workspace_id", "custom_command_id", name="uq_workspace_services_workspace_command"
@@ -85,6 +94,15 @@ class WorkspaceService(Base):
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Epic 13: runtime readiness signal, set by the health probe
+    # (``service_scripts.build_probe_script``) when the owning command declares a
+    # ``health_path``; otherwise stays ``unknown`` forever.
+    health_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unknown", server_default="unknown"
+    )
+    health_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

@@ -321,7 +321,11 @@ async def test_prepare_launch_env_resolves_and_materializes(db_session):
         timeout=30,
     )
 
-    assert env == {"FOO": "bar"}
+    # Epic 13: prepare_launch_env now also exports ENIGMA_WORKSPACE_ID/ENIGMA_BRANCH
+    # (merged in before the user's own values, which always win).
+    assert env["FOO"] == "bar"
+    assert env["ENIGMA_WORKSPACE_ID"] == str(workspace.id)
+    assert env["ENIGMA_BRANCH"] == workspace.default_branch
     [(path, content)] = runtime.sandbox.fs.uploaded
     assert path == "workspace/.env"
     assert b"FOO=bar" in content

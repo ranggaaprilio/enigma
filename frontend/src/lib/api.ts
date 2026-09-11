@@ -492,6 +492,10 @@ export type CustomCommandResponse = {
   enabled: boolean;
   /** `null` falls back to the platform default (15 minutes). */
   timeout_seconds: number | null;
+  /** Root-relative HTTP path probed for readiness; `null` means only a TCP check applies. */
+  health_path: string | null;
+  /** The workspace's primary "Open app" service. Only a `kind="service"` command can be one. */
+  is_entry_point: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -509,6 +513,8 @@ export type CustomCommandPayload = {
   port?: number | null;
   enabled?: boolean;
   timeout_seconds?: number | null;
+  health_path?: string | null;
+  is_entry_point?: boolean;
 };
 
 export type CustomCommandUpdatePayload = Partial<CustomCommandPayload>;
@@ -666,6 +672,10 @@ export type WorkspaceServiceStatus =
   | "exited"
   | "error";
 
+// Epic 13: readiness, orthogonal to WorkspaceServiceStatus -- a service can be "running" (port
+// bound) and "unhealthy" (failing its health check) at the same time.
+export type WorkspaceServiceHealth = "unknown" | "starting" | "healthy" | "unhealthy";
+
 export type WorkspaceServiceResponse = {
   id: string;
   workspace_id: string;
@@ -686,6 +696,10 @@ export type WorkspaceServiceResponse = {
   last_seen_at: string | null;
   preview_session_id: string | null;
   public_url: string | null;
+  health_status: WorkspaceServiceHealth;
+  health_checked_at: string | null;
+  health_path: string | null;
+  is_entry_point: boolean;
 };
 
 /** The workspace-wide mise environment (install/mise-trust), separate from any one
@@ -1864,6 +1878,127 @@ export function getWorkspaceServiceLogs(
   return requestJson<ServiceLogsResponse>(
     `/workspaces/${workspaceId}/services/${serviceId}/logs`,
     { signal },
+  );
+}
+
+// ── Preview composition (Epic 13: service wiring) ─────────────────────────────
+
+export type PreviewUrlKind = "capability" | "alias";
+export type ServiceDiagnosticKind = "cors_missing_allow_origin" | "cors_preflight_rejected";
+export type PreviewAdvisorySeverity = "info" | "warning" | "error";
+export type EntryPointSource = "explicit" | "inferred";
+
+export type ServiceDiagnosisResponse = {
+  id: string;
+  kind: ServiceDiagnosticKind;
+  origin: string;
+  request_method: string | null;
+  required_header: string | null;
+  request_path: string | null;
+  status_code: number | null;
+  detail: string | null;
+  occurrences: number;
+  first_seen_at: string;
+  last_seen_at: string;
+};
+
+export type ComposedServiceResponse = {
+  service_id: string;
+  custom_command_id: string | null;
+  name: string;
+  role: CommandRole;
+  kind: CommandKind;
+  port: number | null;
+  status: WorkspaceServiceStatus;
+  health_status: WorkspaceServiceHealth;
+  health_checked_at: string | null;
+  is_entry_point: boolean;
+  entry_point_source: EntryPointSource;
+  branch: string | null;
+  worktree_id: string | null;
+  preview_session_id: string | null;
+  /** Rotates hourly by default -- label it "temporary link" in the UI. */
+  capability_url: string | null;
+  capability_url_rotates: boolean;
+  /** Stable -- safe to paste into an environment variable. Both null when aliases are
+   * disabled for the workspace, or none has been minted yet for this row. */
+  alias: string | null;
+  alias_url: string | null;
+  alias_prime_url: string | null;
+  localhost_url: string | null;
+  diagnoses: ServiceDiagnosisResponse[];
+};
+
+export type PreviewAdvisoryResponse = {
+  code: string;
+  severity: PreviewAdvisorySeverity;
+  title: string;
+  detail: string;
+  framework: string | null;
+  snippet: string | null;
+  snippet_language: string | null;
+  target_file: string | null;
+  service_ids: string[];
+};
+
+export type PreviewCompositionResponse = {
+  workspace_id: string;
+  preview_alias_enabled: boolean;
+  proxy_base_url: string;
+  entry_point_service_id: string | null;
+  services: ComposedServiceResponse[];
+  advisories: PreviewAdvisoryResponse[];
+};
+
+/**
+ * `checkProxy=false` (the default -- every poll-loop call) costs zero sandbox round-trips.
+ * Pass `true` only on mount and on an explicit "Re-check".
+ */
+export function getPreviewComposition(
+  workspaceId: string,
+  checkProxy: boolean,
+  signal?: AbortSignal,
+): Promise<PreviewCompositionResponse> {
+  const query = checkProxy ? "?check_proxy=true" : "";
+  return requestJson<PreviewCompositionResponse>(
+    `/workspaces/${workspaceId}/preview/composition${query}`,
+    { signal },
+  );
+}
+
+export type PreviewAliasToggleResponse = {
+  preview_alias_enabled: boolean;
+};
+
+export function enablePreviewAliases(workspaceId: string): Promise<PreviewAliasToggleResponse> {
+  return requestJson<PreviewAliasToggleResponse>(
+    `/workspaces/${workspaceId}/preview/aliases/enable`,
+    { method: "POST" },
+  );
+}
+
+export function disablePreviewAliases(workspaceId: string): Promise<PreviewAliasToggleResponse> {
+  return requestJson<PreviewAliasToggleResponse>(
+    `/workspaces/${workspaceId}/preview/aliases/disable`,
+    { method: "POST" },
+  );
+}
+
+export type PreviewAliasRegenerateResponse = {
+  alias: string;
+  alias_url: string;
+};
+
+export function regeneratePreviewAlias(
+  workspaceId: string,
+  customCommandId: string | null,
+): Promise<PreviewAliasRegenerateResponse> {
+  return requestJson<PreviewAliasRegenerateResponse>(
+    `/workspaces/${workspaceId}/preview/aliases/regenerate`,
+    {
+      method: "POST",
+      body: JSON.stringify({ custom_command_id: customCommandId }),
+    },
   );
 }
 
