@@ -49,6 +49,8 @@ function command(overrides: Partial<CustomCommandResponse>): CustomCommandRespon
     sort_order: 10,
     enabled: true,
     timeout_seconds: null,
+    health_path: null,
+    is_entry_point: false,
     created_at: "2026-09-05T00:00:00Z",
     updated_at: "2026-09-05T00:00:00Z",
     ...overrides,
@@ -277,6 +279,75 @@ describe("CustomCommandsPanel registry", () => {
     const call = fetchMock.mock.calls.find(([url]) => String(url).endsWith("/run"));
     expect(JSON.parse(String((call?.[1] as RequestInit).body))).toMatchObject({
       worktree_id: "wt-1",
+    });
+  });
+
+  it("shows health path and entry point fields only for a service, and hydrates them on edit", async () => {
+    const service = command({
+      id: "c2",
+      name: "Serve API",
+      role: "dev",
+      kind: "service",
+      health_path: "/healthz",
+      is_entry_point: true,
+    });
+    const fetchMock = stubFetch((url) => {
+      if (url.match(/\/commands$/)) {
+        return jsonResponse([service]);
+      }
+      return undefined;
+    });
+    render(<CustomCommandsPanel workspace={workspace} />);
+    await screen.findAllByText("Serve API");
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit command" }));
+    expect(screen.getByPlaceholderText("/healthz")).toHaveValue("/healthz");
+    const entryPointCheckbox = screen.getByRole("checkbox", { name: /Entry point/ });
+    expect(entryPointCheckbox).toBeChecked();
+
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/commands/${service.id}`))).toBe(
+        true,
+      ),
+    );
+    const call = fetchMock.mock.calls.find(([url]) =>
+      String(url).endsWith(`/commands/${service.id}`),
+    );
+    expect(JSON.parse(String((call?.[1] as RequestInit).body))).toMatchObject({
+      health_path: "/healthz",
+      is_entry_point: true,
+    });
+  });
+
+  it("hides health path and entry point fields for a task, and never sends is_entry_point for one", async () => {
+    const fetchMock = stubFetch((url) => {
+      if (url.match(/\/commands$/)) {
+        return jsonResponse([INSTALL]);
+      }
+      return undefined;
+    });
+    render(<CustomCommandsPanel workspace={workspace} />);
+    await screen.findAllByText("Install deps");
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit command" }));
+    expect(screen.queryByPlaceholderText("/healthz")).not.toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", { name: /Entry point/ })).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`/commands/${INSTALL.id}`))).toBe(
+        true,
+      ),
+    );
+    const call = fetchMock.mock.calls.find(([url]) =>
+      String(url).endsWith(`/commands/${INSTALL.id}`),
+    );
+    expect(JSON.parse(String((call?.[1] as RequestInit).body))).toMatchObject({
+      health_path: null,
+      is_entry_point: false,
     });
   });
 });

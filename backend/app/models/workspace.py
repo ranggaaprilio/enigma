@@ -9,7 +9,6 @@ from sqlalchemy import (
     Index,
     String,
     Text,
-    UniqueConstraint,
     func,
     text,
 )
@@ -73,6 +72,20 @@ class Workspace(Base):
     # Repo-relative subdirectory the workspace's commands and dev server run in (e.g.
     # "apps/api"); ``None`` => the checkout root. Validated server-side, never absolute.
     app_root: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Repo-relative path (below app_root) where the resolved env vars are materialised as a
+    # .env file before each service launch. ``None`` => no file is written.
+    env_file_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Epic 13: opt-in stable preview aliases (workspace_preview_aliases). The capability-host
+    # scheme stays the default and always works; enabling this adds a second, weaker-posture
+    # hostname per service that survives capability rotation.
+    preview_alias_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    # The editor's stable proxy hostname label (e.g. "editor-3f9a1c0b7d2e"), minted lazily on
+    # the first editor start. Unlike a preview capability host it never rotates: code-server keeps
+    # its workbench state in localStorage keyed by origin, so a rotating host would reset the
+    # open tabs and layout every time the URL was renewed.
+    editor_alias: Mapped[str | None] = mapped_column(String(63), nullable=True, unique=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="creating")
     dev_autostart: Mapped[bool] = mapped_column(
         Boolean,
@@ -103,11 +116,41 @@ class Workspace(Base):
         return self.daytona_sandbox_id
 
 
+# "workspace" => applies to every service in the workspace; "service" => only the service
+# launched from ``custom_command_id``, overriding a workspace-wide value of the same key.
+WORKSPACE_ENV_VAR_SCOPES = ("workspace", "service")
+
+
 class WorkspaceEnvVar(Base):
     __tablename__ = "workspace_env_vars"
     __table_args__ = (
-        UniqueConstraint("workspace_id", "key", name="uq_workspace_env_vars_workspace_key"),
+        CheckConstraint(
+            "scope in ('workspace', 'service')",
+            name="ck_workspace_env_vars_scope",
+        ),
+        CheckConstraint(
+            "(scope = 'workspace' AND custom_command_id IS NULL) OR "
+            "(scope = 'service' AND custom_command_id IS NOT NULL)",
+            name="ck_workspace_env_vars_scope_target",
+        ),
+        # At most one workspace-wide row per (workspace, key).
+        Index(
+            "uq_workspace_env_vars_workspace_key_global",
+            "workspace_id",
+            "key",
+            unique=True,
+            postgresql_where=text("custom_command_id IS NULL"),
+        ),
+        # At most one service-scoped row per (workspace, key, custom_command_id).
+        Index(
+            "uq_workspace_env_vars_workspace_key_command",
+            "workspace_id",
+            "key",
+            "custom_command_id",
+            unique=True,
+        ),
         Index("ix_workspace_env_vars_workspace_id", "workspace_id"),
+        Index("ix_workspace_env_vars_custom_command_id", "custom_command_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -115,6 +158,14 @@ class WorkspaceEnvVar(Base):
         UUID(as_uuid=True),
         ForeignKey("workspaces.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    custom_command_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("custom_commands.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    scope: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="workspace", server_default="workspace"
     )
     key: Mapped[str] = mapped_column(String(128), nullable=False)
     encrypted_value: Mapped[str] = mapped_column(Text, nullable=False)

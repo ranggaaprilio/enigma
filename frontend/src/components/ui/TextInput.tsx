@@ -9,6 +9,7 @@ export function TextInput({
   disabled,
   hint,
   mono,
+  listId,
 }: {
   label: string;
   value: string;
@@ -21,6 +22,9 @@ export function TextInput({
   /** Short helper text rendered under the field (outside the label so labels stay exact). */
   hint?: string;
   mono?: boolean;
+  /** Id of a `<datalist>` elsewhere on the page to drive suggestions. Degrades to a plain
+   * input wherever `<datalist>` is unsupported, jsdom included. */
+  listId?: string;
 }) {
   return (
     <div>
@@ -36,6 +40,7 @@ export function TextInput({
           autoFocus={autoFocus}
           required={required}
           disabled={disabled}
+          list={listId}
           onChange={(event) => onChange(event.target.value)}
         />
       </label>

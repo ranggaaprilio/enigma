@@ -130,6 +130,60 @@ def provider_from_settings(settings: Settings) -> AgentProvider:
     return MockAgentProvider()
 
 
+async def provider_for_run(session: AsyncSession, settings: Settings) -> AgentProvider:
+    """Resolve the agent provider for a run: the stored config wins, the environment is fallback.
+
+    A ``platform_llm_settings`` row always drives the OpenHands provider -- it is the only
+    provider that accepts a base URL (``OpenAIResponsesProvider`` hardcodes api.openai.com), so
+    an OpenAI-*compatible* endpoint has to go through LiteLLM. With no row we defer entirely to
+    ``provider_from_settings``, which stays sync and env-only so its existing unit tests and
+    every env-configured deployment are untouched.
+
+    With nothing configured at all the run is refused rather than answered by the mock provider,
+    unless ``agent_allow_mock_provider`` opts in.
+    """
+    # Imported lazily: app.services.platform_llm imports app.models and app.services.workspaces,
+    # and this module sits below both -- a module-level import risks a cycle. Matches the
+    # existing lazy import of openhands_provider above.
+    from app.services.openhands_provider import (
+        OpenHandsAgentProvider,
+        OpenHandsConfigurationError,
+    )
+    from app.services.platform_llm import (
+        LlmSettingsDecryptionError,
+        PlatformLlmSettingsService,
+    )
+
+    service = PlatformLlmSettingsService(
+        session=session,
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        settings=settings,
+    )
+    try:
+        resolved = await service.resolve()
+    except LlmSettingsDecryptionError as error:
+        raise AgentConfigurationError(str(error)) from error
+
+    if resolved is not None and resolved.source == "database":
+        try:
+            return OpenHandsAgentProvider(
+                base_url=resolved.base_url,
+                api_key=resolved.api_key,
+                model=resolved.model,
+                max_iterations=settings.openhands_max_iterations,
+            )
+        except OpenHandsConfigurationError as error:
+            raise AgentConfigurationError(str(error)) from error
+
+    provider = provider_from_settings(settings)
+    if isinstance(provider, MockAgentProvider) and not settings.agent_allow_mock_provider:
+        raise AgentConfigurationError(
+            "No LLM is configured. A platform owner must set the LLM base URL and model in "
+            "Settings before agent runs can start."
+        )
+    return provider
+
+
 class AgentService:
     def __init__(
         self,
@@ -165,7 +219,7 @@ class AgentService:
         # Block/warn before spending: an enforcing budget over its limit stops the run here.
         await BudgetService(self.session).assert_within_budget(workspace, user_id)
 
-        provider = provider_from_settings(self.settings)
+        provider = await provider_for_run(self.session, self.settings)
         run = AgentRun(
             workspace_id=workspace.id,
             user_id=user_id,
@@ -471,9 +525,7 @@ class AgentService:
         limit: int = 50,
     ) -> tuple[list[AgentFileChange], int, bool]:
         workspace = await self._get_workspace(workspace_id, user_id)
-        result = await self.session.execute(
-            select(AgentRun).where(AgentRun.id == run_id)
-        )
+        result = await self.session.execute(select(AgentRun).where(AgentRun.id == run_id))
         run = result.scalar_one_or_none()
         if run is None:
             raise AgentRunNotFoundError
@@ -581,9 +633,7 @@ class AgentService:
         )
         return workspace
 
-    async def _build_session_context(
-        self, session: AsyncSession, run: AgentRun
-    ) -> str | None:
+    async def _build_session_context(self, session: AsyncSession, run: AgentRun) -> str | None:
         """Assemble a transcript of prior turns in this run's session.
 
         Returns None for one-shot runs (no session) or a session's first turn, so those
@@ -662,7 +712,17 @@ class AgentService:
                 if workspace is None:
                     return
 
-                provider = provider_from_settings(self.settings)
+                provider = await provider_for_run(session, self.settings)
+                # The provider is resolved twice -- create_run stamps run.provider/run.model,
+                # then this runs. Now that the config is editable at runtime, an owner saving
+                # new settings in between would leave the run recording a model that never
+                # ran, and estimate_cost keys off exactly these two columns. Re-stamp with
+                # what will actually execute.
+                if (run.provider, run.model) != (provider.provider_name, provider.model_name):
+                    run.provider = provider.provider_name
+                    run.model = provider.model_name
+                    session.add(run)
+                    await session.flush()
                 self.runtime.register_provider(run.id, provider)
                 terminal_event_received = False
                 tools = WorkspaceTools(
@@ -686,9 +746,7 @@ class AgentService:
                 context = await self._build_session_context(session, run)
                 prompt_for_provider = run.prompt
                 if context:
-                    prompt_for_provider = (
-                        f"{context}\n\n---\nCurrent request:\nUser: {run.prompt}"
-                    )
+                    prompt_for_provider = f"{context}\n\n---\nCurrent request:\nUser: {run.prompt}"
 
                 async for provider_event in provider.stream_response(
                     prompt_for_provider, tools, stop_event
@@ -792,9 +850,7 @@ class AgentService:
             run.completed_at = datetime.now(UTC)
             session.add(run)
             await session.flush()
-            await self._persist_event(
-                session, run.id, "error", message, {"status": "error"}
-            )
+            await self._persist_event(session, run.id, "error", message, {"status": "error"})
             await session.commit()
             await self._record_run_finished(session, run)
 

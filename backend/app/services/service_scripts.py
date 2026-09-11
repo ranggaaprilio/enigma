@@ -248,6 +248,11 @@ class ProbeRow:
     id: str
     paths: ServicePaths
     port: int | None
+    # Epic 13: root-relative HTTP path to probe for readiness (``CustomCommand.health_path``).
+    # ``None`` means only the TCP connect check applies -- the health field then stays
+    # ``"unknown"`` forever, which is the correct, honest answer for a service nobody configured
+    # a health check for.
+    health_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -255,24 +260,54 @@ class ProbeResult:
     status: str
     pid_alive: bool
     port_open: bool
+    # Defaulted so every pre-Epic-13 construction site (including a 4-field probe line from a
+    # skewed process, though script and parser always run in the same process here) still works.
+    health: str = "unknown"
 
 
-def build_probe_script(rows: list[ProbeRow]) -> str:
-    """One sandbox exec that reports every row's status file, pid liveness and port, so N
-    services cost one round-trip instead of N."""
+def build_probe_script(rows: list[ProbeRow], *, health_timeout: float = 1.5) -> str:
+    """One sandbox exec that reports every row's status file, pid liveness, port and (Epic 13)
+    HTTP health, so N services cost one round-trip instead of N.
+
+    Health is only attempted for a row with both a ``health_path`` and an open port -- a closed
+    port cannot possibly answer HTTP, so it costs nothing beyond the TCP check already done.
+    """
     calls = "\n".join(
         f"probe({row.id!r}, {row.paths.status!r}, {row.paths.pid!r}, "
-        f"{row.paths.grep_token!r}, {row.port!r})"
+        f"{row.paths.grep_token!r}, {row.port!r}, {row.health_path!r})"
         for row in rows
     )
     return (
         "python3 - <<'ENIGMA_PROBE_EOF'\n"
+        "import http.client\n"
         "import os\n"
         "import socket\n"
         "import subprocess\n"
         "\n"
         "\n"
-        "def probe(rid, status_path, pid_path, grep_token, port):\n"
+        "def check_health(port, path, timeout):\n"
+        "    # http.client, never urllib: urlopen installs a redirect handler and would follow\n"
+        "    # a 30x, which could turn a loopback probe into an outbound request. This reads\n"
+        "    # only the status line, follows no redirect, and always closes the connection.\n"
+        "    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=timeout)\n"
+        "    try:\n"
+        "        conn.request(\n"
+        "            'GET', path,\n"
+        "            headers={\n"
+        "                'Host': '127.0.0.1:%d' % port,\n"
+        "                'User-Agent': 'enigma-health/1',\n"
+        "            },\n"
+        "        )\n"
+        "        code = conn.getresponse().status\n"
+        "    except Exception:\n"
+        "        return 'unhealthy'\n"
+        "    finally:\n"
+        "        conn.close()\n"
+        "    # A redirect (e.g. '/' -> '/login') still means the app is serving.\n"
+        "    return 'healthy' if 200 <= code < 400 else 'unhealthy'\n"
+        "\n"
+        "\n"
+        "def probe(rid, status_path, pid_path, grep_token, port, health_path):\n"
         "    try:\n"
         "        with open(status_path) as fh:\n"
         "            status = fh.read().strip() or 'none'\n"
@@ -311,7 +346,10 @@ def build_probe_script(rows: list[ProbeRow]) -> str:
         "        s.settimeout(0.3)\n"
         "        port_open = 1 if s.connect_ex(('127.0.0.1', port)) == 0 else 0\n"
         "        s.close()\n"
-        "    print(rid, status, pid_alive, port_open)\n"
+        "    health = 'unknown'\n"
+        "    if port_open and port and health_path:\n"
+        f"        health = check_health(port, health_path, {health_timeout!r})\n"
+        "    print(rid, status, pid_alive, port_open, health)\n"
         "\n"
         f"{calls}\n"
         "ENIGMA_PROBE_EOF"
@@ -319,15 +357,24 @@ def build_probe_script(rows: list[ProbeRow]) -> str:
 
 
 def parse_probe_output(output: str) -> dict[str, ProbeResult]:
+    """Tolerant of both the pre- and post-Epic-13 line shape: 5 fields carry a health token, 4
+    fields (a stale probe script from a different process, in principle -- in practice this
+    codebase always runs the script and the parser from the very same request) default it to
+    ``"unknown"``. Anything else is not a probe line and is skipped."""
     results: dict[str, ProbeResult] = {}
     for line in output.splitlines():
         parts = line.split()
-        if len(parts) != 4:
+        if len(parts) == 5:
+            rid, status, pid_alive, port_open, health = parts
+        elif len(parts) == 4:
+            rid, status, pid_alive, port_open = parts
+            health = "unknown"
+        else:
             continue
-        rid, status, pid_alive, port_open = parts
         results[rid] = ProbeResult(
             status=status,
             pid_alive=pid_alive == "1",
             port_open=port_open == "1",
+            health=health,
         )
     return results

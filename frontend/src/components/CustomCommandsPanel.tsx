@@ -51,6 +51,9 @@ type CommandFormState = {
   port: string;
   timeoutSeconds: string;
   enabled: boolean;
+  // Epic 13: readiness + "Open app" entry point -- only meaningful for a service.
+  healthPath: string;
+  isEntryPoint: boolean;
 };
 
 const emptyForm: CommandFormState = {
@@ -66,6 +69,8 @@ const emptyForm: CommandFormState = {
   port: "",
   timeoutSeconds: "",
   enabled: true,
+  healthPath: "",
+  isEntryPoint: false,
 };
 
 /** Registry entries are shown grouped by lifecycle, in the order you would actually run them. */
@@ -222,6 +227,8 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
       port: command.port === null ? "" : String(command.port),
       timeoutSeconds: command.timeout_seconds === null ? "" : String(command.timeout_seconds),
       enabled: command.enabled,
+      healthPath: command.health_path ?? "",
+      isEntryPoint: command.is_entry_point,
     });
     setModalMode("edit");
     setError(null);
@@ -935,6 +942,39 @@ function CommandModal({
               </span>
             </span>
           </label>
+          {formState.isService && (
+            <>
+              <label className="text-sm font-medium">
+                Health check path
+                <input
+                  className="mt-1 w-full rounded-md border border-line bg-white px-3 py-2 font-mono text-sm outline-none transition focus:border-ink"
+                  placeholder="/healthz"
+                  value={formState.healthPath}
+                  onChange={(event) => onChange({ ...formState, healthPath: event.target.value })}
+                />
+                <span className="mt-1 block text-xs font-normal text-ink/55">
+                  A root-relative HTTP path. Leave empty to fall back to a TCP port check.
+                </span>
+              </label>
+              <label className="flex items-start gap-3 rounded-md border border-line bg-white p-3 text-sm font-medium">
+                <input
+                  checked={formState.isEntryPoint}
+                  className="mt-0.5"
+                  type="checkbox"
+                  onChange={(event) =>
+                    onChange({ ...formState, isEntryPoint: event.target.checked })
+                  }
+                />
+                <span>
+                  Entry point
+                  <span className="mt-1 block text-xs font-normal text-ink/55">
+                    The "Open app" service shown first in the Preview tab. Only one service can be
+                    the entry point.
+                  </span>
+                </span>
+              </label>
+            </>
+          )}
           <label className="flex items-start gap-3 rounded-md border border-line bg-white p-3 text-sm font-medium">
             <input
               checked={formState.requiresConfirmation}
@@ -1036,5 +1076,8 @@ function formPayload(formState: CommandFormState): CustomCommandPayload {
     port: Number.isNaN(port) ? null : port,
     timeout_seconds: Number.isNaN(timeout) ? null : timeout,
     enabled: formState.enabled,
+    // The database CHECK rejects is_entry_point on a non-service row, so a task never sends it.
+    health_path: formState.isService ? formState.healthPath.trim() || null : null,
+    is_entry_point: formState.isService && formState.isEntryPoint,
   };
 }

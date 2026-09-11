@@ -198,3 +198,104 @@ backend in one workspace cannot hold different values for the same key.
 - A managed-secret integration (Doppler, 1Password, Vault, AWS Secrets Manager) as a variable
   source instead of stored values.
 - Per-worktree overrides so a feature branch can point at a different external database.
+
+## Implementation Notes (shipped)
+
+Landed in one pass; migration head is now `0026_env_var_scoping`.
+
+### Corrections to this document, found while implementing
+
+1. **The "Current State" section was already partly stale.** Epics 10/11 had shipped a
+   module-level `load_workspace_env` and `redactable_env_values` in `services/commands.py`
+   before this epic started, so command-run output and the Epic 11 service log stream were
+   already redacted. The two real remaining leaks were `DevServerService._read_log_tail`
+   (produced no redaction at all, and reached the browser via `DevServerState.message`) and
+   `CommandService._execute_run`'s exception path (appended a raw error string to `CommandRun.output`
+   without redaction). Both are fixed.
+2. **Audit metadata for env-var changes was already silently empty**, not merely
+   theoretically leaky: `safe_metadata()` (`services/audit.py`) drops any metadata dict key whose
+   name contains `"token"`, `"secret"`, `"password"`, `"key"`, or `"credential"` — and the existing
+   calls used `metadata={"key": env_var.key}`, so every pre-epic env-var audit row persisted
+   `log_metadata == {}`. Fixed by renaming the field to `variable`/`variables`, which does not
+   collide with the filter.
+
+### Architecture
+
+- **One decrypt point**: `services/workspace_env.py` now owns every read of
+  `WorkspaceEnvVar.encrypted_value`. `resolve(session, settings, workspace_id, *,
+  custom_command_id=None)` returns the env for one launch (workspace-wide rows, overridden by
+  that command's scoped rows); `load_all_values(...)` returns every scope's values for building
+  a redaction tuple only, never handed to a process. `terminal.py`, `commands.py`,
+  `workspace_services.py`, `dev_server.py`, and the service log websocket all call through it;
+  `commands.load_workspace_env` is now a one-line back-compat shim over `resolve`.
+- **Injection is exclusively via the Daytona SDK's `env=` parameter.** Both launch sites
+  (`WorkspaceServiceManager._launch` and `DevServerService._launch_setup`) call a new
+  `prepare_launch_env(...)` before building the launch script, then pass `env=env or None` into
+  `runtime.exec`. No value is ever interpolated into a script body, so nothing under the
+  launch scripts' `set -x` can leak a secret. Verified by tests asserting the secret string is
+  absent from every recorded `runtime.exec` command string while present in the recorded `env`
+  dict. `daytona_runtime.stream_command` additionally validates every key against
+  `^[A-Za-z_][A-Za-z0-9_]*$` before building its `env K=V` prefix, as defense in depth (keys are
+  already validated on write).
+- **`.env` materialisation** (`workspace_env.materialize_env_file`) is a true no-op when
+  `workspace.env_file_path` is unset (no sandbox calls at all). When set, the file is written via
+  `sandbox.fs.upload_file` + `set_file_permissions(mode="600")` — never through a command string —
+  and one idempotent `runtime.exec` (containing only the file *path*, never a value) appends the
+  pattern to the result of `git rev-parse --git-path info/exclude`, resolved dynamically because a
+  linked worktree's `.git` is a file, not a directory, so a hardcoded
+  `<checkout>/.git/info/exclude` would fail there. Failure to update the exclude file is a logged
+  warning, not fatal; failure because the parent directory doesn't exist in the checkout raises
+  `EnvFileError`, which both launch sites turn into `status="error"` rather than a silent skip.
+- **Scoping**: `workspace_env_vars.scope` (`workspace`|`service`) + nullable `custom_command_id`,
+  with a partial unique index for workspace-wide rows and a composite unique index for
+  service-scoped rows (Postgres treats `NULL` as distinct in a plain unique index, so the
+  workspace-wide half needed the partial index). `resolve()` and `affected_running_services()`
+  both treat a service-scoped row as shadowing a workspace-wide row of the same key for that
+  service only.
+- **Bulk editing**: `POST /workspaces/{id}/env-vars/bulk` accepts either a pasted `.env`-formatted
+  `text` or a `values` map (exactly one), parsed by the new pure `services/env_file.py`
+  (`parse_env_text`/`serialize_env` — `export` prefix, single/double-quoted values with escapes,
+  multi-line double-quoted values, inline comments only after whitespace, no shell interpolation).
+  `dry_run: true` computes the same per-key `created|updated|unchanged|invalid` diff without
+  writing anything, so the frontend's preview-then-apply flow needed no separate endpoint.
+  `GET /env-vars/template` returns `text/plain`, keys only, grouped by scope as comments.
+- **Change propagation**: `workspace_env.affected_running_services(...)` computes which active
+  `WorkspaceService` rows a changed key affects (all of them for a workspace-wide key, minus any
+  service with its own override for that key; exactly one for a service-scoped key) and is
+  returned on every upsert/bulk/delete response as `affected_services`, even in `dry_run` mode.
+  Nothing is restarted automatically — the frontend shows a banner with a Restart button per
+  affected service, calling the pre-existing `WorkspaceServiceManager.restart` /
+  `POST .../services/{id}/restart` from Epic 11.
+- **Egress warnings**: `workspace_env.egress_warnings(...)` is a no-op unless
+  `DAYTONA_NETWORK_BLOCK_ALL` is set; otherwise it scans newly-submitted values for a URL-shaped
+  or libpq-style host, skips loopback/localhost, and warns (naming only the key/host/port, never
+  the value) when an IP-literal host isn't covered by any `DAYTONA_NETWORK_ALLOW_LIST` CIDR, or
+  advisorially when the host is a hostname (which can't be checked against CIDRs at save time).
+
+### Frontend
+
+`EnvVarManager`'s single-key-at-a-time rail component is replaced by
+`components/EnvVarEditor/`, moved out of the 360px settings rail into a full-width section:
+grouped read rows with scope badges, inline replace-value, multi-select delete through the
+existing `ConfirmModal`, a bulk-edit mode (paste → preview counts → apply), export-template with
+the existing copy-to-clipboard-with-timeout pattern, an `.env` file path toggle, and an
+`AffectedServicesBanner` with a per-service Restart button. Gated by the pre-existing
+`workspace.manageEnv` permission, which no component had actually checked before this epic.
+
+### Verification
+
+`ruff` clean; **618 backend tests pass** (was 593 before this epic's test-writing — net new: 25
+scoping/bulk tests plus the injection/materialisation/redaction tests from earlier in the epic).
+One test, `test_settings.py::test_command_deny_dangerous_defaults_to_true`, fails only when run as
+part of the full suite (order-dependent env-var pollution) and passes in isolation — confirmed
+pre-existing on a clean checkout, unrelated to this epic. Migration `0026_env_var_scoping` verified
+reversible (`upgrade → downgrade -1 → upgrade`) against local Postgres, including a documented
+lossy dedupe on downgrade for genuinely-scoped rows. Frontend: eslint clean (4 pre-existing
+warnings), **tsc -b** and **vite build** succeed, **205 tests pass** (1 pre-existing skip, up from
+199).
+
+Not covered by automated tests, and still worth a manual pass against a live Daytona sandbox: a
+FastAPI service with `DATABASE_URL` set to a real external database actually answering a query
+through its preview URL, and confirming a materialised `.env` file is genuinely absent from `git
+status` inside a real sandbox checkout (the exclude-file append is unit-tested against a fake
+runtime only).

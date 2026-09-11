@@ -1,5 +1,4 @@
-import hashlib
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from urllib.parse import quote
 from uuid import UUID, uuid4
 
@@ -15,7 +14,14 @@ from app.services.daytona_runtime import (
     DaytonaRuntimeError,
     get_daytona_runtime,
 )
+from app.services.editor_alias import (
+    editor_alias_url,
+    editor_prime_url,
+    ensure_editor_alias,
+)
+from app.services.preview_alias import encode_alias_grant
 from app.services.workspaces import WorkspaceNotFoundError
+from app.services.worktrees import WorktreeNotFoundError, WorktreeService
 
 logger = structlog.get_logger(__name__)
 
@@ -32,11 +38,23 @@ class EditorRuntimeError(Exception):
     pass
 
 
-class EditorTokenError(Exception):
+class EditorWorktreeError(Exception):
     pass
 
 
 class EditorService:
+    """Runs code-server inside the sandbox and exposes it on the preview proxy's stable editor
+    host, so the dashboard can embed it in an iframe.
+
+    The launch command is unchanged from the new-tab era -- code-server still binds
+    ``0.0.0.0:13337`` with ``--auth none`` inside the sandbox, which is never reachable directly.
+    What changed is the URL handed to the browser: it used to be a Daytona signed preview URL
+    (a bearer credential in the address bar, rotating hourly); it is now
+    ``https://editor-<alias>.<proxy-host>/?folder=...``, a stable origin with no credential,
+    authorised per-browser by the proxy's grant cookie. Stability is the point: code-server keeps
+    its whole workbench state in ``localStorage``, which is keyed by origin.
+    """
+
     def __init__(
         self,
         session: AsyncSession,
@@ -47,15 +65,21 @@ class EditorService:
         self.settings = settings
         self.runtime = runtime or get_daytona_runtime()
 
-    async def start_or_reuse(self, workspace_id: UUID, user_id: UUID) -> EditorSession:
+    async def start_or_reuse(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        worktree_id: UUID | None = None,
+    ) -> EditorSession:
         workspace = await self._get_workspace(workspace_id, user_id)
         if not workspace.daytona_sandbox_id:
             raise EditorWorkspacePathError
+        folder = await self._resolve_folder(workspace, worktree_id)
         existing = await self._latest_for_workspace(workspace.id, user_id)
         try:
             result = await self.runtime.exec(
                 workspace,
-                self._ensure_command(workspace.workspace_path),
+                self._ensure_command(folder),
                 cwd=workspace.workspace_path,
                 timeout=self.settings.editor_install_timeout_seconds,
             )
@@ -70,20 +94,21 @@ class EditorService:
                     "code-server could not be started in the sandbox. "
                     "Install it in the Daytona snapshot or enable editor auto-install."
                 )
-            signed_url = await self.runtime.signed_preview_url(
-                workspace,
-                self.settings.editor_port,
-            )
         except DaytonaRuntimeError as error:
             raise EditorRuntimeError(str(error)) from error
-        editor_url = self._editor_url(signed_url, workspace.workspace_path)
+
+        alias = await ensure_editor_alias(self.session, workspace)
+        editor_url = editor_alias_url(
+            alias,
+            base_url=self.settings.daytona_preview_proxy_base_url,
+            folder=folder,
+        )
         now = datetime.now(UTC)
         if existing and existing.status == "active":
             existing.url = editor_url
+            existing.folder = folder
+            existing.worktree_id = worktree_id
             existing.last_active_at = now
-            existing.token_expires_at = now + timedelta(
-                seconds=self.settings.daytona_preview_url_ttl_seconds
-            )
             self.session.add(existing)
             await self.session.commit()
             await self.session.refresh(existing)
@@ -98,9 +123,8 @@ class EditorService:
             process_id=None,
             bind_host="daytona",
             bind_port=self.settings.editor_port,
-            token_hash=hashlib.sha256(editor_url.encode()).hexdigest(),
-            token_expires_at=now
-            + timedelta(seconds=self.settings.daytona_preview_url_ttl_seconds),
+            worktree_id=worktree_id,
+            folder=folder,
             started_at=now,
             last_active_at=now,
         )
@@ -113,30 +137,15 @@ class EditorService:
             action="editor_session_start",
             target_type="editor_session",
             target_id=editor_session.id,
-            metadata={"port": self.settings.editor_port},
+            metadata={"port": self.settings.editor_port, "folder": folder},
         )
         return editor_session
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> EditorSession | None:
+        # No URL renewal: the alias host never expires, and the per-browser grant is minted
+        # separately by `prime_url` on every response.
         workspace = await self._get_workspace(workspace_id, user_id)
-        editor_session = await self._latest_for_workspace(workspace.id, user_id)
-        if editor_session and editor_session.status == "active":
-            if editor_session.token_expires_at <= datetime.now(UTC):
-                try:
-                    signed_url = await self.runtime.signed_preview_url(
-                        workspace,
-                        editor_session.bind_port,
-                    )
-                except DaytonaRuntimeError as error:
-                    raise EditorRuntimeError(str(error)) from error
-                editor_session.url = self._editor_url(signed_url, workspace.workspace_path)
-                editor_session.token_expires_at = datetime.now(UTC) + timedelta(
-                    seconds=self.settings.daytona_preview_url_ttl_seconds
-                )
-                self.session.add(editor_session)
-                await self.session.commit()
-                await self.session.refresh(editor_session)
-        return editor_session
+        return await self._latest_for_workspace(workspace.id, user_id)
 
     async def stop(self, workspace_id: UUID, user_id: UUID) -> EditorSession:
         workspace = await self._get_workspace(workspace_id, user_id)
@@ -170,10 +179,44 @@ class EditorService:
         )
         return editor_session
 
-    def _ensure_command(self, workspace_path: str) -> str:
+    async def prime_url(self, editor_session: EditorSession) -> str:
+        """The credential-bearing URL the iframe loads first.
+
+        The grant is the same token family the proxy stores as a cookie (domain-separated from
+        the platform session token by `preview_alias`), minted fresh per response with a short
+        TTL and never persisted -- so it is only ever in flight, and only long enough for the
+        browser to exchange it for the host-scoped cookie.
+        """
+        workspace = await self.session.get(Workspace, editor_session.workspace_id)
+        if workspace is None or not workspace.editor_alias:
+            raise EditorSessionNotFoundError
+        grant = encode_alias_grant(
+            alias=workspace.editor_alias,
+            workspace_id=workspace.id,
+            secret_key=self.settings.auth_secret_key,
+            ttl_seconds=self.settings.editor_prime_ttl_seconds,
+        )
+        return editor_prime_url(
+            workspace.editor_alias,
+            base_url=self.settings.daytona_preview_proxy_base_url,
+            grant=grant,
+            capability_query_param=self.settings.preview_alias_capability_query_param,
+            folder=editor_session.folder,
+        )
+
+    async def _resolve_folder(self, workspace: Workspace, worktree_id: UUID | None) -> str:
+        try:
+            path = await WorktreeService(
+                self.session, self.runtime, self.settings
+            ).resolve_path(workspace, worktree_id)
+        except WorktreeNotFoundError as error:
+            raise EditorWorktreeError("Worktree not found") from error
+        return self._absolute_workspace_path(path)
+
+    def _ensure_command(self, folder: str) -> str:
         binary = self.settings.editor_code_server_binary
         port = self.settings.editor_port
-        folder = quote(self._absolute_workspace_path(workspace_path), safe="/")
+        quoted_folder = quote(folder, safe="/")
         run_log = "/tmp/execute-code-server.log"
         install_log = "/tmp/execute-code-server-install.log"
         # Make a user-local install discoverable without needing sudo/PATH reloads.
@@ -188,12 +231,12 @@ class EditorService:
         lines.extend(
             [
                 # Fail loudly if the binary still isn't there so the API never hands back
-                # a preview URL that points at a port nothing is listening on.
+                # a URL that points at a port nothing is listening on.
                 f"command -v {binary} >/dev/null 2>&1 || exit 127",
                 (
                     f"pgrep -f '{binary}.*{port}' >/dev/null 2>&1 || "
                     f"nohup {binary} --auth none --bind-addr 0.0.0.0:{port} "
-                    f"{folder} >{run_log} 2>&1 &"
+                    f"{quoted_folder} >{run_log} 2>&1 &"
                 ),
             ]
         )
@@ -217,11 +260,6 @@ class EditorService:
             .limit(1)
         )
         return result.scalar_one_or_none()
-
-    def _editor_url(self, signed_url: str, workspace_path: str) -> str:
-        separator = "&" if "?" in signed_url else "?"
-        folder = quote(self._absolute_workspace_path(workspace_path), safe="/")
-        return f"{signed_url}{separator}folder={folder}"
 
     def _absolute_workspace_path(self, workspace_path: str) -> str:
         # code-server resolves the `folder=` query param as an absolute path inside the

@@ -46,13 +46,13 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
 
 ### Backend (FastAPI + SQLAlchemy)
 - **Entrypoint**: `backend/app/main.py` → `app:app` (FastAPI with CORS + lifespan)
-- **Router**: `backend/app/api/router.py` aggregates 15 sub-routers
+- **Router**: `backend/app/api/router.py` aggregates 22 sub-routers
 - **Config**: `backend/app/core/config.py` via `pydantic-settings` (reads `.env` from CWD, `extra="ignore"`)
 - **Database**: PostgreSQL via SQLAlchemy 2.0 async + `asyncpg` driver (NOT psycopg2)
   - Connection string must be `postgresql+asyncpg://…`
   - Session: `async_session_maker` with `expire_on_commit=False`
   - All DB access MUST use async/await
-- **Migrations**: Alembic with async engine, 25 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0025_workspace_services`)
+- **Migrations**: Alembic with async engine, 29 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0028_platform_llm_settings`)
 - **Auth**: Cookie-based sessions (`execute_session` cookie), NOT JWT. Set-Cookie on login, cleared on logout.
 - **Logging**: `structlog` (configured in `core/logging.py`)
 - **Testing**: `pytest` with `pytest-asyncio` (auto mode), tests at `backend/tests/`
@@ -74,7 +74,7 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
 ### Domain Organization
 
 Backend follows domain-driven layout. Each domain has its own: `api/` (route), `models/` (ORM), `schemas/` (Pydantic), `services/` (logic).
-Domains: `auth`, `workspaces`, `repositories`, `worktrees`, `agents`, `terminal`, `editor`, `preview`, `commands`, `notifications`, `files`, `dev_server`, `workspace_services`, `specs`, `projects`, `teams`, `dashboard`.
+Domains: `auth`, `workspaces`, `repositories`, `worktrees`, `agents`, `terminal`, `editor`, `preview`, `commands`, `notifications`, `files`, `dev_server`, `workspace_services`, `specs`, `projects`, `teams`, `dashboard`, `platform_settings`.
 
 Some domains live in the service layer without their own top-level router — `repositories`, `worktrees`, and the GitHub PR client (`github_client.py`) are exposed through `workspaces` routes under `/{workspace_id}/repo/*` (e.g. `/repo/pull`, `/repo/worktrees`, `/repo/pull-requests`).
 
@@ -87,6 +87,19 @@ The backend manages ephemeral sandboxes via the Daytona API (`backend/app/servic
 ./daytona/build-snapshot.sh
 ```
 Then set `DAYTONA_DEFAULT_SNAPSHOT=enigma-mise-code` in `.env`. The stock `daytonaio/sandbox` image will fail because runtime `curl | sh` installs are blocked by the sandbox network.
+
+### Global LLM Configuration
+
+One platform-wide row in `platform_llm_settings` (`models/platform_llm.py`,
+`services/platform_llm.py`, `api/platform_settings.py`, prefix `/platform/llm-settings`) holds the
+OpenAI-compatible base URL, model, and a Fernet-encrypted API key. Owner-only, gated by
+`require_role("owner")` — this is that helper's first production caller. Frontend: `/settings`
+(`routes/SettingsRoute.tsx`) plus the first-run `/setup` gate (`platform/llmStatus.ts`,
+`SetupGate` in `App.tsx`).
+
+**Precedence is DB row > env (`OPENHANDS_LLM_*`) > refuse.** The single seam is
+`provider_for_run(session, settings)` in `services/agents.py`; `provider_from_settings` stays
+**sync and env-only** because it is unit-tested directly and is the fallback branch.
 
 ### Spec-Driven Development (GitHub Spec Kit)
 
@@ -124,7 +137,9 @@ Then set `DAYTONA_DEFAULT_SNAPSHOT=enigma-mise-code` in `.env`. The stock `dayto
 10. **No runtime type checking in Python** — mypy is not configured. Type hints are documentation only.
 11. **Git/uv/scripts run via `DaytonaRuntime.exec`, not the agent tool sandbox** — the agent tool sandbox blocks them. Spec Kit and worktree operations shell out through `DaytonaRuntime.exec` directly; only file *content* goes through agent tools.
 12. **Spec Kit `implement` is hard-gated** — it cannot run until the `plan` and `tasks` phases are approved. Don't bypass the `awaiting_review` halts.
-13. **Worktree-aware operations** — agent runs and terminals target the active worktree's branch. The frontend tracks it in `localStorage` (`activeWorktree.ts`); the backend resolves it server-side from `worktree_id`. PR creation needs a workspace GitHub token.
+13. **A stored LLM config always drives the OpenHands provider** — it is the only provider that accepts a `base_url`; `OpenAIResponsesProvider` hardcodes `api.openai.com/v1/responses`. With nothing configured, `create_run` raises `AgentConfigurationError` → **503**; tests that drive the run pipeline without an LLM must pass `Settings(agent_allow_mock_provider=True)`.
+14. **`Settings()` is order-dependent in tests** — importing `openhands.sdk` calls `load_dotenv()`, which injects the repo-root `.env` into `os.environ`. A test that means "nothing is configured" must pin the fields explicitly (see `bare_settings()` in `tests/test_platform_llm_settings.py`), never rely on a bare `Settings()`. This is also why `test_settings.py::test_command_deny_dangerous_defaults_to_true` fails locally in a full-suite run but passes alone.
+15. **Worktree-aware operations** — agent runs and terminals target the active worktree's branch. The frontend tracks it in `localStorage` (`activeWorktree.ts`); the backend resolves it server-side from `worktree_id`. PR creation needs a workspace GitHub token.
 
 ## Implementation Plan Reference
 
