@@ -71,3 +71,59 @@ not just GitHub.
 - Org-level template catalogs.
 - Provider-native MR/PR creation for GitLab/Bitbucket.
 - Import from a zip/local upload.
+
+## Implementation Notes (shipped)
+
+### Design decisions
+
+- **Provider abstraction is pure.** `backend/app/services/git_providers.py` owns URL parsing,
+  canonicalisation, per-provider HTTP basic-auth usernames (`x-access-token` / `oauth2` /
+  `x-token-auth` / `git`), PR capability, and host-agnostic redaction. `repositories.py` keeps
+  `sanitize_repository_url` / `sanitize_git_output` as thin wrappers.
+- **Strict URL/auth pairing.** `ssh_key` requires an SSH URL (`git@host:owner/repo.git` or
+  `ssh://git@host/...`); `personal_access_token` requires HTTPS. No silent rewriting.
+- **SSRF guards are literal-only.** IP literals, `localhost`, `*.local/.internal/.lan/...`,
+  dotless hosts, ports on the SaaS providers, `http://`/`git://`/`file://` are rejected. Egress
+  from the sandbox is governed separately by `DAYTONA_NETWORK_ALLOW_LIST`.
+- **All clones run through the git CLI** (`git clone --branch <b> -- <url> .`) so token and SSH
+  auth share `_run_authenticated_git`; the Daytona SDK's go-git clone is no longer used.
+- **SSH keys are generated server-side** (ed25519, `services/ssh_keys.py`), stored encrypted with
+  `WorkspaceSecretCipher`, and only materialised in `/tmp/enigma-ssh/<uuid>/id_ed25519` (0600)
+  for the duration of one git command, with `GIT_SSH_COMMAND` pointing at it
+  (`IdentitiesOnly`, `BatchMode`, `StrictHostKeyChecking=accept-new`).
+- **One credential per workspace** (UNIQUE on `repository_credentials.workspace_id`), with
+  `auth_type` selecting `encrypted_token`(+`username`) or `encrypted_private_key`+`public_key`.
+- **`origin` is reconciled lazily** in push/pull/fetch (`_ensure_origin`), so `connect` stays
+  DB-only and template/blank workspaces gain a remote the first time they push.
+- **Templates and blank workspaces are initialised inside `SqlAlchemyWorkspaceService.create`**
+  (`services/workspace_init.py`): shallow clone → drop `.git` → write `mise.toml` if missing →
+  `git init -b <default_branch>` → initial commit. Blank workspaces get a `README.md` commit so
+  worktrees/discard/commit-detail work before a remote exists.
+- **Provider-native pull requests stay GitHub + token only.** Other providers (or SSH-key
+  credentials) get `409` with a clear message; the UI hides the PR form and shows a
+  "push and open it on <host>" note. GitLab MR / Bitbucket PR creation remains future work.
+- **Seed templates** are GitHub's public Codespaces starters (`react-vite`, `nextjs`,
+  `node-express`, `python-flask`, `python-django`), each with a `mise_config` providing `install`
+  and `dev` tasks. Swap the URLs in migration `0022` to point at organisation-owned templates.
+
+### API surface
+
+| Method / path | Purpose |
+|---|---|
+| `GET /workspace-templates` | Active template catalog (sorted by `sort_order`). |
+| `POST /workspaces`, `POST /projects/{p}/teams/{t}/workspaces` | Body gains `source` (`repository` \| `template` \| `blank`) and `template_id`; `repo_url` is required only for `repository`. |
+| `POST /workspaces/{id}/repo/connect` | Body gains `provider` (`auto` default), `auth_type`, optional `username`; `token` only for token auth. |
+| `GET /workspaces/{id}/repo/credential` | Provider, auth type, public key, `supports_pull_requests`. Never secrets. |
+| `POST /workspaces/{id}/repo/ssh-key` | Ensure/rotate the deploy key pair; returns the public key. |
+
+### Operational notes
+
+- Migration `0022_templates_and_git_providers` (reversible): `workspace_templates`,
+  `workspaces.repo_url` nullable + `source` + `template_id`, credential columns + CHECKs.
+- When `DAYTONA_NETWORK_BLOCK_ALL=true`, allow the git hosts (443/22) and github.com (template
+  clones) in `DAYTONA_NETWORK_ALLOW_LIST`.
+- The sandbox image must ship an OpenSSH client for deploy-key auth; the backend surfaces
+  "SSH client is not available in this sandbox image" otherwise (see `daytona/Dockerfile`).
+- GitHub Enterprise Server and self-hosted Bitbucket are not supported (the REST base URL and
+  `/scm/` path layout differ); self-hosted GitLab works by choosing GitLab explicitly.
+

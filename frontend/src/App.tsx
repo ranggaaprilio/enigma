@@ -110,7 +110,9 @@ function AppRoutes() {
         <Route path="repository" element={<DashboardView view="repository" />} />
         <Route path="files" element={<DashboardView view="files" />} />
         <Route path="commands" element={<DashboardView view="commands" />} />
+        <Route path="spec" element={<DashboardView view="spec" />} />
         <Route path="agents" element={<DashboardView view="agent" />} />
+        <Route path="usage" element={<DashboardView view="usage" />} />
         <Route path="editor" element={<DashboardView view="editor" />} />
         <Route path="terminal" element={<DashboardView view="terminal" />} />
         <Route path="preview" element={<DashboardView view="preview" />} />

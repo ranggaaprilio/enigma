@@ -21,6 +21,7 @@ import {
   X,
 } from "lucide-react";
 
+import { Spinner } from "./ui/Spinner";
 import {
   ApiError,
   createWorkspaceFolder,
@@ -33,12 +34,18 @@ import {
   type WorkspaceFileNode,
   type WorkspaceResponse,
 } from "../lib/api";
+import { useActiveWorktree } from "../lib/activeWorktree";
 
 type PendingAction =
   | { type: "rename"; node: WorkspaceFileNode; newPath: string }
   | { type: "delete"; node: WorkspaceFileNode };
 
 export function FileManagementPanel({ workspace }: { workspace: WorkspaceResponse }) {
+  // The Files view follows the worktree selected in the Worktrees panel (broadcast via
+  // useActiveWorktree), so browsing and every file operation target the active branch's
+  // working tree. null => the base clone.
+  const [active] = useActiveWorktree(workspace.id);
+  const worktreeId = active?.id;
   const [tree, setTree] = useState<WorkspaceFileNode | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [expandedPaths, setExpandedPaths] = useState<Set<string>>(() => new Set([""]));
@@ -60,18 +67,21 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
     setError(null);
     setBusyAction("tree");
     try {
-      const nextTree = await getWorkspaceFileTree(workspace.id, "", signal);
+      const nextTree = await getWorkspaceFileTree(workspace.id, "", worktreeId, signal);
       setTree(nextTree);
       setSelectedPath((current) => current ?? nextTree.path);
     } catch (caughtError) {
       if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
+        // An aborted load has already been replaced by a newer one (StrictMode's double
+        // mount, or a worktree switch). Clearing the busy flag here would switch off the
+        // *replacement's* spinner, so this run must leave every piece of state alone —
+        // which is why the clear below sits after the catch rather than in a `finally`.
         return;
       }
       setError(caughtError instanceof ApiError ? caughtError.message : "Unable to load files.");
-    } finally {
-      setBusyAction((current) => (current === "tree" ? null : current));
     }
-  }, [workspace.id]);
+    setBusyAction((current) => (current === "tree" ? null : current));
+  }, [workspace.id, worktreeId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -92,7 +102,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
     }
 
     const controller = new AbortController();
-    searchWorkspaceFiles(workspace.id, query, controller.signal)
+    searchWorkspaceFiles(workspace.id, query, worktreeId, controller.signal)
       .then((results) => setSearchResults(results))
       .catch((caughtError: unknown) => {
         if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
@@ -102,7 +112,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
       });
 
     return () => controller.abort();
-  }, [searchQuery, workspace.id]);
+  }, [searchQuery, workspace.id, worktreeId]);
 
   function toggleFolder(path: string) {
     setExpandedPaths((current) => {
@@ -123,7 +133,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
       return;
     }
     await runMutation("folder", async () => {
-      await createWorkspaceFolder(workspace.id, { path: folderPath });
+      await createWorkspaceFolder(workspace.id, { path: folderPath }, worktreeId);
       setExpandedPaths((current) => new Set(current).add(parentPath(folderPath)));
       setFolderPath("");
       return "Folder created.";
@@ -138,7 +148,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
     const destination =
       selectedNode?.type === "directory" ? selectedNode.path : parentPath(selectedNode?.path ?? "");
     await runMutation("upload", async () => {
-      await uploadWorkspaceFile(workspace.id, destination, file, file.name);
+      await uploadWorkspaceFile(workspace.id, destination, file, file.name, worktreeId);
       return "File uploaded.";
     });
     event.target.value = "";
@@ -150,7 +160,7 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
     }
     if (pendingAction.type === "delete") {
       await runMutation("delete", async () => {
-        await deleteWorkspaceFile(workspace.id, pendingAction.node.path);
+        await deleteWorkspaceFile(workspace.id, pendingAction.node.path, worktreeId);
         setSelectedPath(null);
         setPendingAction(null);
         return "File deleted.";
@@ -158,10 +168,14 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
       return;
     }
     await runMutation("rename", async () => {
-      const response = await renameWorkspaceFile(workspace.id, {
-        path: pendingAction.node.path,
-        new_path: pendingAction.newPath,
-      });
+      const response = await renameWorkspaceFile(
+        workspace.id,
+        {
+          path: pendingAction.node.path,
+          new_path: pendingAction.newPath,
+        },
+        worktreeId,
+      );
       setSelectedPath(response.path);
       setPendingAction(null);
       return "File renamed.";
@@ -187,7 +201,11 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
     if (!selectedNode || selectedNode.type !== "file") {
       return;
     }
-    window.open(getWorkspaceFileDownloadUrl(workspace.id, selectedNode.path), "_blank", "noopener");
+    window.open(
+      getWorkspaceFileDownloadUrl(workspace.id, selectedNode.path, worktreeId),
+      "_blank",
+      "noopener",
+    );
   }
 
   const visibleNodes = searchQuery.trim() ? searchResults : tree?.children ?? [];
@@ -196,20 +214,27 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
     <section className="grid gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
       <div className="rounded-md border border-line bg-white p-5 shadow-soft">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
+          <div className="min-w-0">
             <p className="text-sm font-medium uppercase tracking-[0.16em] text-ink/55">
               Files
             </p>
             <h3 className="mt-1 text-base font-semibold">{workspace.name}</h3>
+            <p className="mt-1 truncate font-mono text-xs text-ink/55" title="Active branch">
+              {active?.branch ?? workspace.default_branch}
+            </p>
           </div>
           <button
             aria-label="Refresh files"
-            className="flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink"
+            className="flex h-9 w-9 items-center justify-center rounded-md border border-line bg-white text-ink/70 transition hover:bg-panel hover:text-ink disabled:cursor-not-allowed disabled:opacity-50"
             type="button"
             disabled={busyAction === "tree"}
+            aria-busy={busyAction === "tree"}
             onClick={() => void loadTree()}
           >
-            <RefreshCw className="h-4 w-4" aria-hidden="true" />
+            <RefreshCw
+              className={`h-4 w-4 ${busyAction === "tree" ? "animate-spin" : ""}`}
+              aria-hidden="true"
+            />
           </button>
         </div>
 
@@ -265,8 +290,11 @@ export function FileManagementPanel({ workspace }: { workspace: WorkspaceRespons
         )}
 
         <div className="mt-4 max-h-[620px] overflow-auto rounded-md border border-line bg-white p-2">
-          {busyAction === "tree" && !tree && (
-            <div className="p-4 text-sm text-ink/65">Loading files...</div>
+          {!tree && !error && (
+            <div className="flex items-center gap-2 p-4 text-sm text-ink/65">
+              <Spinner className="h-4 w-4" />
+              Loading files...
+            </div>
           )}
           {visibleNodes.length === 0 && tree && (
             <div className="p-4 text-sm text-ink/65">

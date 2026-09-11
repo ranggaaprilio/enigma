@@ -1,10 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  ApiError,
   cloneRepository,
+  ensureRepositorySshKey,
+  getRepositoryCredential,
+  listWorkspaceTemplates,
   commitRepository,
   connectRepository,
   createAgentRun,
+  createAgentSession,
+  createAgentSessionTurn,
+  deleteAgentSession,
+  getAgentSession,
+  listAgentSessions,
+  updateAgentSession,
   createCustomCommand,
   createTerminalSession,
   createWorkspaceFolder,
@@ -15,7 +25,8 @@ import {
   deleteWorkspaceEnvVar,
   detectPreviewSession,
   getDevServerStatus,
-  startDevServer,
+  setupDevServer,
+  runDevServer,
   stopDevServer,
   getAgentRun,
   getAgentStreamUrl,
@@ -234,6 +245,7 @@ describe("getHealth", () => {
 
     await connectRepository(workspaceId, {
       repo_url: "https://github.com/example/demo",
+      auth_type: "personal_access_token",
       token: "raw-secret",
     });
     await cloneRepository(workspaceId);
@@ -387,6 +399,54 @@ describe("getHealth", () => {
     );
     expect(getAgentStreamUrl(workspaceId, runId)).toBe(
       `ws://localhost:8000/workspaces/${workspaceId}/agent/runs/${runId}/stream`,
+    );
+  });
+
+  it("sends credentialed agent session requests", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const sessionId = "aa11bb22-cc33-dd44-ee55-ff6677889900";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: sessionId }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await createAgentSession(workspaceId, { title: "Fix parser" });
+    await listAgentSessions(workspaceId, undefined, 20, 0, "active");
+    await getAgentSession(workspaceId, sessionId);
+    await updateAgentSession(workspaceId, sessionId, { title: "New" });
+    await deleteAgentSession(workspaceId, sessionId);
+    await createAgentSessionTurn(workspaceId, sessionId, { prompt: "Add JSON" });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions?limit=20&offset=0&status=active`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      4,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+      expect.objectContaining({ credentials: "include", method: "PATCH" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      5,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+      expect.objectContaining({ credentials: "include", method: "DELETE" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      6,
+      `http://localhost:8000/workspaces/${workspaceId}/agent/sessions/${sessionId}/turns`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
     );
   });
 
@@ -552,23 +612,59 @@ describe("getHealth", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await startDevServer(workspaceId);
+    await setupDevServer(workspaceId);
+    await runDevServer(workspaceId);
     await getDevServerStatus(workspaceId);
     await stopDevServer(workspaceId);
 
     expect(fetchMock).toHaveBeenNthCalledWith(
       1,
-      `http://localhost:8000/workspaces/${workspaceId}/dev/start`,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/setup`,
       expect.objectContaining({ credentials: "include", method: "POST" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
       2,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/run`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
       `http://localhost:8000/workspaces/${workspaceId}/dev/status`,
       expect.objectContaining({ credentials: "include" }),
     );
     expect(fetchMock).toHaveBeenNthCalledWith(
-      3,
+      4,
       `http://localhost:8000/workspaces/${workspaceId}/dev/stop`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+  });
+
+  it("scopes dev-server setup/run to a worktree when given", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const worktreeId = "7c9d15db-19e2-4c04-95ad-a4e4508ef80d";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ ok: true, status: "installing", message: null }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await setupDevServer(workspaceId, worktreeId);
+    await runDevServer(workspaceId, worktreeId);
+    await runDevServer(workspaceId); // base clone → no worktree_id query param
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/setup?worktree_id=${worktreeId}`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/run?worktree_id=${worktreeId}`,
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/dev/run`,
       expect.objectContaining({ credentials: "include", method: "POST" }),
     );
   });
@@ -608,5 +704,54 @@ describe("getHealth", () => {
       expect.objectContaining({ credentials: "include" }),
     );
     expect(getNotificationStreamUrl()).toBe("ws://localhost:8000/notifications/stream");
+  });
+});
+
+describe("templates and credentials", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("lists templates and reads the credential summary", async () => {
+    const workspaceId = "3e15be87-2551-4d70-b972-33fdf68c49eb";
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => [],
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await listWorkspaceTemplates();
+    await getRepositoryCredential(workspaceId);
+    await ensureRepositorySshKey(workspaceId, true);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "http://localhost:8000/workspace-templates",
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/credential`,
+      expect.objectContaining({ credentials: "include" }),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      3,
+      `http://localhost:8000/workspaces/${workspaceId}/repo/ssh-key`,
+      expect.objectContaining({ method: "POST", body: JSON.stringify({ rotate: true }) }),
+    );
+  });
+
+  it("surfaces a 404 credential as an ApiError with status", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 404,
+        json: async () => ({ detail: "No repository credential configured" }),
+      }),
+    );
+
+    await expect(getRepositoryCredential("ws")).rejects.toMatchObject({ status: 404 });
+    await expect(getRepositoryCredential("ws")).rejects.toBeInstanceOf(ApiError);
   });
 });

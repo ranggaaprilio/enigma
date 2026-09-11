@@ -11,27 +11,69 @@ import {
   type TerminalSessionResponse,
   type WorkspaceResponse,
 } from "../lib/api";
+import { useActiveWorktree } from "../lib/activeWorktree";
+import { useReconnectingWebSocket } from "../lib/useReconnectingWebSocket";
 
-type ConnectionState = "idle" | "connecting" | "connected" | "disconnected" | "error";
-const websocketOpen = 1;
+const STATUS_LABELS: Record<string, string> = {
+  idle: "Idle",
+  connecting: "Connecting",
+  live: "Connected",
+  reconnecting: "Reconnecting",
+  disconnected: "Disconnected",
+};
 
 export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
+  const [activeWorktree] = useActiveWorktree(workspace.id);
+  const worktreeId = activeWorktree?.id ?? null;
   const containerRef = useRef<HTMLDivElement | null>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
-  const socketRef = useRef<WebSocket | null>(null);
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
+  // The hook owns the socket; keep the latest `send` in a ref so xterm's onData/resize
+  // handlers (registered once) always target the current connection.
+  const sendRef = useRef<(data: string | ArrayBufferLike | Blob | ArrayBufferView) => void>(
+    () => {},
+  );
   const [session, setSession] = useState<TerminalSessionResponse | null>(null);
-  const [connectionState, setConnectionState] = useState<ConnectionState>("idle");
+  const [terminalReady, setTerminalReady] = useState(false);
+  const [stopped, setStopped] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  function handleTextMessage(value: string) {
+    try {
+      const payload = JSON.parse(value) as { type?: string; message?: string };
+      if (payload.type === "error" && payload.message) {
+        setError(payload.message);
+      }
+    } catch {
+      terminalRef.current?.write(value);
+    }
+  }
+
+  function fitAndSendSize() {
+    const fitAddon = fitAddonRef.current;
+    const terminal = terminalRef.current;
+    if (!fitAddon || !terminal) {
+      return;
+    }
+    try {
+      fitAddon.fit();
+      sendRef.current(
+        JSON.stringify({ type: "resize", cols: terminal.cols, rows: terminal.rows }),
+      );
+    } catch {
+      return;
+    }
+  }
+
+  // Create the backend session and the xterm instance once per workspace/worktree. The
+  // socket itself is managed by useReconnectingWebSocket below.
   useEffect(() => {
     let cancelled = false;
 
-    async function connect() {
-      setConnectionState("connecting");
+    async function init() {
       setError(null);
-
+      setStopped(false);
       try {
         const terminalSession = await createTerminalSession(workspace.id, { name: "Terminal" });
         if (cancelled) {
@@ -69,36 +111,7 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
         terminalRef.current = terminal;
         fitAddonRef.current = fitAddon;
 
-        const socket = new window.WebSocket(
-          getTerminalSessionSocketUrl(workspace.id, terminalSession.id),
-        );
-        socket.binaryType = "arraybuffer";
-        socketRef.current = socket;
-
-        terminal.onData((data) => {
-          if (socket.readyState === websocketOpen) {
-            socket.send(new TextEncoder().encode(data));
-          }
-        });
-
-        socket.onopen = () => {
-          setConnectionState("connected");
-          fitAndSendSize();
-        };
-        socket.onmessage = (message) => {
-          if (typeof message.data === "string") {
-            handleTextMessage(message.data);
-            return;
-          }
-          terminal.write(new Uint8Array(message.data as ArrayBuffer));
-        };
-        socket.onerror = () => {
-          setConnectionState("error");
-          setError("Terminal connection failed.");
-        };
-        socket.onclose = () => {
-          setConnectionState((current) => (current === "error" ? "error" : "disconnected"));
-        };
+        terminal.onData((data) => sendRef.current(new TextEncoder().encode(data)));
 
         if (containerRef.current && "ResizeObserver" in window) {
           const observer = new ResizeObserver(() => fitAndSendSize());
@@ -106,66 +119,55 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
           resizeObserverRef.current = observer;
         }
 
-        window.setTimeout(() => fitAndSendSize(), 0);
+        setTerminalReady(true);
       } catch (caughtError) {
         if (cancelled) {
           return;
         }
-        setConnectionState("error");
         setError(
           caughtError instanceof ApiError ? caughtError.message : "Unable to open terminal.",
         );
       }
     }
 
-    void connect();
+    void init();
 
     return () => {
       cancelled = true;
       resizeObserverRef.current?.disconnect();
       resizeObserverRef.current = null;
-      socketRef.current?.close();
-      socketRef.current = null;
       terminalRef.current?.dispose();
       terminalRef.current = null;
       fitAddonRef.current = null;
+      setTerminalReady(false);
+      setSession(null);
     };
-  }, [workspace.id]);
+  }, [workspace.id, worktreeId]);
 
-  function handleTextMessage(value: string) {
-    try {
-      const payload = JSON.parse(value) as { type?: string; message?: string };
-      if (payload.type === "error" && payload.message) {
-        setError(payload.message);
-        setConnectionState("error");
-      }
-    } catch {
-      terminalRef.current?.write(value);
-    }
-  }
+  const socketUrl =
+    session && terminalReady && !stopped
+      ? getTerminalSessionSocketUrl(workspace.id, session.id, worktreeId)
+      : null;
 
-  function fitAndSendSize() {
-    const fitAddon = fitAddonRef.current;
-    const terminal = terminalRef.current;
-    const socket = socketRef.current;
-    if (!fitAddon || !terminal) {
-      return;
-    }
-    try {
-      fitAddon.fit();
-      if (socket?.readyState === websocketOpen) {
-        socket.send(
-          JSON.stringify({
-            type: "resize",
-            cols: terminal.cols,
-            rows: terminal.rows,
-          }),
-        );
+  const { connectionState, send } = useReconnectingWebSocket(socketUrl, {
+    binaryType: "arraybuffer",
+    onOpen: () => {
+      setError(null);
+      fitAndSendSize();
+    },
+    onMessage: (message) => {
+      if (typeof message.data === "string") {
+        handleTextMessage(message.data);
+        return;
       }
-    } catch {
-      return;
-    }
-  }
+      terminalRef.current?.write(new Uint8Array(message.data as ArrayBuffer));
+    },
+    onError: () => setError("Terminal connection failed."),
+  });
+
+  useEffect(() => {
+    sendRef.current = send;
+  }, [send]);
 
   async function copySelection() {
     const selection = terminalRef.current?.getSelection();
@@ -177,8 +179,8 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
 
   async function pasteClipboard() {
     const text = await navigator.clipboard?.readText();
-    if (text && socketRef.current?.readyState === websocketOpen) {
-      socketRef.current.send(new TextEncoder().encode(text));
+    if (text) {
+      send(new TextEncoder().encode(text));
     }
   }
 
@@ -189,21 +191,14 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
     setError(null);
     try {
       await deleteTerminalSession(workspace.id, session.id);
-      socketRef.current?.close();
-      setConnectionState("disconnected");
+      setStopped(true); // nulls the socket URL → hook closes the connection, no reconnect
       setSession((current) => (current ? { ...current, status: "stopped" } : current));
     } catch (caughtError) {
       setError(caughtError instanceof ApiError ? caughtError.message : "Unable to stop terminal.");
     }
   }
 
-  const statusLabel = {
-    idle: "Idle",
-    connecting: "Connecting",
-    connected: "Connected",
-    disconnected: "Disconnected",
-    error: "Error",
-  }[connectionState];
+  const statusLabel = error ? "Error" : (STATUS_LABELS[connectionState] ?? "Idle");
 
   return (
     <section className="rounded-md border border-line bg-white p-5 shadow-soft">
@@ -213,6 +208,12 @@ export function TerminalPanel({ workspace }: { workspace: WorkspaceResponse }) {
             Terminal
           </p>
           <h3 className="mt-1 text-base font-semibold">{workspace.name}</h3>
+          <p className="mt-0.5 text-xs text-ink/55">
+            Branch:{" "}
+            <span className="font-medium text-ink/75">
+              {activeWorktree ? activeWorktree.branch : "base"}
+            </span>
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <span className="rounded-full bg-white px-3 py-1 text-sm font-semibold text-ink/65">
