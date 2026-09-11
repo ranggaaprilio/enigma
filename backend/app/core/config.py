@@ -73,7 +73,10 @@ class Settings(BaseSettings):
     terminal_default_rows: int = 34
     editor_code_server_binary: str = "code-server"
     editor_port: int = 13337
-    editor_token_ttl_seconds: int = 60 * 60
+    # TTL of the one-shot grant handed to the browser in the editor iframe's `src`. It only has
+    # to survive the first navigation, after which the proxy's host-scoped cookie takes over --
+    # so it is deliberately far shorter than `preview_alias_cookie_ttl_seconds`.
+    editor_prime_ttl_seconds: int = Field(default=120, gt=0)
     editor_install_timeout_seconds: int = 180
     editor_auto_install: bool = True
     mise_auto_install: bool = True

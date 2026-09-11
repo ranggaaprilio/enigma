@@ -605,8 +605,17 @@ export type EditorSessionResponse = {
   id: string;
   workspace_id: string;
   user_id: string;
+  /** Stable alias URL. Carries no credential, so it is safe to display or copy. */
   url: string;
+  /**
+   * The same URL plus a short-lived grant. This is what the iframe must load: only a request
+   * carrying the grant gets the proxy's host-scoped cookie set. Minted per response, and empty
+   * when the session is not active.
+   */
+  prime_url: string;
   status: EditorSessionStatus;
+  worktree_id: string | null;
+  folder: string | null;
   started_at: string;
   last_active_at: string;
 };
@@ -1775,9 +1784,13 @@ export function deleteTerminalSession(
   );
 }
 
-export function startEditorSession(workspaceId: string): Promise<EditorSessionResponse> {
+export function startEditorSession(
+  workspaceId: string,
+  worktreeId?: string | null,
+): Promise<EditorSessionResponse> {
   return requestJson<EditorSessionResponse>(`/workspaces/${workspaceId}/editor/start`, {
     method: "POST",
+    body: JSON.stringify({ worktree_id: worktreeId ?? null }),
   });
 }
 

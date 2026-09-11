@@ -1,4 +1,5 @@
 import asyncio
+import re
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -8,7 +9,7 @@ from uuid import UUID
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, status
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from sqlalchemy import select
 from starlette.background import BackgroundTask
 from websockets.asyncio.client import connect as ws_connect
@@ -16,13 +17,21 @@ from websockets.asyncio.client import connect as ws_connect
 from app.core.config import Settings, get_settings
 from app.core.logging import configure_logging
 from app.db.session import async_session_maker
-from app.models import PreviewSession, User, Workspace, WorkspacePreviewAlias, WorkspaceService
+from app.models import (
+    EditorSession,
+    PreviewSession,
+    User,
+    Workspace,
+    WorkspacePreviewAlias,
+    WorkspaceService,
+)
 from app.services.daytona_runtime import (
     DaytonaRuntime,
     DaytonaRuntimeError,
     RuntimePreviewLink,
     get_daytona_runtime,
 )
+from app.services.editor_alias import is_editor_alias_label
 from app.services.preview_alias import (
     InvalidPreviewAliasGrantError,
     classify_proxy_host,
@@ -98,6 +107,21 @@ class AliasResolution:
             workspace=self.workspace,
             kind="alias",
         )
+
+
+@dataclass(frozen=True)
+class EditorProxyTarget:
+    """Epic: embedded editor. The editor host family resolves to a workspace plus whichever
+    code-server session is currently active for it -- there is no `PreviewSession` involved,
+    because the editor is not a user service and never appears in the preview surface."""
+
+    workspace: Workspace
+    editor_session: EditorSession | None
+
+    def require_session(self) -> EditorSession:
+        if self.editor_session is None:
+            raise PreviewTargetNotRunningError("Editor is not running")
+        return self.editor_session
 
 
 class PreviewProxyResolver:
@@ -198,6 +222,45 @@ class PreviewProxyResolver:
                 preview_session=preview,
             )
 
+    async def resolve_editor_alias(self, alias: str) -> EditorProxyTarget:
+        """Editor alias -> workspace + its active code-server session, in one query.
+
+        Mirrors `resolve_alias`'s posture exactly: an unknown alias is indistinguishable from an
+        unauthorised one (both end as a 404 at the call site), while a *known* alias whose editor
+        simply is not running resolves with `editor_session=None` so the caller can answer 503 --
+        and it only ever does so after the gate has already authorised the request, so it is
+        never an existence oracle.
+        """
+        async with self.session_factory() as session:
+            result = await session.execute(
+                select(Workspace, EditorSession)
+                .outerjoin(
+                    EditorSession,
+                    (EditorSession.workspace_id == Workspace.id)
+                    & (EditorSession.status == "active"),
+                )
+                .where(Workspace.editor_alias == alias)
+                .order_by(EditorSession.last_active_at.desc())
+                .limit(1)
+            )
+            row = result.first()
+            if row is None:
+                raise InvalidPreviewCapabilityError("Invalid editor alias")
+            workspace, editor_session = row
+            if (
+                workspace is None
+                or workspace.owner_id is None
+                or not workspace.daytona_sandbox_id
+            ):
+                raise InvalidPreviewCapabilityError("Editor workspace is unavailable")
+            owner = await session.get(User, workspace.owner_id)
+            if owner is None or not owner.is_active:
+                raise InvalidPreviewCapabilityError("Editor owner is unavailable")
+            session.expunge(workspace)
+            if editor_session is not None:
+                session.expunge(editor_session)
+            return EditorProxyTarget(workspace=workspace, editor_session=editor_session)
+
     async def verify_capability_for_workspace(
         self, capability_value: str, workspace_id: UUID
     ) -> bool:
@@ -272,6 +335,12 @@ def create_preview_proxy_app(
             raise HTTPException(status_code=404, detail="Preview not found") from None
 
         grant_to_set: str | None = None
+        editor_grant_to_set: str | None = None
+        # `target` is set only by the two preview families -- the editor has no `PreviewSession`
+        # to carry, which is why CORS diagnosis is skipped for it. `is_editor` says so
+        # explicitly rather than leaving that meaning implicit in `target is None`.
+        target: PreviewProxyTarget | None = None
+        is_editor = False
         query = request.url.query
 
         # Dispatch on shape: an alias always contains a hyphen (by construction -- see
@@ -280,7 +349,55 @@ def create_preview_proxy_app(
         # epic -- unconditionally, with no separate pre-validation -- so a label's own
         # `resolve()` call (crypto signature + expiry) remains the only thing that decides
         # whether a non-alias-shaped host is a valid capability.
-        if is_alias_label(label):
+        #
+        # The editor family (`editor-<12 hex>`) is alias-shaped too, so it is checked first.
+        # The two can never overlap: `preview_alias.validate_alias` refuses to mint anything
+        # matching `is_editor_alias_label`.
+        if is_editor_alias_label(label):
+            is_editor = True
+            try:
+                editor_target = await proxy_resolver.resolve_editor_alias(label)
+            except InvalidPreviewCapabilityError:
+                raise HTTPException(status_code=404, detail="Preview not found") from None
+
+            query = _strip_query_param(query, proxy_settings.preview_alias_capability_query_param)
+
+            if not _is_preflight(request):
+                gate = _editor_gate(
+                    proxy_settings,
+                    alias=label,
+                    workspace_id=editor_target.workspace.id,
+                    cookie_value=request.cookies.get(proxy_settings.preview_alias_cookie_name),
+                    grant_value=request.query_params.get(
+                        proxy_settings.preview_alias_capability_query_param
+                    ),
+                )
+                if not gate.authorized:
+                    raise HTTPException(status_code=404, detail="Preview not found")
+                editor_grant_to_set = gate.grant_to_set
+
+                if (
+                    proxy_settings.preview_alias_strict_origin
+                    and request.method not in ("GET", "HEAD", "OPTIONS", "TRACE")
+                ):
+                    origin = request.headers.get("origin", "")
+                    if not await _origin_belongs_to_workspace(
+                        proxy_resolver, proxy_settings, origin, editor_target.workspace.id
+                    ):
+                        raise HTTPException(status_code=404, detail="Preview not found")
+
+            # Deliberately no 303 redirect here, unlike the preview alias path: that redirect
+            # exists only to strip the token out of the address bar, and the editor is loaded in
+            # an iframe which has none. Forwarding directly also means the very first navigation
+            # already renders code-server.
+            try:
+                editor_session = editor_target.require_session()
+            except PreviewTargetNotRunningError:
+                # Carries the cookie even though it failed -- see `_editor_unavailable`.
+                return _editor_unavailable(proxy_settings, editor_grant_to_set)
+            upstream_workspace = editor_target.workspace
+            upstream_port = editor_session.bind_port
+        elif is_alias_label(label):
             alias = label
             try:
                 resolution = await proxy_resolver.resolve_alias(alias)
@@ -332,15 +449,20 @@ def create_preview_proxy_app(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                     detail="Preview is unavailable",
                 ) from None
+            upstream_workspace = target.workspace
+            upstream_port = target.preview_session.port
         else:
             target = await _resolve_target(proxy_resolver, original_host)
+            upstream_workspace = target.workspace
+            upstream_port = target.preview_session.port
 
         request_body = await request.body()
         try:
             preview_link, upstream_response = await _send_http_request(
                 client=request.app.state.http_client,
                 runtime=proxy_runtime,
-                target=target,
+                workspace=upstream_workspace,
+                port=upstream_port,
                 request=request,
                 path=path,
                 body=request_body,
@@ -348,18 +470,21 @@ def create_preview_proxy_app(
                 original_host=original_host,
             )
         except DaytonaRuntimeError:
+            if is_editor:
+                return _editor_unavailable(proxy_settings, editor_grant_to_set)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Preview is unavailable",
             ) from None
 
-        _maybe_record_cors_diagnosis(
-            proxy_diagnostics,
-            request=request,
-            target=target,
-            upstream_response=upstream_response,
-            self_origin=_proxy_origin(proxy_settings, original_host),
-        )
+        if not is_editor and target is not None:
+            _maybe_record_cors_diagnosis(
+                proxy_diagnostics,
+                request=request,
+                target=target,
+                upstream_response=upstream_response,
+                self_origin=_proxy_origin(proxy_settings, original_host),
+            )
 
         response = StreamingResponse(
             _response_body(upstream_response),
@@ -370,9 +495,16 @@ def create_preview_proxy_app(
             upstream_response,
             preview_link=preview_link,
             proxy_origin=_proxy_origin(proxy_settings, original_host),
+            # Only for the editor: code-server is *meant* to be framed by the dashboard, so an
+            # upstream `X-Frame-Options`/`frame-ancestors` would break the surface outright.
+            # The preview path is left byte-identical -- a previewed app keeps whatever
+            # clickjacking posture its author chose.
+            strip_frame_headers=is_editor,
         )
         if grant_to_set is not None:
             _set_alias_cookie(response, proxy_settings, grant_to_set)
+        if editor_grant_to_set is not None:
+            _set_editor_cookie(response, proxy_settings, editor_grant_to_set)
         return response
 
     app.add_api_route("/", proxy_http, methods=HTTP_METHODS)
@@ -388,7 +520,33 @@ def create_preview_proxy_app(
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
 
-        if is_alias_label(label):
+        if is_editor_alias_label(label):
+            # Same cookie-only rule as the preview alias below. In practice this is never the
+            # broken case: code-server's socket only opens after the workbench document has
+            # loaded over HTTP, and that navigation is what set the cookie.
+            try:
+                editor_target = await proxy_resolver.resolve_editor_alias(label)
+            except InvalidPreviewCapabilityError:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            gate = _editor_gate(
+                proxy_settings,
+                alias=label,
+                workspace_id=editor_target.workspace.id,
+                cookie_value=websocket.cookies.get(proxy_settings.preview_alias_cookie_name),
+                grant_value=None,
+            )
+            if not gate.authorized:
+                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+                return
+            try:
+                editor_session = editor_target.require_session()
+            except PreviewTargetNotRunningError:
+                await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
+                return
+            upstream_workspace = editor_target.workspace
+            upstream_port = editor_session.bind_port
+        elif is_alias_label(label):
             # Alias WebSockets are cookie-only: Starlette cannot attach a Set-Cookie to a
             # pre-accept() close, and browsers do not reliably honour one from a handshake
             # response either. A capability-only handshake (no prior HTTP visit to this alias
@@ -421,17 +579,22 @@ def create_preview_proxy_app(
             except PreviewTargetNotRunningError:
                 await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
                 return
+            upstream_workspace = target.workspace
+            upstream_port = target.preview_session.port
         else:
             try:
                 target = await proxy_resolver.resolve(original_host)
             except InvalidPreviewCapabilityError:
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                 return
+            upstream_workspace = target.workspace
+            upstream_port = target.preview_session.port
 
         try:
             upstream = await _connect_websocket(
                 runtime=proxy_runtime,
-                target=target,
+                workspace=upstream_workspace,
+                port=upstream_port,
                 websocket=websocket,
                 path=path,
                 original_host=original_host,
@@ -547,6 +710,57 @@ async def _alias_gate(
     return _AliasGateResult(authorized=False)
 
 
+def _editor_gate(
+    settings: Settings,
+    *,
+    alias: str,
+    workspace_id: UUID,
+    cookie_value: str | None,
+    grant_value: str | None,
+) -> _AliasGateResult:
+    """The editor's gate. Structurally the same as `_alias_gate`, with one deliberate
+    difference: both the cookie *and* the query-param credential are alias **grants**, not
+    capabilities.
+
+    A preview alias is primed by a capability, which is bound to a running `PreviewSession`.
+    The editor has no such session to bind to, so the backend mints the grant directly (see
+    `EditorService.prime_url`) with a very short TTL and hands it to the browser exactly once,
+    in the iframe's `src`. Because `decode_alias_grant` binds every grant to a specific
+    `(alias, workspace_id)` pair and is domain-separated from the platform session token, a
+    grant minted for one workspace's editor cannot authorise another's -- nor can a preview
+    alias's grant authorise an editor host, since the alias in the signature would not match.
+    """
+    for candidate, from_cookie in ((cookie_value, True), (grant_value, False)):
+        if not candidate:
+            continue
+        try:
+            grant = decode_alias_grant(
+                candidate,
+                alias=alias,
+                workspace_id=workspace_id,
+                secret_key=settings.auth_secret_key,
+                max_lifetime_seconds=settings.preview_alias_grant_max_lifetime_seconds,
+            )
+        except InvalidPreviewAliasGrantError:
+            # A stale cookie must never veto an otherwise-valid grant in the query string --
+            # that is the exact case a reloaded iframe hits after the cookie has aged out.
+            continue
+        if from_cookie and not should_refresh_grant(
+            grant, ttl_seconds=settings.preview_alias_cookie_ttl_seconds
+        ):
+            return _AliasGateResult(authorized=True)
+        fresh = encode_alias_grant(
+            alias=alias,
+            workspace_id=workspace_id,
+            secret_key=settings.auth_secret_key,
+            ttl_seconds=settings.preview_alias_cookie_ttl_seconds,
+        )
+        return _AliasGateResult(
+            authorized=True, grant_to_set=fresh, via_capability=not from_cookie
+        )
+    return _AliasGateResult(authorized=False)
+
+
 def _is_preflight(request: Request) -> bool:
     return (
         request.method == "OPTIONS"
@@ -593,6 +807,49 @@ def _set_alias_cookie(response: Response, settings: Settings, value: str) -> Non
     )
 
 
+def _set_editor_cookie(response: Response, settings: Settings, value: str) -> None:
+    """Same cookie as `_set_alias_cookie`, plus `Partitioned`.
+
+    Starlette's `set_cookie` has no `partitioned=` argument, hence the raw header. The attribute
+    is not optional here: the editor cookie is always set on a **cross-site iframe**, and an
+    unpartitioned `SameSite=None` cookie is dropped outright by browsers that block third-party
+    cookies -- which would strand the editor in a permanent 404 loop the moment the one-shot
+    grant in the URL was consumed. Partitioned (CHIPS) scopes the cookie to the embedding
+    top-level site, which is exactly the lifetime the editor wants. The trade-off is that a
+    first-party tab is a different partition, so "Open in new tab" must load the prime URL too.
+    """
+    parts = [
+        f"{settings.preview_alias_cookie_name}={value}",
+        "Path=/",
+        f"Max-Age={settings.preview_alias_cookie_ttl_seconds}",
+        "HttpOnly",
+        "Secure",
+        "SameSite=None",
+        "Partitioned",
+    ]
+    # No `Domain=` -- host-only, so one editor host's grant is never sent to a sibling, on top
+    # of the grant's own signature binding.
+    response.raw_headers.append((b"set-cookie", "; ".join(parts).encode("latin-1")))
+
+
+def _editor_unavailable(settings: Settings, grant_to_set: str | None) -> Response:
+    """A 503 for the editor that still sets the grant cookie.
+
+    The grant in the URL is one-shot: the dashboard mints it per response and the iframe's `src`
+    is fixed for the life of the frame. If a transient upstream failure on the very first
+    (priming) navigation returned a bare 503, the browser would have spent its grant without
+    getting a cookie, and every retry inside the frame would 404 until the panel was reloaded.
+    Attaching the cookie here means a retry succeeds as soon as the sandbox comes back.
+    """
+    response = JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": "Editor is unavailable"},
+    )
+    if grant_to_set is not None:
+        _set_editor_cookie(response, settings, grant_to_set)
+    return response
+
+
 async def _origin_belongs_to_workspace(
     resolver: PreviewProxyResolver,
     settings: Settings,
@@ -613,6 +870,9 @@ async def _origin_belongs_to_workspace(
     except InvalidPreviewCapabilityError:
         return False
     try:
+        if proxy_host.kind == "editor":
+            editor_target = await resolver.resolve_editor_alias(proxy_host.label)
+            return editor_target.workspace.id == workspace_id
         if proxy_host.kind == "alias":
             resolution = await resolver.resolve_alias(proxy_host.label)
             return resolution.workspace.id == workspace_id
@@ -626,17 +886,17 @@ async def _send_http_request(
     *,
     client: httpx.AsyncClient,
     runtime: DaytonaRuntime,
-    target: PreviewProxyTarget,
+    workspace: Workspace,
+    port: int,
     request: Request,
     path: str,
     body: bytes,
     query: str,
     original_host: str,
 ) -> tuple[RuntimePreviewLink, httpx.Response]:
-    preview_link = await runtime.preview_link(
-        target.workspace,
-        target.preview_session.port,
-    )
+    # Takes `(workspace, port)` rather than a target so the preview families and the editor --
+    # which has no `PreviewSession` to carry a port on -- share one forwarding path.
+    preview_link = await runtime.preview_link(workspace, port)
     response = await _send_http_attempt(
         client,
         preview_link,
@@ -650,10 +910,7 @@ async def _send_http_request(
         return preview_link, response
 
     await response.aclose()
-    preview_link = await runtime.preview_link(
-        target.workspace,
-        target.preview_session.port,
-    )
+    preview_link = await runtime.preview_link(workspace, port)
     response = await _send_http_attempt(
         client,
         preview_link,
@@ -699,17 +956,15 @@ async def _send_http_attempt(
 async def _connect_websocket(
     *,
     runtime: DaytonaRuntime,
-    target: PreviewProxyTarget,
+    workspace: Workspace,
+    port: int,
     websocket: WebSocket,
     path: str,
     original_host: str,
 ):
     last_error: Exception | None = None
     for _attempt in range(2):
-        preview_link = await runtime.preview_link(
-            target.workspace,
-            target.preview_session.port,
-        )
+        preview_link = await runtime.preview_link(workspace, port)
         headers = _forward_headers(websocket.headers, WEBSOCKET_HEADERS_TO_STRIP)
         headers["X-Daytona-Preview-Token"] = preview_link.token
         headers["X-Daytona-Skip-Preview-Warning"] = "true"
@@ -757,11 +1012,21 @@ def _upstream_url(
     return urlunsplit((scheme, parsed.netloc, f"{base_path}{request_path}", query, ""))
 
 
+# Matches one `frame-ancestors ...` directive of a CSP, with or without a trailing `;`.
+_FRAME_ANCESTORS_PATTERN = re.compile(r"\s*frame-ancestors\b[^;]*;?", re.IGNORECASE)
+_CSP_HEADERS = {"content-security-policy", "content-security-policy-report-only"}
+
+
+def _without_frame_ancestors(value: str) -> str:
+    return _FRAME_ANCESTORS_PATTERN.sub("", value).strip().strip(";").strip()
+
+
 def _response_headers(
     response: httpx.Response,
     *,
     preview_link: RuntimePreviewLink,
     proxy_origin: str,
+    strip_frame_headers: bool = False,
 ) -> list[tuple[bytes, bytes]]:
     headers: list[tuple[bytes, bytes]] = []
     upstream = urlsplit(preview_link.url)
@@ -770,6 +1035,16 @@ def _response_headers(
         lower_key = key.lower()
         if lower_key in HOP_BY_HOP_HEADERS:
             continue
+        if strip_frame_headers:
+            # Editor only. Everything else about the header set is left exactly as the upstream
+            # sent it -- only the two headers that would refuse the embed are touched, and only
+            # their framing directive, so a CSP's other directives survive.
+            if lower_key == "x-frame-options":
+                continue
+            if lower_key in _CSP_HEADERS:
+                value = _without_frame_ancestors(value)
+                if not value:
+                    continue
         if lower_key == "location" and value.startswith(upstream_origin):
             value = f"{proxy_origin}{value[len(upstream_origin):]}"
         headers.append((key.encode("latin-1"), value.encode("latin-1")))

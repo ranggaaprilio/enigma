@@ -39,6 +39,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.models import CustomCommand, Workspace, WorkspacePreviewAlias
+from app.services.editor_alias import is_editor_alias_label
 from app.services.preview_capability import (
     InvalidPreviewCapabilityError,
     is_capability_label,
@@ -73,6 +74,7 @@ RESERVED_ALIAS_LABELS = frozenset(
         "proxy",
         "dashboard",
         "auth",
+        "editor",
         "login",
         "logout",
         "static",
@@ -114,6 +116,11 @@ def validate_alias(candidate: str, *, base_url: str) -> str:
         raise InvalidPreviewAliasError(f"{candidate!r} is not a valid alias label")
     if candidate in RESERVED_ALIAS_LABELS:
         raise InvalidPreviewAliasError(f"{candidate!r} is a reserved name")
+    if is_editor_alias_label(candidate):
+        # `editor-<12 hex>` is the embedded code-server's own host family (services/editor_alias).
+        # Excluding it here is what keeps the proxy's shape-based dispatch unambiguous: no
+        # user-mintable preview alias can ever occupy an editor host.
+        raise InvalidPreviewAliasError(f"{candidate!r} is reserved for the editor")
     proxy_hostname = (urlsplit(base_url).hostname or "").lower()
     if candidate in proxy_hostname.split("."):
         raise InvalidPreviewAliasError(f"{candidate!r} collides with the proxy's own hostname")
@@ -124,7 +131,7 @@ def validate_alias(candidate: str, *, base_url: str) -> str:
 # Host classification: alias vs. capability
 # ---------------------------------------------------------------------------
 
-ProxyHostKind = Literal["capability", "alias"]
+ProxyHostKind = Literal["capability", "editor", "alias"]
 
 
 @dataclass(frozen=True)
@@ -141,6 +148,8 @@ def classify_proxy_host(host: str, *, base_url: str) -> ProxyHost:
     label = proxy_host_label(host, base_url=base_url)
     if is_capability_label(label):
         return ProxyHost(kind="capability", label=label)
+    if is_editor_alias_label(label):
+        return ProxyHost(kind="editor", label=label)
     if is_alias_label(label):
         return ProxyHost(kind="alias", label=label)
     raise InvalidPreviewCapabilityError("Invalid preview proxy host")

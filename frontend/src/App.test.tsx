@@ -1120,14 +1120,17 @@ describe("App auth routing", () => {
     ).toBe(true);
   });
 
-  it("opens the editor tab and launches code-server in a new browser tab", async () => {
-    const editorUrl = "http://localhost:8080/?folder=/workspace/demo";
+  it("opens the editor tab and embeds code-server in an iframe", async () => {
+    const editorUrl = "http://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo";
     const editorSession = {
       id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
       workspace_id: workspace.id,
       user_id: authUser.id,
       url: editorUrl,
+      prime_url: `${editorUrl}&__enigma_cap=grant-token`,
       status: "active",
+      worktree_id: null,
+      folder: "/workspace/demo",
       started_at: "2026-05-23T00:00:00Z",
       last_active_at: "2026-05-23T00:00:00Z",
     };
@@ -1159,27 +1162,37 @@ describe("App auth routing", () => {
     render(<App />);
 
     await userEvent.click(await screen.findByRole("link", { name: "Editor" }));
-    expect(await screen.findByText("Editor is not running.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Editor is not running. Start it to open code-server here."),
+    ).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Open new tab" }));
+    await userEvent.click(screen.getByRole("button", { name: "Start editor" }));
 
-    expect(await screen.findByText("code-server is ready")).toBeInTheDocument();
-    expect(openSpy).toHaveBeenCalledWith(editorUrl, "_blank", "noopener,noreferrer");
+    // The editor now lives inside the dashboard, so starting it must not open a tab at all.
+    const frame = await screen.findByTitle("Demo editor");
+    expect(frame).toHaveAttribute("src", `${editorUrl}&__enigma_cap=grant-token`);
+    expect(openSpy).not.toHaveBeenCalled();
   });
 
-  it("shows a fallback code-server link when the popup is blocked", async () => {
-    const editorUrl = "http://localhost:8080/?folder=/workspace/demo";
+  it("opens a new tab with the prime URL, not the bare alias URL", async () => {
+    // The grant cookie is partitioned per top-level site, so a first-party tab has no cookie of
+    // its own -- it must carry a grant or it lands on a 404.
+    const editorUrl = "http://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo";
+    const primeUrl = `${editorUrl}&__enigma_cap=grant-token`;
     const editorSession = {
       id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
       workspace_id: workspace.id,
       user_id: authUser.id,
       url: editorUrl,
+      prime_url: primeUrl,
       status: "active",
+      worktree_id: null,
+      folder: "/workspace/demo",
       started_at: "2026-05-23T00:00:00Z",
       last_active_at: "2026-05-23T00:00:00Z",
     };
-    vi.spyOn(window, "open").mockReturnValue(null);
-    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue({} as Window);
+    const fetchMock = vi.fn((url: string) => {
       if (url.endsWith("/auth/me")) {
         return Promise.resolve(jsonResponse(authUser));
       }
@@ -1193,10 +1206,7 @@ describe("App auth routing", () => {
         return Promise.resolve(jsonResponse([]));
       }
       if (url.endsWith(`/workspaces/${workspace.id}/editor/status`)) {
-        return Promise.resolve(jsonResponse({ status: "inactive", session: null }));
-      }
-      if (url.endsWith(`/workspaces/${workspace.id}/editor/start`) && init?.method === "POST") {
-        return Promise.resolve(jsonResponse(editorSession));
+        return Promise.resolve(jsonResponse({ status: "active", session: editorSession }));
       }
       return fallbackResponse(url);
     });
@@ -1206,26 +1216,78 @@ describe("App auth routing", () => {
     render(<App />);
 
     await userEvent.click(await screen.findByRole("link", { name: "Editor" }));
-    await userEvent.click(screen.getByRole("button", { name: "Open new tab" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open new tab" }));
+
+    expect(openSpy).toHaveBeenCalledWith(primeUrl, "_blank", "noopener,noreferrer");
+  });
+
+  it("shows a fallback code-server link when the popup is blocked", async () => {
+    const editorUrl = "http://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo";
+    const primeUrl = `${editorUrl}&__enigma_cap=grant-token`;
+    const editorSession = {
+      id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
+      workspace_id: workspace.id,
+      user_id: authUser.id,
+      url: editorUrl,
+      prime_url: primeUrl,
+      status: "active",
+      worktree_id: null,
+      folder: "/workspace/demo",
+      started_at: "2026-05-23T00:00:00Z",
+      last_active_at: "2026-05-23T00:00:00Z",
+    };
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/editor/status`)) {
+        return Promise.resolve(jsonResponse({ status: "active", session: editorSession }));
+      }
+      return fallbackResponse(url);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", workspaceBase);
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("link", { name: "Editor" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open new tab" }));
 
     expect(await screen.findByRole("link", { name: "Continue to code-server" })).toHaveAttribute(
       "href",
-      editorUrl,
+      primeUrl,
     );
   });
 
   it("shows editor failure state and can restart", async () => {
-    const editorUrl = "http://localhost:8080/?folder=/workspace/demo";
+    const editorUrl = "http://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo";
     const failedSession = {
       id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
       workspace_id: workspace.id,
       user_id: authUser.id,
       url: editorUrl,
+      prime_url: "",
       status: "error",
+      worktree_id: null,
+      folder: "/workspace/demo",
       started_at: "2026-05-23T00:00:00Z",
       last_active_at: "2026-05-23T00:00:00Z",
     };
-    const activeSession = { ...failedSession, status: "active" };
+    const activeSession = {
+      ...failedSession,
+      status: "active",
+      prime_url: `${editorUrl}&__enigma_cap=grant-token`,
+    };
     const openSpy = vi.spyOn(window, "open").mockReturnValue({} as Window);
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith("/auth/me")) {
@@ -1261,8 +1323,11 @@ describe("App auth routing", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Restart" }));
 
-    expect(await screen.findByText("code-server is ready")).toBeInTheDocument();
-    expect(openSpy).toHaveBeenCalledWith(editorUrl, "_blank", "noopener,noreferrer");
+    expect(await screen.findByTitle("Demo editor")).toHaveAttribute(
+      "src",
+      `${editorUrl}&__enigma_cap=grant-token`,
+    );
+    expect(openSpy).not.toHaveBeenCalled();
   });
 
   it("opens the preview tab, shows a running service, and controls the iframe", async () => {

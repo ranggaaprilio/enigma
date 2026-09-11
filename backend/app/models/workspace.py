@@ -81,6 +81,11 @@ class Workspace(Base):
     preview_alias_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    # The editor's stable proxy hostname label (e.g. "editor-3f9a1c0b7d2e"), minted lazily on
+    # the first editor start. Unlike a preview capability host it never rotates: code-server keeps
+    # its workbench state in localStorage keyed by origin, so a rotating host would reset the
+    # open tabs and layout every time the URL was renewed.
+    editor_alias: Mapped[str | None] = mapped_column(String(63), nullable=True, unique=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="creating")
     dev_autostart: Mapped[bool] = mapped_column(
         Boolean,

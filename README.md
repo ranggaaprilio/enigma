@@ -33,7 +33,7 @@ The workspace dashboard exposes each capability as a surface (tab):
 | **Pull Requests** | Open and list GitHub pull requests from a worktree branch via the GitHub REST API (cached locally). Other providers: push the branch and open the MR/PR on the host. |
 | **Spec (SDD)** | Run the GitHub Spec Kit pipeline (`constitution → specify → clarify → plan → analyze → tasks → implement`) with human review gates between phases. |
 | **Agents** | Run an AI coding agent against the sandbox; stream thinking/tool-call events live over WebSocket, review the files it changed, and stop a run mid-flight. |
-| **Editor** | Launch `code-server` (VS Code in the browser) bound to the workspace. |
+| **Editor** | `code-server` (VS Code in the browser) embedded directly in the dashboard, served through the preview proxy on a stable per-workspace hostname. Pick which worktree to open, reload the frame, or pop it out into its own tab. |
 | **Terminal** | Full interactive PTY shell into the sandbox over WebSocket (`xterm.js`). |
 | **Preview** | After clone, auto-detect the project toolchain via `mise` and install dependencies (environment only — the app is not started). A **Run App** button then runs the `dev` task on demand; the open port is detected and served through a signed preview proxy. |
 | **Files** | Browse the workspace tree, read, upload, and manage files. |
@@ -163,6 +163,15 @@ Key points:
   the background (toolchain + dependencies only). The app's `dev` task is started on demand from the
   **Run App** button; the panel then polls for the open port and exposes it through the preview proxy
   on port 8001 using short-lived signed URLs. An app that was run auto-resumes after a sandbox sleep.
+- **Editor** runs `code-server` on port 13337 inside the sandbox and serves it through the same
+  proxy, on a **stable** hostname (`editor-<token>.<proxy-host>`) minted once per workspace. The
+  hostname has to be stable because code-server keeps its whole workbench state (open editors,
+  layout, settings) in `localStorage`, which is keyed by origin — a rotating capability URL would
+  reset the editor about once an hour. Because the URL therefore carries no credential, the browser
+  is authorised instead by a short-lived, signed, `HttpOnly` grant cookie: the dashboard loads the
+  iframe once with a one-shot grant in the query string, the proxy exchanges it for the cookie, and
+  every later request (including code-server's WebSocket) rides that. The cookie is `Partitioned`
+  (CHIPS) because it is always set on a cross-site iframe.
 
 ### Git strategy
 
@@ -266,7 +275,7 @@ Key points:
 |---|---|---|
 | Frontend (Vite + React) | 5173 | Hot-reload in dev mode |
 | Backend (FastAPI) | 8000 | Auto-reload with `--reload`; API docs at `/docs` |
-| Preview proxy | 8001 | Proxies Daytona sandbox preview URLs |
+| Preview proxy | 8001 | Proxies Daytona sandbox preview URLs and the embedded editor |
 | PostgreSQL 16 | 5432 | Persisted in `postgres_data` volume |
 | Redis 7 | 6379 | Persisted in `redis_data` volume |
 
