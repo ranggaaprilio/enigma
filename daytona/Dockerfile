@@ -15,6 +15,12 @@
 #
 # Base image already provides: Linux shell, Git, Python 3, and the process/network
 # utilities the backend relies on for commands and port detection.
+#
+# SSH deploy keys (backend/app/services/repositories.py, ``_run_ssh_git``) additionally
+# need an OpenSSH client on PATH. The backend reports "SSH client is not available in this
+# sandbox image" when ``ssh`` is missing; if the base snapshot ever drops it, install
+# ``openssh-client`` here (requires a root build stage) and optionally pre-seed
+# ~/.ssh/known_hosts for github.com / gitlab.com / bitbucket.org.
 ARG BASE_SNAPSHOT=daytonaio/sandbox:0.8.0
 FROM ${BASE_SNAPSHOT}
 
@@ -50,8 +56,10 @@ RUN set -eux; \
 # SDD workflow (docs/improvement-epics/01-spec-driven-development.md) works at runtime.
 # uv tool install drops the `specify` entry point into $HOME/.local/bin, which is exactly
 # where the runtime PATH (set below) looks. Pin SPEC_KIT_REF to a tagged release for
-# reproducible snapshots; empty = latest at build time.
-ARG SPEC_KIT_REF=
+# reproducible snapshots; empty = latest at build time. Pinned so the runtime
+# `specify init --integration claude ...` (backend/app/services/speckit.py) stays in sync
+# with the installed CLI surface and doesn't drift on upstream breaking changes.
+ARG SPEC_KIT_REF=v0.11.9
 RUN set -eux; \
     curl -fsSL https://astral.sh/uv/install.sh | sh; \
     if [ -n "${SPEC_KIT_REF}" ]; then \

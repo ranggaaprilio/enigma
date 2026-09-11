@@ -1,3 +1,4 @@
+import asyncio
 from typing import Protocol
 from uuid import UUID
 
@@ -6,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
+from app.core.metrics import agent_runs_created_total
 from app.core.security import verify_session_token
 from app.db.session import async_session_maker, get_db_session
 from app.models import AgentEvent, AgentFileChange, AgentRun, User
@@ -17,6 +19,7 @@ from app.schemas.agents import (
     AgentRunDetailResponse,
     AgentRunResponse,
 )
+from app.services.access import WorkspaceAccessDeniedError, can_drive, require_workspace_access
 from app.services.agents import (
     AgentConfigurationError,
     AgentRunAlreadyActiveError,
@@ -26,7 +29,11 @@ from app.services.agents import (
     agent_runtime,
     event_payload,
 )
+from app.services.budgets import BudgetExceededError
+from app.services.daytona_runtime import get_daytona_runtime
+from app.services.rate_limit import RedisRateLimiter
 from app.services.workspaces import WorkspaceNotFoundError
+from app.services.worktrees import WorktreeNotFoundError, WorktreeService
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/agent", tags=["agents"])
 
@@ -34,8 +41,38 @@ DB_SESSION_DEP = Depends(get_db_session)
 SETTINGS_DEP = Depends(get_settings)
 
 
+async def enforce_agent_run_rate_limit(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    settings: Settings = SETTINGS_DEP,
+) -> None:
+    """Throttle agent-run creation per (user, workspace). Raises 429 when the window limit
+    is exceeded — protects the AI/compute path from being hammered."""
+    limiter = RedisRateLimiter(
+        prefix="agent:run",
+        scope="agent_run",
+        attempts=settings.agent_run_rate_limit_attempts,
+        window_seconds=settings.agent_run_rate_limit_window_seconds,
+    )
+    await limiter.check(f"{current_user.id}:{workspace_id}")
+
+
+AGENT_RUN_RATE_LIMIT_DEP = Depends(enforce_agent_run_rate_limit)
+
+# Send a lightweight keepalive frame when the agent produces no events for this
+# long, so idle WebSockets are not reaped by intermediaries during long pauses.
+STREAM_PING_INTERVAL_SECONDS = 20.0
+
+
 class AgentServiceProtocol(Protocol):
-    async def create_run(self, workspace_id: UUID, user_id: UUID, prompt: str) -> AgentRun: ...
+    async def create_run(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        prompt: str,
+        working_dir: str | None = None,
+        worktree_id: UUID | None = None,
+    ) -> AgentRun: ...
 
     async def list_runs(
         self,
@@ -79,6 +116,20 @@ async def get_agent_service(
 AGENT_SERVICE_DEP = Depends(get_agent_service)
 
 
+async def get_worktree_service(
+    session: AsyncSession = DB_SESSION_DEP,
+    settings: Settings = SETTINGS_DEP,
+) -> WorktreeService:
+    return WorktreeService(
+        session=session,
+        runtime=get_daytona_runtime(),
+        settings=settings,
+    )
+
+
+WORKTREE_SERVICE_DEP = Depends(get_worktree_service)
+
+
 def agent_event_response(event: AgentEvent) -> AgentEventResponse:
     return AgentEventResponse(
         id=event.id,
@@ -96,11 +147,15 @@ def agent_run_detail_response(run: AgentRun) -> AgentRunDetailResponse:
         id=run.id,
         workspace_id=run.workspace_id,
         user_id=run.user_id,
+        session_id=run.session_id,
         prompt=run.prompt,
         status=run.status,
         provider=run.provider,
         model=run.model,
         tokens_used=run.tokens_used,
+        input_tokens=run.input_tokens,
+        output_tokens=run.output_tokens,
+        estimated_cost=float(run.estimated_cost) if run.estimated_cost is not None else None,
         started_at=run.started_at,
         completed_at=run.completed_at,
         error_message=run.error_message,
@@ -112,24 +167,59 @@ def not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent run not found")
 
 
-@router.post("/runs", response_model=AgentRunResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/runs",
+    response_model=AgentRunResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[AGENT_RUN_RATE_LIMIT_DEP],
+)
 async def create_agent_run(
     workspace_id: UUID,
     payload: AgentRunCreateRequest,
     current_user: User = CURRENT_USER_DEP,
     service: AgentServiceProtocol = AGENT_SERVICE_DEP,
+    worktree_service: WorktreeService = WORKTREE_SERVICE_DEP,
 ) -> AgentRun:
     try:
-        return await service.create_run(workspace_id, current_user.id, payload.prompt)
+        working_dir: str | None = None
+        if payload.worktree_id is not None:
+            worktree = await worktree_service.get_worktree_for_driver(
+                workspace_id, current_user.id, payload.worktree_id
+            )
+            working_dir = worktree.path
+        run = await service.create_run(
+            workspace_id,
+            current_user.id,
+            payload.prompt,
+            working_dir=working_dir,
+            worktree_id=payload.worktree_id,
+        )
+        agent_runs_created_total.inc()
+        return run
     except WorkspaceNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workspace not found",
         ) from None
+    except WorkspaceAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to drive this workspace",
+        ) from None
+    except WorktreeNotFoundError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Worktree not found",
+        ) from None
     except AgentRunAlreadyActiveError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Workspace already has an active agent run",
+        ) from None
+    except BudgetExceededError as error:
+        raise HTTPException(
+            status_code=status.HTTP_402_PAYMENT_REQUIRED,
+            detail=str(error),
         ) from None
     except AgentConfigurationError as error:
         raise HTTPException(
@@ -218,6 +308,11 @@ async def stop_agent_run(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Workspace not found",
         ) from None
+    except WorkspaceAccessDeniedError:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="You do not have permission to drive this workspace",
+        ) from None
     except AgentRunNotFoundError:
         raise not_found() from None
 
@@ -237,6 +332,9 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
             settings=settings,
         )
         try:
+            _workspace, viewer_role = await require_workspace_access(
+                session, workspace_id, user.id
+            )
             events = await service.list_events(workspace_id, run_id, user.id)
             run = await service.get_run(workspace_id, run_id, user.id)
         except (WorkspaceNotFoundError, AgentRunNotFoundError):
@@ -244,6 +342,9 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
             return
 
     await websocket.accept()
+    await websocket.send_json(
+        {"type": "role", "content": "driver" if can_drive(viewer_role) else "observer"}
+    )
     for event in events:
         await websocket.send_json(event_payload(event))
 
@@ -254,7 +355,16 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
     queue = agent_runtime.subscribe(run_id)
     try:
         while True:
-            payload = await queue.get()
+            try:
+                payload = await asyncio.wait_for(
+                    queue.get(), timeout=STREAM_PING_INTERVAL_SECONDS
+                )
+            except TimeoutError:
+                # No agent activity in a while; send a keepalive so the socket
+                # stays open through long thinking pauses. The client ignores
+                # frames of type "ping".
+                await websocket.send_json({"type": "ping"})
+                continue
             await websocket.send_json(payload)
             status_value = payload.get("metadata", {}).get("status")
             if status_value in {"completed", "error", "stopped"}:

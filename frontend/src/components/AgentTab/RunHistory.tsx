@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
-import { Clock, Cpu, Loader2 } from "lucide-react";
+import { Clock, Coins, Cpu, Loader2 } from "lucide-react";
 import type { AgentRunResponse, AgentRunStatus } from "../../lib/api";
 import { listAgentRuns } from "../../lib/api";
+import { formatCost } from "../usage/format";
 
 interface RunHistoryProps {
   workspaceId: string;
@@ -150,6 +151,10 @@ export function RunHistory({ workspaceId, onSelectRun, selectedRunId }: RunHisto
                     <span className="inline-flex items-center gap-0.5">
                       <Cpu className="h-3 w-3" />
                       {formatTokenCount(run.tokens_used)}
+                    </span>
+                    <span className="inline-flex items-center gap-0.5" title="Estimated cost">
+                      <Coins className="h-3 w-3" />
+                      {formatCost(run.estimated_cost)}
                     </span>
                   </div>
                 </div>

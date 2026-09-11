@@ -9,11 +9,15 @@ function makeRun(overrides: Partial<AgentRunResponse> = {}): AgentRunResponse {
     id: `run-${Math.random().toString(36).slice(2, 10)}`,
     workspace_id: "ws-1",
     user_id: "user-1",
+    session_id: null,
     prompt: "Fix the login bug",
     status: "completed",
     provider: "mock",
     model: "gpt-4",
     tokens_used: 1500,
+    input_tokens: 1000,
+    output_tokens: 500,
+    estimated_cost: 0.0012,
     started_at: "2026-06-12T10:00:00Z",
     completed_at: "2026-06-12T10:01:30Z",
     error_message: null,
@@ -70,6 +74,15 @@ describe("RunHistory", () => {
     );
 
     expect(await screen.findByRole("button", { name: "Load more" })).toBeInTheDocument();
+  });
+
+  it("shows the estimated cost for a run", async () => {
+    const runs = [makeRun({ id: "run-cost", estimated_cost: 0.42 })];
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(runs)));
+
+    render(<RunHistory workspaceId="ws-1" onSelectRun={vi.fn()} />);
+
+    expect(await screen.findByText("$0.42")).toBeInTheDocument();
   });
 
   it('hides "Load more" when fewer than 20 runs are returned', async () => {

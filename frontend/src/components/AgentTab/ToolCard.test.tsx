@@ -389,3 +389,147 @@ describe("ToolCard", () => {
     expect(screen.getByText("Unknown tool")).toBeInTheDocument();
   });
 });
+
+// ---------------------------------------------------------------------------
+// Editing-tool dispatch (apply_patch / search_code / git_status / blocked)
+// ---------------------------------------------------------------------------
+
+describe("ToolCard editing-tool dispatch", () => {
+  // `openhands_provider` writes the tool identifier as `metadata.tool` on both events —
+  // mirror that exactly here, so a rename of the metadata key fails the dispatch tests
+  // instead of silently degrading every rich tool view to the generic <pre> fallback.
+  function paired(toolName: string, resultMeta: Record<string, unknown>, content = "") {
+    const call = makeEvent({
+      event_type: "tool_call",
+      tool_call_id: "tc",
+      metadata: { tool: toolName },
+    });
+    const result = makeEvent({
+      event_type: "tool_result",
+      tool_call_id: "tc",
+      content,
+      metadata: { tool: toolName, ...resultMeta },
+    });
+    return { toolCallId: "tc", call, result };
+  }
+
+  it("dispatches on a result-only tool identifier", async () => {
+    const user = userEvent.setup();
+    const diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n";
+    const event = {
+      toolCallId: "tc",
+      call: makeEvent({ event_type: "tool_call", tool_call_id: "tc", metadata: {} }),
+      result: makeEvent({
+        event_type: "tool_result",
+        tool_call_id: "tc",
+        metadata: { tool: "git_diff", diff },
+      }),
+    };
+    render(<ToolCard event={event} />);
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("Diff")).toBeInTheDocument();
+  });
+
+  it("never dispatches off the content summary", async () => {
+    const user = userEvent.setup();
+    const event = {
+      toolCallId: "tc",
+      call: makeEvent({
+        event_type: "tool_call",
+        tool_call_id: "tc",
+        content: "git_status",
+        metadata: {},
+      }),
+      result: makeEvent({
+        event_type: "tool_result",
+        tool_call_id: "tc",
+        content: "some prose",
+        metadata: { branch: "feat", is_clean: true, files: [] },
+      }),
+    };
+    render(<ToolCard event={event} />);
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.queryByText("Status")).not.toBeInTheDocument();
+  });
+
+  it("renders apply_patch result as a diff", async () => {
+    const user = userEvent.setup();
+    const diff = "--- a/x.py\n+++ b/x.py\n@@ -1 +1 @@\n-old\n+new\n";
+    render(<ToolCard event={paired("apply_patch", { diff })} />);
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("Diff")).toBeInTheDocument();
+    expect(screen.getByText("+new")).toBeInTheDocument();
+    expect(screen.getByText("-old")).toBeInTheDocument();
+  });
+
+  it("renders search_code results grouped with line numbers", async () => {
+    const user = userEvent.setup();
+    const matches = [
+      { path: "a.py", line_number: 3, text: "hit one" },
+      { path: "a.py", line_number: 9, text: "hit two" },
+    ];
+    render(<ToolCard event={paired("search_code", { matches })} />);
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("Results")).toBeInTheDocument();
+    expect(screen.getByText("a.py")).toBeInTheDocument();
+    expect(screen.getByText("hit one")).toBeInTheDocument();
+    expect(screen.getByText("3")).toBeInTheDocument();
+  });
+
+  it("parses search_code matches delivered as a JSON string", async () => {
+    const user = userEvent.setup();
+    const matches = JSON.stringify([{ path: "z.py", line_number: 1, text: "zed" }]);
+    render(<ToolCard event={paired("search_code", { matches })} />);
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("zed")).toBeInTheDocument();
+  });
+
+  it("renders git_status as a file list with branch", async () => {
+    const user = userEvent.setup();
+    render(
+      <ToolCard
+        event={paired("git_status", {
+          branch: "feat",
+          is_clean: false,
+          files: [{ path: "README.md", status: "M" }],
+        })}
+      />,
+    );
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("README.md")).toBeInTheDocument();
+    expect(screen.getByText("feat")).toBeInTheDocument();
+  });
+
+  it("renders a blocked-command notice for policy rejections", async () => {
+    const user = userEvent.setup();
+    render(
+      <ToolCard
+        event={paired("run_command", { ok: false }, "Command is not allowed")}
+      />,
+    );
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("Command blocked by policy")).toBeInTheDocument();
+    expect(screen.getByText("Command is not allowed")).toBeInTheDocument();
+  });
+
+  it("does not crash on malformed metadata, falls back to generic output", async () => {
+    const user = userEvent.setup();
+    render(
+      <ToolCard
+        event={paired("search_code", { matches: "not json {" }, "raw output")}
+      />,
+    );
+
+    await user.click(screen.getByRole("button"));
+    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.getByText("raw output")).toBeInTheDocument();
+  });
+});

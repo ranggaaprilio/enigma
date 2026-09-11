@@ -75,10 +75,17 @@ class MockAgentProvider(AgentProvider):
         if stop_event.is_set():
             return
         await asyncio.sleep(0.01)
+        final_text = f"Mock run complete for: {prompt[:160]}"
+        input_tokens = max(1, len(prompt.split()))
+        output_tokens = max(1, len(final_text.split()))
         yield ProviderEvent(
             "output_text",
-            f"Mock run complete for: {prompt[:160]}",
-            {"tokens_used": max(1, len(prompt.split()))},
+            final_text,
+            {
+                "tokens_used": input_tokens + output_tokens,
+                "input_tokens": input_tokens,
+                "output_tokens": output_tokens,
+            },
         )
 
 
@@ -164,12 +171,15 @@ class OpenAIResponsesProvider(AgentProvider):
         if event_type == "response.completed":
             response = payload.get("response") or {}
             usage = response.get("usage") or {}
-            total_tokens = usage.get("total_tokens")
-            return ProviderEvent(
-                "status",
-                "completed",
-                {"status": "completed", "tokens_used": total_tokens},
-            )
+            metadata: dict = {
+                "status": "completed",
+                "tokens_used": usage.get("total_tokens"),
+            }
+            if usage.get("input_tokens") is not None:
+                metadata["input_tokens"] = usage.get("input_tokens")
+            if usage.get("output_tokens") is not None:
+                metadata["output_tokens"] = usage.get("output_tokens")
+            return ProviderEvent("status", "completed", metadata)
         if event_type == "response.failed":
             error = (payload.get("response") or {}).get("error") or {}
             return ProviderEvent("error", str(error.get("message") or "OpenAI response failed"))

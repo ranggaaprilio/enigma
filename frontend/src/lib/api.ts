@@ -6,6 +6,8 @@ export type HealthResponse = {
 };
 
 export type UserRole = "owner" | "developer" | "viewer";
+/** The requesting user's role in a specific workspace, as reported by the backend. */
+export type WorkspaceRole = "owner" | "team_lead" | "team_member" | "team_viewer";
 
 export type UserResponse = {
   id: string;
@@ -39,6 +41,27 @@ export type NotificationResponse = {
   created_at: string;
 };
 
+export type CommentTargetType = "run" | "spec_phase" | "pr";
+
+export type CommentResponse = {
+  id: string;
+  target_type: CommentTargetType;
+  target_id: string;
+  user_id: string;
+  body: string;
+  resolved_at: string | null;
+  resolved_by: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
+export type PresenceUser = {
+  user_id: string;
+  name: string;
+  connection_id: string;
+  joined_at: string;
+};
+
 export type AuditLogResponse = {
   id: string;
   user_id: string;
@@ -50,20 +73,62 @@ export type AuditLogResponse = {
   created_at: string;
 };
 
+/** Where a workspace's repository came from. Template/blank workspaces have no remote yet. */
+export type WorkspaceSource = "repository" | "template" | "blank";
+export type GitProvider = "github" | "gitlab" | "bitbucket" | "generic";
+/** `auto` lets the backend detect the provider from the URL host. */
+export type GitProviderChoice = GitProvider | "auto";
+export type RepositoryAuthType = "personal_access_token" | "ssh_key";
+
+export type WorkspaceTemplateResponse = {
+  id: string;
+  slug: string;
+  name: string;
+  description: string;
+  source_repo_url: string;
+  default_branch: string;
+  icon: string | null;
+  tags: string[];
+  preview_port: number | null;
+  sort_order: number;
+  created_at: string;
+  updated_at: string;
+};
+
+/** Public view of a workspace's git credential — never contains the token or private key. */
+export type RepositoryCredentialResponse = {
+  provider: GitProvider;
+  auth_type: RepositoryAuthType;
+  username: string | null;
+  /** Present for `ssh_key` credentials: add it as a deploy key with write access on the host. */
+  public_key: string | null;
+  supports_pull_requests: boolean;
+  repo_url: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type WorkspaceResponse = {
   id: string;
   owner_id: string;
   name: string;
   slug: string;
-  repo_url: string;
+  /** `null` for template/blank workspaces until a remote is connected. */
+  repo_url: string | null;
+  source?: WorkspaceSource;
+  template_id?: string | null;
   default_branch: string;
   runtime: string;
   sandbox_id: string | null;
   snapshot: string | null;
   workspace_path: string;
+  /** Repo-relative subdirectory commands and the dev server run in; null = checkout root. */
+  app_root: string | null;
   status: WorkspaceStatus;
   created_at: string;
   updated_at: string;
+  /** Caller's role in this workspace; null when the backend could not resolve one. */
+  viewer_role: WorkspaceRole | null;
 };
 
 export type WorkspaceStatusResponse = Pick<
@@ -80,12 +145,20 @@ export type WorkspaceStatusResponse = Pick<
 
 export type WorkspaceCreatePayload = {
   name: string;
-  repo_url: string;
+  /** Required when `source` is `repository`; omit for `template` and `blank`. */
+  repo_url?: string;
+  source?: WorkspaceSource;
+  template_id?: string;
   default_branch?: string;
   snapshot?: string | null;
 };
 
-export type WorkspaceUpdatePayload = Partial<WorkspaceCreatePayload>;
+export type WorkspaceUpdatePayload = Partial<
+  Pick<WorkspaceCreatePayload, "name" | "repo_url" | "default_branch" | "snapshot">
+> & {
+  /** Send `""` to clear it back to the checkout root. Validated server-side. */
+  app_root?: string | null;
+};
 
 export type WorkspaceEnvVarResponse = {
   id: string;
@@ -102,7 +175,12 @@ export type WorkspaceEnvVarPayload = {
 
 export type RepositoryConnectPayload = {
   repo_url: string;
-  token: string;
+  provider?: GitProviderChoice;
+  auth_type: RepositoryAuthType;
+  /** Required for `personal_access_token`; must be omitted for `ssh_key`. */
+  token?: string;
+  /** Optional basic-auth username override (Bitbucket app passwords, generic hosts). */
+  username?: string;
 };
 
 export type RepositoryFileStatus = {
@@ -121,6 +199,30 @@ export type RepositoryDiffResponse = {
   diff: string;
 };
 
+export type GitCommitResponse = {
+  hash: string;
+  short_hash: string;
+  author_name: string;
+  author_email: string;
+  date: string;
+  subject: string;
+};
+
+export type RepositoryLogResponse = {
+  commits: GitCommitResponse[];
+};
+
+export type RepositoryCommitDetailResponse = {
+  hash: string;
+  short_hash: string;
+  author_name: string;
+  author_email: string;
+  date: string;
+  subject: string;
+  body: string;
+  diff: string;
+};
+
 export type RepositoryCommitPayload = {
   message: string;
 };
@@ -128,6 +230,43 @@ export type RepositoryCommitPayload = {
 export type RepositoryOperationResponse = {
   ok: boolean;
   message: string;
+};
+
+export type WorktreeResponse = {
+  id: string;
+  branch: string;
+  path: string;
+  base_ref: string;
+  is_base: boolean;
+  status: string;
+  is_clean: boolean;
+  ahead: number;
+  behind: number;
+};
+
+export type WorktreeCreatePayload = {
+  branch: string;
+  base?: string | null;
+};
+
+export type PullRequestResponse = {
+  id: string;
+  worktree_id: string | null;
+  number: number;
+  url: string;
+  state: string;
+  head: string;
+  base: string;
+  title: string;
+};
+
+export type PullRequestCreatePayload = {
+  worktree_id?: string | null;
+  head?: string | null;
+  base?: string | null;
+  title: string;
+  body?: string | null;
+  draft?: boolean;
 };
 
 export type WorkspaceFileNode = {
@@ -181,11 +320,15 @@ export type AgentRunResponse = {
   id: string;
   workspace_id: string;
   user_id: string;
+  session_id: string | null;
   prompt: string;
   status: AgentRunStatus;
   provider: string;
   model: string;
   tokens_used: number | null;
+  input_tokens: number | null;
+  output_tokens: number | null;
+  estimated_cost: number | null;
   started_at: string;
   completed_at: string | null;
   error_message: string | null;
@@ -211,7 +354,63 @@ export type AgentFileChangeListResponse = {
 
 export type AgentRunCreatePayload = {
   prompt: string;
+  worktree_id?: string | null;
 };
+
+export type AgentSessionStatus = "active" | "archived";
+
+export type AgentSessionResponse = {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  title: string | null;
+  status: AgentSessionStatus;
+  created_at: string;
+  updated_at: string;
+};
+
+// Detail returns turns as AgentRun summaries (no events); per-turn events come from
+// getAgentRun / the WebSocket stream.
+export type AgentSessionDetailResponse = AgentSessionResponse & {
+  turns: AgentRunResponse[]; // ordered oldest → newest
+};
+
+export type AgentSessionCreatePayload = {
+  title?: string | null;
+};
+
+export type AgentSessionUpdatePayload = {
+  title?: string | null;
+  status?: AgentSessionStatus;
+};
+
+export type AgentTurnCreatePayload = {
+  prompt: string;
+  worktree_id?: string | null;
+};
+
+/** Lifecycle role of a registry entry. Drives grouping and what the dev server runs. */
+export type CommandRole =
+  | "install"
+  | "migrate"
+  | "dev"
+  | "test"
+  | "lint"
+  | "seed"
+  | "custom";
+
+/** `service` (a long-running process with a port) is executed from Epic 11 onwards. */
+export type CommandKind = "task" | "service";
+
+export const COMMAND_ROLES: CommandRole[] = [
+  "install",
+  "migrate",
+  "dev",
+  "test",
+  "lint",
+  "seed",
+  "custom",
+];
 
 export type CustomCommandResponse = {
   id: string;
@@ -222,6 +421,15 @@ export type CustomCommandResponse = {
   icon: string | null;
   hotkey: string | null;
   requires_confirmation: boolean;
+  role: CommandRole;
+  kind: CommandKind;
+  /** Relative to the workspace's app root; `null` means the app root itself. */
+  cwd: string | null;
+  port: number | null;
+  sort_order: number;
+  enabled: boolean;
+  /** `null` falls back to the platform default (15 minutes). */
+  timeout_seconds: number | null;
   created_at: string;
   updated_at: string;
 };
@@ -233,15 +441,28 @@ export type CustomCommandPayload = {
   icon?: string | null;
   hotkey?: string | null;
   requires_confirmation: boolean;
+  role?: CommandRole;
+  kind?: CommandKind;
+  cwd?: string | null;
+  port?: number | null;
+  enabled?: boolean;
+  timeout_seconds?: number | null;
 };
 
 export type CustomCommandUpdatePayload = Partial<CustomCommandPayload>;
+
+export type CommandReorderPayload = {
+  items: { id: string; sort_order: number }[];
+};
 
 export type CommandRunResponse = {
   id: string;
   custom_command_id: string;
   workspace_id: string;
   user_id: string;
+  /** Which worktree the run targeted; `null` means the base clone. */
+  worktree_id: string | null;
+  cwd: string | null;
   status: CommandRunStatus;
   exit_code: number | null;
   output: string;
@@ -251,6 +472,46 @@ export type CommandRunResponse = {
 
 export type CommandRunCreatePayload = {
   confirmed?: boolean;
+  worktree_id?: string | null;
+};
+
+/** A detection *proposal*. Nothing is persisted until the user imports it. */
+export type DetectedCommand = {
+  name: string;
+  command: string;
+  role: CommandRole;
+  cwd: string | null;
+  port: number | null;
+  /** The manifest this was derived from, so the UI can explain the suggestion. */
+  source_file: string;
+  reason: string;
+};
+
+export type DetectCommandsResponse = {
+  candidates: DetectedCommand[];
+};
+
+export type ImportCommandItem = {
+  name: string;
+  command: string;
+  role?: CommandRole;
+  // Omit to let the server default it from role (a `dev`-role candidate becomes `service`).
+  kind?: CommandKind;
+  cwd?: string | null;
+  port?: number | null;
+};
+
+export type RunPresetResponse = {
+  slug: string;
+  name: string;
+  description: string;
+  commands: {
+    name: string;
+    command: string;
+    role: CommandRole;
+    cwd: string | null;
+    port: number | null;
+  }[];
 };
 
 export type CommandRunStreamMessage =
@@ -295,6 +556,12 @@ export type PreviewSessionResponse = {
   status: PreviewSessionStatus;
   created_at: string;
   last_seen_at: string;
+  // The worktree this preview belongs to (null = base clone) and its branch.
+  worktree_id: string | null;
+  branch: string | null;
+  // Which workspace service this preview was detected for (Epic 11); null for a session
+  // detected via the legacy single-port scan.
+  service_id: string | null;
 };
 
 export type PreviewDetectResponse = {
@@ -305,6 +572,7 @@ export type PreviewDetectResponse = {
 export type DevServerStatus =
   | "idle"
   | "installing"
+  | "ready"
   | "starting"
   | "running"
   | "stopped"
@@ -316,12 +584,68 @@ export type DevServerStatusResponse = {
   status: DevServerStatus;
   port: number | null;
   message: string | null;
+  // The worktree the dev server is running in (null = base clone) and its branch.
+  worktree_id: string | null;
+  branch: string | null;
 };
 
 export type DevServerActionResponse = {
   ok: boolean;
   status: DevServerStatus;
   message: string | null;
+};
+
+/** A running (or desired-to-run) instance of a workspace's service command (Epic 11). */
+export type WorkspaceServiceStatus =
+  | "installing"
+  | "starting"
+  | "running"
+  | "stopped"
+  | "exited"
+  | "error";
+
+export type WorkspaceServiceResponse = {
+  id: string;
+  workspace_id: string;
+  // null = the built-in mise `dev` service (no registry command owns it).
+  custom_command_id: string | null;
+  name: string;
+  role: CommandRole;
+  kind: CommandKind;
+  command: string | null;
+  port: number | null;
+  status: WorkspaceServiceStatus;
+  desired: boolean;
+  worktree_id: string | null;
+  branch: string | null;
+  last_error: string | null;
+  exit_code: number | null;
+  started_at: string | null;
+  last_seen_at: string | null;
+  preview_session_id: string | null;
+  public_url: string | null;
+};
+
+/** The workspace-wide mise environment (install/mise-trust), separate from any one
+ * service's run status — the pre-Epic-11 `/dev/setup` concept. */
+export type WorkspaceEnvironmentState = {
+  status: string;
+  message: string | null;
+};
+
+export type WorkspaceServicesResponse = {
+  services: WorkspaceServiceResponse[];
+  environment: WorkspaceEnvironmentState;
+  limit: number;
+};
+
+export type ServiceActionResponse = {
+  service: WorkspaceServiceResponse;
+  warning: string | null;
+};
+
+export type ServiceLogsResponse = {
+  content: string;
 };
 
 export type LoginPayload = {
@@ -357,11 +681,15 @@ export function getAgentStreamUrl(workspaceId: string, runId: string) {
   return baseUrl.toString();
 }
 
-export function getTerminalSessionSocketUrl(workspaceId: string, sessionId: string) {
+export function getTerminalSessionSocketUrl(
+  workspaceId: string,
+  sessionId: string,
+  worktreeId?: string | null,
+) {
   const baseUrl = new URL(getApiBaseUrl());
   baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
   baseUrl.pathname = `/workspaces/${workspaceId}/terminal/sessions/${sessionId}`;
-  baseUrl.search = "";
+  baseUrl.search = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
   return baseUrl.toString();
 }
 
@@ -369,6 +697,14 @@ export function getCommandRunStreamUrl(workspaceId: string, runId: string) {
   const baseUrl = new URL(getApiBaseUrl());
   baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
   baseUrl.pathname = `/workspaces/${workspaceId}/command-runs/${runId}/stream`;
+  baseUrl.search = "";
+  return baseUrl.toString();
+}
+
+export function getServiceLogStreamUrl(workspaceId: string, serviceId: string) {
+  const baseUrl = new URL(getApiBaseUrl());
+  baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+  baseUrl.pathname = `/workspaces/${workspaceId}/services/${serviceId}/logs/stream`;
   baseUrl.search = "";
   return baseUrl.toString();
 }
@@ -381,10 +717,24 @@ export function getNotificationStreamUrl() {
   return baseUrl.toString();
 }
 
-export function getWorkspaceFileDownloadUrl(workspaceId: string, path: string) {
+export function getPresenceStreamUrl(workspaceId: string) {
+  const baseUrl = new URL(getApiBaseUrl());
+  baseUrl.protocol = baseUrl.protocol === "https:" ? "wss:" : "ws:";
+  baseUrl.pathname = `/workspaces/${workspaceId}/presence/stream`;
+  baseUrl.search = "";
+  return baseUrl.toString();
+}
+
+export function getWorkspaceFileDownloadUrl(
+  workspaceId: string,
+  path: string,
+  worktreeId?: string,
+) {
   const baseUrl = new URL(getApiBaseUrl());
   baseUrl.pathname = `/workspaces/${workspaceId}/files/download`;
-  baseUrl.search = `?path=${encodeURIComponent(path)}`;
+  const params = new URLSearchParams({ path });
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  baseUrl.search = params.toString();
   return baseUrl.toString();
 }
 
@@ -460,6 +810,30 @@ export function markAllNotificationsRead(): Promise<NotificationResponse[]> {
   return requestJson<NotificationResponse[]>("/notifications/read-all", { method: "POST" });
 }
 
+export function listComments(
+  targetType: CommentTargetType,
+  targetId: string,
+  signal?: AbortSignal,
+): Promise<CommentResponse[]> {
+  const params = new URLSearchParams({ target_type: targetType, target_id: targetId });
+  return requestJson<CommentResponse[]>(`/comments?${params.toString()}`, { signal });
+}
+
+export function createComment(
+  targetType: CommentTargetType,
+  targetId: string,
+  body: string,
+): Promise<CommentResponse> {
+  return requestJson<CommentResponse>("/comments", {
+    method: "POST",
+    body: JSON.stringify({ target_type: targetType, target_id: targetId, body }),
+  });
+}
+
+export function resolveComment(commentId: string): Promise<CommentResponse> {
+  return requestJson<CommentResponse>(`/comments/${commentId}/resolve`, { method: "PATCH" });
+}
+
 export function listWorkspaces(signal?: AbortSignal): Promise<WorkspaceResponse[]> {
   return requestJson<WorkspaceResponse[]>("/workspaces", { signal });
 }
@@ -483,6 +857,17 @@ export function updateWorkspace(
 
 export function deleteWorkspace(workspaceId: string): Promise<{ ok: boolean }> {
   return requestJson<{ ok: boolean }>(`/workspaces/${workspaceId}`, { method: "DELETE" });
+}
+
+/**
+ * Retry provisioning a workspace whose sandbox failed to come up. Idempotent — the backend
+ * reuses the existing sandbox when there is one. `getWorkspaceStatus` cannot recover such a
+ * workspace because it has no sandbox to query.
+ */
+export function reprovisionWorkspace(workspaceId: string): Promise<WorkspaceResponse> {
+  return requestJson<WorkspaceResponse>(`/workspaces/${workspaceId}/provision`, {
+    method: "POST",
+  });
 }
 
 export function getWorkspaceStatus(
@@ -533,6 +918,29 @@ export function connectRepository(
   });
 }
 
+export function getRepositoryCredential(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<RepositoryCredentialResponse> {
+  return requestJson<RepositoryCredentialResponse>(`/workspaces/${workspaceId}/repo/credential`, {
+    signal,
+  });
+}
+
+export function ensureRepositorySshKey(
+  workspaceId: string,
+  rotate = false,
+): Promise<RepositoryCredentialResponse> {
+  return requestJson<RepositoryCredentialResponse>(`/workspaces/${workspaceId}/repo/ssh-key`, {
+    method: "POST",
+    body: JSON.stringify({ rotate }),
+  });
+}
+
+export function listWorkspaceTemplates(signal?: AbortSignal): Promise<WorkspaceTemplateResponse[]> {
+  return requestJson<WorkspaceTemplateResponse[]>("/workspace-templates", { signal });
+}
+
 export function cloneRepository(workspaceId: string): Promise<RepositoryOperationResponse> {
   return requestJson<RepositoryOperationResponse>(`/workspaces/${workspaceId}/repo/clone`, {
     method: "POST",
@@ -541,9 +949,11 @@ export function cloneRepository(workspaceId: string): Promise<RepositoryOperatio
 
 export function getRepositoryStatus(
   workspaceId: string,
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<RepositoryStatusResponse> {
-  return requestJson<RepositoryStatusResponse>(`/workspaces/${workspaceId}/repo/status`, {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<RepositoryStatusResponse>(`/workspaces/${workspaceId}/repo/status${query}`, {
     signal,
   });
 }
@@ -551,12 +961,46 @@ export function getRepositoryStatus(
 export function getRepositoryDiff(
   workspaceId: string,
   path?: string,
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<RepositoryDiffResponse> {
-  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  const query = params.toString() ? `?${params.toString()}` : "";
   return requestJson<RepositoryDiffResponse>(`/workspaces/${workspaceId}/repo/diff${query}`, {
     signal,
   });
+}
+
+export function getRepositoryLog(
+  workspaceId: string,
+  worktreeId?: string,
+  limit?: number,
+  skip?: number,
+  signal?: AbortSignal,
+): Promise<RepositoryLogResponse> {
+  const params = new URLSearchParams();
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  if (limit != null) params.set("limit", String(limit));
+  if (skip != null) params.set("skip", String(skip));
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return requestJson<RepositoryLogResponse>(`/workspaces/${workspaceId}/repo/log${query}`, {
+    signal,
+  });
+}
+
+export function getCommitDetail(
+  workspaceId: string,
+  sha: string,
+  worktreeId?: string,
+  signal?: AbortSignal,
+): Promise<RepositoryCommitDetailResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<RepositoryCommitDetailResponse>(
+    `/workspaces/${workspaceId}/repo/commits/${encodeURIComponent(sha)}${query}`,
+    { signal },
+  );
 }
 
 export function pullRepository(workspaceId: string): Promise<RepositoryOperationResponse> {
@@ -581,12 +1025,143 @@ export function pushRepository(workspaceId: string): Promise<RepositoryOperation
   });
 }
 
+export function discardRepositoryChanges(
+  workspaceId: string,
+  path?: string,
+  worktreeId?: string,
+): Promise<RepositoryOperationResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/discard${query}`,
+    { method: "POST", body: JSON.stringify({ path: path ?? null }) },
+  );
+}
+
+export function fetchRepository(
+  workspaceId: string,
+  worktreeId?: string,
+): Promise<RepositoryOperationResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/fetch${query}`,
+    { method: "POST" },
+  );
+}
+
+export function listWorktrees(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<WorktreeResponse[]> {
+  return requestJson<WorktreeResponse[]>(`/workspaces/${workspaceId}/repo/worktrees`, {
+    signal,
+  });
+}
+
+export function createWorktree(
+  workspaceId: string,
+  payload: WorktreeCreatePayload,
+): Promise<WorktreeResponse> {
+  return requestJson<WorktreeResponse>(`/workspaces/${workspaceId}/repo/worktrees`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function removeWorktree(
+  workspaceId: string,
+  worktreeId: string,
+  force = false,
+): Promise<RepositoryOperationResponse> {
+  const query = force ? "?force=true" : "";
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}${query}`,
+    { method: "DELETE" },
+  );
+}
+
+export function commitWorktree(
+  workspaceId: string,
+  worktreeId: string,
+  payload: RepositoryCommitPayload,
+): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}/commit`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
+}
+
+export function pushWorktree(
+  workspaceId: string,
+  worktreeId: string,
+): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}/push`,
+    { method: "POST" },
+  );
+}
+
+export function pullWorktree(
+  workspaceId: string,
+  worktreeId: string,
+): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}/pull`,
+    { method: "POST" },
+  );
+}
+
+export function syncWorktree(
+  workspaceId: string,
+  worktreeId: string,
+  strategy: "merge" | "rebase" = "merge",
+): Promise<RepositoryOperationResponse> {
+  return requestJson<RepositoryOperationResponse>(
+    `/workspaces/${workspaceId}/repo/worktrees/${worktreeId}/sync`,
+    { method: "POST", body: JSON.stringify({ strategy }) },
+  );
+}
+
+export function createPullRequest(
+  workspaceId: string,
+  payload: PullRequestCreatePayload,
+): Promise<PullRequestResponse> {
+  return requestJson<PullRequestResponse>(`/workspaces/${workspaceId}/repo/pull-requests`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listPullRequests(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<PullRequestResponse[]> {
+  return requestJson<PullRequestResponse[]>(
+    `/workspaces/${workspaceId}/repo/pull-requests`,
+    { signal },
+  );
+}
+
+export function getPullRequest(
+  workspaceId: string,
+  number: number,
+  signal?: AbortSignal,
+): Promise<PullRequestResponse> {
+  return requestJson<PullRequestResponse>(
+    `/workspaces/${workspaceId}/repo/pull-requests/${number}`,
+    { signal },
+  );
+}
+
 export function getWorkspaceFileTree(
   workspaceId: string,
   path = "",
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileNode> {
-  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  const params = new URLSearchParams();
+  if (path) params.set("path", path);
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  const query = params.toString() ? `?${params.toString()}` : "";
   return requestJson<WorkspaceFileNode>(`/workspaces/${workspaceId}/files/tree${query}`, {
     signal,
   });
@@ -595,10 +1170,13 @@ export function getWorkspaceFileTree(
 export function readWorkspaceFile(
   workspaceId: string,
   path: string,
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileReadResponse> {
+  const params = new URLSearchParams({ path });
+  if (worktreeId) params.set("worktree_id", worktreeId);
   return requestJson<WorkspaceFileReadResponse>(
-    `/workspaces/${workspaceId}/files/read?path=${encodeURIComponent(path)}`,
+    `/workspaces/${workspaceId}/files/read?${params.toString()}`,
     { signal },
   );
 }
@@ -606,11 +1184,16 @@ export function readWorkspaceFile(
 export function writeWorkspaceFile(
   workspaceId: string,
   payload: WorkspaceFileWritePayload,
+  worktreeId?: string,
 ): Promise<WorkspaceFileOperationResponse> {
-  return requestJson<WorkspaceFileOperationResponse>(`/workspaces/${workspaceId}/files/write`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<WorkspaceFileOperationResponse>(
+    `/workspaces/${workspaceId}/files/write${query}`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
 export async function uploadWorkspaceFile(
@@ -618,15 +1201,16 @@ export async function uploadWorkspaceFile(
   path: string,
   file: File | Blob,
   filename?: string,
+  worktreeId?: string,
 ): Promise<WorkspaceFileOperationResponse> {
   const name =
     filename ??
     (typeof File !== "undefined" && file instanceof File ? file.name : undefined) ??
     "upload.bin";
+  const params = new URLSearchParams({ path, filename: name });
+  if (worktreeId) params.set("worktree_id", worktreeId);
   const response = await fetch(
-    `${getApiBaseUrl()}/workspaces/${workspaceId}/files/upload?path=${encodeURIComponent(
-      path,
-    )}&filename=${encodeURIComponent(name)}`,
+    `${getApiBaseUrl()}/workspaces/${workspaceId}/files/upload?${params.toString()}`,
     {
       method: "POST",
       credentials: "include",
@@ -653,37 +1237,55 @@ export async function uploadWorkspaceFile(
 export function createWorkspaceFolder(
   workspaceId: string,
   payload: WorkspaceFolderCreatePayload,
+  worktreeId?: string,
 ): Promise<WorkspaceFileOperationResponse> {
-  return requestJson<WorkspaceFileOperationResponse>(`/workspaces/${workspaceId}/files/folders`, {
-    method: "POST",
-    body: JSON.stringify(payload),
-  });
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<WorkspaceFileOperationResponse>(
+    `/workspaces/${workspaceId}/files/folders${query}`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
 export function renameWorkspaceFile(
   workspaceId: string,
   payload: WorkspaceFileRenamePayload,
+  worktreeId?: string,
 ): Promise<WorkspaceFileOperationResponse> {
-  return requestJson<WorkspaceFileOperationResponse>(`/workspaces/${workspaceId}/files/rename`, {
-    method: "PATCH",
-    body: JSON.stringify(payload),
-  });
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<WorkspaceFileOperationResponse>(
+    `/workspaces/${workspaceId}/files/rename${query}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
 }
 
-export function deleteWorkspaceFile(workspaceId: string, path: string): Promise<{ ok: boolean }> {
-  return requestJson<{ ok: boolean }>(
-    `/workspaces/${workspaceId}/files?path=${encodeURIComponent(path)}`,
-    { method: "DELETE" },
-  );
+export function deleteWorkspaceFile(
+  workspaceId: string,
+  path: string,
+  worktreeId?: string,
+): Promise<{ ok: boolean }> {
+  const params = new URLSearchParams({ path });
+  if (worktreeId) params.set("worktree_id", worktreeId);
+  return requestJson<{ ok: boolean }>(`/workspaces/${workspaceId}/files?${params.toString()}`, {
+    method: "DELETE",
+  });
 }
 
 export function searchWorkspaceFiles(
   workspaceId: string,
   query: string,
+  worktreeId?: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileNode[]> {
+  const params = new URLSearchParams({ q: query });
+  if (worktreeId) params.set("worktree_id", worktreeId);
   return requestJson<WorkspaceFileNode[]>(
-    `/workspaces/${workspaceId}/files/search?q=${encodeURIComponent(query)}`,
+    `/workspaces/${workspaceId}/files/search?${params.toString()}`,
     { signal },
   );
 }
@@ -739,6 +1341,83 @@ export function getAgentFileChanges(
   );
 }
 
+export function createAgentSession(
+  workspaceId: string,
+  payload: AgentSessionCreatePayload = {},
+): Promise<AgentSessionResponse> {
+  return requestJson<AgentSessionResponse>(`/workspaces/${workspaceId}/agent/sessions`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function listAgentSessions(
+  workspaceId: string,
+  signal?: AbortSignal,
+  limit?: number,
+  offset?: number,
+  status?: AgentSessionStatus,
+): Promise<AgentSessionResponse[]> {
+  const params = new URLSearchParams();
+  if (limit !== undefined) params.set("limit", String(limit));
+  if (offset !== undefined) params.set("offset", String(offset));
+  if (status !== undefined) params.set("status", status);
+  const query = params.toString() ? `?${params.toString()}` : "";
+  return requestJson<AgentSessionResponse[]>(
+    `/workspaces/${workspaceId}/agent/sessions${query}`,
+    { signal },
+  );
+}
+
+export function getAgentSession(
+  workspaceId: string,
+  sessionId: string,
+  signal?: AbortSignal,
+): Promise<AgentSessionDetailResponse> {
+  return requestJson<AgentSessionDetailResponse>(
+    `/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+    { signal },
+  );
+}
+
+export function updateAgentSession(
+  workspaceId: string,
+  sessionId: string,
+  payload: AgentSessionUpdatePayload,
+): Promise<AgentSessionResponse> {
+  return requestJson<AgentSessionResponse>(
+    `/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export function deleteAgentSession(
+  workspaceId: string,
+  sessionId: string,
+): Promise<{ ok: boolean }> {
+  return requestJson<{ ok: boolean }>(
+    `/workspaces/${workspaceId}/agent/sessions/${sessionId}`,
+    { method: "DELETE" },
+  );
+}
+
+export function createAgentSessionTurn(
+  workspaceId: string,
+  sessionId: string,
+  payload: AgentTurnCreatePayload,
+): Promise<AgentRunResponse> {
+  return requestJson<AgentRunResponse>(
+    `/workspaces/${workspaceId}/agent/sessions/${sessionId}/turns`,
+    {
+      method: "POST",
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
 export function createCustomCommand(
   workspaceId: string,
   payload: CustomCommandPayload,
@@ -783,8 +1462,63 @@ export function runCustomCommand(
 ): Promise<CommandRunResponse> {
   return requestJson<CommandRunResponse>(`/workspaces/${workspaceId}/commands/${commandId}/run`, {
     method: "POST",
-    body: JSON.stringify({ confirmed: payload.confirmed ?? false }),
+    body: JSON.stringify({
+      confirmed: payload.confirmed ?? false,
+      worktree_id: payload.worktree_id ?? null,
+    }),
   });
+}
+
+/** Bulk `sort_order` update; returns the whole registry in its new order. */
+export function reorderCustomCommands(
+  workspaceId: string,
+  payload: CommandReorderPayload,
+): Promise<CustomCommandResponse[]> {
+  return requestJson<CustomCommandResponse[]>(`/workspaces/${workspaceId}/commands/reorder`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+/** Read-only: proposes entries from the repo's manifests without persisting anything. */
+export function detectRunCommands(
+  workspaceId: string,
+  worktreeId?: string | null,
+): Promise<DetectCommandsResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<DetectCommandsResponse>(
+    `/workspaces/${workspaceId}/commands/detect${query}`,
+    { method: "POST" },
+  );
+}
+
+export function importRunCommands(
+  workspaceId: string,
+  items: ImportCommandItem[],
+): Promise<CustomCommandResponse[]> {
+  return requestJson<CustomCommandResponse[]>(`/workspaces/${workspaceId}/commands/import`, {
+    method: "POST",
+    body: JSON.stringify({ items }),
+  });
+}
+
+export function listRunPresets(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<RunPresetResponse[]> {
+  return requestJson<RunPresetResponse[]>(`/workspaces/${workspaceId}/commands/presets`, {
+    signal,
+  });
+}
+
+export function applyRunPreset(
+  workspaceId: string,
+  slug: string,
+): Promise<CustomCommandResponse[]> {
+  return requestJson<CustomCommandResponse[]>(
+    `/workspaces/${workspaceId}/commands/presets/${encodeURIComponent(slug)}/apply`,
+    { method: "POST" },
+  );
 }
 
 export function listCustomCommandRuns(
@@ -885,8 +1619,30 @@ export function stopPreviewSession(
   );
 }
 
-export function startDevServer(workspaceId: string): Promise<DevServerActionResponse> {
-  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/start`, {
+/**
+ * Prepare the environment (toolchain + dependencies) without running the app.
+ * Scoped to a worktree when `worktreeId` is given (defaults to the base clone).
+ */
+export function setupDevServer(
+  workspaceId: string,
+  worktreeId?: string | null,
+): Promise<DevServerActionResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/setup${query}`, {
+    method: "POST",
+  });
+}
+
+/**
+ * Run the app's dev task on demand (the Preview "Run App" button), in the given
+ * worktree when `worktreeId` is set (defaults to the base clone).
+ */
+export function runDevServer(
+  workspaceId: string,
+  worktreeId?: string | null,
+): Promise<DevServerActionResponse> {
+  const query = worktreeId ? `?worktree_id=${encodeURIComponent(worktreeId)}` : "";
+  return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/run${query}`, {
     method: "POST",
   });
 }
@@ -918,6 +1674,81 @@ export function stopDevServer(workspaceId: string): Promise<DevServerActionRespo
   return requestJson<DevServerActionResponse>(`/workspaces/${workspaceId}/dev/stop`, {
     method: "POST",
   });
+}
+
+// ── Workspace services (Epic 11: multi-service preview) ──────────────────────
+
+export function listWorkspaceServices(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<WorkspaceServicesResponse> {
+  return requestJson<WorkspaceServicesResponse>(`/workspaces/${workspaceId}/services`, {
+    signal,
+  });
+}
+
+/**
+ * Reconciles every service marked desired against the sandbox, restarting any that were
+ * running before the sandbox slept. Safe to poll — mirrors `ensureDevServer` for the whole
+ * service list.
+ */
+export function ensureWorkspaceServices(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<WorkspaceServicesResponse> {
+  return requestJson<WorkspaceServicesResponse>(`/workspaces/${workspaceId}/services/ensure`, {
+    method: "POST",
+    signal,
+  });
+}
+
+export function startWorkspaceService(
+  workspaceId: string,
+  serviceId: string,
+  worktreeId?: string | null,
+): Promise<ServiceActionResponse> {
+  return requestJson<ServiceActionResponse>(
+    `/workspaces/${workspaceId}/services/${serviceId}/start`,
+    {
+      method: "POST",
+      body: JSON.stringify({ worktree_id: worktreeId ?? null }),
+    },
+  );
+}
+
+export function stopWorkspaceService(
+  workspaceId: string,
+  serviceId: string,
+): Promise<ServiceActionResponse> {
+  return requestJson<ServiceActionResponse>(
+    `/workspaces/${workspaceId}/services/${serviceId}/stop`,
+    { method: "POST" },
+  );
+}
+
+export function restartWorkspaceService(
+  workspaceId: string,
+  serviceId: string,
+  worktreeId?: string | null,
+): Promise<ServiceActionResponse> {
+  return requestJson<ServiceActionResponse>(
+    `/workspaces/${workspaceId}/services/${serviceId}/restart`,
+    {
+      method: "POST",
+      body: JSON.stringify({ worktree_id: worktreeId ?? null }),
+    },
+  );
+}
+
+export function getWorkspaceServiceLogs(
+  workspaceId: string,
+  serviceId: string,
+  signal?: AbortSignal,
+): Promise<ServiceLogsResponse> {
+  return requestJson<ServiceLogsResponse>(
+    `/workspaces/${workspaceId}/services/${serviceId}/logs`,
+    { signal },
+  );
 }
 
 // ── Projects & Teams ──────────────────────────────────────────────────────────
@@ -1176,4 +2007,333 @@ export type DashboardSummary = {
 
 export function getDashboardSummary(signal?: AbortSignal): Promise<DashboardSummary> {
   return requestJson<DashboardSummary>("/dashboard/summary", { signal });
+}
+
+// Cost & usage analytics
+
+export type UsageScope = "workspace" | "team" | "project";
+export type UsageBreakdownDimension = "project" | "team" | "workspace" | "user";
+
+export type UsageTotals = {
+  run_count: number;
+  input_tokens: number;
+  output_tokens: number;
+  tokens_used: number;
+  estimated_cost: number;
+};
+
+export type UsageSeriesPoint = {
+  date: string;
+  run_count: number;
+  tokens_used: number;
+  estimated_cost: number;
+};
+
+export type UsageBreakdownItem = {
+  id: string | null;
+  name: string;
+  run_count: number;
+  tokens_used: number;
+  estimated_cost: number;
+};
+
+export type UsageSummary = {
+  scope: UsageScope | null;
+  scope_id: string | null;
+  date_from: string;
+  date_to: string;
+  totals: UsageTotals;
+  series: UsageSeriesPoint[];
+  breakdown_dimension: UsageBreakdownDimension;
+  breakdown: UsageBreakdownItem[];
+  top_spenders: UsageBreakdownItem[];
+};
+
+export type UsageQuery = {
+  scope?: UsageScope;
+  id?: string;
+  from?: string;
+  to?: string;
+};
+
+export function getUsageSummary(query: UsageQuery = {}, signal?: AbortSignal): Promise<UsageSummary> {
+  const params = new URLSearchParams();
+  if (query.scope) params.set("scope", query.scope);
+  if (query.id) params.set("id", query.id);
+  if (query.from) params.set("from", query.from);
+  if (query.to) params.set("to", query.to);
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  return requestJson<UsageSummary>(`/dashboard/usage${suffix}`, { signal });
+}
+
+// Usage budgets
+
+export type BudgetPeriod = "daily" | "weekly" | "monthly" | "total";
+export type BudgetStatus = "ok" | "warning" | "over";
+
+export type Budget = {
+  id: string;
+  scope: UsageScope;
+  scope_id: string;
+  period: BudgetPeriod;
+  limit_cost: number | null;
+  limit_tokens: number | null;
+  threshold_percent: number;
+  enforce: boolean;
+  created_at: string;
+  updated_at: string;
+  current_cost: number;
+  current_tokens: number;
+  status: BudgetStatus;
+};
+
+export type BudgetCreatePayload = {
+  scope: UsageScope;
+  scope_id: string;
+  period?: BudgetPeriod;
+  limit_cost?: number | null;
+  limit_tokens?: number | null;
+  threshold_percent?: number;
+  enforce?: boolean;
+};
+
+export type BudgetUpdatePayload = {
+  period?: BudgetPeriod;
+  limit_cost?: number | null;
+  limit_tokens?: number | null;
+  threshold_percent?: number;
+  enforce?: boolean;
+};
+
+export function listBudgets(
+  scope: UsageScope,
+  id: string,
+  signal?: AbortSignal,
+): Promise<Budget[]> {
+  const params = new URLSearchParams({ scope, id });
+  return requestJson<Budget[]>(`/budgets?${params.toString()}`, { signal });
+}
+
+export function createBudget(payload: BudgetCreatePayload): Promise<Budget> {
+  return requestJson<Budget>("/budgets", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function updateBudget(budgetId: string, payload: BudgetUpdatePayload): Promise<Budget> {
+  return requestJson<Budget>(`/budgets/${budgetId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteBudget(budgetId: string): Promise<void> {
+  return requestJson<void>(`/budgets/${budgetId}`, { method: "DELETE" });
+}
+
+// --- Spec-Driven Development (SDD) ---------------------------------------------------
+
+export type SpecPhaseName =
+  | "constitution"
+  | "specify"
+  | "clarify"
+  | "plan"
+  | "analyze"
+  | "tasks"
+  | "implement";
+
+export type SpecWorkflowStatus =
+  | "pending"
+  | "running"
+  | "awaiting_review"
+  | "completed"
+  | "error";
+
+export type SpecPhaseStatus =
+  | "pending"
+  | "running"
+  | "awaiting_review"
+  | "approved"
+  | "changes_requested"
+  | "completed"
+  | "error";
+
+export type SpecPhaseResponse = {
+  id: string;
+  workflow_id: string;
+  phase: SpecPhaseName;
+  status: SpecPhaseStatus;
+  artifact_path: string | null;
+  agent_run_id: string | null;
+  reviewed_by: string | null;
+  reviewed_at: string | null;
+  review_notes: string | null;
+  attempt: number;
+  created_at: string;
+  updated_at: string;
+};
+
+export type SpecWorkflowResponse = {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  feature_name: string;
+  feature_slug: string;
+  description: string;
+  branch: string;
+  spec_dir: string;
+  worktree_path: string | null;
+  status: SpecWorkflowStatus;
+  current_phase: SpecPhaseName;
+  created_at: string;
+  updated_at: string;
+  phases: SpecPhaseResponse[];
+};
+
+export type SpecArtifactResponse = {
+  phase: SpecPhaseName;
+  path: string | null;
+  content: string;
+};
+
+export type SpecArtifactItem = {
+  name: string;
+  path: string;
+};
+
+export type SpecArtifactListResponse = {
+  phase: SpecPhaseName;
+  items: SpecArtifactItem[];
+};
+
+export type OpenQuestion = {
+  id: string;
+  category: string | null;
+  severity: string | null;
+  location: string | null;
+  summary: string | null;
+  recommendation: string | null;
+};
+
+export type OpenQuestionsResponse = {
+  phase: SpecPhaseName;
+  items: OpenQuestion[];
+};
+
+export type SpecWorkflowCreatePayload = {
+  feature_name: string;
+  description: string;
+};
+
+export function listSpecWorkflows(
+  workspaceId: string,
+  signal?: AbortSignal,
+): Promise<SpecWorkflowResponse[]> {
+  return requestJson<SpecWorkflowResponse[]>(`/workspaces/${workspaceId}/spec/workflows`, {
+    signal,
+  });
+}
+
+export function getSpecWorkflow(
+  workspaceId: string,
+  workflowId: string,
+  signal?: AbortSignal,
+): Promise<SpecWorkflowResponse> {
+  return requestJson<SpecWorkflowResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}`,
+    { signal },
+  );
+}
+
+export function createSpecWorkflow(
+  workspaceId: string,
+  payload: SpecWorkflowCreatePayload,
+): Promise<SpecWorkflowResponse> {
+  return requestJson<SpecWorkflowResponse>(`/workspaces/${workspaceId}/spec/workflows`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function getSpecArtifact(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+  path?: string,
+  signal?: AbortSignal,
+): Promise<SpecArtifactResponse> {
+  const query = path ? `?path=${encodeURIComponent(path)}` : "";
+  return requestJson<SpecArtifactResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/artifact${query}`,
+    { signal },
+  );
+}
+
+export function listSpecArtifacts(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+  signal?: AbortSignal,
+): Promise<SpecArtifactListResponse> {
+  return requestJson<SpecArtifactListResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/artifacts`,
+    { signal },
+  );
+}
+
+export function getAnalyzeQuestions(
+  workspaceId: string,
+  workflowId: string,
+  signal?: AbortSignal,
+): Promise<OpenQuestionsResponse> {
+  return requestJson<OpenQuestionsResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/analyze/questions`,
+    { signal },
+  );
+}
+
+export function submitAnalyzeAnswers(
+  workspaceId: string,
+  workflowId: string,
+  answers: { id: string; answer: string }[],
+): Promise<SpecPhaseResponse> {
+  return requestJson<SpecPhaseResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/analyze/answers`,
+    { method: "POST", body: JSON.stringify({ answers }) },
+  );
+}
+
+export function runSpecPhase(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+): Promise<SpecPhaseResponse> {
+  return requestJson<SpecPhaseResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/run`,
+    { method: "POST" },
+  );
+}
+
+export function approveSpecPhase(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+): Promise<SpecPhaseResponse> {
+  return requestJson<SpecPhaseResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/approve`,
+    { method: "POST" },
+  );
+}
+
+export function requestSpecChanges(
+  workspaceId: string,
+  workflowId: string,
+  phase: SpecPhaseName,
+  notes: string,
+): Promise<SpecPhaseResponse> {
+  return requestJson<SpecPhaseResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/phases/${phase}/request-changes`,
+    { method: "POST", body: JSON.stringify({ notes }) },
+  );
 }
