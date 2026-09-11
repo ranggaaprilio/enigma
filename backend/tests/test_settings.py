@@ -1,3 +1,5 @@
+import pytest
+
 from app.core.config import Settings
 
 
@@ -41,3 +43,38 @@ def test_daytona_network_allow_list_parses_comma_separated_string():
     settings = Settings(daytona_network_allow_list="10.0.0.0/16, 10.1.0.0/16 ")
 
     assert settings.daytona_network_allow_list == ["10.0.0.0/16", "10.1.0.0/16"]
+
+
+def test_non_local_environment_requires_https_or_localhost_preview_proxy():
+    """Epic 13: the preview-alias grant cookie needs SameSite=None; Secure, which cannot be set
+    over plain HTTP except on the browser's localhost exemption."""
+    with pytest.raises(ValueError, match="daytona_preview_proxy_base_url"):
+        Settings(
+            environment="production",
+            auth_secret_key="a-real-secret",
+            workspace_env_encryption_key="a-real-key",
+            metrics_token="a-real-token",
+            daytona_preview_proxy_base_url="http://preview.example.com",
+        )
+
+
+def test_non_local_environment_allows_http_localhost_preview_proxy():
+    settings = Settings(
+        environment="production",
+        auth_secret_key="a-real-secret",
+        workspace_env_encryption_key="a-real-key",
+        metrics_token="a-real-token",
+        daytona_preview_proxy_base_url="http://localhost:8001",
+    )
+    assert settings.daytona_preview_proxy_base_url == "http://localhost:8001"
+
+
+def test_non_local_environment_allows_https_preview_proxy():
+    settings = Settings(
+        environment="production",
+        auth_secret_key="a-real-secret",
+        workspace_env_encryption_key="a-real-key",
+        metrics_token="a-real-token",
+        daytona_preview_proxy_base_url="https://preview.example.com",
+    )
+    assert settings.daytona_preview_proxy_base_url == "https://preview.example.com"

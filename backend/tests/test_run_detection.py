@@ -6,6 +6,7 @@ import pytest
 
 from app.services.run_detection import (
     RunDetectionService,
+    RunDetectionUnavailableError,
     candidates_from_manifests,
     infer_port,
     infer_role,
@@ -411,3 +412,153 @@ def test_python_installer_is_decided_per_package():
         if candidate.cwd == "backend" and candidate.name == "install"
     )
     assert install.command == "uv sync"
+
+
+# ---------------------------------------------------------------------------
+# read_proxy_configs: the IO layer over proxy_detection.py -- at most 2 sandbox execs,
+# scoped to each service's own working directory.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWorkspace:
+    def __init__(self, *, owner_id, sandbox_id="sandbox-1", app_root=None) -> None:
+        self.id = "workspace-1"
+        self.owner_id = owner_id
+        self.daytona_sandbox_id = sandbox_id
+        self.app_root = app_root
+        self.workspace_path = "workspace"
+        self.default_branch = "main"
+
+
+class _FakeSession:
+    def __init__(self, workspace) -> None:
+        self.workspace = workspace
+
+    async def get(self, model, pk):
+        return self.workspace if pk == self.workspace.id else None
+
+
+class _FakeProxyRuntime:
+    """Answers `RunDetectionService._read_files`'s delimited-bundle script by looking up each
+    requested path (relative to the exec's own `cwd`) in a flat `{path: content}` map -- so the
+    test controls file existence/content without needing a real shell or filesystem."""
+
+    def __init__(self, files: dict[str, str]) -> None:
+        self.files = files
+        self.execs: list[str] = []
+
+    async def exec(self, workspace, script, *, cwd=None, env=None, timeout=None):
+        import re
+        import shlex
+
+        from app.services.daytona_runtime import RuntimeCommandResult
+
+        self.execs.append(script)
+        quoted_paths = re.findall(r"\[ -f (\S+) \]", script)
+        lines: list[str] = []
+        for quoted in quoted_paths:
+            path = shlex.split(quoted)[0]
+            content = self.files.get(path)
+            if content is None:
+                continue
+            lines.append(f"<<<ENIGMA-FILE:{path}>>>")
+            lines.append(content)
+        stdout = "\n".join(lines) + ("\n" if lines else "")
+        return RuntimeCommandResult(exit_code=0, stdout=stdout, stderr="")
+
+
+def _service(session, runtime):
+    from app.core.config import get_settings
+
+    return RunDetectionService(session=session, settings=get_settings(), runtime=runtime)
+
+
+async def test_read_proxy_configs_scopes_to_each_services_own_directory():
+    workspace = _FakeWorkspace(owner_id="user-1")
+    session = _FakeSession(workspace)
+    vite_content = (
+        "export default defineConfig({ server: { proxy: { '/api': "
+        "'http://localhost:8000' } } })\n"
+    )
+    runtime = _FakeProxyRuntime({"frontend/vite.config.ts": vite_content})
+    service = _service(session, runtime)
+
+    results = await service.read_proxy_configs(
+        "workspace-1",
+        "user-1",
+        worktree_id=None,
+        service_cwds={"web": "frontend", "api": "backend"},
+    )
+
+    assert results["web"][0].configured is True
+    assert results["api"] == []  # nothing found under backend/
+
+
+async def test_read_proxy_configs_costs_at_most_one_exec_with_no_angular():
+    workspace = _FakeWorkspace(owner_id="user-1")
+    session = _FakeSession(workspace)
+    runtime = _FakeProxyRuntime({})
+    service = _service(session, runtime)
+
+    await service.read_proxy_configs(
+        "workspace-1", "user-1", worktree_id=None, service_cwds={"web": None}
+    )
+
+    assert len(runtime.execs) == 1
+
+
+async def test_read_proxy_configs_costs_exactly_two_execs_with_an_angular_proxy_config():
+    workspace = _FakeWorkspace(owner_id="user-1")
+    session = _FakeSession(workspace)
+    angular_json = (
+        '{"projects": {"app": {"architect": {"serve": {"options": '
+        '{"proxyConfig": "proxy.conf.json"}}}}}}'
+    )
+    proxy_conf = '{"/api": {"target": "http://localhost:8000"}}'
+    runtime = _FakeProxyRuntime(
+        {"angular.json": angular_json, "proxy.conf.json": proxy_conf}
+    )
+    service = _service(session, runtime)
+
+    results = await service.read_proxy_configs(
+        "workspace-1", "user-1", worktree_id=None, service_cwds={"web": None}
+    )
+
+    assert len(runtime.execs) == 2
+    assert results["web"][0].configured is True
+    assert results["web"][0].targets == ("http://localhost:8000",)
+
+
+async def test_read_proxy_configs_deduplicates_shared_directories():
+    """Two services sharing the same cwd (e.g. install + dev in the same package) must not
+    double the exec's file list."""
+    workspace = _FakeWorkspace(owner_id="user-1")
+    session = _FakeSession(workspace)
+    runtime = _FakeProxyRuntime({})
+    service = _service(session, runtime)
+
+    await service.read_proxy_configs(
+        "workspace-1",
+        "user-1",
+        worktree_id=None,
+        service_cwds={"a": "frontend", "b": "frontend"},
+    )
+
+    # Exactly one [ -f ... ] check per unique (directory, filename) pair -- "frontend" was
+    # requested for two services, so it must appear only once in the combined script.
+    from app.services.proxy_detection import PROXY_CONFIG_FILES
+
+    script = runtime.execs[0]
+    assert script.count("[ -f ") == len(PROXY_CONFIG_FILES)
+
+
+async def test_read_proxy_configs_raises_when_sandbox_not_ready():
+    workspace = _FakeWorkspace(owner_id="user-1", sandbox_id=None)
+    session = _FakeSession(workspace)
+    runtime = _FakeProxyRuntime({})
+    service = _service(session, runtime)
+
+    with pytest.raises(RunDetectionUnavailableError):
+        await service.read_proxy_configs(
+            "workspace-1", "user-1", worktree_id=None, service_cwds={"web": None}
+        )

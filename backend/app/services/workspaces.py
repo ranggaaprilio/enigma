@@ -1,11 +1,13 @@
 import re
+from dataclasses import dataclass
+from typing import Literal
 from uuid import UUID
 
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Workspace, WorkspaceEnvVar, WorkspaceTemplate
+from app.models import CustomCommand, Workspace, WorkspaceEnvVar, WorkspaceTemplate
 from app.models.project import TeamMember
 from app.services.daytona_runtime import DaytonaRuntime, DaytonaRuntimeError
 from app.services.git_providers import sanitize_repository_url
@@ -17,6 +19,8 @@ ENV_KEY_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 SNAPSHOT_UNSET = object()
 # Distinguishes "leave app_root alone" from "clear it back to the checkout root".
 APP_ROOT_UNSET = object()
+# Distinguishes "leave env_file_path alone" from "clear it back to unset (no file written)".
+ENV_FILE_PATH_UNSET = object()
 
 
 class WorkspaceAlreadyExistsError(Exception):
@@ -33,6 +37,23 @@ class WorkspaceRuntimeError(Exception):
 
 class InvalidEnvVarKeyError(Exception):
     pass
+
+
+class InvalidEnvScopeError(Exception):
+    """Raised when a ``custom_command_id`` is given that doesn't exist, or doesn't belong to
+    the workspace an env-var operation targets."""
+
+    pass
+
+
+EnvVarWriteStatus = Literal["created", "updated", "unchanged"]
+
+
+@dataclass(frozen=True)
+class BulkItem:
+    key: str
+    status: Literal["created", "updated", "unchanged", "invalid"]
+    message: str | None = None
 
 
 class WorkspaceSecretCipher:
@@ -246,6 +267,7 @@ class SqlAlchemyWorkspaceService:
         default_branch: str | None = None,
         snapshot: str | None | object = SNAPSHOT_UNSET,
         app_root: str | None | object = APP_ROOT_UNSET,
+        env_file_path: str | None | object = ENV_FILE_PATH_UNSET,
     ) -> Workspace:
         workspace = await self.get_for_owner(workspace_id, owner_id)
         if name is not None:
@@ -259,6 +281,8 @@ class SqlAlchemyWorkspaceService:
             workspace.snapshot = snapshot
         if app_root is not APP_ROOT_UNSET:
             workspace.app_root = app_root or None
+        if env_file_path is not ENV_FILE_PATH_UNSET:
+            workspace.env_file_path = env_file_path or None
         self.session.add(workspace)
         await self.session.commit()
         await self.session.refresh(workspace)
@@ -278,9 +302,18 @@ class SqlAlchemyWorkspaceService:
         result = await self.session.execute(
             select(WorkspaceEnvVar)
             .where(WorkspaceEnvVar.workspace_id == workspace.id)
-            .order_by(WorkspaceEnvVar.key)
+            .order_by(WorkspaceEnvVar.custom_command_id.is_not(None), WorkspaceEnvVar.key)
         )
         return list(result.scalars().all())
+
+    async def _validate_custom_command_id(
+        self, workspace_id: UUID, custom_command_id: UUID | None
+    ) -> None:
+        if custom_command_id is None:
+            return
+        command = await self.session.get(CustomCommand, custom_command_id)
+        if command is None or command.workspace_id != workspace_id:
+            raise InvalidEnvScopeError
 
     async def upsert_env_var(
         self,
@@ -288,41 +321,245 @@ class SqlAlchemyWorkspaceService:
         owner_id: UUID,
         key: str,
         value: str,
-    ) -> WorkspaceEnvVar:
+        *,
+        custom_command_id: UUID | None = None,
+    ) -> tuple[WorkspaceEnvVar, EnvVarWriteStatus]:
         normalized_key = validate_env_key(key)
         workspace = await self.get_for_owner(workspace_id, owner_id)
+        await self._validate_custom_command_id(workspace.id, custom_command_id)
+        env_var, write_status = await self._upsert_one(
+            workspace.id, normalized_key, value, custom_command_id=custom_command_id
+        )
+        self.session.add(env_var)
+        await self.session.flush()
+        await self.session.commit()
+        await self.session.refresh(env_var)
+        return env_var, write_status
+
+    async def _upsert_one(
+        self,
+        workspace_id: UUID,
+        normalized_key: str,
+        value: str,
+        *,
+        custom_command_id: UUID | None,
+    ) -> tuple[WorkspaceEnvVar, EnvVarWriteStatus]:
+        """Write (without flush/commit) a single row, scoped by `(workspace_id, key,
+        custom_command_id)`. Returns the row and whether it was created/updated/unchanged,
+        determined by comparing the decrypted existing value -- never exposed beyond this
+        comparison."""
+        command_filter = (
+            WorkspaceEnvVar.custom_command_id.is_(None)
+            if custom_command_id is None
+            else WorkspaceEnvVar.custom_command_id == custom_command_id
+        )
         result = await self.session.execute(
             select(WorkspaceEnvVar).where(
-                WorkspaceEnvVar.workspace_id == workspace.id,
+                WorkspaceEnvVar.workspace_id == workspace_id,
                 WorkspaceEnvVar.key == normalized_key,
+                command_filter,
             )
         )
         env_var = result.scalar_one_or_none()
         encrypted_value = self.cipher.encrypt(value)
         if env_var is None:
             env_var = WorkspaceEnvVar(
-                workspace_id=workspace.id,
+                workspace_id=workspace_id,
+                custom_command_id=custom_command_id,
+                scope="service" if custom_command_id else "workspace",
                 key=normalized_key,
                 encrypted_value=encrypted_value,
             )
-        else:
-            env_var.encrypted_value = encrypted_value
-        self.session.add(env_var)
-        await self.session.flush()
-        await self.session.commit()
-        await self.session.refresh(env_var)
-        return env_var
+            return env_var, "created"
 
-    async def delete_env_var(self, workspace_id: UUID, owner_id: UUID, key: str) -> None:
+        existing_value = self.cipher.decrypt(env_var.encrypted_value)
+        write_status: EnvVarWriteStatus = "unchanged" if existing_value == value else "updated"
+        env_var.encrypted_value = encrypted_value
+        return env_var, write_status
+
+    async def bulk_upsert_env_vars(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        values: dict[str, str],
+        *,
+        custom_command_id: UUID | None = None,
+        dry_run: bool = False,
+    ) -> list[BulkItem]:
+        workspace = await self.get_for_owner(workspace_id, owner_id)
+        await self._validate_custom_command_id(workspace.id, custom_command_id)
+
+        valid_keys: dict[str, str] = {}
+        items: list[BulkItem] = []
+        for key, value in values.items():
+            try:
+                normalized_key = validate_env_key(key)
+            except InvalidEnvVarKeyError:
+                items.append(
+                    BulkItem(
+                        key=key,
+                        status="invalid",
+                        message="must use uppercase letters, numbers, and underscores",
+                    )
+                )
+                continue
+            valid_keys[normalized_key] = value
+
+        if valid_keys:
+            command_filter = (
+                WorkspaceEnvVar.custom_command_id.is_(None)
+                if custom_command_id is None
+                else WorkspaceEnvVar.custom_command_id == custom_command_id
+            )
+            result = await self.session.execute(
+                select(WorkspaceEnvVar).where(
+                    WorkspaceEnvVar.workspace_id == workspace.id,
+                    WorkspaceEnvVar.key.in_(list(valid_keys.keys())),
+                    command_filter,
+                )
+            )
+            existing_by_key = {row.key: row for row in result.scalars().all()}
+
+            for normalized_key, value in valid_keys.items():
+                env_var = existing_by_key.get(normalized_key)
+                encrypted_value = self.cipher.encrypt(value)
+                if env_var is None:
+                    write_status: EnvVarWriteStatus = "created"
+                    if not dry_run:
+                        env_var = WorkspaceEnvVar(
+                            workspace_id=workspace.id,
+                            custom_command_id=custom_command_id,
+                            scope="service" if custom_command_id else "workspace",
+                            key=normalized_key,
+                            encrypted_value=encrypted_value,
+                        )
+                        self.session.add(env_var)
+                else:
+                    existing_value = self.cipher.decrypt(env_var.encrypted_value)
+                    write_status = "unchanged" if existing_value == value else "updated"
+                    if not dry_run and write_status == "updated":
+                        env_var.encrypted_value = encrypted_value
+                items.append(BulkItem(key=normalized_key, status=write_status))
+
+            if not dry_run:
+                await self.session.flush()
+                await self.session.commit()
+
+        return items
+
+    async def delete_env_var(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        key: str,
+        *,
+        custom_command_id: UUID | None = None,
+    ) -> None:
         normalized_key = validate_env_key(key)
         workspace = await self.get_for_owner(workspace_id, owner_id)
+        command_filter = (
+            WorkspaceEnvVar.custom_command_id.is_(None)
+            if custom_command_id is None
+            else WorkspaceEnvVar.custom_command_id == custom_command_id
+        )
         result = await self.session.execute(
             select(WorkspaceEnvVar).where(
                 WorkspaceEnvVar.workspace_id == workspace.id,
                 WorkspaceEnvVar.key == normalized_key,
+                command_filter,
             )
         )
         env_var = result.scalar_one_or_none()
         if env_var is not None:
             await self.session.delete(env_var)
         await self.session.commit()
+
+    async def bulk_delete_env_vars(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        keys: list[str],
+        *,
+        custom_command_id: UUID | None = None,
+    ) -> tuple[list[str], list[str]]:
+        workspace = await self.get_for_owner(workspace_id, owner_id)
+        await self._validate_custom_command_id(workspace.id, custom_command_id)
+
+        deleted: list[str] = []
+        missing: list[str] = []
+        normalized_keys: list[str] = []
+        for key in keys:
+            try:
+                normalized_keys.append(validate_env_key(key))
+            except InvalidEnvVarKeyError:
+                # Not a valid key shape, so it can never have been stored -- report it missing
+                # rather than dropping it silently.
+                missing.append(key)
+
+        command_filter = (
+            WorkspaceEnvVar.custom_command_id.is_(None)
+            if custom_command_id is None
+            else WorkspaceEnvVar.custom_command_id == custom_command_id
+        )
+        existing_by_key: dict[str, WorkspaceEnvVar] = {}
+        if normalized_keys:
+            result = await self.session.execute(
+                select(WorkspaceEnvVar).where(
+                    WorkspaceEnvVar.workspace_id == workspace.id,
+                    WorkspaceEnvVar.key.in_(normalized_keys),
+                    command_filter,
+                )
+            )
+            existing_by_key = {row.key: row for row in result.scalars().all()}
+
+        for key in normalized_keys:
+            env_var = existing_by_key.get(key)
+            if env_var is None:
+                missing.append(key)
+            else:
+                deleted.append(key)
+                await self.session.delete(env_var)
+
+        await self.session.commit()
+        return deleted, missing
+
+    async def env_template(self, workspace_id: UUID, owner_id: UUID) -> str:
+        """A `.env`-shaped template of every stored key (all scopes) for this workspace, with
+        every value blanked -- never decrypted. Workspace-wide keys are grouped first, then one
+        group per service with its own scoped overrides."""
+        workspace = await self.get_for_owner(workspace_id, owner_id)
+        result = await self.session.execute(
+            select(WorkspaceEnvVar)
+            .where(WorkspaceEnvVar.workspace_id == workspace.id)
+            .order_by(WorkspaceEnvVar.custom_command_id.is_not(None), WorkspaceEnvVar.key)
+        )
+        env_vars = list(result.scalars().all())
+
+        command_ids = {
+            env_var.custom_command_id for env_var in env_vars if env_var.custom_command_id
+        }
+        command_names: dict[UUID, str] = {}
+        if command_ids:
+            commands_result = await self.session.execute(
+                select(CustomCommand).where(CustomCommand.id.in_(command_ids))
+            )
+            command_names = {
+                command.id: command.name for command in commands_result.scalars().all()
+            }
+
+        workspace_wide = [env_var for env_var in env_vars if env_var.custom_command_id is None]
+        by_command: dict[UUID, list[WorkspaceEnvVar]] = {}
+        for env_var in env_vars:
+            if env_var.custom_command_id is not None:
+                by_command.setdefault(env_var.custom_command_id, []).append(env_var)
+
+        sections: list[str] = []
+        if workspace_wide:
+            lines = "\n".join(f"{env_var.key}=" for env_var in workspace_wide)
+            sections.append(f"# Workspace-wide\n{lines}\n")
+        for command_id, rows in by_command.items():
+            name = command_names.get(command_id, "Unknown service")
+            lines = "\n".join(f"{env_var.key}=" for env_var in rows)
+            sections.append(f"# Service: {name} ({command_id})\n{lines}\n")
+
+        return "\n".join(sections)

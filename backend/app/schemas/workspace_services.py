@@ -7,6 +7,9 @@ from pydantic import BaseModel, ConfigDict
 WorkspaceServiceStatus = Literal[
     "installing", "starting", "running", "stopped", "exited", "error"
 ]
+# Epic 13: readiness, orthogonal to WorkspaceServiceStatus -- a service can be "running" (port
+# bound) and "unhealthy" (failing its health check) at the same time.
+WorkspaceServiceHealth = Literal["unknown", "starting", "healthy", "unhealthy"]
 
 
 class WorkspaceServiceResponse(BaseModel):
@@ -31,6 +34,12 @@ class WorkspaceServiceResponse(BaseModel):
     # reconciliation); None otherwise.
     preview_session_id: UUID | None = None
     public_url: str | None = None
+    # Epic 13: health/readiness + entry-point marker. health_path/is_entry_point are None/False
+    # for the built-in mise service, which has no user-editable command row to carry them on.
+    health_status: WorkspaceServiceHealth = "unknown"
+    health_checked_at: datetime | None = None
+    health_path: str | None = None
+    is_entry_point: bool = False
 
     model_config = ConfigDict(from_attributes=True)
 
