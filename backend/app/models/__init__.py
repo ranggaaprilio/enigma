@@ -5,6 +5,7 @@ from app.models.command import CommandRun, CustomCommand
 from app.models.comment import Comment
 from app.models.editor import EditorSession
 from app.models.notification import AuditLog, Notification
+from app.models.platform_llm import PlatformLlmSettings
 from app.models.preview import PreviewSession
 from app.models.project import Project, ProjectMember, Team, TeamMember
 from app.models.repository import RepositoryCredential
@@ -29,6 +30,7 @@ __all__ = [
     "CustomCommand",
     "EditorSession",
     "Notification",
+    "PlatformLlmSettings",
     "PreviewSession",
     "Project",
     "ProjectMember",

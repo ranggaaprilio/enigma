@@ -48,6 +48,11 @@ class Settings(BaseSettings):
     openhands_llm_api_key: str | None = None
     openhands_llm_model: str | None = None
     openhands_max_iterations: int = 30
+    # The mock agent is a test/dev affordance, not a deployment mode. With nothing configured
+    # (no platform_llm_settings row and no usable env config) an agent run is refused with a
+    # 503 instead of silently replying with a canned transcript. Tests that exercise the run
+    # pipeline without an LLM opt in explicitly.
+    agent_allow_mock_provider: bool = False
     agent_command_timeout_seconds: int = 20
     agent_max_command_output_chars: int = 20_000
     agent_command_allowlist_enabled: bool = False

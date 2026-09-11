@@ -733,6 +733,61 @@ export type RegisterPayload = LoginPayload & {
   name?: string;
 };
 
+/** Where the active LLM configuration came from. `null` when nothing is configured. */
+export type LlmSettingsSource = "database" | "environment";
+
+/**
+ * Readable by any authenticated user, so the first-run gate can tell whether setup is still
+ * pending. `base_url`/`model` are not secrets and are included so a non-owner's read-only view
+ * has something to show; the API key never appears here.
+ */
+export type LlmSettingsStatusResponse = {
+  configured: boolean;
+  source: LlmSettingsSource | null;
+  base_url: string | null;
+  model: string | null;
+};
+
+/** Owner-only. The API key is write-only: only `has_api_key` and a constant mask come back. */
+export type LlmSettingsResponse = {
+  base_url: string | null;
+  model: string | null;
+  has_api_key: boolean;
+  masked_api_key: string | null;
+  source: LlmSettingsSource | null;
+  updated_at: string | null;
+};
+
+export type LlmSettingsUpdatePayload = {
+  base_url: string;
+  model: string;
+  /** Omit to keep the stored key; "" clears it. Never send a value the user did not type. */
+  api_key?: string;
+};
+
+/**
+ * Draft values, so the endpoint can be verified *before* it is saved -- the first-run case,
+ * where nothing is stored yet. Omitted fields fall back to the stored configuration.
+ */
+export type LlmSettingsTestPayload = {
+  base_url?: string;
+  model?: string;
+  api_key?: string;
+};
+
+export type LlmProbeResponse = {
+  ok: boolean;
+  message: string;
+  /** Model ids from `GET {base_url}/models`; null when the endpoint does not expose them. */
+  models: string[] | null;
+  latency_ms: number | null;
+};
+
+export type LlmSettingsDeleteResponse = {
+  ok: boolean;
+  cleared: boolean;
+};
+
 export class ApiError extends Error {
   status: number;
 
@@ -891,6 +946,34 @@ export function register(payload: RegisterPayload): Promise<UserResponse> {
 
 export function logout(): Promise<{ ok: boolean }> {
   return requestJson<{ ok: boolean }>("/auth/logout", { method: "POST" });
+}
+
+export function getLlmSettingsStatus(signal?: AbortSignal): Promise<LlmSettingsStatusResponse> {
+  return requestJson<LlmSettingsStatusResponse>("/platform/llm-settings/status", { signal });
+}
+
+export function getLlmSettings(signal?: AbortSignal): Promise<LlmSettingsResponse> {
+  return requestJson<LlmSettingsResponse>("/platform/llm-settings", { signal });
+}
+
+export function updateLlmSettings(
+  payload: LlmSettingsUpdatePayload,
+): Promise<LlmSettingsResponse> {
+  return requestJson<LlmSettingsResponse>("/platform/llm-settings", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function testLlmSettings(payload: LlmSettingsTestPayload): Promise<LlmProbeResponse> {
+  return requestJson<LlmProbeResponse>("/platform/llm-settings/test", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteLlmSettings(): Promise<LlmSettingsDeleteResponse> {
+  return requestJson<LlmSettingsDeleteResponse>("/platform/llm-settings", { method: "DELETE" });
 }
 
 export function listNotifications(signal?: AbortSignal): Promise<NotificationResponse[]> {

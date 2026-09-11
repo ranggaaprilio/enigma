@@ -41,7 +41,30 @@ The workspace dashboard exposes each capability as a surface (tab):
 | **Audit & Notifications** | Every workspace action is recorded to an audit log; long-running events (agent runs, pushes, PRs, spec phases) raise notifications. |
 
 Supporting platform features: cookie-based authentication (the first registered user becomes the
-platform owner), project/team membership and roles, and a dashboard overview across workspaces.
+platform owner), project/team membership and roles, a dashboard overview across workspaces, and
+**Global Settings** (below) for the platform-wide LLM connection.
+
+### Global LLM settings
+
+The agent needs an **OpenAI-compatible** endpoint. Rather than only reading it from the server's
+environment, Enigma stores it in the database so it can be set from the UI:
+
+- **Who** — only the platform owner (the first registered user) can read or change it. Everyone
+  else can see *whether* it is configured, so the UI can explain why agent runs are blocked.
+- **Where** — **Settings** in the sidebar (`/settings`). On first run, an authenticated user is
+  sent to `/setup` until an endpoint is saved; that prompt is skippable.
+- **What** — base URL, model, and an optional API key (local runtimes such as Ollama and LM
+  Studio need none). The key is Fernet-encrypted with `WORKSPACE_ENV_ENCRYPTION_KEY` and is never
+  returned by the API — the UI shows a mask and never prefills it. **Test connection** probes
+  `GET {base_url}/models` (falling back to a one-token chat completion) and populates the model
+  dropdown.
+- **Precedence** — **stored settings → `OPENHANDS_LLM_*` environment → refuse.** Existing
+  env-configured deployments keep working untouched. With nothing configured, creating an agent
+  run returns **503** with an actionable message instead of silently using the mock provider
+  (set `AGENT_ALLOW_MOCK_PROVIDER=true` to opt back into the mock).
+
+A stored configuration always drives the OpenHands/LiteLLM provider, because it is the only one
+that accepts a base URL — the direct `openai` provider hardcodes `api.openai.com`.
 
 ## How it works
 
@@ -282,10 +305,11 @@ Copy `.env.example` to `.env`. Key variables:
 | `DAYTONA_DEFAULT_SNAPSHOT` | Recommended | Custom snapshot name (e.g. `enigma-mise-code`) — needed for preview/editor/SDD (see below) |
 | `DAYTONA_AUTO_STOP_MINUTES` | No | Idle minutes before a sandbox auto-stops (default `30`) |
 | `AUTH_SECRET_KEY` | Yes (prod) | Secret for signing session tokens — change from default in production |
-| `WORKSPACE_ENV_ENCRYPTION_KEY` | Yes (prod) | Fernet key for encrypting workspace env vars and repo tokens |
-| `AGENT_PROVIDER` | Yes | Agent engine: `openhands`, `openai`, or `auto` (falls back to a mock if unset) |
-| `OPENHANDS_LLM_BASE_URL` / `OPENHANDS_LLM_API_KEY` / `OPENHANDS_LLM_MODEL` | If `openhands` | OpenAI-compatible endpoint config for the OpenHands agent |
-| `OPENAI_API_KEY` / `OPENAI_MODEL` | If `openai` | Credentials for the direct OpenAI Responses provider |
+| `WORKSPACE_ENV_ENCRYPTION_KEY` | Yes (prod) | Fernet key for encrypting workspace env vars, repo tokens, and the global LLM API key. Rotating it invalidates all three |
+| `AGENT_PROVIDER` | No | Agent engine: `openhands`, `openai`, or `auto`. **Fallback only** — the global LLM settings stored from the UI take precedence |
+| `OPENHANDS_LLM_BASE_URL` / `OPENHANDS_LLM_API_KEY` / `OPENHANDS_LLM_MODEL` | No | Fallback OpenAI-compatible endpoint. Overridden by the DB-backed global LLM settings |
+| `OPENAI_API_KEY` / `OPENAI_MODEL` | If `openai` | Credentials for the direct OpenAI Responses provider (cannot take a custom base URL) |
+| `AGENT_ALLOW_MOCK_PROVIDER` | No | Allow the mock agent when nothing is configured (default `false`, so runs fail with a clear 503 instead) |
 | `MAX_WORKTREES_PER_WORKSPACE` | No | Feature-worktree cap per workspace (default `5`) |
 | `EDITOR_AUTO_INSTALL` | No | `false` when `code-server` is baked into the snapshot |
 

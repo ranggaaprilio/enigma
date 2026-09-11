@@ -211,6 +211,19 @@ const usageSummary = {
  * `recent_projects`, which crashed the tree on render.
  */
 function fallbackResponse(url: string) {
+  // `AuthProvider`'s sibling `LlmStatusProvider` reads this on every authenticated render, and
+  // the first-run gate redirects to /setup on an affirmative `configured: false`. Answering it
+  // here keeps these tests exercising the app rather than the setup screen.
+  if (url.endsWith("/platform/llm-settings/status")) {
+    return Promise.resolve(
+      jsonResponse({
+        configured: true,
+        source: "database",
+        base_url: "http://llm.example/v1",
+        model: "test-model",
+      }),
+    );
+  }
   if (url.includes("/dashboard/summary")) {
     return Promise.resolve(jsonResponse(dashboardSummary));
   }
@@ -1380,5 +1393,156 @@ describe("App auth routing", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Stop" }));
     expect(await screen.findByText(/Preview: 0\/1 running/)).toBeInTheDocument();
+  });
+
+  // --- first-run LLM setup gate ------------------------------------------------------------
+  // `HomeRoute` and `AdaptiveDashboardRoute` hand-roll their auth check instead of going
+  // through `PrivateRoute`, so the gate has to be applied to each of them separately. These
+  // are the regression tests for exactly that bypass.
+
+  function stubUnconfigured(
+    overrides: (url: string) => ReturnType<typeof jsonResponse> | undefined = () => undefined,
+  ) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const handled = overrides(url);
+        if (handled) return Promise.resolve(handled);
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        if (url.endsWith("/platform/llm-settings/status")) {
+          return Promise.resolve(
+            jsonResponse({ configured: false, source: null, base_url: null, model: null }),
+          );
+        }
+        if (url.endsWith("/workspaces")) {
+          return Promise.resolve(jsonResponse([workspace]));
+        }
+        return fallbackResponse(url);
+      }),
+    );
+  }
+
+  it("sends an authenticated user to setup while no LLM is configured", async () => {
+    window.history.pushState({}, "", "/");
+    stubUnconfigured();
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Connect a language model" }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/setup");
+  });
+
+  it("gates the workspace dashboard too, not just PrivateRoute pages", async () => {
+    window.history.pushState({}, "", workspaceBase);
+    stubUnconfigured();
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Connect a language model" }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/setup");
+  });
+
+  it("never redirects the setup page itself", async () => {
+    window.history.pushState({}, "", "/setup");
+    stubUnconfigured();
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Connect a language model" }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/setup");
+  });
+
+  it("keeps the app reachable after skipping setup", async () => {
+    window.history.pushState({}, "", "/");
+    stubUnconfigured();
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Skip for now" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard", level: 1 }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/");
+    expect(window.localStorage.getItem("enigma.llmSetupSkipped")).toBe("1");
+  });
+
+  it("shows a non-owner an explanation rather than a form they cannot use", async () => {
+    window.history.pushState({}, "", "/");
+    stubUnconfigured((url) =>
+      url.endsWith("/auth/me")
+        ? jsonResponse({ ...authUser, role: "viewer" })
+        : undefined,
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: /Enigma isn.t set up yet/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Base URL")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue to Enigma" })).toBeInTheDocument();
+  });
+
+  it("does not block the app when the status endpoint fails", async () => {
+    window.history.pushState({}, "", "/");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        if (url.endsWith("/platform/llm-settings/status")) {
+          return Promise.resolve(jsonResponse({ detail: "boom" }, false, 500));
+        }
+        return fallbackResponse(url);
+      }),
+    );
+
+    render(<App />);
+
+    // Fails open: the gate is UX only, the backend is what refuses an unconfigured run.
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard", level: 1 }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/");
+  });
+
+  it("renders the global settings page for an authenticated user", async () => {
+    window.history.pushState({}, "", "/settings");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        if (url.endsWith("/platform/llm-settings")) {
+          return Promise.resolve(
+            jsonResponse({
+              base_url: "http://llm.example/v1",
+              model: "test-model",
+              has_api_key: true,
+              masked_api_key: "********",
+              source: "database",
+              updated_at: "2026-09-11T00:00:00Z",
+            }),
+          );
+        }
+        return fallbackResponse(url);
+      }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    expect(await screen.findByLabelText("Base URL")).toHaveValue("http://llm.example/v1");
   });
 });

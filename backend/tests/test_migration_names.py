@@ -78,3 +78,19 @@ def test_command_and_workspace_service_new_constraint_names_match_migration():
     )
     service_names = _names_in(service_path)
     assert "ck_workspace_services_health_status" in service_names
+
+
+_PLATFORM_LLM_MIGRATION_PATH = (
+    Path(__file__).resolve().parent.parent
+    / "alembic"
+    / "versions"
+    / "0028_platform_llm_settings.py"
+)
+
+
+def test_platform_llm_settings_constraint_names_match_migration():
+    model_path = Path(__file__).resolve().parent.parent / "app" / "models" / "platform_llm.py"
+    model_names = _names_in(model_path)
+    migration_names = _names_in(_PLATFORM_LLM_MIGRATION_PATH)
+    missing = model_names - migration_names
+    assert not missing, f"Names in model but not migration: {missing}"
