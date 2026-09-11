@@ -29,8 +29,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.models import CustomCommand, PreviewSession, Workspace, WorkspaceService, WorkspaceWorktree
+from app.models.workspace_service import WORKSPACE_SERVICE_ACTIVE_STATUSES
 from app.services.audit import AuditLogService
-from app.services.commands import load_workspace_env, redactable_env_values
 from app.services.daytona_runtime import (
     DaytonaRuntime,
     DaytonaRuntimeError,
@@ -53,14 +53,22 @@ from app.services.service_scripts import (
     parse_probe_output,
     service_paths,
 )
+from app.services.workspace_env import (
+    EnvFileError,
+    load_all_values,
+    prepare_launch_env,
+    redactable_env_values,
+)
 from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
 
 MISE_CONFIG_FILES = ("mise.toml", ".mise.toml", "mise/config.toml", ".config/mise/config.toml")
 
-# A row in any of these statuses is "alive" for cap/port-conflict purposes.
-ACTIVE_STATUSES = ("installing", "starting", "running")
+# A row in any of these statuses is "alive" for cap/port-conflict purposes. Re-exported alias
+# of ``models.workspace_service.WORKSPACE_SERVICE_ACTIVE_STATUSES`` (the canonical home, so
+# ``workspace_env.py`` -- which this module imports from -- can use it without a cycle).
+ACTIVE_STATUSES = WORKSPACE_SERVICE_ACTIVE_STATUSES
 
 
 class WorkspaceServiceWorkspacePathError(Exception):
@@ -229,7 +237,7 @@ class WorkspaceServiceManager:
         content = result.stdout or ""
         # A log's content is user-visible: redact the same way the log-stream WebSocket does,
         # so a poll of this endpoint can never leak a secret the stream already hides.
-        env = await load_workspace_env(self.session, self.settings, workspace_id)
+        env = await load_all_values(self.session, self.settings, workspace_id)
         return redact_secrets(content, *redactable_env_values(env))
 
     async def log_paths(self, workspace_id: UUID, service_id: UUID, user_id: UUID) -> ServicePaths:
@@ -559,6 +567,24 @@ class WorkspaceServiceManager:
             await self.session.commit()
             return row
 
+        try:
+            env = await prepare_launch_env(
+                self.session,
+                self.settings,
+                self.runtime,
+                workspace,
+                checkout=checkout,
+                custom_command_id=command.id if command else None,
+                timeout=self.settings.dev_server_command_timeout_seconds,
+            )
+        except EnvFileError as error:
+            row.status = "error"
+            row.last_error = str(error)
+            row.worktree_id = resolved_worktree_id
+            self._add(row)
+            await self.session.commit()
+            return row
+
         install_deps = True
         paths = self._paths_for(row, is_primary)
         gen = uuid4().hex
@@ -589,6 +615,7 @@ class WorkspaceServiceManager:
                 workspace,
                 script,
                 cwd=launch_cwd,
+                env=env or None,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
         except DaytonaRuntimeError as error:

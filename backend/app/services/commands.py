@@ -1,5 +1,4 @@
 import asyncio
-import re
 import shlex
 from collections import defaultdict
 from datetime import UTC, datetime
@@ -10,14 +9,16 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
-from app.models import CommandRun, CustomCommand, Workspace, WorkspaceEnvVar
+from app.models import CommandRun, CustomCommand, Workspace
 from app.services.agent_tools import DangerousCommandError
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
 from app.services.git_providers import redact_secrets
 from app.services.notifications import NotificationService
 from app.services.run_paths import RunPathError, resolve_run_cwd
-from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
+from app.services.workspace_env import redactable_env_values
+from app.services.workspace_env import resolve as _resolve_env
+from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
 
@@ -451,6 +452,9 @@ class CommandService:
             if custom_command is None or workspace is None:
                 return
 
+            # Populated once the env is loaded below; an exception before that point (e.g. an
+            # invalid command) has nothing to redact yet.
+            secrets: tuple[str, ...] = ()
             try:
                 argv = validate_user_command(custom_command.command)
                 command = " ".join(shlex.quote(value) for value in argv)
@@ -482,7 +486,9 @@ class CommandService:
                 status = "completed" if exit_code == 0 else "failed"
                 await self._mark_finished(session, run, status, exit_code)
             except Exception as error:
-                await self._append_output(session, run, f"{error}\n")
+                await self._append_output(
+                    session, run, redact_secrets(f"{error}\n", *secrets)
+                )
                 await self._mark_finished(session, run, "error", None)
 
     def _run_timeout(self, custom_command: CustomCommand) -> int:
@@ -592,44 +598,9 @@ async def load_workspace_env(
     settings: Settings,
     workspace_id: UUID,
 ) -> dict[str, str]:
-    """Decrypt every env var saved for a workspace. Shared by command runs and, from Epic 11,
-    per-service log redaction — the one place that touches ``WorkspaceSecretCipher``."""
-    result = await session.execute(
-        select(WorkspaceEnvVar).where(WorkspaceEnvVar.workspace_id == workspace_id)
-    )
-    cipher = WorkspaceSecretCipher(settings.workspace_env_encryption_key)
-    values: dict[str, str] = {}
-    for item in result.scalars().all():
-        decrypted = cipher.decrypt(item.encrypted_value)
-        if decrypted is not None:
-            values[item.key] = decrypted
-    return values
-
-
-# Env keys whose values are credential material whatever their length.
-_SECRET_KEY = re.compile(
-    r"(SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE|CREDENTIAL|API_?KEY|ACCESS_?KEY|AUTH|DSN|_URL|_URI)",
-    re.IGNORECASE,
-)
-# A value this long is unlikely to be an ordinary word that legitimately shows up in output.
-_REDACT_MIN_LENGTH = 16
-
-
-def redactable_env_values(env: dict[str, str]) -> tuple[str, ...]:
-    """The env values worth masking in run output.
-
-    ``redact_secrets`` is a plain substring replace, so feeding it *every* value turned
-    ``DEBUG=1`` into ``[redacted]0 passed in [redacted].23s`` and blanked every line mentioning
-    ``development``. A value is masked when its key looks like a credential (``DATABASE_PASSWORD``,
-    ``API_TOKEN``, a connection ``_URL`` that may embed one) or when it is long enough that it
-    cannot be an incidental word. Short values under plain keys (``PORT=3000``, ``NODE_ENV``)
-    stay visible.
-    """
-    return tuple(
-        value
-        for key, value in env.items()
-        if value and (_SECRET_KEY.search(key) or len(value) >= _REDACT_MIN_LENGTH)
-    )
+    """Back-compat shim -- ``app.services.workspace_env.resolve`` is now the single decrypt
+    point."""
+    return await _resolve_env(session, settings, workspace_id)
 
 
 def validate_user_command(command: str) -> list[str]:

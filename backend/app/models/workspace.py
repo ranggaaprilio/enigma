@@ -9,7 +9,6 @@ from sqlalchemy import (
     Index,
     String,
     Text,
-    UniqueConstraint,
     func,
     text,
 )
@@ -73,6 +72,9 @@ class Workspace(Base):
     # Repo-relative subdirectory the workspace's commands and dev server run in (e.g.
     # "apps/api"); ``None`` => the checkout root. Validated server-side, never absolute.
     app_root: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Repo-relative path (below app_root) where the resolved env vars are materialised as a
+    # .env file before each service launch. ``None`` => no file is written.
+    env_file_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="creating")
     dev_autostart: Mapped[bool] = mapped_column(
         Boolean,
@@ -103,11 +105,41 @@ class Workspace(Base):
         return self.daytona_sandbox_id
 
 
+# "workspace" => applies to every service in the workspace; "service" => only the service
+# launched from ``custom_command_id``, overriding a workspace-wide value of the same key.
+WORKSPACE_ENV_VAR_SCOPES = ("workspace", "service")
+
+
 class WorkspaceEnvVar(Base):
     __tablename__ = "workspace_env_vars"
     __table_args__ = (
-        UniqueConstraint("workspace_id", "key", name="uq_workspace_env_vars_workspace_key"),
+        CheckConstraint(
+            "scope in ('workspace', 'service')",
+            name="ck_workspace_env_vars_scope",
+        ),
+        CheckConstraint(
+            "(scope = 'workspace' AND custom_command_id IS NULL) OR "
+            "(scope = 'service' AND custom_command_id IS NOT NULL)",
+            name="ck_workspace_env_vars_scope_target",
+        ),
+        # At most one workspace-wide row per (workspace, key).
+        Index(
+            "uq_workspace_env_vars_workspace_key_global",
+            "workspace_id",
+            "key",
+            unique=True,
+            postgresql_where=text("custom_command_id IS NULL"),
+        ),
+        # At most one service-scoped row per (workspace, key, custom_command_id).
+        Index(
+            "uq_workspace_env_vars_workspace_key_command",
+            "workspace_id",
+            "key",
+            "custom_command_id",
+            unique=True,
+        ),
         Index("ix_workspace_env_vars_workspace_id", "workspace_id"),
+        Index("ix_workspace_env_vars_custom_command_id", "custom_command_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -115,6 +147,14 @@ class WorkspaceEnvVar(Base):
         UUID(as_uuid=True),
         ForeignKey("workspaces.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    custom_command_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("custom_commands.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    scope: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="workspace", server_default="workspace"
     )
     key: Mapped[str] = mapped_column(String(128), nullable=False)
     encrypted_value: Mapped[str] = mapped_column(Text, nullable=False)

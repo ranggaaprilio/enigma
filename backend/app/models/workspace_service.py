@@ -24,6 +24,11 @@ from app.db.base import Base
 # ``stopped``); ``error`` covers a launch failure surfaced via ``last_error``.
 WORKSPACE_SERVICE_STATUSES = ("installing", "starting", "running", "stopped", "exited", "error")
 
+# A row in any of these statuses is "alive" for cap/port-conflict/env-change-impact purposes.
+# Lives here (rather than in ``services/workspace_services.py``, which imports from
+# ``services/workspace_env.py``) so ``workspace_env.py`` can use it without a circular import.
+WORKSPACE_SERVICE_ACTIVE_STATUSES = ("installing", "starting", "running")
+
 
 class WorkspaceService(Base):
     """A running (or desired-to-run) instance of a workspace's `dev`/service command.

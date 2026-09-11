@@ -76,6 +76,7 @@ const workspace = {
   updated_at: "2026-05-23T00:00:00Z",
   // The shell gates every action on this; "owner" keeps the role-gated controls enabled.
   viewer_role: "owner",
+  env_file_path: null,
 };
 
 // Workspace views live under the project/team hierarchy — there are no top-level `/files`,
@@ -155,6 +156,15 @@ function jsonResponse(payload: unknown, ok = true, status = 200) {
   };
 }
 
+function textResponse(body: string, ok = true, status = 200) {
+  return {
+    ok,
+    status,
+    json: async () => ({}),
+    text: async () => body,
+  };
+}
+
 const healthResponse = { status: "ok", database: "ok", redis: "ok" };
 
 // `GET /dashboard/summary`, in the shape `DashboardSummary` declares. The overview route
@@ -212,6 +222,26 @@ function fallbackResponse(url: string) {
   }
   if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
     return Promise.resolve(jsonResponse([]));
+  }
+  if (url.includes("/env-vars/template")) {
+    return Promise.resolve(textResponse(""));
+  }
+  if (url.includes("/env-vars/bulk-delete")) {
+    return Promise.resolve(jsonResponse({ deleted: [], missing: [], affected_services: [] }));
+  }
+  if (url.includes("/env-vars/bulk")) {
+    return Promise.resolve(
+      jsonResponse({
+        items: [],
+        created: 0,
+        updated: 0,
+        unchanged: 0,
+        invalid: 0,
+        dry_run: true,
+        affected_services: [],
+        warnings: [],
+      }),
+    );
   }
   if (url.endsWith("/notifications")) {
     return Promise.resolve(jsonResponse([]));

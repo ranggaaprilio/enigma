@@ -8,17 +8,15 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
-from app.models import TerminalSession, Workspace, WorkspaceEnvVar
+from app.models import TerminalSession, Workspace
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import (
     DaytonaRuntime,
     DaytonaRuntimeError,
     get_daytona_runtime,
 )
-from app.services.workspaces import (
-    WorkspaceNotFoundError,
-    WorkspaceSecretCipher,
-)
+from app.services.workspace_env import resolve as _resolve_env
+from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
 
@@ -147,16 +145,7 @@ class TerminalService:
         await self.session.commit()
 
     async def environment(self, workspace_id: UUID) -> dict[str, str]:
-        result = await self.session.execute(
-            select(WorkspaceEnvVar).where(WorkspaceEnvVar.workspace_id == workspace_id)
-        )
-        cipher = WorkspaceSecretCipher(self.settings.workspace_env_encryption_key)
-        values: dict[str, str] = {}
-        for item in result.scalars().all():
-            value = cipher.decrypt(item.encrypted_value)
-            if value is not None:
-                values[item.key] = value
-        return values
+        return await _resolve_env(self.session, self.settings, workspace_id)
 
     async def _get_workspace(self, workspace_id: UUID, user_id: UUID) -> Workspace:
         workspace = await self.session.get(Workspace, workspace_id)

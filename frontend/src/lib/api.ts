@@ -129,6 +129,8 @@ export type WorkspaceResponse = {
   updated_at: string;
   /** Caller's role in this workspace; null when the backend could not resolve one. */
   viewer_role: WorkspaceRole | null;
+  /** Path (relative to the sandbox) a `.env` file is written to on service start; null = disabled. */
+  env_file_path: string | null;
 };
 
 export type WorkspaceStatusResponse = Pick<
@@ -158,7 +160,11 @@ export type WorkspaceUpdatePayload = Partial<
 > & {
   /** Send `""` to clear it back to the checkout root. Validated server-side. */
   app_root?: string | null;
+  /** Send `null` to disable writing a `.env` file. */
+  env_file_path?: string | null;
 };
+
+export type EnvVarScope = "workspace" | "service";
 
 export type WorkspaceEnvVarResponse = {
   id: string;
@@ -166,11 +172,67 @@ export type WorkspaceEnvVarResponse = {
   masked_value: string;
   created_at: string;
   updated_at: string;
+  scope: EnvVarScope;
+  /** Which service command this variable is scoped to; null when `scope` is `workspace`. */
+  custom_command_id: string | null;
 };
 
 export type WorkspaceEnvVarPayload = {
   key: string;
   value: string;
+  /** Scope the variable to one service command instead of the whole workspace. */
+  custom_command_id?: string | null;
+};
+
+/** A workspace service affected by an env-var change, surfaced so the caller can offer a restart. */
+export type AffectedService = {
+  service_id: string;
+  custom_command_id: string | null;
+  name: string;
+  status: string;
+  keys: string[];
+};
+
+export type WorkspaceEnvVarUpsertResponse = WorkspaceEnvVarResponse & {
+  affected_services: AffectedService[];
+  warnings: string[];
+};
+
+export type EnvVarBulkItem = {
+  key: string;
+  status: "created" | "updated" | "unchanged" | "invalid";
+  line: number | null;
+  message: string | null;
+};
+
+export type EnvVarBulkResponse = {
+  items: EnvVarBulkItem[];
+  created: number;
+  updated: number;
+  unchanged: number;
+  invalid: number;
+  dry_run: boolean;
+  affected_services: AffectedService[];
+  warnings: string[];
+};
+
+/** Exactly one of `text`/`values` must be provided. */
+export type EnvVarBulkRequest = {
+  text?: string;
+  values?: Record<string, string>;
+  custom_command_id?: string | null;
+  dry_run: boolean;
+};
+
+export type EnvVarBulkDeleteRequest = {
+  keys: string[];
+  custom_command_id?: string | null;
+};
+
+export type EnvVarBulkDeleteResponse = {
+  deleted: string[];
+  missing: string[];
+  affected_services: AffectedService[];
 };
 
 export type RepositoryConnectPayload = {
@@ -772,6 +834,29 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
   return payload as T;
 }
 
+/** Like {@link requestJson}, but for endpoints that respond with `text/plain` instead of JSON. */
+async function requestText(path: string, init: RequestInit = {}): Promise<string> {
+  const response = await fetch(`${getApiBaseUrl()}${path}`, {
+    ...init,
+    credentials: "include",
+    headers: {
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...init.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { detail?: string } | null;
+    const message =
+      payload && typeof payload === "object" && "detail" in payload && payload.detail
+        ? payload.detail
+        : "Request failed";
+    throw new ApiError(message, response.status);
+  }
+
+  return response.text();
+}
+
 export function getCurrentUser(signal?: AbortSignal): Promise<UserResponse> {
   return requestJson<UserResponse>("/auth/me", { signal });
 }
@@ -887,18 +972,49 @@ export function listWorkspaceEnvVars(
 export function upsertWorkspaceEnvVar(
   workspaceId: string,
   payload: WorkspaceEnvVarPayload,
-): Promise<WorkspaceEnvVarResponse> {
-  return requestJson<WorkspaceEnvVarResponse>(`/workspaces/${workspaceId}/env-vars`, {
+): Promise<WorkspaceEnvVarUpsertResponse> {
+  return requestJson<WorkspaceEnvVarUpsertResponse>(`/workspaces/${workspaceId}/env-vars`, {
     method: "PUT",
     body: JSON.stringify(payload),
   });
 }
 
-export function deleteWorkspaceEnvVar(workspaceId: string, key: string): Promise<{ ok: boolean }> {
+export function deleteWorkspaceEnvVar(
+  workspaceId: string,
+  key: string,
+  customCommandId?: string | null,
+): Promise<{ ok: boolean }> {
+  const params = new URLSearchParams({ key });
+  if (customCommandId) params.set("custom_command_id", customCommandId);
   return requestJson<{ ok: boolean }>(
-    `/workspaces/${workspaceId}/env-vars?key=${encodeURIComponent(key)}`,
+    `/workspaces/${workspaceId}/env-vars?${params.toString()}`,
     { method: "DELETE" },
   );
+}
+
+export function bulkUpsertWorkspaceEnvVars(
+  workspaceId: string,
+  payload: EnvVarBulkRequest,
+): Promise<EnvVarBulkResponse> {
+  return requestJson<EnvVarBulkResponse>(`/workspaces/${workspaceId}/env-vars/bulk`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function bulkDeleteWorkspaceEnvVars(
+  workspaceId: string,
+  payload: EnvVarBulkDeleteRequest,
+): Promise<EnvVarBulkDeleteResponse> {
+  return requestJson<EnvVarBulkDeleteResponse>(`/workspaces/${workspaceId}/env-vars/bulk-delete`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+/** `.env`-shaped template with keys only (no values), grouped by scope as `#` comments. */
+export function getWorkspaceEnvVarTemplate(workspaceId: string): Promise<string> {
+  return requestText(`/workspaces/${workspaceId}/env-vars/template`);
 }
 
 export function listAuditLogs(

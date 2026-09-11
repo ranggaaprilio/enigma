@@ -20,7 +20,6 @@ from app.schemas.workspace_services import (
     WorkspaceServiceResponse,
     WorkspaceServicesResponse,
 )
-from app.services.commands import load_workspace_env, redactable_env_values
 from app.services.daytona_runtime import (
     DaytonaCommandTimeoutError,
     DaytonaRuntimeError,
@@ -28,6 +27,7 @@ from app.services.daytona_runtime import (
 )
 from app.services.git_providers import redact_secrets
 from app.services.service_scripts import ServicePaths
+from app.services.workspace_env import load_all_values, redactable_env_values
 from app.services.workspace_services import (
     WorkspaceServiceLimitError,
     WorkspaceServiceManager,
@@ -291,7 +291,7 @@ async def stream_workspace_service_logs(
         try:
             workspace = await manager.get_workspace_for(workspace_id, user.id)
             paths = await manager.log_paths(workspace_id, service_id, user.id)
-            env = await load_workspace_env(session, settings, workspace_id)
+            env = await load_all_values(session, settings, workspace_id)
         except (
             WorkspaceNotFoundError,
             WorkspaceServiceNotFoundError,

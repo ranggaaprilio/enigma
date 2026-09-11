@@ -71,6 +71,7 @@ class FakeRuntime:
         self.fail_probe = fail_probe
         self.commands: list[str] = []
         self.cwds: list[str | None] = []
+        self.envs: list[dict | None] = []
 
     async def get_sandbox(self, workspace, *, start: bool = True) -> FakeSandbox:
         return self.sandbox
@@ -78,6 +79,7 @@ class FakeRuntime:
     async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
         self.commands.append(command)
         self.cwds.append(cwd)
+        self.envs.append(env)
         if "ENIGMA_PROBE_EOF" in command:
             if self.fail_probe:
                 raise DaytonaRuntimeError("sandbox unreachable")
@@ -506,6 +508,69 @@ async def test_logs_tail_redacts_workspace_secrets(db_session):
 
     assert secret_value not in content
     assert "[redacted]" in content
+
+
+async def test_logs_tail_redacts_service_scoped_workspace_secrets(db_session):
+    """`load_all_values` must catch scoped (per-service) rows too, not just workspace-wide ones
+    -- ``resolve()`` alone would miss a row scoped to a *different* service."""
+    user, workspace = await make_workspace(db_session)
+    cmd = await make_service_command(db_session, workspace, port=8000)
+    cipher = WorkspaceSecretCipher(get_settings().workspace_env_encryption_key)
+    secret_value = "svc-scoped-secret-1234567890"
+    db_session.add(
+        WorkspaceEnvVar(
+            id=uuid4(),
+            workspace_id=workspace.id,
+            key="SERVICE_TOKEN",
+            encrypted_value=cipher.encrypt(secret_value),
+            scope="service",
+            custom_command_id=cmd.id,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git"}),
+        log_content=f"connecting with SERVICE_TOKEN={secret_value}\n",
+    )
+    manager = WorkspaceServiceManager(db_session, get_settings(), runtime)
+    await manager.list(workspace.id, user.id)
+    row = await _row_for_command(db_session, workspace.id, cmd.id)
+
+    content = await manager.logs_tail(workspace.id, row.id, user.id, 20_000)
+
+    assert secret_value not in content
+    assert "[redacted]" in content
+
+
+async def test_launch_passes_env_to_runtime_exec(db_session):
+    """Injection happens exclusively through the runtime's `env` parameter -- a secret value
+    must never appear in the launched script body (`runtime.commands`)."""
+    user, workspace = await make_workspace(db_session)
+    cmd = await make_service_command(db_session, workspace, port=8000)
+    cipher = WorkspaceSecretCipher(get_settings().workspace_env_encryption_key)
+    secret_value = "sk-live-abcdef1234567890"
+    db_session.add(
+        WorkspaceEnvVar(
+            id=uuid4(),
+            workspace_id=workspace.id,
+            key="API_KEY",
+            encrypted_value=cipher.encrypt(secret_value),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}))
+    manager = WorkspaceServiceManager(db_session, get_settings(), runtime)
+    await manager.list(workspace.id, user.id)
+    row = await _row_for_command(db_session, workspace.id, cmd.id)
+
+    await manager.start(workspace.id, row.id, user.id)
+
+    assert runtime.envs[-1] == {"API_KEY": secret_value}
+    assert all(secret_value not in command for command in runtime.commands)
 
 
 async def test_ensure_running_does_not_relaunch_on_a_transient_probe_failure(db_session):
