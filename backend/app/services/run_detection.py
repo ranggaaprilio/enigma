@@ -33,6 +33,14 @@ from app.services.daytona_runtime import (
     DaytonaRuntimeError,
     get_daytona_runtime,
 )
+from app.services.proxy_detection import (
+    PROXY_CONFIG_FILES,
+    ProxyConfig,
+    proxy_configs_from_manifests,
+)
+from app.services.proxy_detection import (
+    angular_proxy_config_path as _angular_proxy_config_path,
+)
 from app.services.run_paths import join_subpath, resolve_worktree, validate_relative_subpath
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -177,6 +185,17 @@ def infer_port(command: str) -> int | None:
     for signature, port in _PORT_BY_SIGNATURE:
         if signature in lowered:
             return port
+    return None
+
+
+def framework_signature(command: str) -> str | None:
+    """The matched key from `_PORT_BY_SIGNATURE` (e.g. ``"vite"``, ``"uvicorn"``), or `None`.
+    Epic 13's composition service classifies a service as web/api from this single source of
+    truth, rather than a second hardcoded port/name table."""
+    lowered = command.lower()
+    for signature, _port in _PORT_BY_SIGNATURE:
+        if signature in lowered:
+            return signature
     return None
 
 
@@ -607,6 +626,84 @@ class RunDetectionService:
             package_dirs=len(package_dirs),
         )
         return candidates
+
+    async def read_proxy_configs(
+        self,
+        workspace_id: UUID,
+        user_id: UUID,
+        *,
+        worktree_id: UUID | None,
+        service_cwds: dict[str, str | None],
+    ) -> dict[str, list[ProxyConfig]]:
+        """Epic 13: dev-proxy configuration, scoped to each service's own working directory --
+        never the whole `ROOT_MANIFESTS` bundle, which would inflate `/commands/detect`'s
+        latency-sensitive round trip for a feature this endpoint doesn't need. At most two
+        sandbox execs total regardless of how many services a workspace has: one for every
+        directory's fixed-name config files, and a second only when at least one of them is an
+        `angular.json` naming a `proxyConfig` file to also read.
+
+        `service_cwds` maps an opaque caller-chosen key (typically the service id) to that
+        service's `cwd` (relative to the resolved app root; `None` = the app root itself).
+        """
+        workspace = await self._get_workspace(workspace_id, user_id)
+        if not workspace.daytona_sandbox_id:
+            raise RunDetectionUnavailableError("Workspace sandbox is not ready")
+
+        checkout, _, _ = await resolve_worktree(self.session, workspace, worktree_id)
+        app_root = validate_relative_subpath(getattr(workspace, "app_root", None))
+        root = join_subpath(checkout, app_root)
+
+        directories: dict[str, str] = {
+            key: (validate_relative_subpath(cwd) or "") for key, cwd in service_cwds.items()
+        }
+        unique_dirs = sorted(set(directories.values()))
+
+        def _prefixed(directory: str, name: str) -> str:
+            return f"{directory}/{name}" if directory else name
+
+        wanted = [
+            _prefixed(directory, name) for directory in unique_dirs for name in PROXY_CONFIG_FILES
+        ]
+        files = await self._read_files(workspace, root, tuple(wanted))
+
+        per_directory: dict[str, dict[str, str]] = {directory: {} for directory in unique_dirs}
+        for directory in unique_dirs:
+            for name in PROXY_CONFIG_FILES:
+                full_path = _prefixed(directory, name)
+                if full_path in files:
+                    per_directory[directory][name] = files[full_path]
+
+        # Second pass: any angular.json declaring a proxyConfig -> read that one extra file.
+        angular_wanted: list[str] = []
+        angular_owner: dict[str, str] = {}
+        for directory, file_map in per_directory.items():
+            angular_json = file_map.get("angular.json")
+            if angular_json is None:
+                continue
+            proxy_path = _angular_proxy_config_path(angular_json)
+            if proxy_path:
+                full_path = _prefixed(directory, proxy_path)
+                angular_wanted.append(full_path)
+                angular_owner[full_path] = directory
+
+        angular_files_by_directory: dict[str, dict[str, str]] = {
+            directory: {} for directory in unique_dirs
+        }
+        if angular_wanted:
+            angular_files = await self._read_files(workspace, root, tuple(angular_wanted))
+            for full_path, directory in angular_owner.items():
+                content = angular_files.get(full_path)
+                if content is not None:
+                    proxy_path = full_path[len(f"{directory}/") :] if directory else full_path
+                    angular_files_by_directory[directory][proxy_path] = content
+
+        results: dict[str, list[ProxyConfig]] = {}
+        for key, directory in directories.items():
+            results[key] = proxy_configs_from_manifests(
+                per_directory[directory],
+                angular_proxy_files=angular_files_by_directory[directory],
+            )
+        return results
 
     async def _read_files(
         self, workspace: Workspace, root: str, paths: tuple[str, ...]

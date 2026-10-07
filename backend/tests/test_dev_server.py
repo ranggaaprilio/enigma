@@ -10,7 +10,14 @@ from app.api import dev_server as dev_server_module
 from app.core.config import get_settings
 from app.core.security import hash_password
 from app.main import app
-from app.models import CustomCommand, User, Workspace, WorkspaceService, WorkspaceWorktree
+from app.models import (
+    CustomCommand,
+    User,
+    Workspace,
+    WorkspaceEnvVar,
+    WorkspaceService,
+    WorkspaceWorktree,
+)
 from app.services.daytona_runtime import RuntimeCommandResult
 from app.services.dev_server import (
     DevServerNotClonedError,
@@ -18,7 +25,7 @@ from app.services.dev_server import (
     DevServerState,
 )
 from app.services.users import DuplicateUserEmailError
-from app.services.workspaces import WorkspaceNotFoundError
+from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 from app.services.worktrees import WorktreeNotFoundError
 
 
@@ -75,13 +82,16 @@ class FakeRuntime:
         status_value: str = "none",
         open_ports: set[int] | None = None,
         dev_process_alive: bool = False,
+        tail_output: str = "",
     ) -> None:
         self.sandbox = sandbox
         self.status_value = status_value
         self.open_ports = open_ports or set()
         self.dev_process_alive = dev_process_alive
+        self.tail_output = tail_output
         self.commands: list[str] = []
         self.cwds: list[str | None] = []
+        self.envs: list[dict | None] = []
 
     async def get_sandbox(self, workspace, *, start: bool = True) -> FakeSandbox:
         return self.sandbox
@@ -89,6 +99,9 @@ class FakeRuntime:
     async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
         self.commands.append(command)
         self.cwds.append(cwd)
+        self.envs.append(env)
+        if "mise install (binary)" in command:
+            return RuntimeCommandResult(exit_code=0, stdout=self.tail_output, stderr="")
         if "ENIGMA_PROBE_EOF" in command:
             return self._probe_response(command)
         if "ENIGMA_PORTS_EOF" in command:
@@ -111,12 +124,15 @@ class FakeRuntime:
 
     def _probe_response(self, command: str) -> RuntimeCommandResult:
         """`service_scripts.build_probe_script` embeds one `probe(id, status_path, pid_path,
-        grep_token, port)` call per row it wants a status for. This fake answers every row
-        identically from its own `status_value`/`dev_process_alive`/`open_ports` knobs, which is
-        enough because these tests only ever probe a single (the primary) row at a time."""
+        grep_token, port, health_path)` call per row it wants a status for. This fake answers
+        every row identically from its own `status_value`/`dev_process_alive`/`open_ports`
+        knobs, which is enough because these tests only ever probe a single (the primary) row
+        at a time. `health_path` is captured but ignored -- these tests emit 4-field lines
+        (health defaults to "unknown"), since none of them exercise the health probe itself
+        (see test_service_health.py for that)."""
         lines = []
         for row_id, port_token in re.findall(
-            r"probe\('([^']*)', '[^']*', '[^']*', '[^']*', (None|\d+)\)", command
+            r"probe\('([^']*)', '[^']*', '[^']*', '[^']*', (None|\d+), (?:None|'[^']*')\)", command
         ):
             pid_alive = 1 if self.dev_process_alive else 0
             if port_token == "None":
@@ -162,6 +178,12 @@ class FakeResult:
     def scalar_one_or_none(self):
         return self._rows[0] if self._rows else None
 
+    def all(self) -> list:
+        # Epic 13's build_template_context does a multi-column select (WorkspaceService,
+        # CustomCommand); these tests never populate that joined query (see `execute` above),
+        # so this is always `[]` here -- present only so `.all()` doesn't raise.
+        return self._rows
+
 
 class FakeSession:
     def __init__(
@@ -178,6 +200,8 @@ class FakeSession:
         self.registry = registry or {}
         # WorkspaceService rows created by WorkspaceServiceManager during a test, keyed by id.
         self.services: dict[UUID, WorkspaceService] = {}
+        # Seeded by tests that want env vars injected/redacted.
+        self.env_vars: list[WorkspaceEnvVar] = []
 
     async def get(self, model, pk):
         if self.workspace.id == pk:
@@ -195,7 +219,11 @@ class FakeSession:
         compiled = statement.compile()
         params = compiled.params
         froms = statement.get_final_froms()
-        table_name = froms[0].name if froms else None
+        # A joined FROM (Epic 13's build_template_context: workspace_services outerjoin
+        # custom_commands) has no single `.name` -- these tests exercise the dev-server
+        # facade's script/pid behaviour, not sibling-service template context, so an empty
+        # result is the correct answer (no services -> no per-service ENIGMA_* exports).
+        table_name = getattr(froms[0], "name", None) if froms else None
 
         if table_name == "custom_commands":
             role = params.get("role_1")
@@ -218,6 +246,16 @@ class FakeSession:
                 allowed = params["status_1"]
                 rows = [r for r in rows if r.status in allowed]
             rows.sort(key=lambda r: r.created_at or datetime.min.replace(tzinfo=UTC))
+            return FakeResult(rows)
+
+        if table_name == "workspace_env_vars":
+            rows = list(self.env_vars)
+            if "workspace_id_1" in params:
+                rows = [r for r in rows if r.workspace_id == params["workspace_id_1"]]
+            if "custom_command_id_1" in params:
+                rows = [r for r in rows if r.custom_command_id == params["custom_command_id_1"]]
+            elif "custom_command_id IS NULL" in str(compiled):
+                rows = [r for r in rows if r.custom_command_id is None]
             return FakeResult(rows)
 
         return FakeResult([])
@@ -1037,3 +1075,67 @@ async def test_worktree_run_skips_the_cd_when_install_and_dev_share_a_directory(
     launch = next(command for command in runtime.commands if "nohup" in command)
     assert "( cd " not in launch
     assert "pnpm install" in launch
+
+
+# --- env injection at launch (Epic 12) -----------------------------------
+
+
+async def test_setup_passes_env_to_runtime_exec():
+    """Injection happens exclusively through the runtime's `env` parameter -- a secret value
+    must never appear in the launched script body (`runtime.commands`)."""
+    user = _user()
+    workspace = _workspace(user)
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git", "workspace/mise.toml"}))
+    session = FakeSession(workspace)
+    cipher = WorkspaceSecretCipher(get_settings().workspace_env_encryption_key)
+    secret_value = "sk-live-abcdef1234567890"
+    session.env_vars.append(
+        WorkspaceEnvVar(
+            id=uuid4(),
+            workspace_id=workspace.id,
+            custom_command_id=None,
+            key="API_KEY",
+            encrypted_value=cipher.encrypt(secret_value),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    service = DevServerService(session, get_settings(), runtime)
+
+    await service.setup(workspace.id, user.id)
+
+    # Epic 13: every launch also carries ENIGMA_WORKSPACE_ID/ENIGMA_BRANCH -- assert the
+    # user's own value survives untouched rather than pinning the exact dict.
+    assert runtime.envs[-1]["API_KEY"] == secret_value
+    assert all(secret_value not in command for command in runtime.commands)
+
+
+async def test_error_state_log_tail_is_redacted():
+    """`_read_log_tail`'s output reaches the browser via `DevServerState.message`, so it must
+    be redacted exactly like every other log surface."""
+    user = _user()
+    workspace = _workspace(user)
+    secret_value = "sk-live-abcdef1234567890"
+    runtime = FakeRuntime(
+        FakeSandbox({"workspace/.git"}),
+        tail_output=f"connecting with API_KEY={secret_value}\n",
+    )
+    session = FakeSession(workspace)
+    cipher = WorkspaceSecretCipher(get_settings().workspace_env_encryption_key)
+    session.env_vars.append(
+        WorkspaceEnvVar(
+            id=uuid4(),
+            workspace_id=workspace.id,
+            custom_command_id=None,
+            key="API_KEY",
+            encrypted_value=cipher.encrypt(secret_value),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    service = DevServerService(session, get_settings(), runtime)
+
+    tail = await service._read_log_tail(workspace)
+
+    assert secret_value not in tail
+    assert "[redacted]" in tail

@@ -129,6 +129,8 @@ export type WorkspaceResponse = {
   updated_at: string;
   /** Caller's role in this workspace; null when the backend could not resolve one. */
   viewer_role: WorkspaceRole | null;
+  /** Path (relative to the sandbox) a `.env` file is written to on service start; null = disabled. */
+  env_file_path: string | null;
 };
 
 export type WorkspaceStatusResponse = Pick<
@@ -158,7 +160,11 @@ export type WorkspaceUpdatePayload = Partial<
 > & {
   /** Send `""` to clear it back to the checkout root. Validated server-side. */
   app_root?: string | null;
+  /** Send `null` to disable writing a `.env` file. */
+  env_file_path?: string | null;
 };
+
+export type EnvVarScope = "workspace" | "service";
 
 export type WorkspaceEnvVarResponse = {
   id: string;
@@ -166,11 +172,67 @@ export type WorkspaceEnvVarResponse = {
   masked_value: string;
   created_at: string;
   updated_at: string;
+  scope: EnvVarScope;
+  /** Which service command this variable is scoped to; null when `scope` is `workspace`. */
+  custom_command_id: string | null;
 };
 
 export type WorkspaceEnvVarPayload = {
   key: string;
   value: string;
+  /** Scope the variable to one service command instead of the whole workspace. */
+  custom_command_id?: string | null;
+};
+
+/** A workspace service affected by an env-var change, surfaced so the caller can offer a restart. */
+export type AffectedService = {
+  service_id: string;
+  custom_command_id: string | null;
+  name: string;
+  status: string;
+  keys: string[];
+};
+
+export type WorkspaceEnvVarUpsertResponse = WorkspaceEnvVarResponse & {
+  affected_services: AffectedService[];
+  warnings: string[];
+};
+
+export type EnvVarBulkItem = {
+  key: string;
+  status: "created" | "updated" | "unchanged" | "invalid";
+  line: number | null;
+  message: string | null;
+};
+
+export type EnvVarBulkResponse = {
+  items: EnvVarBulkItem[];
+  created: number;
+  updated: number;
+  unchanged: number;
+  invalid: number;
+  dry_run: boolean;
+  affected_services: AffectedService[];
+  warnings: string[];
+};
+
+/** Exactly one of `text`/`values` must be provided. */
+export type EnvVarBulkRequest = {
+  text?: string;
+  values?: Record<string, string>;
+  custom_command_id?: string | null;
+  dry_run: boolean;
+};
+
+export type EnvVarBulkDeleteRequest = {
+  keys: string[];
+  custom_command_id?: string | null;
+};
+
+export type EnvVarBulkDeleteResponse = {
+  deleted: string[];
+  missing: string[];
+  affected_services: AffectedService[];
 };
 
 export type RepositoryConnectPayload = {
@@ -430,6 +492,10 @@ export type CustomCommandResponse = {
   enabled: boolean;
   /** `null` falls back to the platform default (15 minutes). */
   timeout_seconds: number | null;
+  /** Root-relative HTTP path probed for readiness; `null` means only a TCP check applies. */
+  health_path: string | null;
+  /** The workspace's primary "Open app" service. Only a `kind="service"` command can be one. */
+  is_entry_point: boolean;
   created_at: string;
   updated_at: string;
 };
@@ -447,6 +513,8 @@ export type CustomCommandPayload = {
   port?: number | null;
   enabled?: boolean;
   timeout_seconds?: number | null;
+  health_path?: string | null;
+  is_entry_point?: boolean;
 };
 
 export type CustomCommandUpdatePayload = Partial<CustomCommandPayload>;
@@ -537,8 +605,17 @@ export type EditorSessionResponse = {
   id: string;
   workspace_id: string;
   user_id: string;
+  /** Stable alias URL. Carries no credential, so it is safe to display or copy. */
   url: string;
+  /**
+   * The same URL plus a short-lived grant. This is what the iframe must load: only a request
+   * carrying the grant gets the proxy's host-scoped cookie set. Minted per response, and empty
+   * when the session is not active.
+   */
+  prime_url: string;
   status: EditorSessionStatus;
+  worktree_id: string | null;
+  folder: string | null;
   started_at: string;
   last_active_at: string;
 };
@@ -604,6 +681,10 @@ export type WorkspaceServiceStatus =
   | "exited"
   | "error";
 
+// Epic 13: readiness, orthogonal to WorkspaceServiceStatus -- a service can be "running" (port
+// bound) and "unhealthy" (failing its health check) at the same time.
+export type WorkspaceServiceHealth = "unknown" | "starting" | "healthy" | "unhealthy";
+
 export type WorkspaceServiceResponse = {
   id: string;
   workspace_id: string;
@@ -624,6 +705,10 @@ export type WorkspaceServiceResponse = {
   last_seen_at: string | null;
   preview_session_id: string | null;
   public_url: string | null;
+  health_status: WorkspaceServiceHealth;
+  health_checked_at: string | null;
+  health_path: string | null;
+  is_entry_point: boolean;
 };
 
 /** The workspace-wide mise environment (install/mise-trust), separate from any one
@@ -655,6 +740,61 @@ export type LoginPayload = {
 
 export type RegisterPayload = LoginPayload & {
   name?: string;
+};
+
+/** Where the active LLM configuration came from. `null` when nothing is configured. */
+export type LlmSettingsSource = "database" | "environment";
+
+/**
+ * Readable by any authenticated user, so the first-run gate can tell whether setup is still
+ * pending. `base_url`/`model` are not secrets and are included so a non-owner's read-only view
+ * has something to show; the API key never appears here.
+ */
+export type LlmSettingsStatusResponse = {
+  configured: boolean;
+  source: LlmSettingsSource | null;
+  base_url: string | null;
+  model: string | null;
+};
+
+/** Owner-only. The API key is write-only: only `has_api_key` and a constant mask come back. */
+export type LlmSettingsResponse = {
+  base_url: string | null;
+  model: string | null;
+  has_api_key: boolean;
+  masked_api_key: string | null;
+  source: LlmSettingsSource | null;
+  updated_at: string | null;
+};
+
+export type LlmSettingsUpdatePayload = {
+  base_url: string;
+  model: string;
+  /** Omit to keep the stored key; "" clears it. Never send a value the user did not type. */
+  api_key?: string;
+};
+
+/**
+ * Draft values, so the endpoint can be verified *before* it is saved -- the first-run case,
+ * where nothing is stored yet. Omitted fields fall back to the stored configuration.
+ */
+export type LlmSettingsTestPayload = {
+  base_url?: string;
+  model?: string;
+  api_key?: string;
+};
+
+export type LlmProbeResponse = {
+  ok: boolean;
+  message: string;
+  /** Model ids from `GET {base_url}/models`; null when the endpoint does not expose them. */
+  models: string[] | null;
+  latency_ms: number | null;
+};
+
+export type LlmSettingsDeleteResponse = {
+  ok: boolean;
+  cleared: boolean;
 };
 
 export class ApiError extends Error {
@@ -772,6 +912,29 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
   return payload as T;
 }
 
+/** Like {@link requestJson}, but for endpoints that respond with `text/plain` instead of JSON. */
+async function requestText(path: string, init: RequestInit = {}): Promise<string> {
+  const response = await fetch(`${getApiBaseUrl()}${path}`, {
+    ...init,
+    credentials: "include",
+    headers: {
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...init.headers,
+    },
+  });
+
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { detail?: string } | null;
+    const message =
+      payload && typeof payload === "object" && "detail" in payload && payload.detail
+        ? payload.detail
+        : "Request failed";
+    throw new ApiError(message, response.status);
+  }
+
+  return response.text();
+}
+
 export function getCurrentUser(signal?: AbortSignal): Promise<UserResponse> {
   return requestJson<UserResponse>("/auth/me", { signal });
 }
@@ -792,6 +955,34 @@ export function register(payload: RegisterPayload): Promise<UserResponse> {
 
 export function logout(): Promise<{ ok: boolean }> {
   return requestJson<{ ok: boolean }>("/auth/logout", { method: "POST" });
+}
+
+export function getLlmSettingsStatus(signal?: AbortSignal): Promise<LlmSettingsStatusResponse> {
+  return requestJson<LlmSettingsStatusResponse>("/platform/llm-settings/status", { signal });
+}
+
+export function getLlmSettings(signal?: AbortSignal): Promise<LlmSettingsResponse> {
+  return requestJson<LlmSettingsResponse>("/platform/llm-settings", { signal });
+}
+
+export function updateLlmSettings(
+  payload: LlmSettingsUpdatePayload,
+): Promise<LlmSettingsResponse> {
+  return requestJson<LlmSettingsResponse>("/platform/llm-settings", {
+    method: "PUT",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function testLlmSettings(payload: LlmSettingsTestPayload): Promise<LlmProbeResponse> {
+  return requestJson<LlmProbeResponse>("/platform/llm-settings/test", {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function deleteLlmSettings(): Promise<LlmSettingsDeleteResponse> {
+  return requestJson<LlmSettingsDeleteResponse>("/platform/llm-settings", { method: "DELETE" });
 }
 
 export function listNotifications(signal?: AbortSignal): Promise<NotificationResponse[]> {
@@ -887,18 +1078,49 @@ export function listWorkspaceEnvVars(
 export function upsertWorkspaceEnvVar(
   workspaceId: string,
   payload: WorkspaceEnvVarPayload,
-): Promise<WorkspaceEnvVarResponse> {
-  return requestJson<WorkspaceEnvVarResponse>(`/workspaces/${workspaceId}/env-vars`, {
+): Promise<WorkspaceEnvVarUpsertResponse> {
+  return requestJson<WorkspaceEnvVarUpsertResponse>(`/workspaces/${workspaceId}/env-vars`, {
     method: "PUT",
     body: JSON.stringify(payload),
   });
 }
 
-export function deleteWorkspaceEnvVar(workspaceId: string, key: string): Promise<{ ok: boolean }> {
+export function deleteWorkspaceEnvVar(
+  workspaceId: string,
+  key: string,
+  customCommandId?: string | null,
+): Promise<{ ok: boolean }> {
+  const params = new URLSearchParams({ key });
+  if (customCommandId) params.set("custom_command_id", customCommandId);
   return requestJson<{ ok: boolean }>(
-    `/workspaces/${workspaceId}/env-vars?key=${encodeURIComponent(key)}`,
+    `/workspaces/${workspaceId}/env-vars?${params.toString()}`,
     { method: "DELETE" },
   );
+}
+
+export function bulkUpsertWorkspaceEnvVars(
+  workspaceId: string,
+  payload: EnvVarBulkRequest,
+): Promise<EnvVarBulkResponse> {
+  return requestJson<EnvVarBulkResponse>(`/workspaces/${workspaceId}/env-vars/bulk`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function bulkDeleteWorkspaceEnvVars(
+  workspaceId: string,
+  payload: EnvVarBulkDeleteRequest,
+): Promise<EnvVarBulkDeleteResponse> {
+  return requestJson<EnvVarBulkDeleteResponse>(`/workspaces/${workspaceId}/env-vars/bulk-delete`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+/** `.env`-shaped template with keys only (no values), grouped by scope as `#` comments. */
+export function getWorkspaceEnvVarTemplate(workspaceId: string): Promise<string> {
+  return requestText(`/workspaces/${workspaceId}/env-vars/template`);
 }
 
 export function listAuditLogs(
@@ -1562,9 +1784,13 @@ export function deleteTerminalSession(
   );
 }
 
-export function startEditorSession(workspaceId: string): Promise<EditorSessionResponse> {
+export function startEditorSession(
+  workspaceId: string,
+  worktreeId?: string | null,
+): Promise<EditorSessionResponse> {
   return requestJson<EditorSessionResponse>(`/workspaces/${workspaceId}/editor/start`, {
     method: "POST",
+    body: JSON.stringify({ worktree_id: worktreeId ?? null }),
   });
 }
 
@@ -1748,6 +1974,127 @@ export function getWorkspaceServiceLogs(
   return requestJson<ServiceLogsResponse>(
     `/workspaces/${workspaceId}/services/${serviceId}/logs`,
     { signal },
+  );
+}
+
+// ── Preview composition (Epic 13: service wiring) ─────────────────────────────
+
+export type PreviewUrlKind = "capability" | "alias";
+export type ServiceDiagnosticKind = "cors_missing_allow_origin" | "cors_preflight_rejected";
+export type PreviewAdvisorySeverity = "info" | "warning" | "error";
+export type EntryPointSource = "explicit" | "inferred";
+
+export type ServiceDiagnosisResponse = {
+  id: string;
+  kind: ServiceDiagnosticKind;
+  origin: string;
+  request_method: string | null;
+  required_header: string | null;
+  request_path: string | null;
+  status_code: number | null;
+  detail: string | null;
+  occurrences: number;
+  first_seen_at: string;
+  last_seen_at: string;
+};
+
+export type ComposedServiceResponse = {
+  service_id: string;
+  custom_command_id: string | null;
+  name: string;
+  role: CommandRole;
+  kind: CommandKind;
+  port: number | null;
+  status: WorkspaceServiceStatus;
+  health_status: WorkspaceServiceHealth;
+  health_checked_at: string | null;
+  is_entry_point: boolean;
+  entry_point_source: EntryPointSource;
+  branch: string | null;
+  worktree_id: string | null;
+  preview_session_id: string | null;
+  /** Rotates hourly by default -- label it "temporary link" in the UI. */
+  capability_url: string | null;
+  capability_url_rotates: boolean;
+  /** Stable -- safe to paste into an environment variable. Both null when aliases are
+   * disabled for the workspace, or none has been minted yet for this row. */
+  alias: string | null;
+  alias_url: string | null;
+  alias_prime_url: string | null;
+  localhost_url: string | null;
+  diagnoses: ServiceDiagnosisResponse[];
+};
+
+export type PreviewAdvisoryResponse = {
+  code: string;
+  severity: PreviewAdvisorySeverity;
+  title: string;
+  detail: string;
+  framework: string | null;
+  snippet: string | null;
+  snippet_language: string | null;
+  target_file: string | null;
+  service_ids: string[];
+};
+
+export type PreviewCompositionResponse = {
+  workspace_id: string;
+  preview_alias_enabled: boolean;
+  proxy_base_url: string;
+  entry_point_service_id: string | null;
+  services: ComposedServiceResponse[];
+  advisories: PreviewAdvisoryResponse[];
+};
+
+/**
+ * `checkProxy=false` (the default -- every poll-loop call) costs zero sandbox round-trips.
+ * Pass `true` only on mount and on an explicit "Re-check".
+ */
+export function getPreviewComposition(
+  workspaceId: string,
+  checkProxy: boolean,
+  signal?: AbortSignal,
+): Promise<PreviewCompositionResponse> {
+  const query = checkProxy ? "?check_proxy=true" : "";
+  return requestJson<PreviewCompositionResponse>(
+    `/workspaces/${workspaceId}/preview/composition${query}`,
+    { signal },
+  );
+}
+
+export type PreviewAliasToggleResponse = {
+  preview_alias_enabled: boolean;
+};
+
+export function enablePreviewAliases(workspaceId: string): Promise<PreviewAliasToggleResponse> {
+  return requestJson<PreviewAliasToggleResponse>(
+    `/workspaces/${workspaceId}/preview/aliases/enable`,
+    { method: "POST" },
+  );
+}
+
+export function disablePreviewAliases(workspaceId: string): Promise<PreviewAliasToggleResponse> {
+  return requestJson<PreviewAliasToggleResponse>(
+    `/workspaces/${workspaceId}/preview/aliases/disable`,
+    { method: "POST" },
+  );
+}
+
+export type PreviewAliasRegenerateResponse = {
+  alias: string;
+  alias_url: string;
+};
+
+export function regeneratePreviewAlias(
+  workspaceId: string,
+  customCommandId: string | null,
+): Promise<PreviewAliasRegenerateResponse> {
+  return requestJson<PreviewAliasRegenerateResponse>(
+    `/workspaces/${workspaceId}/preview/aliases/regenerate`,
+    {
+      method: "POST",
+      body: JSON.stringify({ custom_command_id: customCommandId }),
+    },
   );
 }
 

@@ -76,6 +76,7 @@ const workspace = {
   updated_at: "2026-05-23T00:00:00Z",
   // The shell gates every action on this; "owner" keeps the role-gated controls enabled.
   viewer_role: "owner",
+  env_file_path: null,
 };
 
 // Workspace views live under the project/team hierarchy — there are no top-level `/files`,
@@ -155,6 +156,15 @@ function jsonResponse(payload: unknown, ok = true, status = 200) {
   };
 }
 
+function textResponse(body: string, ok = true, status = 200) {
+  return {
+    ok,
+    status,
+    json: async () => ({}),
+    text: async () => body,
+  };
+}
+
 const healthResponse = { status: "ok", database: "ok", redis: "ok" };
 
 // `GET /dashboard/summary`, in the shape `DashboardSummary` declares. The overview route
@@ -201,6 +211,19 @@ const usageSummary = {
  * `recent_projects`, which crashed the tree on render.
  */
 function fallbackResponse(url: string) {
+  // `AuthProvider`'s sibling `LlmStatusProvider` reads this on every authenticated render, and
+  // the first-run gate redirects to /setup on an affirmative `configured: false`. Answering it
+  // here keeps these tests exercising the app rather than the setup screen.
+  if (url.endsWith("/platform/llm-settings/status")) {
+    return Promise.resolve(
+      jsonResponse({
+        configured: true,
+        source: "database",
+        base_url: "http://llm.example/v1",
+        model: "test-model",
+      }),
+    );
+  }
   if (url.includes("/dashboard/summary")) {
     return Promise.resolve(jsonResponse(dashboardSummary));
   }
@@ -212,6 +235,26 @@ function fallbackResponse(url: string) {
   }
   if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
     return Promise.resolve(jsonResponse([]));
+  }
+  if (url.includes("/env-vars/template")) {
+    return Promise.resolve(textResponse(""));
+  }
+  if (url.includes("/env-vars/bulk-delete")) {
+    return Promise.resolve(jsonResponse({ deleted: [], missing: [], affected_services: [] }));
+  }
+  if (url.includes("/env-vars/bulk")) {
+    return Promise.resolve(
+      jsonResponse({
+        items: [],
+        created: 0,
+        updated: 0,
+        unchanged: 0,
+        invalid: 0,
+        dry_run: true,
+        affected_services: [],
+        warnings: [],
+      }),
+    );
   }
   if (url.endsWith("/notifications")) {
     return Promise.resolve(jsonResponse([]));
@@ -263,6 +306,18 @@ function fallbackResponse(url: string) {
         message: null,
         worktree_id: null,
         branch: null,
+      }),
+    );
+  }
+  if (url.includes("/preview/composition")) {
+    return Promise.resolve(
+      jsonResponse({
+        workspace_id: workspace.id,
+        preview_alias_enabled: false,
+        proxy_base_url: "http://localhost:8001",
+        entry_point_service_id: null,
+        services: [],
+        advisories: [],
       }),
     );
   }
@@ -1065,14 +1120,17 @@ describe("App auth routing", () => {
     ).toBe(true);
   });
 
-  it("opens the editor tab and launches code-server in a new browser tab", async () => {
-    const editorUrl = "http://localhost:8080/?folder=/workspace/demo";
+  it("opens the editor tab and embeds code-server in an iframe", async () => {
+    const editorUrl = "http://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo";
     const editorSession = {
       id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
       workspace_id: workspace.id,
       user_id: authUser.id,
       url: editorUrl,
+      prime_url: `${editorUrl}&__enigma_cap=grant-token`,
       status: "active",
+      worktree_id: null,
+      folder: "/workspace/demo",
       started_at: "2026-05-23T00:00:00Z",
       last_active_at: "2026-05-23T00:00:00Z",
     };
@@ -1104,27 +1162,37 @@ describe("App auth routing", () => {
     render(<App />);
 
     await userEvent.click(await screen.findByRole("link", { name: "Editor" }));
-    expect(await screen.findByText("Editor is not running.")).toBeInTheDocument();
+    expect(
+      await screen.findByText("Editor is not running. Start it to open code-server here."),
+    ).toBeInTheDocument();
 
-    await userEvent.click(screen.getByRole("button", { name: "Open new tab" }));
+    await userEvent.click(screen.getByRole("button", { name: "Start editor" }));
 
-    expect(await screen.findByText("code-server is ready")).toBeInTheDocument();
-    expect(openSpy).toHaveBeenCalledWith(editorUrl, "_blank", "noopener,noreferrer");
+    // The editor now lives inside the dashboard, so starting it must not open a tab at all.
+    const frame = await screen.findByTitle("Demo editor");
+    expect(frame).toHaveAttribute("src", `${editorUrl}&__enigma_cap=grant-token`);
+    expect(openSpy).not.toHaveBeenCalled();
   });
 
-  it("shows a fallback code-server link when the popup is blocked", async () => {
-    const editorUrl = "http://localhost:8080/?folder=/workspace/demo";
+  it("opens a new tab with the prime URL, not the bare alias URL", async () => {
+    // The grant cookie is partitioned per top-level site, so a first-party tab has no cookie of
+    // its own -- it must carry a grant or it lands on a 404.
+    const editorUrl = "http://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo";
+    const primeUrl = `${editorUrl}&__enigma_cap=grant-token`;
     const editorSession = {
       id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
       workspace_id: workspace.id,
       user_id: authUser.id,
       url: editorUrl,
+      prime_url: primeUrl,
       status: "active",
+      worktree_id: null,
+      folder: "/workspace/demo",
       started_at: "2026-05-23T00:00:00Z",
       last_active_at: "2026-05-23T00:00:00Z",
     };
-    vi.spyOn(window, "open").mockReturnValue(null);
-    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+    const openSpy = vi.spyOn(window, "open").mockReturnValue({} as Window);
+    const fetchMock = vi.fn((url: string) => {
       if (url.endsWith("/auth/me")) {
         return Promise.resolve(jsonResponse(authUser));
       }
@@ -1138,10 +1206,7 @@ describe("App auth routing", () => {
         return Promise.resolve(jsonResponse([]));
       }
       if (url.endsWith(`/workspaces/${workspace.id}/editor/status`)) {
-        return Promise.resolve(jsonResponse({ status: "inactive", session: null }));
-      }
-      if (url.endsWith(`/workspaces/${workspace.id}/editor/start`) && init?.method === "POST") {
-        return Promise.resolve(jsonResponse(editorSession));
+        return Promise.resolve(jsonResponse({ status: "active", session: editorSession }));
       }
       return fallbackResponse(url);
     });
@@ -1151,26 +1216,78 @@ describe("App auth routing", () => {
     render(<App />);
 
     await userEvent.click(await screen.findByRole("link", { name: "Editor" }));
-    await userEvent.click(screen.getByRole("button", { name: "Open new tab" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open new tab" }));
+
+    expect(openSpy).toHaveBeenCalledWith(primeUrl, "_blank", "noopener,noreferrer");
+  });
+
+  it("shows a fallback code-server link when the popup is blocked", async () => {
+    const editorUrl = "http://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo";
+    const primeUrl = `${editorUrl}&__enigma_cap=grant-token`;
+    const editorSession = {
+      id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
+      workspace_id: workspace.id,
+      user_id: authUser.id,
+      url: editorUrl,
+      prime_url: primeUrl,
+      status: "active",
+      worktree_id: null,
+      folder: "/workspace/demo",
+      started_at: "2026-05-23T00:00:00Z",
+      last_active_at: "2026-05-23T00:00:00Z",
+    };
+    vi.spyOn(window, "open").mockReturnValue(null);
+    const fetchMock = vi.fn((url: string) => {
+      if (url.endsWith("/auth/me")) {
+        return Promise.resolve(jsonResponse(authUser));
+      }
+      if (url.endsWith("/workspaces")) {
+        return Promise.resolve(jsonResponse([workspace]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/agent/runs`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/env-vars`)) {
+        return Promise.resolve(jsonResponse([]));
+      }
+      if (url.endsWith(`/workspaces/${workspace.id}/editor/status`)) {
+        return Promise.resolve(jsonResponse({ status: "active", session: editorSession }));
+      }
+      return fallbackResponse(url);
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    window.history.pushState({}, "", workspaceBase);
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("link", { name: "Editor" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Open new tab" }));
 
     expect(await screen.findByRole("link", { name: "Continue to code-server" })).toHaveAttribute(
       "href",
-      editorUrl,
+      primeUrl,
     );
   });
 
   it("shows editor failure state and can restart", async () => {
-    const editorUrl = "http://localhost:8080/?folder=/workspace/demo";
+    const editorUrl = "http://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo";
     const failedSession = {
       id: "0ea59c8a-698c-4ec1-84c7-1c40271760e7",
       workspace_id: workspace.id,
       user_id: authUser.id,
       url: editorUrl,
+      prime_url: "",
       status: "error",
+      worktree_id: null,
+      folder: "/workspace/demo",
       started_at: "2026-05-23T00:00:00Z",
       last_active_at: "2026-05-23T00:00:00Z",
     };
-    const activeSession = { ...failedSession, status: "active" };
+    const activeSession = {
+      ...failedSession,
+      status: "active",
+      prime_url: `${editorUrl}&__enigma_cap=grant-token`,
+    };
     const openSpy = vi.spyOn(window, "open").mockReturnValue({} as Window);
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith("/auth/me")) {
@@ -1206,8 +1323,11 @@ describe("App auth routing", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Restart" }));
 
-    expect(await screen.findByText("code-server is ready")).toBeInTheDocument();
-    expect(openSpy).toHaveBeenCalledWith(editorUrl, "_blank", "noopener,noreferrer");
+    expect(await screen.findByTitle("Demo editor")).toHaveAttribute(
+      "src",
+      `${editorUrl}&__enigma_cap=grant-token`,
+    );
+    expect(openSpy).not.toHaveBeenCalled();
   });
 
   it("opens the preview tab, shows a running service, and controls the iframe", async () => {
@@ -1237,6 +1357,10 @@ describe("App auth routing", () => {
       last_seen_at: "2026-05-25T00:00:00Z",
       preview_session_id: "prev-1",
       public_url: publicUrl as string | null,
+      health_status: "healthy" as string,
+      health_checked_at: "2026-05-25T00:00:00Z" as string | null,
+      health_path: "/healthz",
+      is_entry_point: true,
     };
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {
       if (url.endsWith("/auth/me")) {
@@ -1260,6 +1384,44 @@ describe("App auth routing", () => {
           }),
         );
       }
+      if (url.includes(`/workspaces/${workspace.id}/preview/composition`)) {
+        return Promise.resolve(
+          jsonResponse({
+            workspace_id: workspace.id,
+            preview_alias_enabled: false,
+            proxy_base_url: "http://localhost:8001",
+            entry_point_service_id: currentService.is_entry_point ? currentService.id : null,
+            services: [
+              {
+                service_id: currentService.id,
+                custom_command_id: currentService.custom_command_id,
+                name: currentService.name,
+                role: currentService.role,
+                kind: currentService.kind,
+                port: currentService.port,
+                status: currentService.status,
+                health_status: currentService.health_status,
+                health_checked_at: currentService.health_checked_at,
+                is_entry_point: currentService.is_entry_point,
+                entry_point_source: "explicit",
+                branch: currentService.branch,
+                worktree_id: currentService.worktree_id,
+                preview_session_id: currentService.preview_session_id,
+                capability_url: currentService.public_url,
+                capability_url_rotates: true,
+                alias: null,
+                alias_url: null,
+                alias_prime_url: null,
+                localhost_url: currentService.port
+                  ? `http://127.0.0.1:${currentService.port}`
+                  : null,
+                diagnoses: [],
+              },
+            ],
+            advisories: [],
+          }),
+        );
+      }
       if (
         url.endsWith(`/workspaces/${workspace.id}/services/${serviceId}/stop`) &&
         init?.method === "POST"
@@ -1280,6 +1442,14 @@ describe("App auth routing", () => {
     const frame = await screen.findByTitle("Web preview");
     expect(frame).toHaveAttribute("src", publicUrl);
 
+    // Epic 13: the entry-point card (its own "Copy app URL" button, distinct from
+    // ServiceRow's "Copy URL") and the healthy badge -- rendered once in the entry-point
+    // card and once in the service row below it.
+    expect(await screen.findByRole("button", { name: "Copy app URL" })).toBeInTheDocument();
+    await waitFor(() => {
+      expect(screen.getAllByText("Healthy").length).toBeGreaterThan(0);
+    });
+
     await userEvent.click(screen.getByRole("button", { name: "Mobile" }));
     expect(frame).toHaveClass("max-w-[390px]");
 
@@ -1288,5 +1458,156 @@ describe("App auth routing", () => {
 
     await userEvent.click(screen.getByRole("button", { name: "Stop" }));
     expect(await screen.findByText(/Preview: 0\/1 running/)).toBeInTheDocument();
+  });
+
+  // --- first-run LLM setup gate ------------------------------------------------------------
+  // `HomeRoute` and `AdaptiveDashboardRoute` hand-roll their auth check instead of going
+  // through `PrivateRoute`, so the gate has to be applied to each of them separately. These
+  // are the regression tests for exactly that bypass.
+
+  function stubUnconfigured(
+    overrides: (url: string) => ReturnType<typeof jsonResponse> | undefined = () => undefined,
+  ) {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        const handled = overrides(url);
+        if (handled) return Promise.resolve(handled);
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        if (url.endsWith("/platform/llm-settings/status")) {
+          return Promise.resolve(
+            jsonResponse({ configured: false, source: null, base_url: null, model: null }),
+          );
+        }
+        if (url.endsWith("/workspaces")) {
+          return Promise.resolve(jsonResponse([workspace]));
+        }
+        return fallbackResponse(url);
+      }),
+    );
+  }
+
+  it("sends an authenticated user to setup while no LLM is configured", async () => {
+    window.history.pushState({}, "", "/");
+    stubUnconfigured();
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Connect a language model" }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/setup");
+  });
+
+  it("gates the workspace dashboard too, not just PrivateRoute pages", async () => {
+    window.history.pushState({}, "", workspaceBase);
+    stubUnconfigured();
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Connect a language model" }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/setup");
+  });
+
+  it("never redirects the setup page itself", async () => {
+    window.history.pushState({}, "", "/setup");
+    stubUnconfigured();
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: "Connect a language model" }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/setup");
+  });
+
+  it("keeps the app reachable after skipping setup", async () => {
+    window.history.pushState({}, "", "/");
+    stubUnconfigured();
+
+    render(<App />);
+
+    await userEvent.click(await screen.findByRole("button", { name: "Skip for now" }));
+
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard", level: 1 }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/");
+    expect(window.localStorage.getItem("enigma.llmSetupSkipped")).toBe("1");
+  });
+
+  it("shows a non-owner an explanation rather than a form they cannot use", async () => {
+    window.history.pushState({}, "", "/");
+    stubUnconfigured((url) =>
+      url.endsWith("/auth/me")
+        ? jsonResponse({ ...authUser, role: "viewer" })
+        : undefined,
+    );
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("heading", { name: /Enigma isn.t set up yet/ }),
+    ).toBeInTheDocument();
+    expect(screen.queryByLabelText("Base URL")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Continue to Enigma" })).toBeInTheDocument();
+  });
+
+  it("does not block the app when the status endpoint fails", async () => {
+    window.history.pushState({}, "", "/");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        if (url.endsWith("/platform/llm-settings/status")) {
+          return Promise.resolve(jsonResponse({ detail: "boom" }, false, 500));
+        }
+        return fallbackResponse(url);
+      }),
+    );
+
+    render(<App />);
+
+    // Fails open: the gate is UX only, the backend is what refuses an unconfigured run.
+    expect(
+      await screen.findByRole("heading", { name: "Dashboard", level: 1 }),
+    ).toBeInTheDocument();
+    expect(window.location.pathname).toBe("/");
+  });
+
+  it("renders the global settings page for an authenticated user", async () => {
+    window.history.pushState({}, "", "/settings");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        if (url.endsWith("/platform/llm-settings")) {
+          return Promise.resolve(
+            jsonResponse({
+              base_url: "http://llm.example/v1",
+              model: "test-model",
+              has_api_key: true,
+              masked_api_key: "********",
+              source: "database",
+              updated_at: "2026-09-11T00:00:00Z",
+            }),
+          );
+        }
+        return fallbackResponse(url);
+      }),
+    );
+
+    render(<App />);
+
+    expect(await screen.findByRole("heading", { name: "Settings" })).toBeInTheDocument();
+    expect(await screen.findByLabelText("Base URL")).toHaveValue("http://llm.example/v1");
   });
 });

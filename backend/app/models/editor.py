@@ -1,7 +1,16 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -39,8 +48,20 @@ class EditorSession(Base):
     process_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     bind_host: Mapped[str] = mapped_column(String(128), nullable=False)
     bind_port: Mapped[int] = mapped_column(Integer, nullable=False)
-    token_hash: Mapped[str] = mapped_column(String(128), nullable=False)
-    token_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Legacy of the Daytona signed-URL model. The editor URL is now a stable alias host with no
+    # credential in it, so neither column is written any more.
+    token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    token_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Which worktree code-server was opened on (NULL = base clone) and the resolved absolute
+    # sandbox path handed to it as `?folder=`.
+    worktree_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspace_worktrees.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    folder: Mapped[str | None] = mapped_column(Text, nullable=True)
     started_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

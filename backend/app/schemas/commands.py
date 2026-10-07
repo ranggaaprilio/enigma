@@ -27,6 +27,18 @@ def normalize_subpath(value: str | None) -> str | None:
         raise ValueError(str(error)) from error
 
 
+def normalize_health_path(value: str | None) -> str | None:
+    """Mirrors ``ck_custom_commands_health_path``: a root-relative HTTP path, like a URL path."""
+    if value is None:
+        return None
+    stripped = value.strip()
+    if not stripped:
+        return None
+    if not stripped.startswith("/"):
+        raise ValueError("health_path must start with '/'")
+    return stripped
+
+
 class CustomCommandCreateRequest(BaseModel):
     name: str = Field(min_length=1, max_length=160)
     command: str = Field(min_length=1, max_length=4000)
@@ -40,11 +52,21 @@ class CustomCommandCreateRequest(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     enabled: bool = True
     timeout_seconds: int | None = Field(default=None, ge=1, le=86400)
+    # Epic 13: readiness + "Open app" entry point. Only meaningful for a `kind="service"`
+    # command -- enforced by the service layer (which knows the *effective* kind after role
+    # defaulting) and, as a last line of defense, the database CHECK.
+    health_path: str | None = Field(default=None, max_length=512)
+    is_entry_point: bool = False
 
     @field_validator("cwd")
     @classmethod
     def normalize_cwd(cls, value: str | None) -> str | None:
         return normalize_subpath(value)
+
+    @field_validator("health_path")
+    @classmethod
+    def normalize_health_path_field(cls, value: str | None) -> str | None:
+        return normalize_health_path(value)
 
     @field_validator("name", "command")
     @classmethod
@@ -70,6 +92,7 @@ _NON_NULLABLE_UPDATE_FIELDS = (
     "role",
     "kind",
     "enabled",
+    "is_entry_point",
 )
 
 
@@ -86,11 +109,18 @@ class CustomCommandUpdateRequest(BaseModel):
     port: int | None = Field(default=None, ge=1, le=65535)
     enabled: bool | None = None
     timeout_seconds: int | None = Field(default=None, ge=1, le=86400)
+    health_path: str | None = Field(default=None, max_length=512)
+    is_entry_point: bool | None = None
 
     @field_validator("cwd")
     @classmethod
     def normalize_cwd(cls, value: str | None) -> str | None:
         return normalize_subpath(value)
+
+    @field_validator("health_path")
+    @classmethod
+    def normalize_health_path_field(cls, value: str | None) -> str | None:
+        return normalize_health_path(value)
 
     @field_validator("name", "command")
     @classmethod
@@ -156,6 +186,8 @@ class CustomCommandResponse(BaseModel):
     sort_order: int
     enabled: bool
     timeout_seconds: int | None
+    health_path: str | None = None
+    is_entry_point: bool = False
     created_at: datetime
     updated_at: datetime
 

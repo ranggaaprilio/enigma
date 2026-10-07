@@ -321,7 +321,9 @@ class TestBudgetService:
             enforce=True,
         )
 
-        agent_service = AgentService(session, session_maker, Settings())
+        agent_service = AgentService(
+            session, session_maker, Settings(agent_allow_mock_provider=True)
+        )
         with pytest.raises(BudgetExceededError):
             await agent_service.create_run(data.ws_solo.id, data.owner.id, "please run")
 
@@ -343,7 +345,9 @@ class TestBudgetService:
         )
 
         monkeypatch.setattr("app.services.agents.asyncio.create_task", _fake_create_task)
-        agent_service = AgentService(session, session_maker, Settings())
+        agent_service = AgentService(
+            session, session_maker, Settings(agent_allow_mock_provider=True)
+        )
         run = await agent_service.create_run(data.ws_solo.id, data.owner.id, "please run")
         assert run.id is not None
 
@@ -385,7 +389,11 @@ def _override_budget_service(session):
 
 def _override_agent_service(session, session_maker):
     async def _override():
-        return AgentService(session=session, session_maker=session_maker, settings=Settings())
+        return AgentService(
+            session=session,
+            session_maker=session_maker,
+            settings=Settings(agent_allow_mock_provider=True),
+        )
 
     return _override
 

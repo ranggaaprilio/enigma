@@ -1,4 +1,5 @@
 import asyncio
+import re
 import shlex
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -54,6 +55,12 @@ class RuntimeCommandResult:
 class RuntimePreviewLink:
     url: str
     token: str
+
+
+# Local to avoid a circular import with `app.services.workspace_env` (which itself depends on
+# this module for the `DaytonaRuntime` type). Env var keys are already validated on write; this
+# is defense in depth against building a shell string with a malformed key.
+_ENV_KEY_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def map_daytona_error(error: Exception) -> DaytonaRuntimeError:
@@ -224,6 +231,9 @@ class DaytonaRuntime:
         except Exception:
             pass
         working_directory = cwd or workspace.workspace_path
+        for key in env or {}:
+            if not _ENV_KEY_PATTERN.fullmatch(key):
+                raise ValueError(f"invalid environment variable name: {key!r}")
         env_prefix = " ".join(
             f"{key}={shlex.quote(value)}" for key, value in sorted((env or {}).items())
         )

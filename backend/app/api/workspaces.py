@@ -1,7 +1,9 @@
-from typing import Protocol
+import re
+from typing import Literal, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.audit_support import (
@@ -29,10 +31,17 @@ from app.schemas.repositories import (
     SshKeyRequest,
 )
 from app.schemas.workspaces import (
+    AffectedServiceResponse,
     DeleteResponse,
     WorkspaceCreateRequest,
+    WorkspaceEnvVarBulkDeleteRequest,
+    WorkspaceEnvVarBulkDeleteResponse,
+    WorkspaceEnvVarBulkItem,
+    WorkspaceEnvVarBulkRequest,
+    WorkspaceEnvVarBulkResponse,
     WorkspaceEnvVarResponse,
     WorkspaceEnvVarUpsertRequest,
+    WorkspaceEnvVarUpsertResponse,
     WorkspaceResponse,
     WorkspaceStatusResponse,
     WorkspaceUpdateRequest,
@@ -47,6 +56,7 @@ from app.schemas.worktrees import (
 )
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntimeError, get_daytona_runtime
+from app.services.env_file import parse_env_text
 from app.services.git_providers import supports_pull_requests
 from app.services.github_client import GitHubApiError, PullRequestService
 from app.services.notifications import NotificationService
@@ -63,10 +73,14 @@ from app.services.repositories import (
     RepositoryTokenError,
 )
 from app.services.templates import TemplateNotFoundError
+from app.services.workspace_env import affected_running_services, egress_warnings
 from app.services.workspace_init import WorkspaceInitializationError
 from app.services.workspaces import (
     APP_ROOT_UNSET,
+    ENV_FILE_PATH_UNSET,
     SNAPSHOT_UNSET,
+    BulkItem,
+    InvalidEnvScopeError,
     InvalidEnvVarKeyError,
     SqlAlchemyWorkspaceService,
     WorkspaceAlreadyExistsError,
@@ -120,6 +134,7 @@ class WorkspaceService(Protocol):
         default_branch: str | None = None,
         snapshot: str | None | object = SNAPSHOT_UNSET,
         app_root: str | None | object = APP_ROOT_UNSET,
+        env_file_path: str | None | object = ENV_FILE_PATH_UNSET,
     ) -> Workspace: ...
 
     async def reprovision(self, workspace_id: UUID, owner_id: UUID) -> Workspace: ...
@@ -134,9 +149,39 @@ class WorkspaceService(Protocol):
         owner_id: UUID,
         key: str,
         value: str,
-    ) -> WorkspaceEnvVar: ...
+        *,
+        custom_command_id: UUID | None = None,
+    ) -> tuple[WorkspaceEnvVar, Literal["created", "updated", "unchanged"]]: ...
 
-    async def delete_env_var(self, workspace_id: UUID, owner_id: UUID, key: str) -> None: ...
+    async def bulk_upsert_env_vars(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        values: dict[str, str],
+        *,
+        custom_command_id: UUID | None = None,
+        dry_run: bool = False,
+    ) -> list[BulkItem]: ...
+
+    async def delete_env_var(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        key: str,
+        *,
+        custom_command_id: UUID | None = None,
+    ) -> None: ...
+
+    async def bulk_delete_env_vars(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        keys: list[str],
+        *,
+        custom_command_id: UUID | None = None,
+    ) -> tuple[list[str], list[str]]: ...
+
+    async def env_template(self, workspace_id: UUID, owner_id: UUID) -> str: ...
 
 
 async def get_workspace_service(
@@ -347,7 +392,22 @@ def env_response(env_var: WorkspaceEnvVar) -> WorkspaceEnvVarResponse:
         masked_value=mask_env_value(),
         created_at=env_var.created_at,
         updated_at=env_var.updated_at,
+        scope=env_var.scope,
+        custom_command_id=env_var.custom_command_id,
     )
+
+
+def affected_service_responses(services) -> list[AffectedServiceResponse]:
+    return [
+        AffectedServiceResponse(
+            service_id=item.service_id,
+            custom_command_id=item.custom_command_id,
+            name=item.name,
+            status=item.status,
+            keys=item.keys,
+        )
+        for item in services
+    ]
 
 
 @router.post("/{workspace_id}/repo/connect", response_model=WorkspaceResponse)
@@ -1369,6 +1429,8 @@ async def update_workspace(
             update_values["snapshot"] = payload.snapshot
         if "app_root" in payload.model_fields_set:
             update_values["app_root"] = payload.app_root
+        if "env_file_path" in payload.model_fields_set:
+            update_values["env_file_path"] = payload.env_file_path
         workspace = await service.update(**update_values)
     except WorkspaceNotFoundError:
         raise not_found() from None
@@ -1487,28 +1549,63 @@ async def list_env_vars(
     return [env_response(env_var) for env_var in env_vars]
 
 
-@router.put("/{workspace_id}/env-vars", response_model=WorkspaceEnvVarResponse)
+# Best-effort key extraction from a `ParseProblem.message` for the "duplicate key" case
+# (`"KEY appears N times; last value used"`) -- every other problem message has no key at all.
+_DUPLICATE_KEY_MESSAGE_PATTERN = re.compile(
+    r"^(?P<key>[A-Za-z_][A-Za-z0-9_]*) appears \d+ times; last value used$"
+)
+
+
+def _bulk_item_for_problem(problem) -> WorkspaceEnvVarBulkItem:
+    match = _DUPLICATE_KEY_MESSAGE_PATTERN.match(problem.message)
+    key = match.group("key") if match else f"line {problem.line_no}"
+    return WorkspaceEnvVarBulkItem(key=key, status="invalid", message=problem.message)
+
+
+def _invalid_env_scope_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="custom_command_id does not belong to this workspace",
+    )
+
+
+def _invalid_env_key_error() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="Environment variable keys must use uppercase letters, numbers, and underscores",
+    )
+
+
+@router.put("/{workspace_id}/env-vars", response_model=WorkspaceEnvVarUpsertResponse)
 async def upsert_env_var(
     workspace_id: UUID,
     payload: WorkspaceEnvVarUpsertRequest,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
     audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
-) -> WorkspaceEnvVarResponse:
+    session: AsyncSession = DB_SESSION_DEP,
+    settings: Settings = SETTINGS_DEP,
+) -> WorkspaceEnvVarUpsertResponse:
     try:
-        env_var = await service.upsert_env_var(
+        env_var, _write_status = await service.upsert_env_var(
             workspace_id=workspace_id,
             owner_id=current_user.id,
             key=payload.key,
             value=payload.value,
+            custom_command_id=payload.custom_command_id,
         )
     except WorkspaceNotFoundError:
         raise not_found() from None
+    except InvalidEnvScopeError:
+        raise _invalid_env_scope_error() from None
     except InvalidEnvVarKeyError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Environment variable keys must use uppercase letters, numbers, and underscores",
-        ) from None
+        raise _invalid_env_key_error() from None
+
+    affected = await affected_running_services(
+        session, workspace_id, [(env_var.key, payload.custom_command_id)]
+    )
+    warnings = egress_warnings({env_var.key: payload.value}, settings)
+
     await record_audit_safely(
         audit_log_service,
         user_id=current_user.id,
@@ -1516,28 +1613,32 @@ async def upsert_env_var(
         action="workspace_env_var_upsert",
         target_type="workspace_env_var",
         target_id=env_var.key,
-        metadata={"key": env_var.key},
+        metadata={"variable": env_var.key, "scope": env_var.scope},
     )
-    return env_response(env_var)
+    return WorkspaceEnvVarUpsertResponse(
+        **env_response(env_var).model_dump(),
+        affected_services=affected_service_responses(affected),
+        warnings=warnings,
+    )
 
 
 @router.delete("/{workspace_id}/env-vars", response_model=DeleteResponse)
 async def delete_env_var(
     workspace_id: UUID,
     key: str = Query(min_length=1, max_length=128),
+    custom_command_id: UUID | None = Query(None),
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
     audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
 ) -> DeleteResponse:
     try:
-        await service.delete_env_var(workspace_id, current_user.id, key)
+        await service.delete_env_var(
+            workspace_id, current_user.id, key, custom_command_id=custom_command_id
+        )
     except WorkspaceNotFoundError:
         raise not_found() from None
     except InvalidEnvVarKeyError:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Environment variable keys must use uppercase letters, numbers, and underscores",
-        ) from None
+        raise _invalid_env_key_error() from None
     await record_audit_safely(
         audit_log_service,
         user_id=current_user.id,
@@ -1545,6 +1646,153 @@ async def delete_env_var(
         action="workspace_env_var_delete",
         target_type="workspace_env_var",
         target_id=key,
-        metadata={"key": key},
+        metadata={"variable": key, "scope": "service" if custom_command_id else "workspace"},
     )
     return DeleteResponse(ok=True)
+
+
+@router.post("/{workspace_id}/env-vars/bulk", response_model=WorkspaceEnvVarBulkResponse)
+async def bulk_upsert_env_vars(
+    workspace_id: UUID,
+    payload: WorkspaceEnvVarBulkRequest,
+    current_user: User = CURRENT_USER_DEP,
+    service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+    session: AsyncSession = DB_SESSION_DEP,
+    settings: Settings = SETTINGS_DEP,
+) -> WorkspaceEnvVarBulkResponse:
+    parse_invalid: list[WorkspaceEnvVarBulkItem] = []
+    if payload.text is not None:
+        parsed_lines, problems = parse_env_text(payload.text)
+        values = {line.key: line.value for line in parsed_lines}
+        parse_invalid = [_bulk_item_for_problem(problem) for problem in problems]
+    else:
+        values = payload.values or {}
+
+    try:
+        results: list[BulkItem] = await service.bulk_upsert_env_vars(
+            workspace_id=workspace_id,
+            owner_id=current_user.id,
+            values=values,
+            custom_command_id=payload.custom_command_id,
+            dry_run=payload.dry_run,
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except InvalidEnvScopeError:
+        raise _invalid_env_scope_error() from None
+
+    items = [
+        WorkspaceEnvVarBulkItem(key=item.key, status=item.status, message=item.message)
+        for item in results
+    ] + parse_invalid
+
+    counts = {"created": 0, "updated": 0, "unchanged": 0, "invalid": 0}
+    for item in items:
+        counts[item.status] += 1
+
+    written_pairs = [
+        (item.key, payload.custom_command_id)
+        for item in items
+        if item.status in ("created", "updated")
+    ]
+    affected = await affected_running_services(session, workspace_id, written_pairs)
+    warnings = egress_warnings(
+        {item.key: values[item.key] for item in items if item.key in values}, settings
+    )
+
+    if not payload.dry_run and written_pairs:
+        await record_audit_safely(
+            audit_log_service,
+            user_id=current_user.id,
+            workspace_id=workspace_id,
+            action="workspace_env_var_bulk_upsert",
+            target_type="workspace_env_var",
+            target_id=str(workspace_id),
+            metadata={
+                "variables": [key for key, _ in written_pairs],
+                "scope": "service" if payload.custom_command_id else "workspace",
+                "custom_command_id": (
+                    str(payload.custom_command_id) if payload.custom_command_id else None
+                ),
+            },
+        )
+
+    return WorkspaceEnvVarBulkResponse(
+        items=items,
+        created=counts["created"],
+        updated=counts["updated"],
+        unchanged=counts["unchanged"],
+        invalid=counts["invalid"],
+        dry_run=payload.dry_run,
+        affected_services=affected_service_responses(affected),
+        warnings=warnings,
+    )
+
+
+@router.post(
+    "/{workspace_id}/env-vars/bulk-delete", response_model=WorkspaceEnvVarBulkDeleteResponse
+)
+async def bulk_delete_env_vars(
+    workspace_id: UUID,
+    payload: WorkspaceEnvVarBulkDeleteRequest,
+    current_user: User = CURRENT_USER_DEP,
+    service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+    audit_log_service: AuditLogService = AUDIT_LOG_SERVICE_DEP,
+    session: AsyncSession = DB_SESSION_DEP,
+) -> WorkspaceEnvVarBulkDeleteResponse:
+    try:
+        deleted, missing = await service.bulk_delete_env_vars(
+            workspace_id,
+            current_user.id,
+            payload.keys,
+            custom_command_id=payload.custom_command_id,
+        )
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    except InvalidEnvScopeError:
+        raise _invalid_env_scope_error() from None
+
+    affected = await affected_running_services(
+        session, workspace_id, [(key, payload.custom_command_id) for key in deleted]
+    )
+
+    if deleted:
+        await record_audit_safely(
+            audit_log_service,
+            user_id=current_user.id,
+            workspace_id=workspace_id,
+            action="workspace_env_var_bulk_delete",
+            target_type="workspace_env_var",
+            target_id=str(workspace_id),
+            metadata={
+                "variables": deleted,
+                "scope": "service" if payload.custom_command_id else "workspace",
+                "custom_command_id": (
+                    str(payload.custom_command_id) if payload.custom_command_id else None
+                ),
+            },
+        )
+
+    return WorkspaceEnvVarBulkDeleteResponse(
+        deleted=deleted,
+        missing=missing,
+        affected_services=affected_service_responses(affected),
+    )
+
+
+@router.get("/{workspace_id}/env-vars/template")
+async def env_var_template(
+    workspace_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: WorkspaceService = WORKSPACE_SERVICE_DEP,
+) -> PlainTextResponse:
+    try:
+        text = await service.env_template(workspace_id, current_user.id)
+    except WorkspaceNotFoundError:
+        raise not_found() from None
+    return PlainTextResponse(
+        text,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": 'attachment; filename=".env.example"'},
+    )

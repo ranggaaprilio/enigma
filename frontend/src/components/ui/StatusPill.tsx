@@ -1,7 +1,16 @@
-import { CheckCircle2, Circle, Loader2, TerminalSquare, XCircle } from "lucide-react";
+import {
+  CheckCircle2,
+  Circle,
+  HeartCrack,
+  HeartPulse,
+  Loader2,
+  TerminalSquare,
+  XCircle,
+} from "lucide-react";
 
-/** Covers both the command-run vocabulary and the workspace-service vocabulary (Epic 11) so
- * one pill renders either consistently. An unrecognised value falls back to a neutral dot. */
+/** Covers both the command-run vocabulary and the workspace-service vocabulary (Epic 11), plus
+ * the Epic 13 health vocabulary, so one pill renders any of them consistently. An unrecognised
+ * value falls back to a neutral dot. */
 export type StatusPillStatus =
   | "idle"
   | "running"
@@ -11,7 +20,9 @@ export type StatusPillStatus =
   | "installing"
   | "starting"
   | "stopped"
-  | "exited";
+  | "exited"
+  | "healthy"
+  | "unhealthy";
 
 const TONE_CLASS: Partial<Record<StatusPillStatus, string>> = {
   idle: "bg-white text-muted ring-1 ring-line",
@@ -23,6 +34,8 @@ const TONE_CLASS: Partial<Record<StatusPillStatus, string>> = {
   failed: "bg-[#fff5f2] text-danger",
   error: "bg-[#fff5f2] text-danger",
   exited: "bg-[#fff5f2] text-danger",
+  healthy: "bg-line text-signal",
+  unhealthy: "bg-[#fff5f2] text-danger",
 };
 
 const ICON: Partial<Record<StatusPillStatus, typeof CheckCircle2>> = {
@@ -34,6 +47,8 @@ const ICON: Partial<Record<StatusPillStatus, typeof CheckCircle2>> = {
   failed: XCircle,
   error: XCircle,
   exited: XCircle,
+  healthy: HeartPulse,
+  unhealthy: HeartCrack,
 };
 
 const SPINNING: Partial<Record<StatusPillStatus, boolean>> = {

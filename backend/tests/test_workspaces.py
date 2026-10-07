@@ -18,6 +18,8 @@ from app.services.templates import TemplateNotFoundError
 from app.services.users import DuplicateUserEmailError
 from app.services.workspace_init import WorkspaceInitializationError
 from app.services.workspaces import (
+    BulkItem,
+    InvalidEnvScopeError,
     InvalidEnvVarKeyError,
     SqlAlchemyWorkspaceService,
     WorkspaceAlreadyExistsError,
@@ -50,7 +52,21 @@ class FakeWorkspaceService:
         self.cipher = cipher
         self.workspaces: dict[UUID, Workspace] = {}
         self.env_vars: dict[UUID, list[WorkspaceEnvVar]] = {}
+        # Workspace-wide entries only, kept exactly as before scoping existed -- some tests
+        # index into this directly.
         self.encrypted_values: dict[tuple[UUID, str], str] = {}
+        # Service-scoped entries: (workspace_id, custom_command_id, key) -> encrypted value.
+        self.scoped_encrypted_values: dict[tuple[UUID, UUID, str], str] = {}
+        # Registered by tests that need `custom_command_id` scoping to validate, since this
+        # fake has no real `custom_commands` table to check against.
+        self.custom_command_workspace: dict[UUID, UUID] = {}
+        self.custom_command_names: dict[UUID, str] = {}
+
+    def register_custom_command(
+        self, command_id: UUID, workspace_id: UUID, name: str = "Service"
+    ) -> None:
+        self.custom_command_workspace[command_id] = workspace_id
+        self.custom_command_names[command_id] = name
 
     async def list_for_owner(self, owner_id: UUID) -> list[Workspace]:
         return [
@@ -115,6 +131,8 @@ class FakeWorkspaceService:
         repo_url: str | None = None,
         default_branch: str | None = None,
         snapshot: str | None = None,
+        app_root: str | None = None,
+        env_file_path: str | None = None,
     ) -> Workspace:
         workspace = await self.get_for_owner(workspace_id, owner_id)
         if name is not None:
@@ -126,6 +144,10 @@ class FakeWorkspaceService:
             workspace.default_branch = default_branch
         if snapshot is not None:
             workspace.snapshot = snapshot
+        if app_root is not None:
+            workspace.app_root = app_root
+        if env_file_path is not None:
+            workspace.env_file_path = env_file_path
         workspace.updated_at = datetime.now(UTC)
         return workspace
 
@@ -135,7 +157,34 @@ class FakeWorkspaceService:
 
     async def list_env_vars(self, workspace_id: UUID, owner_id: UUID) -> list[WorkspaceEnvVar]:
         workspace = await self.get_for_owner(workspace_id, owner_id)
-        return self.env_vars.get(workspace.id, [])
+        rows = self.env_vars.get(workspace.id, [])
+        return sorted(rows, key=lambda row: (row.custom_command_id is not None, row.key))
+
+    def _check_scope(self, workspace_id: UUID, custom_command_id: UUID | None) -> None:
+        if custom_command_id is None:
+            return
+        if self.custom_command_workspace.get(custom_command_id) != workspace_id:
+            raise InvalidEnvScopeError
+
+    def _find_env_var(
+        self, workspace_id: UUID, key: str, custom_command_id: UUID | None
+    ) -> WorkspaceEnvVar | None:
+        return next(
+            (
+                existing
+                for existing in self.env_vars.get(workspace_id, [])
+                if existing.key == key and existing.custom_command_id == custom_command_id
+            ),
+            None,
+        )
+
+    def _record_encrypted_value(
+        self, workspace_id: UUID, key: str, custom_command_id: UUID | None, encrypted_value: str
+    ) -> None:
+        if custom_command_id is None:
+            self.encrypted_values[(workspace_id, key)] = encrypted_value
+        else:
+            self.scoped_encrypted_values[(workspace_id, custom_command_id, key)] = encrypted_value
 
     async def upsert_env_var(
         self,
@@ -143,36 +192,165 @@ class FakeWorkspaceService:
         owner_id: UUID,
         key: str,
         value: str,
-    ) -> WorkspaceEnvVar:
+        *,
+        custom_command_id: UUID | None = None,
+    ) -> tuple[WorkspaceEnvVar, str]:
         workspace = await self.get_for_owner(workspace_id, owner_id)
+        self._check_scope(workspace.id, custom_command_id)
         normalized_key = validate_env_key(key)
         encrypted_value = self.cipher.encrypt(value)
-        self.encrypted_values[(workspace.id, normalized_key)] = encrypted_value
-        now = datetime.now(UTC)
-        env_var = WorkspaceEnvVar(
-            id=uuid4(),
-            workspace_id=workspace.id,
-            key=normalized_key,
-            encrypted_value=encrypted_value,
-            created_at=now,
-            updated_at=now,
+        existing = self._find_env_var(workspace.id, normalized_key, custom_command_id)
+        if existing is None:
+            now = datetime.now(UTC)
+            env_var = WorkspaceEnvVar(
+                id=uuid4(),
+                workspace_id=workspace.id,
+                custom_command_id=custom_command_id,
+                scope="service" if custom_command_id else "workspace",
+                key=normalized_key,
+                encrypted_value=encrypted_value,
+                created_at=now,
+                updated_at=now,
+            )
+            self.env_vars.setdefault(workspace.id, []).append(env_var)
+            write_status = "created"
+        else:
+            old_value = self.cipher.decrypt(existing.encrypted_value)
+            write_status = "unchanged" if old_value == value else "updated"
+            existing.encrypted_value = encrypted_value
+            existing.updated_at = datetime.now(UTC)
+            env_var = existing
+        self._record_encrypted_value(
+            workspace.id, normalized_key, custom_command_id, encrypted_value
         )
-        self.env_vars[workspace.id] = [
-            existing
-            for existing in self.env_vars.get(workspace.id, [])
-            if existing.key != normalized_key
-        ]
-        self.env_vars[workspace.id].append(env_var)
-        return env_var
+        return env_var, write_status
 
-    async def delete_env_var(self, workspace_id: UUID, owner_id: UUID, key: str) -> None:
+    async def bulk_upsert_env_vars(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        values: dict[str, str],
+        *,
+        custom_command_id: UUID | None = None,
+        dry_run: bool = False,
+    ) -> list[BulkItem]:
+        workspace = await self.get_for_owner(workspace_id, owner_id)
+        self._check_scope(workspace.id, custom_command_id)
+
+        items: list[BulkItem] = []
+        for key, value in values.items():
+            try:
+                normalized_key = validate_env_key(key)
+            except InvalidEnvVarKeyError:
+                items.append(
+                    BulkItem(
+                        key=key,
+                        status="invalid",
+                        message="must use uppercase letters, numbers, and underscores",
+                    )
+                )
+                continue
+
+            existing = self._find_env_var(workspace.id, normalized_key, custom_command_id)
+            if existing is None:
+                write_status = "created"
+                if not dry_run:
+                    now = datetime.now(UTC)
+                    encrypted_value = self.cipher.encrypt(value)
+                    env_var = WorkspaceEnvVar(
+                        id=uuid4(),
+                        workspace_id=workspace.id,
+                        custom_command_id=custom_command_id,
+                        scope="service" if custom_command_id else "workspace",
+                        key=normalized_key,
+                        encrypted_value=encrypted_value,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    self.env_vars.setdefault(workspace.id, []).append(env_var)
+                    self._record_encrypted_value(
+                        workspace.id, normalized_key, custom_command_id, encrypted_value
+                    )
+            else:
+                old_value = self.cipher.decrypt(existing.encrypted_value)
+                write_status = "unchanged" if old_value == value else "updated"
+                if not dry_run and write_status == "updated":
+                    encrypted_value = self.cipher.encrypt(value)
+                    existing.encrypted_value = encrypted_value
+                    existing.updated_at = datetime.now(UTC)
+                    self._record_encrypted_value(
+                        workspace.id, normalized_key, custom_command_id, encrypted_value
+                    )
+            items.append(BulkItem(key=normalized_key, status=write_status))
+        return items
+
+    async def delete_env_var(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        key: str,
+        *,
+        custom_command_id: UUID | None = None,
+    ) -> None:
         workspace = await self.get_for_owner(workspace_id, owner_id)
         normalized_key = validate_env_key(key)
         self.env_vars[workspace.id] = [
             existing
             for existing in self.env_vars.get(workspace.id, [])
-            if existing.key != normalized_key
+            if not (
+                existing.key == normalized_key and existing.custom_command_id == custom_command_id
+            )
         ]
+
+    async def bulk_delete_env_vars(
+        self,
+        workspace_id: UUID,
+        owner_id: UUID,
+        keys: list[str],
+        *,
+        custom_command_id: UUID | None = None,
+    ) -> tuple[list[str], list[str]]:
+        workspace = await self.get_for_owner(workspace_id, owner_id)
+        self._check_scope(workspace.id, custom_command_id)
+
+        deleted: list[str] = []
+        missing: list[str] = []
+        for key in keys:
+            try:
+                normalized_key = validate_env_key(key)
+            except InvalidEnvVarKeyError:
+                missing.append(key)
+                continue
+            existing = self._find_env_var(workspace.id, normalized_key, custom_command_id)
+            if existing is None:
+                missing.append(normalized_key)
+            else:
+                deleted.append(normalized_key)
+                self.env_vars[workspace.id] = [
+                    item for item in self.env_vars.get(workspace.id, []) if item is not existing
+                ]
+        return deleted, missing
+
+    async def env_template(self, workspace_id: UUID, owner_id: UUID) -> str:
+        workspace = await self.get_for_owner(workspace_id, owner_id)
+        env_vars = self.env_vars.get(workspace.id, [])
+        workspace_wide = sorted(
+            (row for row in env_vars if row.custom_command_id is None), key=lambda row: row.key
+        )
+        by_command: dict[UUID, list[WorkspaceEnvVar]] = {}
+        for row in env_vars:
+            if row.custom_command_id is not None:
+                by_command.setdefault(row.custom_command_id, []).append(row)
+
+        sections: list[str] = []
+        if workspace_wide:
+            lines = "\n".join(f"{row.key}=" for row in workspace_wide)
+            sections.append(f"# Workspace-wide\n{lines}\n")
+        for command_id, rows in by_command.items():
+            name = self.custom_command_names.get(command_id, "Unknown service")
+            lines = "\n".join(f"{row.key}=" for row in sorted(rows, key=lambda row: row.key))
+            sections.append(f"# Service: {name} ({command_id})\n{lines}\n")
+        return "\n".join(sections)
 
 
 class FakeRateLimiter:
@@ -308,6 +486,229 @@ async def test_env_vars_are_encrypted_masked_and_validated(workspace_context):
 def test_invalid_env_key_is_rejected():
     with pytest.raises(InvalidEnvVarKeyError):
         validate_env_key("bad-key")
+
+
+async def _create_workspace_via_api(client: AsyncClient, name: str) -> str:
+    response = await client.post(
+        "/workspaces",
+        json={"name": name, "repo_url": f"https://github.com/example/{name.lower()}"},
+    )
+    assert response.status_code == 201, response.text
+    return response.json()["id"]
+
+
+async def test_bulk_upsert_env_vars_reports_per_item_status_and_counts(workspace_context):
+    user, service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        workspace_id = await _create_workspace_via_api(client, "Bulk")
+
+        await client.put(
+            f"/workspaces/{workspace_id}/env-vars",
+            json={"key": "SAME", "value": "same-value"},
+        )
+        await client.put(
+            f"/workspaces/{workspace_id}/env-vars",
+            json={"key": "CHANGED", "value": "old-value"},
+        )
+
+        text = "SAME=same-value\nCHANGED=new-value\nNEW_ONE=a\nNEW_TWO=b\n1BAD=nope\n"
+        response = await client.post(
+            f"/workspaces/{workspace_id}/env-vars/bulk",
+            json={"text": text},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["created"] == 2
+    assert payload["updated"] == 1
+    assert payload["unchanged"] == 1
+    assert payload["invalid"] == 1
+    assert payload["dry_run"] is False
+    body_text = str(payload)
+    for value in ("same-value", "new-value", "old-value", "nope"):
+        assert value not in body_text
+
+
+async def test_bulk_upsert_dry_run_persists_nothing(workspace_context):
+    user, service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        workspace_id = await _create_workspace_via_api(client, "DryRun")
+
+        response = await client.post(
+            f"/workspaces/{workspace_id}/env-vars/bulk",
+            json={"values": {"NEW_KEY": "value"}, "dry_run": True},
+        )
+        listed = await client.get(f"/workspaces/{workspace_id}/env-vars")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["dry_run"] is True
+    assert payload["created"] == 1
+    assert payload["items"] == [{"key": "NEW_KEY", "status": "created", "message": None}]
+    assert listed.json() == []
+
+
+async def test_bulk_upsert_requires_exactly_one_of_text_or_values(workspace_context):
+    user, service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        workspace_id = await _create_workspace_via_api(client, "Neither")
+
+        neither = await client.post(f"/workspaces/{workspace_id}/env-vars/bulk", json={})
+        both = await client.post(
+            f"/workspaces/{workspace_id}/env-vars/bulk",
+            json={"text": "A=1", "values": {"A": "1"}},
+        )
+
+    assert neither.status_code == 422
+    assert both.status_code == 422
+
+
+async def test_upsert_env_var_rejects_custom_command_from_a_different_workspace(workspace_context):
+    user, service, _tmp_path = workspace_context
+    foreign_workspace = await service.create(
+        owner_id=uuid4(),
+        name="Beta",
+        repo_url="https://github.com/example/beta",
+        default_branch="main",
+    )
+    foreign_command_id = uuid4()
+    service.register_custom_command(foreign_command_id, foreign_workspace.id)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        workspace_id = await _create_workspace_via_api(client, "Alpha")
+        response = await client.put(
+            f"/workspaces/{workspace_id}/env-vars",
+            json={"key": "FOO", "value": "bar", "custom_command_id": str(foreign_command_id)},
+        )
+
+    assert response.status_code == 400
+
+
+async def test_same_key_scoped_to_two_different_commands_persists_independently(workspace_context):
+    user, service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        workspace_id = await _create_workspace_via_api(client, "Scoped")
+
+        command_a = uuid4()
+        command_b = uuid4()
+        service.register_custom_command(command_a, UUID(workspace_id), name="API")
+        service.register_custom_command(command_b, UUID(workspace_id), name="Worker")
+
+        first = await client.put(
+            f"/workspaces/{workspace_id}/env-vars",
+            json={"key": "PORT", "value": "8000", "custom_command_id": str(command_a)},
+        )
+        second = await client.put(
+            f"/workspaces/{workspace_id}/env-vars",
+            json={"key": "PORT", "value": "9000", "custom_command_id": str(command_b)},
+        )
+        listed = await client.get(f"/workspaces/{workspace_id}/env-vars")
+
+    assert first.status_code == 200
+    assert first.json()["scope"] == "service"
+    assert first.json()["custom_command_id"] == str(command_a)
+    assert second.status_code == 200
+    assert second.json()["custom_command_id"] == str(command_b)
+
+    scoped_rows = [row for row in listed.json() if row["key"] == "PORT"]
+    assert len(scoped_rows) == 2
+    assert {row["custom_command_id"] for row in scoped_rows} == {
+        str(command_a),
+        str(command_b),
+    }
+
+
+async def test_delete_env_var_with_custom_command_id_only_removes_that_scope(workspace_context):
+    user, service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        workspace_id = await _create_workspace_via_api(client, "DeleteScope")
+
+        command_id = uuid4()
+        service.register_custom_command(command_id, UUID(workspace_id))
+
+        await client.put(
+            f"/workspaces/{workspace_id}/env-vars", json={"key": "FOO", "value": "wide"}
+        )
+        await client.put(
+            f"/workspaces/{workspace_id}/env-vars",
+            json={"key": "FOO", "value": "scoped", "custom_command_id": str(command_id)},
+        )
+        delete_response = await client.delete(
+            f"/workspaces/{workspace_id}/env-vars",
+            params={"key": "FOO", "custom_command_id": str(command_id)},
+        )
+        listed = await client.get(f"/workspaces/{workspace_id}/env-vars")
+
+    assert delete_response.status_code == 200
+    rows = listed.json()
+    assert len(rows) == 1
+    assert rows[0]["custom_command_id"] is None
+    assert rows[0]["scope"] == "workspace"
+
+
+async def test_bulk_delete_env_vars_reports_deleted_and_missing(workspace_context):
+    user, service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        workspace_id = await _create_workspace_via_api(client, "BulkDelete")
+        await client.put(
+            f"/workspaces/{workspace_id}/env-vars", json={"key": "ONE", "value": "1"}
+        )
+        await client.put(
+            f"/workspaces/{workspace_id}/env-vars", json={"key": "TWO", "value": "2"}
+        )
+
+        response = await client.post(
+            f"/workspaces/{workspace_id}/env-vars/bulk-delete",
+            json={"keys": ["ONE", "TWO", "THREE"]},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert sorted(payload["deleted"]) == ["ONE", "TWO"]
+    assert payload["missing"] == ["THREE"]
+
+
+async def test_env_template_lists_keys_without_values_and_groups_by_scope(workspace_context):
+    user, service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        workspace_id = await _create_workspace_via_api(client, "Template")
+
+        command_id = uuid4()
+        service.register_custom_command(command_id, UUID(workspace_id), name="API Server")
+
+        await client.put(
+            f"/workspaces/{workspace_id}/env-vars",
+            json={"key": "DATABASE_URL", "value": "postgres://secret-host/db"},
+        )
+        await client.put(
+            f"/workspaces/{workspace_id}/env-vars",
+            json={"key": "PORT", "value": "8000", "custom_command_id": str(command_id)},
+        )
+        response = await client.get(f"/workspaces/{workspace_id}/env-vars/template")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/plain")
+    body = response.text
+    assert "DATABASE_URL=" in body
+    assert "PORT=" in body
+    assert "postgres://secret-host/db" not in body
+    assert "# Workspace-wide" in body
+    assert "# Service: API Server" in body
 
 
 async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
@@ -704,3 +1105,47 @@ async def test_reprovision_marks_error_when_the_runtime_still_fails():
         await service.reprovision(workspace.id, owner_id)
 
     assert workspace.status == "error"
+
+
+# --- PATCH env_file_path ---------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "candidate",
+    ["/abs", "../x", "dir/", ".git/x"],
+)
+async def test_patch_env_file_path_rejects_invalid_values(workspace_context, candidate):
+    user, _service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        created = await client.post(
+            "/workspaces",
+            json={"name": "Demo", "repo_url": "https://github.com/example/demo"},
+        )
+        workspace_id = created.json()["id"]
+        response = await client.patch(
+            f"/workspaces/{workspace_id}",
+            json={"env_file_path": candidate},
+        )
+
+    assert response.status_code == 422
+
+
+async def test_patch_env_file_path_accepts_and_echoes_a_valid_value(workspace_context):
+    user, _service, _tmp_path = workspace_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post("/auth/login", json={"email": user.email, "password": "password"})
+        created = await client.post(
+            "/workspaces",
+            json={"name": "Demo", "repo_url": "https://github.com/example/demo"},
+        )
+        workspace_id = created.json()["id"]
+        response = await client.patch(
+            f"/workspaces/{workspace_id}",
+            json={"env_file_path": "apps/api/.env"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["env_file_path"] == "apps/api/.env"

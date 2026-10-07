@@ -12,12 +12,14 @@ import {
   LayoutDashboard,
   ListChecks,
   Monitor,
+  Settings,
   Terminal,
   Users,
   Workflow,
 } from "lucide-react";
 
 import { useAuth } from "../auth/context";
+import { useLlmStatus } from "../platform/llmStatus";
 
 export type AppSidebarProps = {
   projectId?: string;
@@ -35,6 +37,8 @@ type NavItem = {
   icon: ComponentType<{ className?: string }>;
   to: string;
   end?: boolean;
+  /** Trailing dot, used to flag that the platform still needs configuring. */
+  badge?: "warn";
 };
 
 function workspaceNav(base: string): NavItem[] {
@@ -56,6 +60,7 @@ function workspaceNav(base: string): NavItem[] {
 const TOP_NAV: NavItem[] = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/", end: true },
   { label: "Projects", icon: FolderKanban, to: "/projects", end: true },
+  { label: "Settings", icon: Settings, to: "/settings", end: true },
 ];
 
 export function AppSidebar({
@@ -68,6 +73,9 @@ export function AppSidebar({
 }: AppSidebarProps) {
   const { user, logout } = useAuth();
   const navigate = useNavigate();
+  // Skipping first-run setup persists, so this dot is the standing reminder that agent runs
+  // are still blocked. The sidebar is on every page, which makes it the cheapest place for it.
+  const { state: llmState } = useLlmStatus();
 
   async function handleLogout() {
     await logout();
@@ -88,7 +96,14 @@ export function AppSidebar({
       <nav className="flex flex-1 flex-col gap-1 overflow-y-auto">
         <SectionLabel>Menu</SectionLabel>
         {TOP_NAV.map((item) => (
-          <SidebarLink key={item.label} item={item} />
+          <SidebarLink
+            key={item.label}
+            item={
+              item.to === "/settings" && llmState === "unconfigured"
+                ? { ...item, badge: "warn" }
+                : item
+            }
+          />
         ))}
 
         {projectId && (
@@ -148,7 +163,7 @@ export function AppSidebar({
 }
 
 function SidebarLink({ item }: { item: NavItem }) {
-  const { label, icon: Icon, to, end } = item;
+  const { label, icon: Icon, to, end, badge } = item;
   return (
     <NavLink
       to={to}
@@ -163,6 +178,12 @@ function SidebarLink({ item }: { item: NavItem }) {
     >
       <Icon className="h-4 w-4 shrink-0" aria-hidden="true" />
       <span className="truncate">{label}</span>
+      {badge === "warn" && (
+        <span
+          className="ml-auto h-1.5 w-1.5 shrink-0 rounded-full bg-warn"
+          aria-label="No language model configured"
+        />
+      )}
     </NavLink>
   );
 }

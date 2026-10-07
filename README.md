@@ -33,7 +33,7 @@ The workspace dashboard exposes each capability as a surface (tab):
 | **Pull Requests** | Open and list GitHub pull requests from a worktree branch via the GitHub REST API (cached locally). Other providers: push the branch and open the MR/PR on the host. |
 | **Spec (SDD)** | Run the GitHub Spec Kit pipeline (`constitution → specify → clarify → plan → analyze → tasks → implement`) with human review gates between phases. |
 | **Agents** | Run an AI coding agent against the sandbox; stream thinking/tool-call events live over WebSocket, review the files it changed, and stop a run mid-flight. |
-| **Editor** | Launch `code-server` (VS Code in the browser) bound to the workspace. |
+| **Editor** | `code-server` (VS Code in the browser) embedded directly in the dashboard, served through the preview proxy on a stable per-workspace hostname. Pick which worktree to open, reload the frame, or pop it out into its own tab. |
 | **Terminal** | Full interactive PTY shell into the sandbox over WebSocket (`xterm.js`). |
 | **Preview** | After clone, auto-detect the project toolchain via `mise` and install dependencies (environment only — the app is not started). A **Run App** button then runs the `dev` task on demand; the open port is detected and served through a signed preview proxy. |
 | **Files** | Browse the workspace tree, read, upload, and manage files. |
@@ -41,7 +41,30 @@ The workspace dashboard exposes each capability as a surface (tab):
 | **Audit & Notifications** | Every workspace action is recorded to an audit log; long-running events (agent runs, pushes, PRs, spec phases) raise notifications. |
 
 Supporting platform features: cookie-based authentication (the first registered user becomes the
-platform owner), project/team membership and roles, and a dashboard overview across workspaces.
+platform owner), project/team membership and roles, a dashboard overview across workspaces, and
+**Global Settings** (below) for the platform-wide LLM connection.
+
+### Global LLM settings
+
+The agent needs an **OpenAI-compatible** endpoint. Rather than only reading it from the server's
+environment, Enigma stores it in the database so it can be set from the UI:
+
+- **Who** — only the platform owner (the first registered user) can read or change it. Everyone
+  else can see *whether* it is configured, so the UI can explain why agent runs are blocked.
+- **Where** — **Settings** in the sidebar (`/settings`). On first run, an authenticated user is
+  sent to `/setup` until an endpoint is saved; that prompt is skippable.
+- **What** — base URL, model, and an optional API key (local runtimes such as Ollama and LM
+  Studio need none). The key is Fernet-encrypted with `WORKSPACE_ENV_ENCRYPTION_KEY` and is never
+  returned by the API — the UI shows a mask and never prefills it. **Test connection** probes
+  `GET {base_url}/models` (falling back to a one-token chat completion) and populates the model
+  dropdown.
+- **Precedence** — **stored settings → `OPENHANDS_LLM_*` environment → refuse.** Existing
+  env-configured deployments keep working untouched. With nothing configured, creating an agent
+  run returns **503** with an actionable message instead of silently using the mock provider
+  (set `AGENT_ALLOW_MOCK_PROVIDER=true` to opt back into the mock).
+
+A stored configuration always drives the OpenHands/LiteLLM provider, because it is the only one
+that accepts a base URL — the direct `openai` provider hardcodes `api.openai.com`.
 
 ## How it works
 
@@ -140,6 +163,15 @@ Key points:
   the background (toolchain + dependencies only). The app's `dev` task is started on demand from the
   **Run App** button; the panel then polls for the open port and exposes it through the preview proxy
   on port 8001 using short-lived signed URLs. An app that was run auto-resumes after a sandbox sleep.
+- **Editor** runs `code-server` on port 13337 inside the sandbox and serves it through the same
+  proxy, on a **stable** hostname (`editor-<token>.<proxy-host>`) minted once per workspace. The
+  hostname has to be stable because code-server keeps its whole workbench state (open editors,
+  layout, settings) in `localStorage`, which is keyed by origin — a rotating capability URL would
+  reset the editor about once an hour. Because the URL therefore carries no credential, the browser
+  is authorised instead by a short-lived, signed, `HttpOnly` grant cookie: the dashboard loads the
+  iframe once with a one-shot grant in the query string, the proxy exchanges it for the cookie, and
+  every later request (including code-server's WebSocket) rides that. The cookie is `Partitioned`
+  (CHIPS) because it is always set on a cross-site iframe.
 
 ### Git strategy
 
@@ -243,7 +275,7 @@ Key points:
 |---|---|---|
 | Frontend (Vite + React) | 5173 | Hot-reload in dev mode |
 | Backend (FastAPI) | 8000 | Auto-reload with `--reload`; API docs at `/docs` |
-| Preview proxy | 8001 | Proxies Daytona sandbox preview URLs |
+| Preview proxy | 8001 | Proxies Daytona sandbox preview URLs and the embedded editor |
 | PostgreSQL 16 | 5432 | Persisted in `postgres_data` volume |
 | Redis 7 | 6379 | Persisted in `redis_data` volume |
 
@@ -282,10 +314,11 @@ Copy `.env.example` to `.env`. Key variables:
 | `DAYTONA_DEFAULT_SNAPSHOT` | Recommended | Custom snapshot name (e.g. `enigma-mise-code`) — needed for preview/editor/SDD (see below) |
 | `DAYTONA_AUTO_STOP_MINUTES` | No | Idle minutes before a sandbox auto-stops (default `30`) |
 | `AUTH_SECRET_KEY` | Yes (prod) | Secret for signing session tokens — change from default in production |
-| `WORKSPACE_ENV_ENCRYPTION_KEY` | Yes (prod) | Fernet key for encrypting workspace env vars and repo tokens |
-| `AGENT_PROVIDER` | Yes | Agent engine: `openhands`, `openai`, or `auto` (falls back to a mock if unset) |
-| `OPENHANDS_LLM_BASE_URL` / `OPENHANDS_LLM_API_KEY` / `OPENHANDS_LLM_MODEL` | If `openhands` | OpenAI-compatible endpoint config for the OpenHands agent |
-| `OPENAI_API_KEY` / `OPENAI_MODEL` | If `openai` | Credentials for the direct OpenAI Responses provider |
+| `WORKSPACE_ENV_ENCRYPTION_KEY` | Yes (prod) | Fernet key for encrypting workspace env vars, repo tokens, and the global LLM API key. Rotating it invalidates all three |
+| `AGENT_PROVIDER` | No | Agent engine: `openhands`, `openai`, or `auto`. **Fallback only** — the global LLM settings stored from the UI take precedence |
+| `OPENHANDS_LLM_BASE_URL` / `OPENHANDS_LLM_API_KEY` / `OPENHANDS_LLM_MODEL` | No | Fallback OpenAI-compatible endpoint. Overridden by the DB-backed global LLM settings |
+| `OPENAI_API_KEY` / `OPENAI_MODEL` | If `openai` | Credentials for the direct OpenAI Responses provider (cannot take a custom base URL) |
+| `AGENT_ALLOW_MOCK_PROVIDER` | No | Allow the mock agent when nothing is configured (default `false`, so runs fail with a clear 503 instead) |
 | `MAX_WORKTREES_PER_WORKSPACE` | No | Feature-worktree cap per workspace (default `5`) |
 | `EDITOR_AUTO_INSTALL` | No | `false` when `code-server` is baked into the snapshot |
 

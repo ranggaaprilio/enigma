@@ -23,6 +23,7 @@ const created: WorkspaceResponse = {
   created_at: "2026-09-04T00:00:00Z",
   updated_at: "2026-09-04T00:00:00Z",
   viewer_role: "owner",
+  env_file_path: null,
 };
 
 const template = {

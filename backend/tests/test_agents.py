@@ -530,7 +530,7 @@ class TestAgentFileChange:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
         file_change = await service.create_file_change(
             run_id=run.id,
             path="src/main.py",
@@ -586,7 +586,7 @@ class TestAgentFileChange:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
         await service.create_file_change(run.id, "a.py", "created", "call_1")
         await service.create_file_change(run.id, "b.py", "modified", "call_2")
         await service.create_file_change(run.id, "c.py", "deleted", None)
@@ -637,7 +637,7 @@ class TestAgentFileChange:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
         await service.create_file_change(run.id, "x.py", "created", "tool_a")
         await service.create_file_change(run.id, "y.py", "modified", "tool_a")
         await service.create_file_change(run.id, "z.py", "deleted", "tool_b")
@@ -691,7 +691,7 @@ class TestAgentFileChange:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
         await service.create_file_change(run.id, "d.py", "created", "call_1")
         await session.commit()
 
@@ -728,10 +728,19 @@ def override_get_db_session(session):
 
 
 def override_get_agent_service(session, session_maker):
-    """Factory to create a get_agent_service override that uses the test session."""
+    """Factory to create a get_agent_service override that uses the test session.
+
+    ``agent_allow_mock_provider=True`` is the explicit opt-in these tests need: with no
+    ``platform_llm_settings`` row and no ``OPENHANDS_LLM_*`` env vars, ``provider_for_run``
+    refuses to start a run rather than quietly answering with the mock provider.
+    """
 
     async def _override() -> AgentService:
-        return AgentService(session=session, session_maker=session_maker, settings=Settings())
+        return AgentService(
+            session=session,
+            session_maker=session_maker,
+            settings=Settings(agent_allow_mock_provider=True),
+        )
 
     return _override
 
@@ -743,7 +752,7 @@ def override_get_agent_session_service(session, session_maker, settings=None):
         return AgentService(
             session=session,
             session_maker=session_maker,
-            settings=settings or Settings(),
+            settings=settings or Settings(agent_allow_mock_provider=True),
         )
 
     return _override
@@ -824,7 +833,7 @@ class TestFileChangesAPI:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
         await service.create_file_change(run.id, "src/main.py", "created", "tool_call_1")
         await service.create_file_change(run.id, "src/utils.py", "modified", "tool_call_2")
         await service.create_file_change(run.id, "README.md", "deleted", None)
@@ -968,7 +977,7 @@ class TestFileChangesAPI:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
         for i in range(55):
             await service.create_file_change(run.id, f"file{i}.py", "modified")
         await session.commit()
@@ -1128,7 +1137,7 @@ class TestFileChangesAPI:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
         change = await service.create_file_change(
             run.id, "src/schema_test.py", "modified", "tool_schema_123"
         )
@@ -1357,7 +1366,7 @@ class TestFileChangeComputation:
         session.add(workspace)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
 
         async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(
@@ -1410,7 +1419,7 @@ class TestFileChangeComputation:
         session.add(workspace)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
 
         async def mock_status(self, workspace_id, owner_id, *, worktree_path=None):
             return GitStatus(cloned=False, branch=None, is_clean=True, files=[])
@@ -1464,7 +1473,7 @@ class TestFileChangeComputation:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
 
         baseline = [GitFileStatus(path="a.py", status="Added")]
 
@@ -1534,7 +1543,7 @@ class TestFileChangeComputation:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
 
         baseline = []
 
@@ -1601,7 +1610,7 @@ class TestFileChangeComputation:
         session.add(run)
         await session.flush()
 
-        service = AgentService(session, session_maker, Settings())
+        service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
 
         for i in range(55):
             await service.create_file_change(run.id, f"file{i}.py", "modified")
@@ -1665,7 +1674,7 @@ class TestAgentRunLifecycle:
         user, workspace = await self._setup_workspace(session, session_maker, "lifecycle")
 
         try:
-            service = AgentService(session, session_maker, Settings())
+            service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
 
             run = AgentRun(
                 workspace_id=workspace.id,
@@ -1817,7 +1826,7 @@ class TestAgentRunLifecycle:
         user, workspace = await self._setup_workspace(session, session_maker, "errorpartial")
 
         try:
-            service = AgentService(session, session_maker, Settings())
+            service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
 
             run = AgentRun(
                 workspace_id=workspace.id,
@@ -1904,7 +1913,7 @@ class TestAgentRunLifecycle:
                 mock_status,
             )
 
-            service = AgentService(session, session_maker, Settings())
+            service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
 
             baseline = await service._capture_baseline(workspace.id, session)
             assert baseline == []
@@ -2007,7 +2016,7 @@ class TestAgentRunLifecycle:
         user, workspace = await self._setup_workspace(session, session_maker, "crosscut")
 
         try:
-            service = AgentService(session, session_maker, Settings())
+            service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
 
             run = AgentRun(
                 workspace_id=workspace.id,
@@ -2401,7 +2410,7 @@ class TestAgentSessions:
         user, workspace = await self._setup(session, session_maker, "sessautotitle")
         monkeypatch.setattr("app.services.agents.asyncio.create_task", _fake_create_task)
         try:
-            service = AgentService(session, session_maker, Settings())
+            service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
             agent_session = AgentSession(
                 workspace_id=workspace.id, user_id=user.id, title=None, status="active"
             )
@@ -2532,7 +2541,7 @@ class TestAgentSessions:
         session, session_maker = db_session
         user, workspace = await self._setup(session, session_maker, "sessctx")
         try:
-            service = AgentService(session, session_maker, Settings())
+            service = AgentService(session, session_maker, Settings(agent_allow_mock_provider=True))
             agent_session = AgentSession(
                 workspace_id=workspace.id, user_id=user.id, title="ctx", status="active"
             )

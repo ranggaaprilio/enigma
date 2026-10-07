@@ -1,4 +1,4 @@
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,6 +11,7 @@ from app.core.security import hash_password
 from app.main import app
 from app.models import EditorSession, User, Workspace
 from app.services.editor import EditorService, EditorSessionNotFoundError
+from app.services.editor_alias import editor_alias_url, editor_prime_url, is_editor_alias_label
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -43,12 +44,20 @@ class FakeEditorService:
         self.workspace = workspace
         self.session: EditorSession | None = None
         self.stopped = False
+        self.started_with_worktree_id: UUID | None = None
 
-    async def start_or_reuse(self, workspace_id: UUID, user_id: UUID) -> EditorSession:
+    async def start_or_reuse(
+        self, workspace_id: UUID, user_id: UUID, worktree_id: UUID | None = None
+    ) -> EditorSession:
         self._ensure_workspace(workspace_id, user_id)
         if self.session is None or self.session.status != "active":
             self.session = self._session("active")
+        self.session.worktree_id = worktree_id
+        self.started_with_worktree_id = worktree_id
         return self.session
+
+    async def prime_url(self, editor_session: EditorSession) -> str:
+        return f"{editor_session.url}&__enigma_cap=grant-token"
 
     async def status(self, workspace_id: UUID, user_id: UUID) -> EditorSession | None:
         self._ensure_workspace(workspace_id, user_id)
@@ -72,13 +81,12 @@ class FakeEditorService:
             id=uuid4(),
             workspace_id=self.workspace.id,
             user_id=self.user.id,
-            url="http://localhost:8080/?folder=/workspace/demo",
+            url="https://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo",
             status=status,
             process_id=1234,
             bind_host="127.0.0.1",
             bind_port=13337,
-            token_hash="token-hash",
-            token_expires_at=now + timedelta(hours=1),
+            folder="/workspace/demo",
             started_at=now,
             last_active_at=now,
         )
@@ -148,9 +156,16 @@ async def test_start_status_and_stop_editor_session(editor_context):
     assert inactive.json() == {"status": "inactive", "session": None}
     assert created.status_code == 201
     assert created.json()["status"] == "active"
-    assert created.json()["url"] == "http://localhost:8080/?folder=/workspace/demo"
+    assert created.json()["url"] == "https://editor-a1b2c3d4e5f6.localhost:8001/?folder=/workspace/demo"
+    # The stable URL carries no credential; the prime URL is what the iframe actually loads.
+    assert "__enigma_cap" not in created.json()["url"]
+    assert created.json()["prime_url"].endswith("&__enigma_cap=grant-token")
     assert status_response.json()["status"] == "active"
+    assert status_response.json()["session"]["prime_url"].endswith("&__enigma_cap=grant-token")
     assert stopped.json()["status"] == "stopped"
+    # A stopped session has nothing to prime -- the grant would authorise a host that resolves
+    # to no running editor.
+    assert stopped.json()["prime_url"] == ""
     assert service.stopped is True
 
 
@@ -158,10 +173,10 @@ def test_relative_workspace_path_resolves_to_sandbox_home():
     service = EditorService.__new__(EditorService)
     service.settings = get_settings()
 
-    folder = service._editor_url("https://sandbox.proxy.daytona.example", "workspace")
-    command = service._ensure_command("workspace")
+    folder = service._absolute_workspace_path("workspace")
+    command = service._ensure_command(folder)
 
-    assert folder.endswith("?folder=/home/daytona/workspace")
+    assert folder == "/home/daytona/workspace"
     assert "/home/daytona/workspace" in command
 
 
@@ -169,9 +184,35 @@ def test_absolute_workspace_path_is_left_untouched():
     service = EditorService.__new__(EditorService)
     service.settings = get_settings()
 
-    folder = service._editor_url("https://sandbox.proxy.daytona.example?x=1", "/srv/code")
+    assert service._absolute_workspace_path("/srv/code") == "/srv/code"
 
-    assert folder.endswith("&folder=/srv/code")
+
+def test_editor_url_is_a_stable_alias_host_with_no_credential():
+    alias = "editor-a1b2c3d4e5f6"
+    assert is_editor_alias_label(alias)
+
+    url = editor_alias_url(alias, base_url="https://preview.example.com", folder="/srv/code")
+
+    assert url == "https://preview.example.com".replace(
+        "https://", f"https://{alias}."
+    ) + "/?folder=/srv/code"
+    assert "__enigma_cap" not in url
+
+
+def test_prime_url_appends_the_grant_to_the_stable_url():
+    alias = "editor-a1b2c3d4e5f6"
+
+    url = editor_prime_url(
+        alias,
+        base_url="https://preview.example.com",
+        grant="g.r.a.n.t",
+        capability_query_param="__enigma_cap",
+        folder="/srv/code",
+    )
+
+    assert url == (
+        f"https://{alias}.preview.example.com/?folder=/srv/code&__enigma_cap=g.r.a.n.t"
+    )
 
 
 async def test_editor_workspace_ownership_is_enforced(editor_context):

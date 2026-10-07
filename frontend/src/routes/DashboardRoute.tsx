@@ -7,6 +7,7 @@ import { DiffView } from "../components/AgentTab/DiffView";
 import { DashboardShell } from "../components/DashboardShell";
 import { CustomCommandsPanel } from "../components/CustomCommandsPanel";
 import { EditorPanel } from "../components/EditorPanel";
+import { EnvVarEditor } from "../components/EnvVarEditor";
 import { FileManagementPanel } from "../components/FileManagementPanel";
 import { PreviewPanel } from "../components/PreviewPanel";
 import { SpecPanel } from "../components/SpecPanel";
@@ -34,7 +35,6 @@ import {
   commitWorktree,
   connectRepository,
   createWorkspace,
-  deleteWorkspaceEnvVar,
   discardRepositoryChanges,
   fetchRepository,
   setupDevServer,
@@ -54,7 +54,6 @@ import {
   getWorkspaceStatus,
   reprovisionWorkspace,
   updateWorkspace,
-  upsertWorkspaceEnvVar,
   type AuditLogResponse,
   type GitCommitResponse,
   type GitProviderChoice,
@@ -612,10 +611,17 @@ function WorkspaceSettings({
   onEnvVarsChanged: (envVars: WorkspaceEnvVarResponse[]) => void;
 }) {
   return (
-    <section className="mt-4 grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-      <WorkspaceMetadataForm workspace={workspace} onWorkspaceChanged={onWorkspaceChanged} />
-      <EnvVarManager workspace={workspace} envVars={envVars} onEnvVarsChanged={onEnvVarsChanged} />
-    </section>
+    <>
+      <section className="mt-4 grid gap-4">
+        <WorkspaceMetadataForm workspace={workspace} onWorkspaceChanged={onWorkspaceChanged} />
+      </section>
+      <EnvVarEditor
+        workspace={workspace}
+        envVars={envVars}
+        onEnvVarsChanged={onEnvVarsChanged}
+        onWorkspaceChanged={onWorkspaceChanged}
+      />
+    </>
   );
 }
 
@@ -1461,97 +1467,6 @@ function WorkspaceMetadataForm({
         {isSubmitting ? "Saving..." : isChecking ? "Checking sandbox..." : "Save settings"}
       </button>
     </form>
-  );
-}
-
-function EnvVarManager({
-  workspace,
-  envVars,
-  onEnvVarsChanged,
-}: {
-  workspace: WorkspaceResponse;
-  envVars: WorkspaceEnvVarResponse[];
-  onEnvVarsChanged: (envVars: WorkspaceEnvVarResponse[]) => void;
-}) {
-  const [key, setKey] = useState("");
-  const [value, setValue] = useState("");
-  const [error, setError] = useState<string | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
-
-  async function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setError(null);
-
-    if (!key.trim()) {
-      setError("Enter an environment variable key.");
-      return;
-    }
-
-    setIsSubmitting(true);
-    try {
-      const saved = await upsertWorkspaceEnvVar(workspace.id, { key, value });
-      onEnvVarsChanged([saved, ...envVars.filter((envVar) => envVar.key !== saved.key)]);
-      setKey("");
-      setValue("");
-    } catch (caughtError) {
-      setError(caughtError instanceof ApiError ? caughtError.message : "Unable to save variable.");
-    } finally {
-      setIsSubmitting(false);
-    }
-  }
-
-  async function handleDelete(envKey: string) {
-    setError(null);
-    try {
-      await deleteWorkspaceEnvVar(workspace.id, envKey);
-      onEnvVarsChanged(envVars.filter((envVar) => envVar.key !== envKey));
-    } catch (caughtError) {
-      setError(caughtError instanceof ApiError ? caughtError.message : "Unable to delete variable.");
-    }
-  }
-
-  return (
-    <div className="rounded-md border border-line bg-white p-5 shadow-soft">
-      <h3 className="text-base font-semibold">Environment variables</h3>
-      <form className="mt-4 space-y-3" onSubmit={handleSubmit}>
-        <TextInput label="Key" value={key} onChange={setKey} />
-        <TextInput label="Value" type="password" value={value} onChange={setValue} />
-        {error && <ErrorState message={error} />}
-        <button
-          className="rounded-md bg-primary px-4 py-2 font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
-          type="submit"
-          disabled={isSubmitting}
-        >
-          {isSubmitting ? "Saving..." : "Save variable"}
-        </button>
-      </form>
-
-      <div className="mt-5 space-y-2">
-        {envVars.length === 0 && (
-          <div className="rounded-md border border-dashed border-line bg-white p-4 text-sm text-ink/65">
-            No environment variables yet.
-          </div>
-        )}
-        {envVars.map((envVar) => (
-          <div
-            className="flex items-center justify-between gap-3 rounded-md border border-line bg-white p-3"
-            key={envVar.id}
-          >
-            <div className="min-w-0">
-              <p className="truncate font-mono text-sm font-semibold">{envVar.key}</p>
-              <p className="mt-1 font-mono text-sm text-ink/55">{envVar.masked_value}</p>
-            </div>
-            <button
-              className="rounded-md border border-line px-3 py-1 text-sm font-medium transition hover:bg-panel"
-              type="button"
-              onClick={() => void handleDelete(envVar.key)}
-            >
-              Delete
-            </button>
-          </div>
-        ))}
-      </div>
-    </div>
   );
 }
 
