@@ -26,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
+from app.core.lifecycle import ServiceDrainingError, lifecycle
 from app.models import AgentRun, SpecPhase, SpecWorkflow, User, Workspace
 from app.services.agents import AgentService
 from app.services.audit import AuditLogService
@@ -37,6 +38,7 @@ from app.services.repositories import (
     NoChangesToCommitError,
     RepositoryService,
 )
+from app.services.runtime import run_registry
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 logger = structlog.get_logger(__name__)
@@ -252,6 +254,7 @@ class SpecKitService:
         feature_name: str,
         description: str,
     ) -> SpecWorkflow:
+        lifecycle.ensure_accepting_work()
         await self.ensure_initialized(workspace_id, user_id)
 
         # Constitution-first: only skip straight to ``specify`` when the repo already has a
@@ -330,6 +333,7 @@ class SpecKitService:
         user_id: UUID,
         feedback: str | None = None,
     ) -> SpecPhase:
+        lifecycle.ensure_accepting_work()
         if phase_name not in PHASE_PLANS:
             raise InvalidSpecPhaseError(phase_name)
         workspace = await self._get_workspace(workspace_id, user_id)
@@ -376,6 +380,9 @@ class SpecKitService:
         )
         self._finalizers.add(task)
         task.add_done_callback(self._finalizers.discard)
+        # Shared with agent/command runs so a shutdown drain waits for (or cancels and sweeps)
+        # the finalizer too, rather than erroring a phase whose run just finished.
+        run_registry.register(phase.id, task)
         return phase
 
     async def approve_phase(
@@ -422,6 +429,7 @@ class SpecKitService:
         user_id: UUID,
         notes: str,
     ) -> SpecPhase:
+        lifecycle.ensure_accepting_work()
         await self._get_workspace(workspace_id, user_id)
         await self._get_workflow_row(workspace_id, workflow_id)
         phase = await self._get_phase_row(workflow_id, phase_name)
@@ -477,6 +485,7 @@ class SpecKitService:
         The re-run edits spec.md/plan.md/tasks.md to resolve each answered finding, then
         regenerates analysis.md + open-questions.json (advisory: it never gates ``implement``).
         """
+        lifecycle.ensure_accepting_work()
         workspace = await self._get_workspace(workspace_id, user_id)
         workflow = await self._get_workflow_row(workspace_id, workflow_id)
         phase = await self._get_phase_row(workflow_id, "analyze")
@@ -946,6 +955,10 @@ class SpecKitService:
                 )
                 try:
                     await chained.run_phase(ws_id, workflow_id, "specify", user_id)
+                except ServiceDrainingError:
+                    # A deploy is in progress: specify stays pending for the user to start,
+                    # which is a deferral, not a failure worth an error notification.
+                    logger.info("spec_auto_chain_deferred_by_drain", workflow_id=str(workflow_id))
                 except Exception:  # noqa: BLE001 - best-effort chain in a fire-and-forget task
                     workflow_row = await chain_session.get(SpecWorkflow, workflow_id)
                     specify_row = await self._load_phase(chain_session, workflow_id, "specify")

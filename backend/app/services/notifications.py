@@ -1,5 +1,4 @@
 import asyncio
-from collections import defaultdict
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -7,6 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Notification
+from app.services.runtime import EventBus, InMemoryEventBus, event_bus
 
 
 class NotificationNotFoundError(Exception):
@@ -14,28 +14,26 @@ class NotificationNotFoundError(Exception):
 
 
 class NotificationRuntime:
-    def __init__(self) -> None:
-        self.subscribers: dict[UUID, set[asyncio.Queue[dict]]] = defaultdict(set)
+    """Per-user notification fan-out over the shared ``EventBus``."""
+
+    def __init__(self, bus: EventBus | None = None) -> None:
+        self.bus = bus if bus is not None else InMemoryEventBus()
+
+    @staticmethod
+    def _topic(user_id: UUID) -> str:
+        return f"notifications:{user_id}"
 
     def subscribe(self, user_id: UUID) -> asyncio.Queue[dict]:
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        self.subscribers[user_id].add(queue)
-        return queue
+        return self.bus.subscribe(self._topic(user_id))
 
     def unsubscribe(self, user_id: UUID, queue: asyncio.Queue[dict]) -> None:
-        queues = self.subscribers.get(user_id)
-        if not queues:
-            return
-        queues.discard(queue)
-        if not queues:
-            self.subscribers.pop(user_id, None)
+        self.bus.unsubscribe(self._topic(user_id), queue)
 
     async def publish(self, user_id: UUID, payload: dict) -> None:
-        for queue in list(self.subscribers.get(user_id, set())):
-            await queue.put(payload)
+        await self.bus.publish(self._topic(user_id), payload)
 
 
-notification_runtime = NotificationRuntime()
+notification_runtime = NotificationRuntime(event_bus)
 
 
 class NotificationService:

@@ -135,6 +135,7 @@ class CommandRun(Base):
         Index("ix_command_runs_status", "status"),
         Index("ix_command_runs_created_at", "started_at"),
         Index("ix_command_runs_worktree_id", "worktree_id"),
+        Index("ix_command_runs_status_workspace_id", "status", "workspace_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -170,5 +171,7 @@ class CommandRun(Base):
         server_default=func.now(),
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Stable code for why the run ended in `error` (e.g. "interrupted_by_restart").
+    error_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     custom_command: Mapped[CustomCommand] = relationship(back_populates="runs")

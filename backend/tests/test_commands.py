@@ -1328,7 +1328,7 @@ async def test_real_db_command_run_gets_enigma_exports_in_its_env(real_db_sessio
     )
 
     run = await service.create_run(workspace.id, custom_command.id, user.id, confirmed=True)
-    task = service.runtime.tasks.get(run.id)
+    task = service.runtime.get_task(run.id)
     assert task is not None
     await task
 
@@ -1367,7 +1367,7 @@ async def test_real_db_command_run_with_a_bad_template_fails_the_run_cleanly(rea
     )
 
     run = await service.create_run(workspace.id, custom_command.id, user.id, confirmed=True)
-    task = service.runtime.tasks.get(run.id)
+    task = service.runtime.get_task(run.id)
     assert task is not None
     await task
 
