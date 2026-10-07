@@ -10,6 +10,7 @@ import { AppSidebar } from "./AppSidebar";
 import { PresenceAvatars } from "./PresenceAvatars";
 import {
   getNotificationStreamUrl,
+  isServerReady,
   listNotifications,
   markAllNotificationsRead,
   markNotificationRead,
@@ -179,6 +180,8 @@ function NotificationBell({
   const { connectionState } = useReconnectingWebSocket(getNotificationStreamUrl(), {
     enabled: typeof WebSocket !== "undefined",
     maxRetries: Infinity,
+    // During a deploy this stays "reconnecting" (the banner) until the new instance is ready.
+    readinessCheck: isServerReady,
     onMessage: (event) => {
       try {
         const notification = JSON.parse(event.data) as NotificationResponse;

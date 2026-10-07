@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -108,6 +108,79 @@ beforeEach(() => {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+class StreamSocket {
+  static instances: StreamSocket[] = [];
+  static OPEN = 1;
+  onmessage: ((event: MessageEvent) => void) | null = null;
+  onopen: (() => void) | null = null;
+  onclose: ((event: CloseEvent) => void) | null = null;
+  onerror: ((event: Event) => void) | null = null;
+  readyState = 1;
+  url: string;
+
+  constructor(url: string) {
+    this.url = url;
+    StreamSocket.instances.push(this);
+  }
+
+  close() {
+    this.readyState = 3;
+  }
+
+  emit(payload: unknown) {
+    this.onmessage?.({ data: JSON.stringify(payload) } as MessageEvent);
+  }
+}
+
+describe("CustomCommandsPanel run stream", () => {
+  afterEach(() => {
+    StreamSocket.instances = [];
+  });
+
+  it("tells the user to retry when the run was interrupted by a server restart", async () => {
+    vi.stubGlobal("WebSocket", StreamSocket as unknown as typeof WebSocket);
+    stubFetch((url) => {
+      if (url.endsWith("/run")) {
+        return jsonResponse(
+          {
+            id: "r1",
+            custom_command_id: "c1",
+            workspace_id: WORKSPACE_ID,
+            user_id: "u1",
+            worktree_id: null,
+            cwd: null,
+            status: "running",
+            exit_code: null,
+            output: "",
+            started_at: "2026-09-05T00:00:00Z",
+            completed_at: null,
+            error_reason: null,
+          },
+          201,
+        );
+      }
+      return undefined;
+    });
+    render(<CustomCommandsPanel workspace={workspace} />);
+    await screen.findAllByText("Install deps");
+    await userEvent.click(screen.getByRole("button", { name: "Run command" }));
+    await waitFor(() => expect(StreamSocket.instances.length).toBe(1));
+
+    act(() => {
+      StreamSocket.instances[0].emit({
+        type: "status",
+        status: "error",
+        exit_code: null,
+        reason: "interrupted_by_restart",
+      });
+    });
+
+    const notice = await screen.findByTestId("command-run-interrupted");
+    expect(notice).toHaveTextContent("Run interrupted by a server restart — please retry.");
+    expect(notice).toHaveAttribute("role", "status");
+  });
 });
 
 describe("CustomCommandsPanel registry", () => {
