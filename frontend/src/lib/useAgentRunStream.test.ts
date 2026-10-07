@@ -3,6 +3,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { useAgentRunStream } from "./useAgentRunStream";
 
+// These tests model an unexpected drop while the server stays up; the readiness-gated hold
+// during a deploy is covered in useReconnectingWebSocket.test.ts.
+vi.mock("./api", async (importActual) => ({
+  ...(await importActual<typeof import("./api")>()),
+  isServerReady: () => Promise.resolve(true),
+}));
+
 class MockWebSocket {
   static instances: MockWebSocket[] = [];
 
@@ -91,7 +98,7 @@ describe("useAgentRunStream", () => {
     expect(result.current.events).toHaveLength(0);
   });
 
-  it("clears events on reconnect so replayed events are not duplicated", () => {
+  it("clears events on reconnect so replayed events are not duplicated", async () => {
     vi.useFakeTimers();
     stubWebSocket();
     const { result } = renderHook(() => useAgentRunStream(WS, RUN));
@@ -104,7 +111,9 @@ describe("useAgentRunStream", () => {
     act(() => latestSocket().close());
     expect(result.current.connectionState).toBe("reconnecting");
 
-    act(() => vi.advanceTimersByTime(1000));
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
     expect(MockWebSocket.instances.length).toBe(2);
 
     // The backend replays the same event on the new connection; because the hook cleared
@@ -163,18 +172,22 @@ describe("useAgentRunStream", () => {
     expect(result.current.agentError).toBe("boom");
   });
 
-  it("reconnects up to 3 times then reports disconnected", () => {
+  it("reconnects up to 3 times then reports disconnected", async () => {
     vi.useFakeTimers();
     stubWebSocket();
     const { result } = renderHook(() => useAgentRunStream(WS, RUN));
+    const advance = (ms: number) =>
+      act(async () => {
+        await vi.advanceTimersByTimeAsync(ms);
+      });
 
     // Never call onopen, so reconnectAttempt keeps climbing on each drop.
     act(() => latestSocket().close());
-    act(() => vi.advanceTimersByTime(1000)); // attempt 1 → socket 2
+    await advance(1000); // attempt 1 → socket 2
     act(() => latestSocket().close());
-    act(() => vi.advanceTimersByTime(2000)); // attempt 2 → socket 3
+    await advance(2000); // attempt 2 → socket 3
     act(() => latestSocket().close());
-    act(() => vi.advanceTimersByTime(4000)); // attempt 3 → socket 4
+    await advance(4000); // attempt 3 → socket 4
     act(() => latestSocket().close()); // attempt 4 > max → disconnected
 
     expect(MockWebSocket.instances.length).toBe(4);

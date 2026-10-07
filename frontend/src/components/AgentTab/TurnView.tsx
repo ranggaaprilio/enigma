@@ -1,7 +1,19 @@
 import { useState } from "react";
-import { AlertCircle, Bot, ChevronDown, ChevronRight, FileDiff, MessageSquare } from "lucide-react";
+import {
+  AlertCircle,
+  Bot,
+  ChevronDown,
+  ChevronRight,
+  FileDiff,
+  MessageSquare,
+  RotateCcw,
+} from "lucide-react";
 
-import type { AgentEventResponse, AgentRunResponse } from "../../lib/api";
+import {
+  INTERRUPTED_BY_RESTART,
+  type AgentEventResponse,
+  type AgentRunResponse,
+} from "../../lib/api";
 import { CommentThread } from "../comments/CommentThread";
 import { ChangedFiles } from "./ChangedFiles";
 import { Notice } from "./Notice";
@@ -36,6 +48,14 @@ export function TurnView({
   const outputEvents = events.filter((event) => event.event_type === "output_text");
   const outputText = outputEvents.map((event) => event.content).join("");
   const hasProcess = paired.length > 0 || outputEvents.length > 0;
+  // A server restart closed the run out, from the persisted turn or the live terminal event.
+  // That is not the agent's failure, so it gets a retry prompt instead of the error notices.
+  const interrupted =
+    turn.error_reason === INTERRUPTED_BY_RESTART ||
+    events.some(
+      (event) =>
+        event.event_type === "error" && event.metadata?.reason === INTERRUPTED_BY_RESTART,
+    );
 
   return (
     <article className="flex flex-col gap-3" data-testid="agent-turn">
@@ -51,14 +71,21 @@ export function TurnView({
           {isActive ? "Working" : "Response"}
         </div>
 
-        {agentError && (
+        {interrupted && (
+          <Notice tone="warn" testId="turn-interrupted">
+            <RotateCcw className="h-4 w-4" aria-hidden="true" />
+            Run interrupted by a server restart — please retry.
+          </Notice>
+        )}
+
+        {agentError && !interrupted && (
           <Notice tone="danger">
             <AlertCircle className="h-4 w-4" />
             Agent error: {agentError}
           </Notice>
         )}
 
-        {turn.error_message && (
+        {turn.error_message && !interrupted && (
           <Notice tone="danger" testId="turn-error-message">
             <AlertCircle className="h-4 w-4" />
             Run error: {turn.error_message}

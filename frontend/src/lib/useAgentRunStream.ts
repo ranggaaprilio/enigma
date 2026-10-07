@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
   getAgentStreamUrl,
+  isServerReady,
   type AgentEventResponse,
   type AgentRunStatus,
 } from "./api";
@@ -130,6 +131,8 @@ export function useAgentRunStream(
 
   const { connectionState, stopReconnect } = useReconnectingWebSocket(url, {
     enabled,
+    // A deploy drops the socket; wait for the new instance instead of burning retries.
+    readinessCheck: isServerReady,
     onBeforeConnect: handleBeforeConnect,
     onMessage: handleMessage,
   });

@@ -394,7 +394,12 @@ export type AgentRunResponse = {
   started_at: string;
   completed_at: string | null;
   error_message: string | null;
+  /** Stable code for why the run ended in `error`, e.g. {@link INTERRUPTED_BY_RESTART}. */
+  error_reason?: string | null;
 };
+
+/** `error_reason` of a run the server closed out because its process restarted mid-run. */
+export const INTERRUPTED_BY_RESTART = "interrupted_by_restart";
 
 export type AgentRunDetailResponse = AgentRunResponse & {
   events: AgentEventResponse[];
@@ -536,6 +541,8 @@ export type CommandRunResponse = {
   output: string;
   started_at: string;
   completed_at: string | null;
+  /** Stable code for why the run ended in `error`, e.g. {@link INTERRUPTED_BY_RESTART}. */
+  error_reason?: string | null;
 };
 
 export type CommandRunCreatePayload = {
@@ -584,7 +591,7 @@ export type RunPresetResponse = {
 
 export type CommandRunStreamMessage =
   | { type: "output"; content: string }
-  | { type: "status"; status: CommandRunStatus; exit_code: number | null };
+  | { type: "status"; status: CommandRunStatus; exit_code: number | null; reason?: string };
 
 export type TerminalSessionResponse = {
   id: string;
@@ -887,6 +894,26 @@ export async function getHealth(signal?: AbortSignal): Promise<HealthResponse> {
   }
 
   return payload;
+}
+
+/** A `/ready` probe that has not answered by then counts as "not ready". */
+export const READY_PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * Whether the API is accepting traffic (`/ready` answered 200). False while it is draining for
+ * a deploy (503), unreachable, or too slow to answer — i.e. "reconnecting", not an error.
+ */
+export async function isServerReady(): Promise<boolean> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), READY_PROBE_TIMEOUT_MS);
+  try {
+    const response = await fetch(`${getApiBaseUrl()}/ready`, { signal: controller.signal });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {

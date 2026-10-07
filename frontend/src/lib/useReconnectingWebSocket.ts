@@ -9,6 +9,10 @@ export type StreamConnectionState =
 
 export const DEFAULT_RECONNECT_DELAYS = [1000, 2000, 4000];
 export const DEFAULT_MAX_RECONNECT_RETRIES = 3;
+/** How often a held reconnect re-probes `readinessCheck`. */
+export const READY_POLL_INTERVAL_MS = 2000;
+/** Stop holding for readiness after this long and fall back to plain retries. */
+export const READY_WAIT_LIMIT_MS = 60_000;
 
 export interface UseReconnectingWebSocketOptions {
   /** When false (or url is null) no socket is opened. Defaults to true. */
@@ -21,6 +25,12 @@ export interface UseReconnectingWebSocketOptions {
   maxRetries?: number;
   /** Called immediately before each (re)connect — use to reset per-connection state. */
   onBeforeConnect?: () => void;
+  /**
+   * Probed before each reconnect. While it resolves false (or rejects) — e.g. the server is
+   * draining for a deploy — the reconnect is held in "reconnecting" without spending a retry,
+   * re-probing every {@link READY_POLL_INTERVAL_MS} for up to {@link READY_WAIT_LIMIT_MS}.
+   */
+  readinessCheck?: () => Promise<boolean>;
   onOpen?: (socket: WebSocket) => void;
   onMessage?: (event: MessageEvent) => void;
   onError?: (event: Event) => void;
@@ -60,6 +70,7 @@ export function useReconnectingWebSocket(
   const reconnectAttemptRef = useRef(0);
   const intentionalCloseRef = useRef(false);
   const stoppedRef = useRef(false);
+  const readyWaitStartedRef = useRef<number | null>(null);
 
   // Keep the latest options without retriggering the connect effect.
   const optionsRef = useRef(options);
@@ -92,6 +103,28 @@ export function useReconnectingWebSocket(
     socketRef.current = socket;
     intentionalCloseRef.current = false;
 
+    const reconnect = async () => {
+      reconnectTimeoutRef.current = null;
+      const { readinessCheck } = optionsRef.current;
+      if (readinessCheck) {
+        const ready = await readinessCheck().catch(() => false);
+        // Unmounted, re-targeted or stopped while the probe was in flight.
+        if (intentionalCloseRef.current || stoppedRef.current || socketRef.current !== socket) {
+          readyWaitStartedRef.current = null;
+          return;
+        }
+        if (!ready) {
+          readyWaitStartedRef.current ??= Date.now();
+          if (Date.now() - readyWaitStartedRef.current < READY_WAIT_LIMIT_MS) {
+            reconnectTimeoutRef.current = setTimeout(reconnect, READY_POLL_INTERVAL_MS);
+            return;
+          }
+        }
+      }
+      readyWaitStartedRef.current = null;
+      connect();
+    };
+
     socket.onopen = () => {
       setConnectionState("live");
       reconnectAttemptRef.current = 0;
@@ -122,7 +155,7 @@ export function useReconnectingWebSocket(
 
       setConnectionState("reconnecting");
       const delay = reconnectDelays[Math.min(attempt - 1, reconnectDelays.length - 1)];
-      reconnectTimeoutRef.current = setTimeout(connect, delay);
+      reconnectTimeoutRef.current = setTimeout(reconnect, delay);
     };
   }, [url]);
 
@@ -134,12 +167,14 @@ export function useReconnectingWebSocket(
 
     stoppedRef.current = false;
     reconnectAttemptRef.current = 0;
+    readyWaitStartedRef.current = null;
     setReconnectAttempt(0);
     setConnectionState("connecting");
     connect();
 
     return () => {
       intentionalCloseRef.current = true;
+      readyWaitStartedRef.current = null;
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
         reconnectTimeoutRef.current = null;
