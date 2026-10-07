@@ -12,8 +12,9 @@ from app.main import app
 from app.services import rate_limit as rate_limit_module
 from app.services.rate_limit import RedisRateLimiter
 
-REAL_SECRET = "a-real-production-secret-value"
-REAL_ENCRYPTION_KEY = "another-real-encryption-key-value"
+REAL_SECRET = "a-real-production-secret-value-of-sufficient-length"
+# A well-formed Fernet key (32 url-safe base64 bytes) that is not the shipped default.
+REAL_ENCRYPTION_KEY = "q0pn5-5JpCUzSIqhCv4UbIi4_0wqQJ3vAfUZz1i2h9E="
 REAL_METRICS_TOKEN = "a-real-metrics-scrape-token"
 
 
@@ -75,6 +76,39 @@ def test_non_local_environment_with_real_secrets_forces_secure_cookies(monkeypat
         _env_file=None,
     )
     assert settings.auth_cookie_secure is True
+
+
+def test_malformed_encryption_key_is_rejected_even_locally(monkeypatch):
+    """A bad key would otherwise only surface on the first encrypt/decrypt, long after boot."""
+    _clear_secret_env(monkeypatch)
+    with pytest.raises(ValidationError) as exc:
+        Settings(
+            environment="local",
+            workspace_env_encryption_key="not-a-fernet-key",
+            _env_file=None,
+        )
+    assert "workspace_env_encryption_key" in str(exc.value)
+    assert "Fernet" in str(exc.value)
+
+
+def test_non_local_environment_rejects_short_auth_secret(monkeypatch):
+    _clear_secret_env(monkeypatch)
+    with pytest.raises(ValidationError) as exc:
+        Settings(
+            environment="production",
+            auth_secret_key="too-short",
+            workspace_env_encryption_key=REAL_ENCRYPTION_KEY,
+            metrics_token=REAL_METRICS_TOKEN,
+            _env_file=None,
+        )
+    assert "auth_secret_key" in str(exc.value)
+    assert "32" in str(exc.value)
+
+
+def test_local_environment_allows_short_auth_secret(monkeypatch):
+    _clear_secret_env(monkeypatch)
+    settings = Settings(environment="local", auth_secret_key="secret", _env_file=None)
+    assert settings.auth_secret_key == "secret"
 
 
 class FakeRedis:
@@ -202,3 +236,25 @@ async def test_unhandled_exception_still_carries_request_id():
         app.router.routes = [
             route for route in app.router.routes if getattr(route, "path", None) != "/__test_boom"
         ]
+
+
+def test_settings_validation_errors_never_echo_secret_values(monkeypatch):
+    """pydantic appends `input_value=...` to validation errors; a near-miss production key (or the
+    tail of the whole settings dict, for model-level errors) would land in crash-loop logs."""
+    _clear_secret_env(monkeypatch)
+    with pytest.raises(ValidationError) as field_error:
+        Settings(workspace_env_encryption_key="SECRETVALUE123", _env_file=None)
+    assert "SECRETVALUE123" not in str(field_error.value)
+
+    with pytest.raises(ValidationError) as model_error:
+        Settings(
+            environment="production",
+            auth_secret_key="short-SECRET",
+            workspace_env_encryption_key=REAL_ENCRYPTION_KEY,
+            metrics_token="TOKEN-SECRET-VALUE",
+            _env_file=None,
+        )
+    message = str(model_error.value)
+    assert "short-SECRET" not in message
+    assert REAL_ENCRYPTION_KEY[-8:] not in message
+    assert "TOKEN-SECRET-VALUE" not in message

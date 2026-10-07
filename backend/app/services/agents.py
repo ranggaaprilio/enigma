@@ -1,5 +1,4 @@
 import asyncio
-from collections import defaultdict
 from datetime import UTC, datetime
 from uuid import UUID
 
@@ -8,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
+from app.core.lifecycle import lifecycle
 from app.core.pricing import estimate_cost
 from app.models import AgentEvent, AgentFileChange, AgentRun, AgentSession, Workspace
 from app.services.access import require_workspace_access
@@ -18,6 +18,16 @@ from app.services.budgets import BudgetService
 from app.services.daytona_runtime import get_daytona_runtime
 from app.services.notifications import NotificationService
 from app.services.repositories import RepositoryService
+from app.services.runtime import (
+    EventBus,
+    InMemoryEventBus,
+    InMemoryRunRegistry,
+    RunLock,
+    RunRegistry,
+    event_bus,
+    run_registry,
+)
+from app.services.runtime import run_lock as default_run_lock
 from app.services.workspaces import WorkspaceSecretCipher
 
 ACTIVE_RUN_STATUSES = ("thinking", "executing")
@@ -49,50 +59,41 @@ class AgentSessionArchivedError(Exception):
 
 
 class AgentRuntime:
-    def __init__(self) -> None:
-        self.stop_events: dict[UUID, asyncio.Event] = {}
-        self.subscribers: dict[UUID, set[asyncio.Queue[dict]]] = defaultdict(set)
-        self.tasks: dict[UUID, asyncio.Task] = {}
-        self.providers: dict[UUID, AgentProvider] = {}
+    """Agent-run view over the process-local run state seam (see ``app.services.runtime``)."""
+
+    def __init__(
+        self, registry: RunRegistry | None = None, bus: EventBus | None = None
+    ) -> None:
+        self.registry = registry if registry is not None else InMemoryRunRegistry()
+        self.bus = bus if bus is not None else InMemoryEventBus()
+
+    @staticmethod
+    def _topic(run_id: UUID) -> str:
+        return f"agent_run:{run_id}"
 
     def register_run(self, run_id: UUID, task: asyncio.Task, stop_event: asyncio.Event) -> None:
-        self.tasks[run_id] = task
-        self.stop_events[run_id] = stop_event
-        task.add_done_callback(lambda _task: self.forget_run(run_id))
+        self.registry.register(run_id, task, stop_event)
 
     def forget_run(self, run_id: UUID) -> None:
-        self.tasks.pop(run_id, None)
-        self.stop_events.pop(run_id, None)
-        self.providers.pop(run_id, None)
+        self.registry.forget(run_id)
 
     def register_provider(self, run_id: UUID, provider: AgentProvider) -> None:
-        self.providers[run_id] = provider
+        self.registry.register_provider(run_id, provider)
 
     def request_stop(self, run_id: UUID) -> None:
-        if stop_event := self.stop_events.get(run_id):
-            stop_event.set()
-        if provider := self.providers.get(run_id):
-            provider.pause()
+        self.registry.request_stop(run_id)
 
     def subscribe(self, run_id: UUID) -> asyncio.Queue[dict]:
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        self.subscribers[run_id].add(queue)
-        return queue
+        return self.bus.subscribe(self._topic(run_id))
 
     def unsubscribe(self, run_id: UUID, queue: asyncio.Queue[dict]) -> None:
-        queues = self.subscribers.get(run_id)
-        if not queues:
-            return
-        queues.discard(queue)
-        if not queues:
-            self.subscribers.pop(run_id, None)
+        self.bus.unsubscribe(self._topic(run_id), queue)
 
     async def publish(self, run_id: UUID, payload: dict) -> None:
-        for queue in list(self.subscribers.get(run_id, set())):
-            await queue.put(payload)
+        await self.bus.publish(self._topic(run_id), payload)
 
 
-agent_runtime = AgentRuntime()
+agent_runtime = AgentRuntime(run_registry, event_bus)
 
 
 def event_payload(event: AgentEvent) -> dict:
@@ -191,11 +192,13 @@ class AgentService:
         session_maker: async_sessionmaker[AsyncSession],
         settings: Settings,
         runtime: AgentRuntime = agent_runtime,
+        run_lock: RunLock = default_run_lock,
     ) -> None:
         self.session = session
         self.session_maker = session_maker
         self.settings = settings
         self.runtime = runtime
+        self.run_lock = run_lock
 
     async def create_run(
         self,
@@ -206,44 +209,49 @@ class AgentService:
         worktree_id: UUID | None = None,
         session_id: UUID | None = None,
     ) -> AgentRun:
+        lifecycle.ensure_accepting_work()
         workspace = await self._get_workspace(workspace_id, user_id, require_drive=True)
-        active = await self.session.execute(
-            select(AgentRun.id).where(
-                AgentRun.workspace_id == workspace.id,
-                AgentRun.status.in_(ACTIVE_RUN_STATUSES),
+        # Check-then-insert under the per-workspace lock so two concurrent requests cannot both
+        # pass the "no active run" guard.
+        async with self.run_lock.hold(f"agent_run:workspace:{workspace.id}"):
+            active = await self.session.execute(
+                select(AgentRun.id).where(
+                    AgentRun.workspace_id == workspace.id,
+                    AgentRun.status.in_(ACTIVE_RUN_STATUSES),
+                )
             )
-        )
-        if active.scalar_one_or_none() is not None:
-            raise AgentRunAlreadyActiveError
+            if active.scalar_one_or_none() is not None:
+                raise AgentRunAlreadyActiveError
 
-        # Block/warn before spending: an enforcing budget over its limit stops the run here.
-        await BudgetService(self.session).assert_within_budget(workspace, user_id)
+            # Block/warn before spending: an enforcing budget over its limit stops the run here.
+            await BudgetService(self.session).assert_within_budget(workspace, user_id)
 
-        provider = await provider_for_run(self.session, self.settings)
-        run = AgentRun(
-            workspace_id=workspace.id,
-            user_id=user_id,
-            worktree_id=worktree_id,
-            session_id=session_id,
-            prompt=prompt,
-            status="thinking",
-            provider=provider.provider_name,
-            model=provider.model_name,
-        )
-        self.session.add(run)
-        await self.session.flush()
+            provider = await provider_for_run(self.session, self.settings)
+            run = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user_id,
+                worktree_id=worktree_id,
+                session_id=session_id,
+                prompt=prompt,
+                status="thinking",
+                provider=provider.provider_name,
+                model=provider.model_name,
+            )
+            self.session.add(run)
+            await self.session.flush()
 
-        if session_id is not None:
-            agent_session = await self.session.get(AgentSession, session_id)
-            if agent_session is not None:
-                # Auto-title from the first turn's prompt, and bump updated_at so the session
-                # sorts as recently active (onupdate only fires when a column actually changes).
-                if not agent_session.title:
-                    agent_session.title = prompt[:SESSION_TITLE_MAX_CHARS]
-                agent_session.updated_at = datetime.now(UTC)
-                self.session.add(agent_session)
+            if session_id is not None:
+                agent_session = await self.session.get(AgentSession, session_id)
+                if agent_session is not None:
+                    # Auto-title from the first turn's prompt, and bump updated_at so the
+                    # session sorts as recently active (onupdate only fires when a column
+                    # actually changes).
+                    if not agent_session.title:
+                        agent_session.title = prompt[:SESSION_TITLE_MAX_CHARS]
+                    agent_session.updated_at = datetime.now(UTC)
+                    self.session.add(agent_session)
 
-        await self.session.commit()
+            await self.session.commit()
         await self.session.refresh(run)
         await AuditLogService(self.session).record(
             user_id=user_id,
@@ -799,6 +807,10 @@ class AgentService:
                         session, run, baseline, worktree_path=working_dir
                     )
             except asyncio.CancelledError:
+                if lifecycle.draining:
+                    # Shutdown cancelled us: leave the row active for the lifespan's
+                    # reconciliation sweep to record as interrupted_by_restart.
+                    raise
                 await self._mark_stopped(run_id)
             except Exception as error:
                 await self._mark_error(run_id, str(error))

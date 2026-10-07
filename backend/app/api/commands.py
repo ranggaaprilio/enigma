@@ -30,6 +30,7 @@ from app.services.commands import (
     CustomCommandInvalidError,
     CustomCommandNotFoundError,
     command_runtime,
+    command_status_frame,
 )
 from app.services.rate_limit import RedisRateLimiter
 from app.services.run_detection import RunDetectionService, RunDetectionUnavailableError
@@ -422,9 +423,7 @@ async def stream_command_run(websocket: WebSocket, workspace_id: UUID, run_id: U
     if run.output:
         await websocket.send_json({"type": "output", "content": run.output})
     if run.status != "running":
-        await websocket.send_json(
-            {"type": "status", "status": run.status, "exit_code": run.exit_code}
-        )
+        await websocket.send_json(command_status_frame(run))
         await websocket.close()
         return
 
@@ -442,13 +441,7 @@ async def stream_command_run(websocket: WebSocket, workspace_id: UUID, run_id: U
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                 return
             if current_run.status != "running":
-                await websocket.send_json(
-                    {
-                        "type": "status",
-                        "status": current_run.status,
-                        "exit_code": current_run.exit_code,
-                    }
-                )
+                await websocket.send_json(command_status_frame(current_run))
                 await websocket.close()
                 return
         while True:

@@ -159,6 +159,7 @@ def agent_run_detail_response(run: AgentRun) -> AgentRunDetailResponse:
         started_at=run.started_at,
         completed_at=run.completed_at,
         error_message=run.error_message,
+        error_reason=run.error_reason,
         events=[agent_event_response(event) for event in run.events],
     )
 

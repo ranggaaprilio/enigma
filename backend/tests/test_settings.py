@@ -51,8 +51,8 @@ def test_non_local_environment_requires_https_or_localhost_preview_proxy():
     with pytest.raises(ValueError, match="daytona_preview_proxy_base_url"):
         Settings(
             environment="production",
-            auth_secret_key="a-real-secret",
-            workspace_env_encryption_key="a-real-key",
+            auth_secret_key="a-real-secret-that-is-at-least-32-characters",
+            workspace_env_encryption_key="q0pn5-5JpCUzSIqhCv4UbIi4_0wqQJ3vAfUZz1i2h9E=",
             metrics_token="a-real-token",
             daytona_preview_proxy_base_url="http://preview.example.com",
         )
@@ -61,8 +61,8 @@ def test_non_local_environment_requires_https_or_localhost_preview_proxy():
 def test_non_local_environment_allows_http_localhost_preview_proxy():
     settings = Settings(
         environment="production",
-        auth_secret_key="a-real-secret",
-        workspace_env_encryption_key="a-real-key",
+        auth_secret_key="a-real-secret-that-is-at-least-32-characters",
+        workspace_env_encryption_key="q0pn5-5JpCUzSIqhCv4UbIi4_0wqQJ3vAfUZz1i2h9E=",
         metrics_token="a-real-token",
         daytona_preview_proxy_base_url="http://localhost:8001",
     )
@@ -72,8 +72,8 @@ def test_non_local_environment_allows_http_localhost_preview_proxy():
 def test_non_local_environment_allows_https_preview_proxy():
     settings = Settings(
         environment="production",
-        auth_secret_key="a-real-secret",
-        workspace_env_encryption_key="a-real-key",
+        auth_secret_key="a-real-secret-that-is-at-least-32-characters",
+        workspace_env_encryption_key="q0pn5-5JpCUzSIqhCv4UbIi4_0wqQJ3vAfUZz1i2h9E=",
         metrics_token="a-real-token",
         daytona_preview_proxy_base_url="https://preview.example.com",
     )

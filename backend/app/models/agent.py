@@ -78,6 +78,7 @@ class AgentRun(Base):
         Index("ix_agent_runs_status", "status"),
         Index("ix_agent_runs_created_at", "started_at"),
         Index("ix_agent_runs_session_id", "session_id"),
+        Index("ix_agent_runs_status_workspace_id", "status", "workspace_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -116,6 +117,8 @@ class AgentRun(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Stable code for why the run ended in `error` (e.g. "interrupted_by_restart").
+    error_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     session: Mapped["AgentSession | None"] = relationship(back_populates="runs")
     events: Mapped[list["AgentEvent"]] = relationship(

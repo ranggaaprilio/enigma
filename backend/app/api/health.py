@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from sqlalchemy import text
 
 from app.core.config import get_settings
+from app.core.lifecycle import lifecycle
 from app.db.session import async_session_maker
 from app.services.daytona_runtime import DaytonaRuntime
 from app.services.redis import get_redis_client
@@ -16,6 +17,10 @@ class HealthResponse(BaseModel):
     database: str
     redis: str
     daytona: str
+
+
+class LiveResponse(BaseModel):
+    status: str
 
 
 class ReadyResponse(BaseModel):
@@ -88,6 +93,16 @@ async def health() -> HealthResponse | JSONResponse:
     return JSONResponse(status_code=503, content=payload.model_dump())
 
 
+@router.get("/live", response_model=LiveResponse)
+async def live() -> LiveResponse:
+    """Liveness probe: is the process up and serving its event loop?
+
+    Deliberately dependency-free -- a Postgres or Redis outage must not get the instance
+    killed and restarted. Use ``/ready`` to gate traffic and ``/health`` for diagnostics.
+    """
+    return LiveResponse(status="ok")
+
+
 @router.get("/ready", response_model=ReadyResponse)
 async def ready() -> ReadyResponse | JSONResponse:
     """Readiness probe: can this instance serve API traffic?
@@ -95,7 +110,18 @@ async def ready() -> ReadyResponse | JSONResponse:
     Checks the hard dependencies required to serve requests — Postgres and Redis. Daytona
     is deliberately excluded: it is an external sandbox provider whose outage should not pull
     the instance out of the load balancer.
+
+    A draining instance (shutting down after SIGTERM) answers 503 without probing, so the load
+    balancer stops routing to it while in-flight work finishes.
     """
+    if lifecycle.draining:
+        return JSONResponse(
+            status_code=503,
+            content=ReadyResponse(
+                status="draining", database="skipped", redis="skipped"
+            ).model_dump(),
+        )
+
     database_status = "ok"
     redis_status = "ok"
 
