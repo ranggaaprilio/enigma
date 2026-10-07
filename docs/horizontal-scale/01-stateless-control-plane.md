@@ -88,3 +88,26 @@ Shared multi-team instances stop shipping insecure defaults.
   message.
 - All process-local registries are reached only through `RunRegistry`/`EventBus`/`RunLock`
   interfaces (grep shows no direct dict access from API/service call sites).
+
+## Implementation Notes (shipped)
+
+What the code looked like when this epic started differed from "Current State" above in a few places: `/ready` (Postgres + Redis) and the default-secret self-check (`Settings.enforce_secure_defaults`, which already forced `auth_cookie_secure`) both existed. The work below fills the remaining gaps.
+
+- **State seam** — `backend/app/services/runtime.py`: `RunRegistry`, `EventBus`, `RunLock` protocols with in-memory implementations. `AgentRuntime`, `CommandRuntime` and `NotificationRuntime` are thin views over them (shared `run_registry` / `event_bus`, namespaced topics). `AgentService.create_run` holds `RunLock` per workspace across its check-then-insert. `openhands_tools._BRIDGES` stays process-local on purpose: each bridge holds its run's event loop for the OpenHands worker thread and is never shared.
+- **Reconciliation** — `backend/app/services/reconciliation.py`. In one transaction, active agent runs, `running` command runs and `running` spec phases (plus the workflows of those phases only — a workflow's own `running` also means "idle between phases") become `error`; runs get `error_reason = "interrupted_by_restart"`, agent runs an `error` event (`metadata.reason`), command runs a status frame with `reason`. Migration `0030_run_interruption` adds `error_reason` to `agent_runs`/`command_runs` and `(status, workspace_id)` indexes.
+- **Lifecycle** — `backend/app/core/lifecycle.py` + `main.py` lifespan:
+  1. startup: reconcile, then install the SIGTERM interposer;
+  2. SIGTERM: `draining = True` → `/ready` 503 `draining`, agent/command/spec entry points raise `ServiceDrainingError` → 503 + `Retry-After: 5`; after `SHUTDOWN_DRAIN_DELAY_SECONDS` (5) the signal is forwarded to uvicorn (a second SIGTERM forwards immediately);
+  3. lifespan shutdown: wait `SHUTDOWN_RUN_GRACE_SECONDS` (15) for in-flight runs and Spec Kit finalizers (all in `run_registry`), cancel the rest (agent runs cancelled while draining are *not* marked `stopped`), reconcile **only the ids this process owned**, then — in a `finally` — close Daytona, dispose the DB engine and restore the signal handler. There is no Redis pool to close — every caller opens and closes its own client.
+  The SIGTERM handler itself only flips the flag; logging, the timer and the hand-off run on the loop via `call_soon_threadsafe`. An auto-chained `specify` refused by a drain stays `pending` (deferred, not failed).
+- **Probes** — `/live` (new, dependency-free liveness), `/ready` (traffic gate, 503 while draining), `/health` unchanged (DB/Redis/Daytona diagnostics, still used by the dashboard's API status label).
+- **Config** — `workspace_env_encryption_key` must be a valid Fernet key in every environment; `auth_secret_key` needs ≥ 32 characters outside `local`. `docker-compose.yml` no longer has secret fallbacks (`${VAR:?}`) and sets `stop_grace_period: 30s`.
+- **Frontend** — `useReconnectingWebSocket` takes an optional `readinessCheck` (`isServerReady` → `/ready`): while it is false a reconnect stays "reconnecting" without spending retries (re-probed every 2 s, up to 60 s). Wired into the agent, command and notification streams. `TurnView` and the command panel show "Run interrupted by a server restart — please retry." for `interrupted_by_restart`.
+
+### Production notes
+
+- **One replica, `Recreate` deploys, until epic 04.** Startup reconciliation treats every active run as orphaned; a rolling deploy that overlaps two replicas would let the new one kill the old one's live runs (the shutdown sweep is already scoped to its own runs). Epic 04 (leases) must switch the startup sweep to expired leases. `RunLock` is also process-local; the durable cross-replica guard is a partial unique index on `agent_runs(workspace_id) WHERE status IN ('thinking','executing')`.
+- **Stop timeout ≥ 30 s** (drain delay + run grace + pool close), e.g. Kubernetes `terminationGracePeriodSeconds: 30`. Point the readiness probe at `/ready` and the liveness probe at `/live`; never at `/health`, which fails when Daytona is down.
+- **HTTPS/WSS only.** Any `ENVIRONMENT` other than `local` forces `Secure` cookies, so the API and its WebSockets must be served over TLS; it also refuses to boot without real `AUTH_SECRET_KEY`, `WORKSPACE_ENV_ENCRYPTION_KEY` and `METRICS_TOKEN`.
+- **No secrets in images or compose files** — provide them through the environment / secret store.
+

@@ -52,7 +52,7 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
   - Connection string must be `postgresql+asyncpg://…`
   - Session: `async_session_maker` with `expire_on_commit=False`
   - All DB access MUST use async/await
-- **Migrations**: Alembic with async engine, 29 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0028_platform_llm_settings`)
+- **Migrations**: Alembic with async engine, 30 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0030_run_interruption`)
 - **Auth**: Cookie-based sessions (`execute_session` cookie), NOT JWT. Set-Cookie on login, cleared on logout.
 - **Logging**: `structlog` (configured in `core/logging.py`)
 - **Testing**: `pytest` with `pytest-asyncio` (auto mode), tests at `backend/tests/`
@@ -140,6 +140,9 @@ OpenAI-compatible base URL, model, and a Fernet-encrypted API key. Owner-only, g
 13. **A stored LLM config always drives the OpenHands provider** — it is the only provider that accepts a `base_url`; `OpenAIResponsesProvider` hardcodes `api.openai.com/v1/responses`. With nothing configured, `create_run` raises `AgentConfigurationError` → **503**; tests that drive the run pipeline without an LLM must pass `Settings(agent_allow_mock_provider=True)`.
 14. **`Settings()` is order-dependent in tests** — importing `openhands.sdk` calls `load_dotenv()`, which injects the repo-root `.env` into `os.environ`. A test that means "nothing is configured" must pin the fields explicitly (see `bare_settings()` in `tests/test_platform_llm_settings.py`), never rely on a bare `Settings()`. This is also why `test_settings.py::test_command_deny_dangerous_defaults_to_true` fails locally in a full-suite run but passes alone.
 15. **Worktree-aware operations** — agent runs and terminals target the active worktree's branch. The frontend tracks it in `localStorage` (`activeWorktree.ts`); the backend resolves it server-side from `worktree_id`. PR creation needs a workspace GitHub token.
+16. **Process-local run state goes through `services/runtime.py`** — run tasks/stop events/providers (`RunRegistry`), stream fan-out (`EventBus`, topics `agent_run:` / `command_run:` / `notifications:`) and the one-active-run-per-workspace guard (`RunLock`). Never add a module-level dict of in-flight work; `tests/test_run_runtime.py` greps for it.
+17. **Startup marks every active run `error`/`interrupted_by_restart`** (`services/reconciliation.py`, called from the lifespan; the post-drain shutdown sweep is scoped to the runs this process owned). The startup sweep assumes **one backend replica**: a second live replica would have its runs killed. Spec Kit finalizers are registered in `run_registry` (keyed by phase id) so the drain covers them. `--reload` restarts count too. New work is refused with 503 while `lifecycle.draining` (`core/lifecycle.py`); `/live` is the dependency-free liveness probe, `/ready` the traffic gate, `/health` diagnostics.
+18. **Compose requires `AUTH_SECRET_KEY` and `WORKSPACE_ENV_ENCRYPTION_KEY` in `.env`** (no fallbacks). The encryption key must be a valid Fernet key in every environment; changing it makes stored credentials undecryptable.
 
 ## Implementation Plan Reference
 
