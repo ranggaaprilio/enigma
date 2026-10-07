@@ -34,8 +34,9 @@ services:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
-      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-local-development-auth-secret-change-me}
-      WORKSPACE_ENV_ENCRYPTION_KEY: ${WORKSPACE_ENV_ENCRYPTION_KEY:-SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc=}
+      # No fallbacks: secrets must come from .env (see .env.example for how to generate them).
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?set AUTH_SECRET_KEY in .env}
+      WORKSPACE_ENV_ENCRYPTION_KEY: ${WORKSPACE_ENV_ENCRYPTION_KEY:?set WORKSPACE_ENV_ENCRYPTION_KEY in .env}
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
       DAYTONA_API_URL: ${DAYTONA_API_URL:-https://app.daytona.io/api}
       DAYTONA_TARGET: ${DAYTONA_TARGET:-}
@@ -58,6 +59,9 @@ services:
       AGENT_ALLOW_MOCK_PROVIDER: ${AGENT_ALLOW_MOCK_PROVIDER:-false}
     ports:
       - "8000:8000"
+    # Above SHUTDOWN_DRAIN_DELAY_SECONDS + SHUTDOWN_RUN_GRACE_SECONDS (5 + 15) plus pool close,
+    # so SIGKILL never lands mid-drain.
+    stop_grace_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,7 +77,7 @@ services:
       context: ./backend
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
-      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-local-development-auth-secret-change-me}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?set AUTH_SECRET_KEY in .env}
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
       DAYTONA_API_URL: ${DAYTONA_API_URL:-https://app.daytona.io/api}
       DAYTONA_TARGET: ${DAYTONA_TARGET:-}
