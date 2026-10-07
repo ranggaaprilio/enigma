@@ -29,8 +29,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.models import CustomCommand, PreviewSession, Workspace, WorkspaceService, WorkspaceWorktree
+from app.models.workspace_service import WORKSPACE_SERVICE_ACTIVE_STATUSES
 from app.services.audit import AuditLogService
-from app.services.commands import load_workspace_env, redactable_env_values
 from app.services.daytona_runtime import (
     DaytonaRuntime,
     DaytonaRuntimeError,
@@ -53,14 +53,22 @@ from app.services.service_scripts import (
     parse_probe_output,
     service_paths,
 )
+from app.services.workspace_env import (
+    EnvPrepareError,
+    load_all_values,
+    prepare_launch_env,
+    redactable_env_values,
+)
 from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
 
 MISE_CONFIG_FILES = ("mise.toml", ".mise.toml", "mise/config.toml", ".config/mise/config.toml")
 
-# A row in any of these statuses is "alive" for cap/port-conflict purposes.
-ACTIVE_STATUSES = ("installing", "starting", "running")
+# A row in any of these statuses is "alive" for cap/port-conflict purposes. Re-exported alias
+# of ``models.workspace_service.WORKSPACE_SERVICE_ACTIVE_STATUSES`` (the canonical home, so
+# ``workspace_env.py`` -- which this module imports from -- can use it without a cycle).
+ACTIVE_STATUSES = WORKSPACE_SERVICE_ACTIVE_STATUSES
 
 
 class WorkspaceServiceWorkspacePathError(Exception):
@@ -109,10 +117,16 @@ class WorkspaceServiceManager:
     # ------------------------------------------------------------------
 
     async def list(
-        self, workspace_id: UUID, user_id: UUID
+        self, workspace_id: UUID, user_id: UUID, *, probe: bool = True
     ) -> tuple[list[WorkspaceService], WorkspaceService]:
         """Every service row, refreshed against the sandbox in one probe, with preview
-        sessions reconciled to match. Returns ``(rows, primary_row)``."""
+        sessions reconciled to match. Returns ``(rows, primary_row)``.
+
+        ``probe=False`` (Epic 13's composition endpoint, polled every few seconds by the
+        frontend) skips the sandbox round-trip entirely and returns the rows exactly as last
+        recorded -- the default (``True``) preserves every pre-Epic-13 caller's behaviour
+        unchanged.
+        """
         workspace = await self._get_workspace(workspace_id, user_id)
         await self._sync_definitions(workspace)
         rows = await self._all_rows(workspace)
@@ -120,6 +134,9 @@ class WorkspaceServiceManager:
         if not any(row.id == primary.id for row in rows):
             rows.append(primary)
         rows.sort(key=lambda row: row.created_at or datetime.min.replace(tzinfo=UTC))
+
+        if not probe:
+            return rows, primary
 
         probe_map, target_ports = await self._probe_rows(workspace, rows, primary)
         claimed_ports = {row.port for row in rows if row.port is not None}
@@ -229,7 +246,7 @@ class WorkspaceServiceManager:
         content = result.stdout or ""
         # A log's content is user-visible: redact the same way the log-stream WebSocket does,
         # so a poll of this endpoint can never leak a secret the stream already hides.
-        env = await load_workspace_env(self.session, self.settings, workspace_id)
+        env = await load_all_values(self.session, self.settings, workspace_id)
         return redact_secrets(content, *redactable_env_values(env))
 
     async def log_paths(self, workspace_id: UUID, service_id: UUID, user_id: UUID) -> ServicePaths:
@@ -265,6 +282,10 @@ class WorkspaceServiceManager:
             "last_seen_at": row.last_seen_at,
             "preview_session_id": preview.id if preview is not None else None,
             "public_url": preview.public_url if preview is not None else None,
+            "health_status": row.health_status,
+            "health_checked_at": row.health_checked_at,
+            "health_path": command.health_path if command is not None else None,
+            "is_entry_point": command.is_entry_point if command is not None else False,
         }
 
     async def to_response_list(
@@ -543,7 +564,7 @@ class WorkspaceServiceManager:
         is_primary: bool,
     ) -> WorkspaceService:
         command = await self._command_for(row)
-        checkout, _branch, resolved_worktree_id = await resolve_worktree(
+        checkout, branch, resolved_worktree_id = await resolve_worktree(
             self.session, workspace, worktree_id
         )
         launch_cwd = await self._entry_cwd(workspace, checkout, command)
@@ -554,6 +575,26 @@ class WorkspaceServiceManager:
         if reason is not None:
             row.status = "error"
             row.last_error = reason
+            row.worktree_id = resolved_worktree_id
+            self._add(row)
+            await self.session.commit()
+            return row
+
+        try:
+            env = await prepare_launch_env(
+                self.session,
+                self.settings,
+                self.runtime,
+                workspace,
+                checkout=checkout,
+                custom_command_id=command.id if command else None,
+                timeout=self.settings.dev_server_command_timeout_seconds,
+                service_id=row.id,
+                branch=branch,
+            )
+        except EnvPrepareError as error:
+            row.status = "error"
+            row.last_error = str(error)
             row.worktree_id = resolved_worktree_id
             self._add(row)
             await self.session.commit()
@@ -589,6 +630,7 @@ class WorkspaceServiceManager:
                 workspace,
                 script,
                 cwd=launch_cwd,
+                env=env or None,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
         except DaytonaRuntimeError as error:
@@ -655,6 +697,15 @@ class WorkspaceServiceManager:
             return None
         return command.port or infer_port(command.command)
 
+    async def _health_path_for(self, row: WorkspaceService) -> str | None:
+        """The owning command's configured health-check path, or `None` for the built-in mise
+        service (which has no command, hence no user-editable settings) or a registry command
+        that never set one -- both fall back to a bare TCP connect for readiness."""
+        command = await self._command_for(row)
+        if command is None:
+            return None
+        return command.health_path
+
     async def _probe_rows(
         self,
         workspace: Workspace,
@@ -664,18 +715,22 @@ class WorkspaceServiceManager:
         if not rows:
             return {}, {}
         target_ports = {row.id: await self._target_port(row) for row in rows}
+        health_paths = {row.id: await self._health_path_for(row) for row in rows}
         probe_rows = [
             ProbeRow(
                 id=str(row.id),
                 paths=self._paths_for(row, primary is not None and row.id == primary.id),
                 port=target_ports[row.id],
+                health_path=health_paths[row.id],
             )
             for row in rows
         ]
         try:
             result = await self.runtime.exec(
                 workspace,
-                build_probe_script(probe_rows),
+                build_probe_script(
+                    probe_rows, health_timeout=self.settings.service_health_timeout_seconds
+                ),
                 cwd=workspace.workspace_path,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
@@ -742,8 +797,19 @@ class WorkspaceServiceManager:
                 row.status = self._grace_status(row, probe, now)
         else:
             row.status = "stopped"
+        self._apply_health(row, probe, now)
         row.last_seen_at = now
         self._add(row)
+
+    def _within_start_grace(self, row: WorkspaceService, now: datetime) -> bool:
+        """Shared by `_grace_status` (port-open status) and `_apply_health` (readiness), so the
+        two windows can never drift apart -- a dev server binding its port before it can answer
+        HTTP, or a framework that takes tens of seconds to import, must get the same benefit of
+        the doubt on both signals."""
+        return (
+            row.started_at is None
+            or (now - row.started_at).total_seconds() <= self.settings.service_start_grace_seconds
+        )
 
     def _grace_status(
         self, row: WorkspaceService, probe: ProbeResult, now: datetime
@@ -753,11 +819,32 @@ class WorkspaceServiceManager:
         status read. `_should_relaunch` re-examines this same probe's `pid_alive` directly to
         decide whether to relaunch, so a dead pid still gets relaunched despite the reported
         status staying `starting`."""
-        grace_elapsed = (
-            row.started_at is not None
-            and (now - row.started_at).total_seconds() > self.settings.service_start_grace_seconds
-        )
+        grace_elapsed = not self._within_start_grace(row, now)
         return "running" if (grace_elapsed and probe.pid_alive) else "starting"
+
+    def _apply_health(self, row: WorkspaceService, probe: ProbeResult, now: datetime) -> None:
+        """Sets `health_status`, orthogonal to `status` (Epic 13) -- deliberately never folded
+        into it. `status` answers "is the port bound"; `health_status` answers "does it answer
+        HTTP correctly", and a service can be `running` + `unhealthy` at once (a 500 on every
+        request), which is exactly the case this column exists to surface. `_should_relaunch`
+        is untouched on purpose: an unhealthy-but-listening process is not a crash to recover
+        from by restarting it once a minute -- that would only destroy the logs needed to debug
+        the real (application-level) failure.
+        """
+        if probe.health == "unknown":
+            # No health_path configured, or the port was never open long enough to try one --
+            # never mark checked_at, so a workspace with no health checks stays honestly
+            # "unknown" rather than accumulating a stale "last checked" timestamp.
+            row.health_status = "unknown"
+            return
+        if probe.health == "unhealthy" and self._within_start_grace(row, now):
+            # A framework can take tens of seconds to start answering even once its port is
+            # bound (Django imports, big Vite graphs); don't flash "unhealthy" during that
+            # window just because a first probe landed before the app was ready.
+            row.health_status = "starting"
+        else:
+            row.health_status = probe.health
+        row.health_checked_at = now
 
     async def _should_relaunch(self, row: WorkspaceService, probe: ProbeResult | None) -> bool:
         """Whether `ensure_running` should relaunch this row. A separate decision from the

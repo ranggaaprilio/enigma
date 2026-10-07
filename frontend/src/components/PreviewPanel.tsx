@@ -1,19 +1,23 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Monitor, Smartphone, Tablet } from "lucide-react";
 
 import {
   ApiError,
   ensureWorkspaceServices,
+  getPreviewComposition,
   restartWorkspaceService,
   startWorkspaceService,
   stopWorkspaceService,
+  type PreviewCompositionResponse,
   type WorkspaceEnvironmentState,
   type WorkspaceServiceResponse,
   type WorkspaceServicesResponse,
   type WorkspaceResponse,
 } from "../lib/api";
 import { useActiveWorktree } from "../lib/activeWorktree";
+import { EntryPointCard } from "./preview/EntryPointCard";
 import { ServiceRow } from "./preview/ServiceRow";
+import { WiringAdvisor } from "./preview/WiringAdvisor";
 
 // Fast cadence while something is starting up or has no confirmed preview yet; slow
 // cadence once everything has settled, so the panel still notices a crash while mounted.
@@ -85,6 +89,15 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
   // Bumped after a manual action to re-enter the poll loop immediately.
   const [pollNonce, setPollNonce] = useState(0);
 
+  // Epic 13: the composed preview descriptor -- entry point, health, alias URLs, advisories.
+  // Follows `services` (below) rather than running its own timer: it re-fetches whenever any
+  // service's status/health changes, via the `compositionKey` dependency.
+  const [composition, setComposition] = useState<PreviewCompositionResponse | null>(null);
+  const [recheckRequested, setRecheckRequested] = useState(false);
+  const hasCheckedProxyRef = useRef<string | null>(null);
+  const primedAliasesRef = useRef<Set<string>>(new Set());
+  const compositionRef = useRef<PreviewCompositionResponse | null>(null);
+
   const mergeService = useCallback((updated: WorkspaceServiceResponse) => {
     setServices((current) => current.map((row) => (row.id === updated.id ? updated : row)));
   }, []);
@@ -102,6 +115,74 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
     const running = services.filter((row) => row.status === "running").length;
     onStatusChange({ running, total: services.length });
   }, [services, onStatusChange]);
+
+  useEffect(() => {
+    compositionRef.current = composition;
+  }, [composition]);
+
+  // Derived key: changes whenever any service's status or health changes, so composition
+  // follows the service poll loop with no timer of its own.
+  const compositionKey = useMemo(
+    () => services.map((row) => `${row.id}:${row.status}:${row.health_status}`).join("|"),
+    [services],
+  );
+
+  useEffect(() => {
+    if (services.length === 0) {
+      return;
+    }
+    const controller = new AbortController();
+    const scopeKey = `${workspace.id}:${worktreeId ?? "base"}`;
+    // `check_proxy=true` costs a sandbox read, so it is requested only once per (workspace,
+    // worktree) and on an explicit "Re-check" -- never on every poll tick.
+    const shouldCheckProxy = recheckRequested || hasCheckedProxyRef.current !== scopeKey;
+
+    getPreviewComposition(workspace.id, shouldCheckProxy, controller.signal)
+      .then((result) => {
+        if (shouldCheckProxy) {
+          hasCheckedProxyRef.current = scopeKey;
+        } else {
+          // Keep the last-known proxy advisory (if any) so it doesn't flicker away on a
+          // poll tick that didn't check for it.
+          const previous = compositionRef.current;
+          const keptAdvisory = previous?.advisories.find((a) => a.code === "dev_proxy_missing");
+          if (keptAdvisory && !result.advisories.some((a) => a.code === "dev_proxy_missing")) {
+            result = { ...result, advisories: [...result.advisories, keptAdvisory] };
+          }
+        }
+        setComposition(result);
+        setRecheckRequested(false);
+      })
+      .catch((caughtError) => {
+        if (caughtError instanceof DOMException && caughtError.name === "AbortError") {
+          return;
+        }
+        // Composition is supplementary to the service list -- a failure here should not
+        // block the rest of the preview panel from working.
+        setRecheckRequested(false);
+      });
+
+    return () => controller.abort();
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- compositionRef is a ref
+  }, [compositionKey, workspace.id, worktreeId, recheckRequested]);
+
+  // Alias priming: a browser holding one service's capability primes every sibling alias's
+  // grant cookie before the user opens the app, since cookies are host-scoped and serving one
+  // alias can never set another's cookie (see docs/improvement-epics/13-*.md).
+  useEffect(() => {
+    if (!composition) {
+      return;
+    }
+    for (const service of composition.services) {
+      if (service.alias_prime_url && !primedAliasesRef.current.has(service.alias_prime_url)) {
+        primedAliasesRef.current.add(service.alias_prime_url);
+        fetch(service.alias_prime_url, { credentials: "include", mode: "no-cors" }).catch(() => {
+          // Best-effort: a failed prime just means the first cross-origin call from that
+          // alias will need its own capability, same as before this epic.
+        });
+      }
+    }
+  }, [composition]);
 
   useEffect(() => {
     let cancelled = false;
@@ -135,9 +216,15 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
       applyResponse(response);
 
       if (!autoSelected) {
-        const openable = response.services.find(
-          (row) => row.status === "running" && row.public_url,
-        );
+        const entryPointId = compositionRef.current?.entry_point_service_id;
+        const preferred = entryPointId
+          ? response.services.find(
+              (row) => row.id === entryPointId && row.status === "running" && row.public_url,
+            )
+          : undefined;
+        const openable =
+          preferred ??
+          response.services.find((row) => row.status === "running" && row.public_url);
         if (openable) {
           autoSelected = true;
           setSelectedServiceId(openable.id);
@@ -175,6 +262,20 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
   );
   const iframeUrl =
     selectedService?.status === "running" ? selectedService.public_url : null;
+
+  const composedById = useMemo(() => {
+    const map = new Map<string, NonNullable<typeof composition>["services"][number]>();
+    for (const composed of composition?.services ?? []) {
+      map.set(composed.service_id, composed);
+    }
+    return map;
+  }, [composition]);
+  const entryPointComposed = composition?.services?.find((row) => row.is_entry_point) ?? null;
+  const entryPointService = entryPointComposed
+    ? (services.find((row) => row.id === entryPointComposed.service_id) ?? null)
+    : null;
+  const devProxyAdvisory =
+    composition?.advisories?.find((advisory) => advisory.code === "dev_proxy_missing") ?? null;
 
   async function runService(service: WorkspaceServiceResponse) {
     setBusy({ serviceId: service.id, action: "start" });
@@ -289,6 +390,21 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
         </div>
       </div>
 
+      {entryPointService && entryPointComposed && (
+        <EntryPointCard
+          service={entryPointComposed}
+          isSelected={selectedServiceId === entryPointService.id}
+          onOpen={() => openService(entryPointService)}
+        />
+      )}
+
+      {devProxyAdvisory && (
+        <WiringAdvisor
+          advisory={devProxyAdvisory}
+          onRecheck={() => setRecheckRequested(true)}
+        />
+      )}
+
       {environmentText && (
         <div
           className={`mb-4 rounded-md border p-3 text-sm ${
@@ -334,6 +450,7 @@ export function PreviewPanel({ workspace, onStatusChange }: PreviewPanelProps) {
               logsOpen={logOpenServiceId === service.id}
               logResetToken={logResetTokens[service.id] ?? 0}
               copyLabel={copyFeedback?.serviceId === service.id ? copyFeedback.label : "Copy URL"}
+              diagnoses={composedById.get(service.id)?.diagnoses ?? []}
               onRun={() => void runService(service)}
               onStop={() => void stopService(service)}
               onRestart={() => void restartService(service)}

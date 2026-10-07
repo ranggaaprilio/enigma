@@ -56,6 +56,19 @@ Embed code-server or OpenVSCode Server into the dashboard so developers can manu
 - File edits appear in repository diff.
 - Editor URL is not publicly accessible without authorization.
 
+## Status
+
+Met. The editor renders in an iframe inside the dashboard, served by the preview proxy
+(`backend/app/preview_proxy.py`) on a stable per-workspace hostname (`editor-<token>.<proxy-host>`,
+`backend/app/services/editor_alias.py`).
+
+An earlier revision (commit `3617883`) had replaced the iframe with a raw Daytona signed URL opened
+in a new tab, which failed both "Editor opens inside the dashboard" and, arguably, "Editor URL is
+not publicly accessible without authorization" — the signed URL was a bearer credential valid for an
+hour to a `--auth none` code-server. Authorization now lives at the proxy edge: the URL carries no
+credential and the browser is gated by a short-lived, signed, `HttpOnly`, `Partitioned` grant cookie
+(`backend/app/services/preview_alias.py`'s grant, reused verbatim).
+
 ## Future Enhancements
 
 - Preinstalled extensions.

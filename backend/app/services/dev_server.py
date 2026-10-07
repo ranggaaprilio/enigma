@@ -28,6 +28,7 @@ from app.services.daytona_runtime import (
     DaytonaRuntimeError,
     get_daytona_runtime,
 )
+from app.services.git_providers import redact_secrets
 from app.services.preview import COMMON_PREVIEW_PORTS
 from app.services.run_paths import join_subpath, validate_relative_subpath
 from app.services.sandbox_probe import port_is_open
@@ -35,6 +36,12 @@ from app.services.service_scripts import (
     build_mise_setup_script,
     build_registry_script,
     builtin_paths,
+)
+from app.services.workspace_env import (
+    EnvPrepareError,
+    load_all_values,
+    prepare_launch_env,
+    redactable_env_values,
 )
 from app.services.workspace_services import (
     WorkspaceServiceManager,
@@ -282,6 +289,22 @@ class DevServerService:
         if workspace.dev_worktree_id != worktree_id:
             await self._manager.kill_primary(workspace)
 
+        primary_row = await self._manager.primary_service(workspace)
+        try:
+            env = await prepare_launch_env(
+                self.session,
+                self.settings,
+                self.runtime,
+                workspace,
+                checkout=cwd,
+                custom_command_id=entry.id if entry else None,
+                timeout=self.settings.dev_server_command_timeout_seconds,
+                service_id=primary_row.id,
+                branch=branch,
+            )
+        except EnvPrepareError as error:
+            return DevServerState(status="error", message=str(error))
+
         paths = builtin_paths()
         try:
             gen = uuid4().hex
@@ -301,6 +324,7 @@ class DevServerService:
                 workspace,
                 script,
                 cwd=launch_cwd,
+                env=env or None,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
         except DaytonaRuntimeError as error:
@@ -410,7 +434,11 @@ class DevServerService:
             )
         except DaytonaRuntimeError:
             return ""
-        return (result.stdout or "").strip()[-2000:]
+        tail = (result.stdout or "").strip()[-2000:]
+        # This tail reaches the browser via `DevServerState.message`, so it must be redacted
+        # exactly like every other log surface.
+        env = await load_all_values(self.session, self.settings, workspace.id)
+        return redact_secrets(tail, *redactable_env_values(env))
 
     async def _resolved_port(self, workspace: Workspace) -> int | None:
         entry = await self._registry_entry(workspace, "dev")

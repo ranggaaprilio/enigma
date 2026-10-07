@@ -4,10 +4,13 @@ import {
   Navigate,
   Route,
   Routes,
+  useLocation,
 } from "react-router";
 
 import { AuthProvider } from "./auth/AuthContext";
 import { useAuth } from "./auth/context";
+import { LlmStatusProvider } from "./platform/LlmStatusProvider";
+import { useLlmSetupSkipped, useLlmStatus } from "./platform/llmStatus";
 import {
   DashboardRoute,
   DashboardView,
@@ -20,6 +23,8 @@ import { ProjectMembersRoute } from "./routes/ProjectMembersRoute";
 import { ProjectRoute } from "./routes/ProjectRoute";
 import { ProjectSettingsRoute } from "./routes/ProjectSettingsRoute";
 import { RegisterRoute } from "./routes/RegisterRoute";
+import { SettingsRoute } from "./routes/SettingsRoute";
+import { SetupRoute } from "./routes/SetupRoute";
 import { TeamMembersRoute } from "./routes/TeamMembersRoute";
 import { TeamRoute } from "./routes/TeamRoute";
 
@@ -27,7 +32,9 @@ export default function App() {
   return (
     <BrowserRouter>
       <AuthProvider>
-        <AppRoutes />
+        <LlmStatusProvider>
+          <AppRoutes />
+        </LlmStatusProvider>
       </AuthProvider>
     </BrowserRouter>
   );
@@ -119,6 +126,27 @@ function AppRoutes() {
         <Route path="audit" element={<DashboardView view="audit" />} />
       </Route>
 
+      {/* Platform-wide settings. Any authenticated user may look; only the platform owner
+          may edit (the page renders a locked state for everyone else). */}
+      <Route
+        path="/settings"
+        element={
+          <PrivateRoute>
+            <SettingsRoute />
+          </PrivateRoute>
+        }
+      />
+      {/* First-run LLM setup. Wrapped in `RequireAuth`, deliberately NOT `PrivateRoute`:
+          `PrivateRoute` carries the setup gate, and gating the setup page is a redirect loop. */}
+      <Route
+        path="/setup"
+        element={
+          <RequireAuth>
+            <SetupRoute />
+          </RequireAuth>
+        }
+      />
+
       {/* Home: projects-first. Authenticated users land on their project list. */}
       <Route path="/" element={<HomeRoute />} />
 
@@ -138,7 +166,13 @@ function HomeRoute() {
     return <LandingRoute />;
   }
 
-  return <DashboardOverviewRoute />;
+  // `HomeRoute` hand-rolls its auth check instead of using `PrivateRoute`, so the setup gate
+  // has to be applied explicitly here or `/` bypasses it entirely.
+  return (
+    <SetupGate>
+      <DashboardOverviewRoute />
+    </SetupGate>
+  );
 }
 
 function AdaptiveDashboardRoute() {
@@ -152,10 +186,19 @@ function AdaptiveDashboardRoute() {
     return <Navigate to="/login" replace />;
   }
 
-  return <DashboardRoute />;
+  // Same as `HomeRoute`: this route does not go through `PrivateRoute`, so without an explicit
+  // gate the whole workspace dashboard subtree is reachable while unconfigured.
+  return (
+    <SetupGate>
+      <DashboardRoute />
+    </SetupGate>
+  );
 }
 
-function PrivateRoute({ children }: { children: ReactNode }) {
+const SETUP_PATH = "/setup";
+
+/** Authentication only. Used by the setup route, which must not be setup-gated. */
+function RequireAuth({ children }: { children: ReactNode }) {
   const { status } = useAuth();
 
   if (status === "loading") {
@@ -167,6 +210,44 @@ function PrivateRoute({ children }: { children: ReactNode }) {
   }
 
   return children;
+}
+
+/**
+ * First-run gate: sends an authenticated user to `/setup` while no LLM endpoint is configured.
+ * Skippable, and it only ever fires on an affirmative `"unconfigured"` -- `"unknown"` (still
+ * loading, or the status call failed) falls through, so a status outage never blocks the app.
+ * This is UX only; the backend is what actually refuses an unconfigured agent run.
+ */
+function SetupGate({ children }: { children: ReactNode }) {
+  const { state } = useLlmStatus();
+  const skipped = useLlmSetupSkipped();
+  const location = useLocation();
+
+  // Belt and braces: `/setup` never mounts this today, but a refactor that wrapped it in
+  // `PrivateRoute` would otherwise produce an infinite redirect rather than a visible error.
+  if (location.pathname === SETUP_PATH) {
+    return children;
+  }
+
+  if (state === "unconfigured" && !skipped) {
+    return (
+      <Navigate
+        to={SETUP_PATH}
+        replace
+        state={{ from: `${location.pathname}${location.search}` }}
+      />
+    );
+  }
+
+  return children;
+}
+
+function PrivateRoute({ children }: { children: ReactNode }) {
+  return (
+    <RequireAuth>
+      <SetupGate>{children}</SetupGate>
+    </RequireAuth>
+  );
 }
 
 function PublicOnlyRoute({ children }: { children: ReactNode }) {

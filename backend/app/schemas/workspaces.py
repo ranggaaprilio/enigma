@@ -68,6 +68,9 @@ class WorkspaceUpdateRequest(BaseModel):
     snapshot: str | None = Field(default=None, max_length=255)
     # Repo-relative subdirectory the workspace's commands and dev server run in.
     app_root: str | None = Field(default=None, max_length=512)
+    # Repo-relative path (below app_root) where resolved env vars are materialised as a .env
+    # file before each service launch. `None` clears it (no file written).
+    env_file_path: str | None = Field(default=None, max_length=512)
 
     @field_validator("app_root")
     @classmethod
@@ -76,6 +79,19 @@ class WorkspaceUpdateRequest(BaseModel):
             return validate_relative_subpath(value)
         except RunPathError as error:
             raise ValueError(str(error)) from error
+
+    @field_validator("env_file_path")
+    @classmethod
+    def normalize_env_file_path(cls, value: str | None) -> str | None:
+        if value is not None and value.strip().endswith("/"):
+            raise ValueError("env_file_path must not end with '/'")
+        try:
+            normalized = validate_relative_subpath(value)
+        except RunPathError as error:
+            raise ValueError(str(error)) from error
+        if normalized is not None and normalized.split("/", 1)[0] == ".git":
+            raise ValueError("env_file_path must not point inside .git")
+        return normalized
 
     @field_validator("name", "repo_url", "default_branch")
     @classmethod
@@ -109,6 +125,7 @@ class WorkspaceResponse(BaseModel):
     snapshot: str | None
     workspace_path: str
     app_root: str | None = None
+    env_file_path: str | None = None
     status: WorkspaceStatus
     created_at: datetime
     updated_at: datetime
@@ -160,6 +177,8 @@ class WorkspaceStatusResponse(BaseModel):
 class WorkspaceEnvVarUpsertRequest(BaseModel):
     key: str = Field(min_length=1, max_length=128)
     value: str = Field(max_length=20_000)
+    # `None` => workspace-wide. Set to scope the variable to one service's launches only.
+    custom_command_id: UUID | None = None
 
     @field_validator("key")
     @classmethod
@@ -173,6 +192,62 @@ class WorkspaceEnvVarResponse(BaseModel):
     masked_value: str
     created_at: datetime
     updated_at: datetime
+    scope: Literal["workspace", "service"] = "workspace"
+    custom_command_id: UUID | None = None
+
+
+class AffectedServiceResponse(BaseModel):
+    service_id: UUID
+    custom_command_id: UUID | None
+    name: str
+    status: str
+    keys: list[str]
+
+
+class WorkspaceEnvVarUpsertResponse(WorkspaceEnvVarResponse):
+    affected_services: list[AffectedServiceResponse] = []
+    warnings: list[str] = []
+
+
+class WorkspaceEnvVarBulkItem(BaseModel):
+    key: str
+    status: Literal["created", "updated", "unchanged", "invalid"]
+    message: str | None = None
+
+
+class WorkspaceEnvVarBulkRequest(BaseModel):
+    text: str | None = None
+    values: dict[str, str] | None = None
+    custom_command_id: UUID | None = None
+    dry_run: bool = False
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> "WorkspaceEnvVarBulkRequest":
+        if (self.text is None) == (self.values is None):
+            raise ValueError("provide exactly one of text or values")
+        return self
+
+
+class WorkspaceEnvVarBulkResponse(BaseModel):
+    items: list[WorkspaceEnvVarBulkItem]
+    created: int
+    updated: int
+    unchanged: int
+    invalid: int
+    dry_run: bool
+    affected_services: list[AffectedServiceResponse] = []
+    warnings: list[str] = []
+
+
+class WorkspaceEnvVarBulkDeleteRequest(BaseModel):
+    keys: list[str] = Field(min_length=1, max_length=500)
+    custom_command_id: UUID | None = None
+
+
+class WorkspaceEnvVarBulkDeleteResponse(BaseModel):
+    deleted: list[str]
+    missing: list[str]
+    affected_services: list[AffectedServiceResponse] = []
 
 
 class DeleteResponse(BaseModel):

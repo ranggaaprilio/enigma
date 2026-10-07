@@ -10,12 +10,20 @@ from app.api import commands as commands_module
 from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
-from app.models import CommandRun, CustomCommand, User, Workspace, WorkspaceWorktree
+from app.models import (
+    CommandRun,
+    CustomCommand,
+    User,
+    Workspace,
+    WorkspaceEnvVar,
+    WorkspaceWorktree,
+)
 from app.services.agent_tools import DangerousCommandError
 from app.services.commands import (
     CommandConfirmationRequiredError,
     CommandRuntime,
     CommandService,
+    CustomCommandInvalidError,
     CustomCommandNotFoundError,
     validate_user_command,
 )
@@ -26,7 +34,7 @@ from app.services.run_paths import (
     validate_relative_subpath,
 )
 from app.services.users import DuplicateUserEmailError
-from app.services.workspaces import WorkspaceNotFoundError
+from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 from app.services.worktrees import WorktreeNotFoundError
 
 
@@ -75,11 +83,20 @@ class FakeCommandService:
         port: int | None = None,
         enabled: bool = True,
         timeout_seconds: int | None = None,
+        health_path: str | None = None,
+        is_entry_point: bool = False,
     ) -> CustomCommand:
         self._ensure_workspace(workspace_id, user_id)
         now = datetime.now(UTC)
         # Mirrors CommandService.create_command: a `dev`-role command defaults to a service.
         effective_kind = kind if kind is not None else ("service" if role == "dev" else "task")
+        if is_entry_point and effective_kind != "service":
+            raise CustomCommandInvalidError(
+                "Only a long-running service command can be the entry point."
+            )
+        if is_entry_point:
+            for existing in self.commands.values():
+                existing.is_entry_point = False
         custom_command = CustomCommand(
             id=uuid4(),
             workspace_id=workspace_id,
@@ -95,6 +112,8 @@ class FakeCommandService:
             port=port,
             enabled=enabled,
             timeout_seconds=timeout_seconds,
+            health_path=health_path,
+            is_entry_point=is_entry_point,
             sort_order=len(self.commands) * 10,
             created_at=now,
             updated_at=now,
@@ -117,6 +136,15 @@ class FakeCommandService:
         custom_command = self.commands.get(command_id)
         if custom_command is None:
             raise CustomCommandNotFoundError
+        if values.get("is_entry_point") is True:
+            effective_kind = values.get("kind", custom_command.kind)
+            if effective_kind != "service":
+                raise CustomCommandInvalidError(
+                    "Only a long-running service command can be the entry point."
+                )
+            for other in self.commands.values():
+                if other.id != custom_command.id:
+                    other.is_entry_point = False
         for key, value in values.items():
             setattr(custom_command, key, value)
         custom_command.updated_at = datetime.now(UTC)
@@ -667,6 +695,160 @@ async def test_create_command_rejects_unsafe_registry_values(command_context, fi
     assert response.status_code == 422
 
 
+async def test_create_command_rejects_health_path_without_leading_slash(command_context):
+    _user, workspace, _service = command_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        response = await client.post(
+            f"/workspaces/{workspace.id}/commands",
+            json={
+                "name": "API",
+                "command": "uvicorn app.main:app",
+                "requires_confirmation": False,
+                "role": "dev",
+                "health_path": "healthz",
+            },
+        )
+
+    assert response.status_code == 422
+
+
+async def test_create_command_rejects_task_kind_as_entry_point(command_context):
+    _user, workspace, _service = command_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        response = await client.post(
+            f"/workspaces/{workspace.id}/commands",
+            json={
+                "name": "Lint",
+                "command": "ruff check .",
+                "requires_confirmation": False,
+                "kind": "task",
+                "is_entry_point": True,
+            },
+        )
+
+    assert response.status_code == 400
+
+
+async def test_create_command_accepts_health_path_and_entry_point(command_context):
+    _user, workspace, _service = command_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        created = await client.post(
+            f"/workspaces/{workspace.id}/commands",
+            json={
+                "name": "API",
+                "command": "uvicorn app.main:app --port 8000",
+                "requires_confirmation": False,
+                "role": "dev",
+                "port": 8000,
+                "health_path": "/healthz",
+                "is_entry_point": True,
+            },
+        )
+
+    assert created.status_code == 201
+    body = created.json()
+    assert body["health_path"] == "/healthz"
+    assert body["is_entry_point"] is True
+
+
+async def test_creating_a_second_entry_point_clears_the_first(command_context):
+    _user, workspace, _service = command_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        first = await client.post(
+            f"/workspaces/{workspace.id}/commands",
+            json={
+                "name": "Web",
+                "command": "pnpm dev",
+                "requires_confirmation": False,
+                "role": "dev",
+                "kind": "service",
+                "is_entry_point": True,
+            },
+        )
+        assert first.json()["is_entry_point"] is True
+
+        second = await client.post(
+            f"/workspaces/{workspace.id}/commands",
+            json={
+                "name": "API",
+                "command": "uvicorn app.main:app",
+                "requires_confirmation": False,
+                "kind": "service",
+                "is_entry_point": True,
+            },
+        )
+        assert second.json()["is_entry_point"] is True
+
+        listed = await client.get(f"/workspaces/{workspace.id}/commands")
+        entry_points = [item for item in listed.json() if item["is_entry_point"]]
+        assert len(entry_points) == 1
+        assert entry_points[0]["id"] == second.json()["id"]
+
+
+async def test_update_command_rejects_marking_a_task_as_entry_point(command_context):
+    _user, workspace, _service = command_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        created = await client.post(
+            f"/workspaces/{workspace.id}/commands",
+            json={"name": "Lint", "command": "ruff check .", "requires_confirmation": False},
+        )
+        command_id = created.json()["id"]
+
+        response = await client.patch(
+            f"/workspaces/{workspace.id}/commands/{command_id}",
+            json={"is_entry_point": True},
+        )
+
+    assert response.status_code == 400
+
+
+async def test_update_command_clears_the_previous_entry_point(command_context):
+    _user, workspace, _service = command_context
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await login(client)
+        first = await client.post(
+            f"/workspaces/{workspace.id}/commands",
+            json={
+                "name": "Web",
+                "command": "pnpm dev",
+                "requires_confirmation": False,
+                "kind": "service",
+                "is_entry_point": True,
+            },
+        )
+        second = await client.post(
+            f"/workspaces/{workspace.id}/commands",
+            json={
+                "name": "API",
+                "command": "uvicorn app.main:app",
+                "requires_confirmation": False,
+                "kind": "service",
+            },
+        )
+
+        updated = await client.patch(
+            f"/workspaces/{workspace.id}/commands/{second.json()['id']}",
+            json={"is_entry_point": True},
+        )
+        assert updated.json()["is_entry_point"] is True
+
+        listed = await client.get(f"/workspaces/{workspace.id}/commands")
+        by_id = {item["id"]: item for item in listed.json()}
+        assert by_id[first.json()["id"]]["is_entry_point"] is False
+        assert by_id[second.json()["id"]]["is_entry_point"] is True
+
+
 async def test_reorder_commands_updates_sort_order(command_context):
     _user, workspace, _service = command_context
 
@@ -898,3 +1080,299 @@ async def test_command_run_does_not_require_redis_in_tests(command_context, monk
         run = await client.post(f"/workspaces/{workspace.id}/commands/{command_id}/run")
 
     assert run.status_code == 201
+
+
+# ---------------------------------------------------------------------------
+# Real-DB integration: CommandService.create_command / update_command against the actual
+# partial unique index (uq_custom_commands_entry_point). The FakeCommandService tests above
+# assert the *contract*; this proves the real clear-then-set transaction actually satisfies the
+# database constraint rather than raising an unhandled IntegrityError.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+async def real_db_session():
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    settings = get_settings_for_db()
+    engine = create_async_engine(settings.database_url, pool_pre_ping=True)
+    async with engine.connect() as conn:
+        await conn.begin()
+        session_maker = async_sessionmaker(bind=conn, expire_on_commit=False)
+        async with session_maker() as session:
+            await session.begin_nested()
+            yield session, session_maker
+            await session.rollback()
+    await engine.dispose()
+
+
+def get_settings_for_db():
+    from app.core.config import get_settings as _get_settings
+
+    return _get_settings()
+
+
+async def _make_real_workspace(session) -> tuple[User, Workspace]:
+    user = User(
+        id=uuid4(),
+        email=f"owner-{uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("password"),
+        role="owner",
+        is_active=True,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=user.id,
+        name="Demo",
+        slug=f"demo-{uuid4().hex[:8]}",
+        repo_url="https://github.com/example/demo",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-demo",
+        workspace_path="/workspace",
+        status="ready",
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    session.add(user)
+    session.add(workspace)
+    await session.flush()
+    return user, workspace
+
+
+async def add_workspace_env_var(session, workspace, *, key: str, value: str) -> None:
+    cipher = WorkspaceSecretCipher(get_settings_for_db().workspace_env_encryption_key)
+    session.add(
+        WorkspaceEnvVar(
+            id=uuid4(),
+            workspace_id=workspace.id,
+            custom_command_id=None,
+            scope="workspace",
+            key=key,
+            encrypted_value=cipher.encrypt(value),
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await session.flush()
+
+
+async def test_real_db_creating_a_second_entry_point_clears_the_first_without_integrity_error(
+    real_db_session,
+):
+    session, session_maker = real_db_session
+    user, workspace = await _make_real_workspace(session)
+    service = CommandService(
+        session=session,
+        session_maker=session_maker,
+        settings=get_settings_for_db(),
+        runtime=CommandRuntime(),
+    )
+
+    first = await service.create_command(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        name="Web",
+        command="pnpm dev",
+        description=None,
+        icon=None,
+        hotkey=None,
+        requires_confirmation=False,
+        kind="service",
+        is_entry_point=True,
+    )
+    assert first.is_entry_point is True
+
+    second = await service.create_command(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        name="API",
+        command="uvicorn app.main:app",
+        description=None,
+        icon=None,
+        hotkey=None,
+        requires_confirmation=False,
+        kind="service",
+        is_entry_point=True,
+    )
+    assert second.is_entry_point is True
+
+    await session.refresh(first)
+    assert first.is_entry_point is False
+
+
+async def test_real_db_update_clears_the_previous_entry_point_without_integrity_error(
+    real_db_session,
+):
+    session, session_maker = real_db_session
+    user, workspace = await _make_real_workspace(session)
+    service = CommandService(
+        session=session,
+        session_maker=session_maker,
+        settings=get_settings_for_db(),
+        runtime=CommandRuntime(),
+    )
+
+    first = await service.create_command(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        name="Web",
+        command="pnpm dev",
+        description=None,
+        icon=None,
+        hotkey=None,
+        requires_confirmation=False,
+        kind="service",
+        is_entry_point=True,
+    )
+    second = await service.create_command(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        name="API",
+        command="uvicorn app.main:app",
+        description=None,
+        icon=None,
+        hotkey=None,
+        requires_confirmation=False,
+        kind="service",
+    )
+
+    updated = await service.update_command(
+        workspace_id=workspace.id,
+        command_id=second.id,
+        user_id=user.id,
+        values={"is_entry_point": True},
+    )
+    assert updated.is_entry_point is True
+
+    await session.refresh(first)
+    assert first.is_entry_point is False
+
+
+async def test_real_db_marking_a_task_as_entry_point_raises_clean_error_not_integrity_error(
+    real_db_session,
+):
+    session, session_maker = real_db_session
+    user, workspace = await _make_real_workspace(session)
+    service = CommandService(
+        session=session,
+        session_maker=session_maker,
+        settings=get_settings_for_db(),
+        runtime=CommandRuntime(),
+    )
+
+    with pytest.raises(CustomCommandInvalidError):
+        await service.create_command(
+            workspace_id=workspace.id,
+            user_id=user.id,
+            name="Lint",
+            command="ruff check .",
+            description=None,
+            icon=None,
+            hotkey=None,
+            requires_confirmation=False,
+            kind="task",
+            is_entry_point=True,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Real-DB integration: command runs get strict ${ENIGMA_*} substitution too.
+# ---------------------------------------------------------------------------
+
+
+class FakeCommandDaytonaRuntime:
+    """Captures the `env` a command run would have received, without touching a sandbox."""
+
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def stream_command(
+        self,
+        workspace,
+        session_id,
+        command,
+        *,
+        cwd,
+        env,
+        timeout,
+        on_stdout,
+        on_stderr,
+    ) -> int:
+        self.calls.append({"command": command, "env": env})
+        return 0
+
+
+async def test_real_db_command_run_gets_enigma_exports_in_its_env(real_db_session):
+    session, session_maker = real_db_session
+    user, workspace = await _make_real_workspace(session)
+    daytona_runtime = FakeCommandDaytonaRuntime()
+    service = CommandService(
+        session=session,
+        session_maker=session_maker,
+        settings=get_settings_for_db(),
+        runtime=CommandRuntime(),
+        daytona_runtime=daytona_runtime,
+    )
+    custom_command = await service.create_command(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        name="Echo",
+        command="echo hi",
+        description=None,
+        icon=None,
+        hotkey=None,
+        requires_confirmation=False,
+    )
+
+    run = await service.create_run(workspace.id, custom_command.id, user.id, confirmed=True)
+    task = service.runtime.tasks.get(run.id)
+    assert task is not None
+    await task
+
+    assert len(daytona_runtime.calls) == 1
+    env = daytona_runtime.calls[0]["env"]
+    assert env["ENIGMA_WORKSPACE_ID"] == str(workspace.id)
+    assert env["ENIGMA_BRANCH"] == workspace.default_branch
+
+    await session.refresh(run)
+    assert run.status == "completed"
+
+
+async def test_real_db_command_run_with_a_bad_template_fails_the_run_cleanly(real_db_session):
+    session, session_maker = real_db_session
+    user, workspace = await _make_real_workspace(session)
+    daytona_runtime = FakeCommandDaytonaRuntime()
+    service = CommandService(
+        session=session,
+        session_maker=session_maker,
+        settings=get_settings_for_db(),
+        runtime=CommandRuntime(),
+        daytona_runtime=daytona_runtime,
+    )
+    custom_command = await service.create_command(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        name="Bad template",
+        command="echo hi",
+        description=None,
+        icon=None,
+        hotkey=None,
+        requires_confirmation=False,
+    )
+    await add_workspace_env_var(
+        session, workspace, key="API_BASE_URL", value="${ENIGMA_PREVIEW_URL:nonexistent}"
+    )
+
+    run = await service.create_run(workspace.id, custom_command.id, user.id, confirmed=True)
+    task = service.runtime.tasks.get(run.id)
+    assert task is not None
+    await task
+
+    # The command process itself must never have been started.
+    assert daytona_runtime.calls == []
+    await session.refresh(run)
+    assert run.status == "error"
+    assert "nonexistent" in run.output

@@ -27,6 +27,7 @@ from app.services.commands import (
     CommandRunNotFoundError,
     CommandService,
     CommandWorkspacePathError,
+    CustomCommandInvalidError,
     CustomCommandNotFoundError,
     command_runtime,
 )
@@ -81,6 +82,8 @@ class CommandServiceProtocol(Protocol):
         port: int | None = None,
         enabled: bool = True,
         timeout_seconds: int | None = None,
+        health_path: str | None = None,
+        is_entry_point: bool = False,
     ) -> CustomCommand: ...
 
     async def list_commands(self, workspace_id: UUID, user_id: UUID) -> list[CustomCommand]: ...
@@ -174,9 +177,13 @@ async def create_custom_command(
             port=payload.port,
             enabled=payload.enabled,
             timeout_seconds=payload.timeout_seconds,
+            health_path=payload.health_path,
+            is_entry_point=payload.is_entry_point,
         )
     except WorkspaceNotFoundError:
         raise workspace_not_found() from None
+    except CustomCommandInvalidError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error.message) from None
 
 
 @router.get("/commands", response_model=list[CustomCommandResponse])
@@ -314,6 +321,8 @@ async def update_custom_command(
         raise workspace_not_found() from None
     except CustomCommandNotFoundError:
         raise command_not_found() from None
+    except CustomCommandInvalidError as error:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error.message) from None
 
 
 @router.delete("/commands/{command_id}", response_model=DeleteResponse)

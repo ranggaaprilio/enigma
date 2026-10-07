@@ -1,7 +1,9 @@
 import { ChevronDown, ChevronUp, Copy, ExternalLink, Play, RotateCw, Square } from "lucide-react";
 
-import type { WorkspaceServiceResponse } from "../../lib/api";
+import type { ServiceDiagnosisResponse, WorkspaceServiceResponse } from "../../lib/api";
 import { StatusPill } from "../ui/StatusPill";
+import { CorsDiagnosis } from "./CorsDiagnosis";
+import { HealthBadge } from "./HealthBadge";
 import { ServiceLogPane } from "./ServiceLogPane";
 
 const ROLE_LABEL: Record<string, string> = {
@@ -36,6 +38,7 @@ export function ServiceRow({
   logsOpen,
   logResetToken,
   copyLabel,
+  diagnoses = [],
   onRun,
   onStop,
   onRestart,
@@ -53,6 +56,8 @@ export function ServiceRow({
   /** Bumped on restart so the log pane remounts and drops stale pre-restart output. */
   logResetToken: number;
   copyLabel: string;
+  /** Unresolved CORS diagnoses for this service, from the composed preview descriptor. */
+  diagnoses?: ServiceDiagnosisResponse[];
   onRun: () => void;
   onStop: () => void;
   onRestart: () => void;
@@ -80,6 +85,11 @@ export function ServiceRow({
             {service.port !== null && (
               <span className="shrink-0 text-xs text-ink/55">:{service.port}</span>
             )}
+            {service.is_entry_point && (
+              <span className="shrink-0 rounded-full border border-primary/30 bg-[#fff8f4] px-2 py-0.5 text-xs font-semibold text-primary">
+                Entry point
+              </span>
+            )}
           </div>
           <p className="mt-0.5 text-xs text-ink/55">
             Branch: <span className="font-medium text-ink/75">{service.branch ?? "base"}</span>
@@ -87,6 +97,7 @@ export function ServiceRow({
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <StatusPill status={service.status} />
+          <HealthBadge health={service.health_status} />
           <button
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1 text-xs font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
             type="button"
@@ -167,6 +178,10 @@ export function ServiceRow({
           {message}
         </p>
       )}
+
+      {diagnoses.map((diagnosis) => (
+        <CorsDiagnosis key={diagnosis.id} diagnosis={diagnosis} />
+      ))}
 
       {logsOpen && (
         <ServiceLogPane key={logResetToken} workspaceId={workspaceId} serviceId={service.id} />
