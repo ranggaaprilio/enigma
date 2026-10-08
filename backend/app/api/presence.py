@@ -42,7 +42,9 @@ async def stream_presence(websocket: WebSocket, workspace_id: UUID) -> None:
     connection_id = str(uuid4())
     meta = {"name": user.name or user.email}
     redis = get_redis_client()
-    presence = PresenceService(redis)
+    # The relay blocks in pubsub.listen() for as long as nobody joins or leaves.
+    subscriber = get_redis_client(subscriber=True)
+    presence = PresenceService(redis, subscriber=subscriber)
 
     try:
         # Subscribe *before* snapshotting, and hold delivery until the snapshot is on the
@@ -102,6 +104,7 @@ async def stream_presence(websocket: WebSocket, workspace_id: UUID) -> None:
                     scope, {"type": "leave", "user_id": str(user.id), **meta}
                 )
     finally:
+        await subscriber.aclose()
         await redis.aclose()
 
 

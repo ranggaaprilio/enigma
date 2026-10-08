@@ -6,6 +6,7 @@ import {
   Pencil,
   Play,
   Plus,
+  RotateCcw,
   TerminalSquare,
   Trash2,
   XCircle,
@@ -16,6 +17,8 @@ import {
   createCustomCommand,
   deleteCustomCommand,
   getCommandRunStreamUrl,
+  interruptionMessage,
+  isServerReady,
   listCustomCommandRuns,
   listCustomCommands,
   runCustomCommand,
@@ -376,6 +379,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
   );
 
   const { connectionState, stopReconnect } = useReconnectingWebSocket(streamUrl, {
+    readinessCheck: isServerReady,
     onBeforeConnect: () => {
       // Backend replays the run's full output on every (re)connect; reset to avoid
       // duplicates. Only ever blank the streaming run — a reconnect must not wipe the
@@ -402,16 +406,23 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
         }));
         return;
       }
+      const errorReason = payload.reason ?? null;
       updateStreamingRun((run) => ({
         ...run,
         status: payload.status,
         exit_code: payload.exit_code,
+        error_reason: errorReason,
         completed_at: payload.status === "running" ? null : new Date().toISOString(),
       }));
       setRuns((current) =>
         current.map((item) =>
           item.id === streamingRunId
-            ? { ...item, status: payload.status, exit_code: payload.exit_code }
+            ? {
+                ...item,
+                status: payload.status,
+                exit_code: payload.exit_code,
+                error_reason: errorReason,
+              }
             : item,
         ),
       );
@@ -691,6 +702,16 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                     <h5 className="font-semibold">Output</h5>
                     <StatusPill status={activeRun?.status ?? "idle"} />
                   </div>
+                  {interruptionMessage(activeRun?.error_reason) && (
+                    <div
+                      className="mb-3 flex items-center gap-2 rounded-md border border-warn/30 bg-[#fffbf0] px-3 py-2 text-sm text-warn"
+                      data-testid="command-run-interrupted"
+                      role="status"
+                    >
+                      <RotateCcw className="h-4 w-4" aria-hidden="true" />
+                      {interruptionMessage(activeRun?.error_reason)}
+                    </div>
+                  )}
                   <pre className="min-h-[360px] max-h-[520px] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-line bg-panel p-4 font-mono text-xs leading-5 text-ink">
                     {visibleOutput || "Run output will appear here."}
                   </pre>

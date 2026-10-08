@@ -376,7 +376,7 @@ async def test_openhands_stream_maps_callbacks_and_usage(monkeypatch) -> None:
     assert captured_llm["stream"] is True
 
 
-def test_agent_runtime_stop_is_cooperative() -> None:
+async def test_agent_runtime_stop_is_cooperative() -> None:
     class FakeProvider:
         def __init__(self) -> None:
             self.paused = False
@@ -388,10 +388,12 @@ def test_agent_runtime_stop_is_cooperative() -> None:
     run_id = uuid4()
     stop_event = asyncio.Event()
     provider = FakeProvider()
-    runtime.stop_events[run_id] = stop_event
-    runtime.providers[run_id] = provider  # type: ignore[assignment]
+    task = asyncio.create_task(stop_event.wait())
+    runtime.register_run(run_id, task, stop_event)
+    runtime.register_provider(run_id, provider)  # type: ignore[arg-type]
 
     runtime.request_stop(run_id)
+    await task
 
     assert stop_event.is_set()
     assert provider.paused is True

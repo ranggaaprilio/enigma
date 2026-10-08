@@ -10,6 +10,7 @@ import { AppSidebar } from "./AppSidebar";
 import { PresenceAvatars } from "./PresenceAvatars";
 import {
   getNotificationStreamUrl,
+  isServerReady,
   listNotifications,
   markAllNotificationsRead,
   markNotificationRead,
@@ -151,7 +152,23 @@ function ConnectionBanner({
   return null;
 }
 
-function NotificationBell({
+/** Union by id, newest first. A copy marked read wins, so a refetch that raced a mark-read
+ * cannot flip a notification back to unread. */
+function mergeNotifications(
+  fetched: NotificationResponse[],
+  current: NotificationResponse[],
+): NotificationResponse[] {
+  const byId = new Map<string, NotificationResponse>();
+  for (const item of [...current, ...fetched]) {
+    const existing = byId.get(item.id);
+    byId.set(item.id, existing?.read_at && !item.read_at ? existing : item);
+  }
+  return [...byId.values()].sort(
+    (a, b) => Date.parse(b.created_at) - Date.parse(a.created_at),
+  );
+}
+
+export function NotificationBell({
   onConnectionStateChange,
 }: {
   onConnectionStateChange?: (state: StreamConnectionState) => void;
@@ -163,14 +180,14 @@ function NotificationBell({
 
   useEffect(() => {
     const controller = new AbortController();
+    // Merge rather than replace: the stream may already have delivered newer items.
     listNotifications(controller.signal)
-      .then((data) => setNotifications(Array.isArray(data) ? data : []))
-      .catch((error: unknown) => {
-        if (error instanceof DOMException && error.name === "AbortError") {
-          return;
+      .then((data) => {
+        if (Array.isArray(data)) {
+          setNotifications((current) => mergeNotifications(data, current));
         }
-        setNotifications([]);
-      });
+      })
+      .catch(() => undefined);
     return () => controller.abort();
   }, []);
 
@@ -179,6 +196,19 @@ function NotificationBell({
   const { connectionState } = useReconnectingWebSocket(getNotificationStreamUrl(), {
     enabled: typeof WebSocket !== "undefined",
     maxRetries: Infinity,
+    // During a deploy this stays "reconnecting" (the banner) until the new instance is ready.
+    readinessCheck: isServerReady,
+    onOpen: () => {
+      // The stream only pushes what is created while it is connected, so every open (a
+      // reconnect possibly lands on another replica) backfills the gap from the list endpoint.
+      listNotifications()
+        .then((data) => {
+          if (Array.isArray(data)) {
+            setNotifications((current) => mergeNotifications(data, current));
+          }
+        })
+        .catch(() => undefined);
+    },
     onMessage: (event) => {
       try {
         const notification = JSON.parse(event.data) as NotificationResponse;

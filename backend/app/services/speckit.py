@@ -26,10 +26,17 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
+from app.core.lifecycle import ServiceDrainingError, lifecycle
 from app.models import AgentRun, SpecPhase, SpecWorkflow, User, Workspace
 from app.services.agents import AgentService
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
+from app.services.jobs import (
+    ENQUEUE_FAILED,
+    RunDispatcher,
+    RunQueueUnavailableError,
+    get_run_dispatcher,
+)
 from app.services.notifications import NotificationService
 from app.services.repositories import (
     DEFAULT_COMMIT_AUTHOR,
@@ -37,6 +44,7 @@ from app.services.repositories import (
     NoChangesToCommitError,
     RepositoryService,
 )
+from app.services.runtime import run_registry
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 logger = structlog.get_logger(__name__)
@@ -207,11 +215,13 @@ class SpecKitService:
         session_maker: async_sessionmaker[AsyncSession],
         settings: Settings,
         runtime: DaytonaRuntime | None = None,
+        dispatcher: RunDispatcher | None = None,
     ) -> None:
         self.session = session
         self.session_maker = session_maker
         self.settings = settings
         self.runtime = runtime or get_daytona_runtime()
+        self._dispatcher = dispatcher
         # Strong references to in-flight phase finalizers, so the event loop cannot
         # garbage-collect a running task out from under a workflow.
         self._finalizers: set[asyncio.Task] = set()
@@ -252,6 +262,7 @@ class SpecKitService:
         feature_name: str,
         description: str,
     ) -> SpecWorkflow:
+        lifecycle.ensure_accepting_work()
         await self.ensure_initialized(workspace_id, user_id)
 
         # Constitution-first: only skip straight to ``specify`` when the repo already has a
@@ -330,6 +341,7 @@ class SpecKitService:
         user_id: UUID,
         feedback: str | None = None,
     ) -> SpecPhase:
+        lifecycle.ensure_accepting_work()
         if phase_name not in PHASE_PLANS:
             raise InvalidSpecPhaseError(phase_name)
         workspace = await self._get_workspace(workspace_id, user_id)
@@ -350,6 +362,7 @@ class SpecKitService:
             session=self.session,
             session_maker=self.session_maker,
             settings=self.settings,
+            dispatcher=self._dispatcher,
         )
         # Propagates AgentRunAlreadyActiveError (mapped to 409 by the router) when the
         # workspace already has an active run.
@@ -368,6 +381,23 @@ class SpecKitService:
         await self.session.commit()
         await self.session.refresh(phase)
 
+        if self.settings.run_execution_mode == "queue":
+            # A worker job polls the run instead of an in-process task (see app.worker).
+            dispatcher = self._dispatcher or get_run_dispatcher()
+            try:
+                await dispatcher.enqueue_spec_finalize(phase.id, run.id)
+            except Exception as error:
+                # Without its finalizer the phase could never advance; don't let the agent run
+                # spend (and hold the workspace) for nothing.
+                await agent_service.fail_active_run(
+                    run.id, ENQUEUE_FAILED, "The run could not be queued for execution."
+                )
+                await self._mark_phase_failed(
+                    workflow_id, phase_name, user_id, "the phase could not be queued"
+                )
+                raise RunQueueUnavailableError from error
+            return phase
+
         # Finalize off-request once the agent run reaches a terminal state. The task is
         # retained until it finishes; a bare `create_task` reference can be collected
         # mid-flight, silently abandoning the phase in `running`.
@@ -376,6 +406,9 @@ class SpecKitService:
         )
         self._finalizers.add(task)
         task.add_done_callback(self._finalizers.discard)
+        # Shared with agent/command runs so a shutdown drain waits for (or cancels and sweeps)
+        # the finalizer too, rather than erroring a phase whose run just finished.
+        run_registry.register(phase.id, task)
         return phase
 
     async def approve_phase(
@@ -422,6 +455,7 @@ class SpecKitService:
         user_id: UUID,
         notes: str,
     ) -> SpecPhase:
+        lifecycle.ensure_accepting_work()
         await self._get_workspace(workspace_id, user_id)
         await self._get_workflow_row(workspace_id, workflow_id)
         phase = await self._get_phase_row(workflow_id, phase_name)
@@ -477,6 +511,7 @@ class SpecKitService:
         The re-run edits spec.md/plan.md/tasks.md to resolve each answered finding, then
         regenerates analysis.md + open-questions.json (advisory: it never gates ``implement``).
         """
+        lifecycle.ensure_accepting_work()
         workspace = await self._get_workspace(workspace_id, user_id)
         workflow = await self._get_workflow_row(workspace_id, workflow_id)
         phase = await self._get_phase_row(workflow_id, "analyze")
@@ -788,6 +823,7 @@ class SpecKitService:
         phase_name: str,
         run_id: UUID,
         user_id: UUID,
+        run_status: str | None = None,
     ) -> None:
         """Fire-and-forget finalizer wrapper: never let an exception escape.
 
@@ -799,7 +835,9 @@ class SpecKitService:
         notification. Record the failure the same way a non-completed run does instead.
         """
         try:
-            await self._finalize_phase_inner(workflow_id, phase_name, run_id, user_id)
+            await self._finalize_phase_inner(
+                workflow_id, phase_name, run_id, user_id, run_status=run_status
+            )
         except Exception as error:  # noqa: BLE001 - last line of defence for a bare task
             logger.exception(
                 "spec_phase_finalize_failed",
@@ -850,8 +888,11 @@ class SpecKitService:
         phase_name: str,
         run_id: UUID,
         user_id: UUID,
+        run_status: str | None = None,
     ) -> None:
-        run_status = await self._await_run_terminal(run_id)
+        # Inline mode polls here; a queue-mode worker job has already seen the run finish.
+        if run_status is None:
+            run_status = await self._await_run_terminal(run_id)
         async with self.session_maker() as session:
             workflow = await session.get(SpecWorkflow, workflow_id)
             phase = await self._load_phase(session, workflow_id, phase_name)
@@ -942,10 +983,18 @@ class SpecKitService:
         if auto_chain_specify:
             async with self.session_maker() as chain_session:
                 chained = SpecKitService(
-                    chain_session, self.session_maker, self.settings, self.runtime
+                    chain_session,
+                    self.session_maker,
+                    self.settings,
+                    self.runtime,
+                    dispatcher=self._dispatcher,
                 )
                 try:
                     await chained.run_phase(ws_id, workflow_id, "specify", user_id)
+                except ServiceDrainingError:
+                    # A deploy is in progress: specify stays pending for the user to start,
+                    # which is a deferral, not a failure worth an error notification.
+                    logger.info("spec_auto_chain_deferred_by_drain", workflow_id=str(workflow_id))
                 except Exception:  # noqa: BLE001 - best-effort chain in a fire-and-forget task
                     workflow_row = await chain_session.get(SpecWorkflow, workflow_id)
                     specify_row = await self._load_phase(chain_session, workflow_id, "specify")

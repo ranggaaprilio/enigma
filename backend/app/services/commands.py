@@ -1,22 +1,37 @@
 import asyncio
 import shlex
-from collections import defaultdict
 from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
+from app.core.lifecycle import lifecycle
 from app.models import CommandRun, CustomCommand, Workspace
 from app.services.agent_tools import DangerousCommandError
 from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
 from app.services.env_templates import enigma_exports, substitute
 from app.services.git_providers import redact_secrets
+from app.services.jobs import (
+    ENQUEUE_FAILED,
+    RunDispatcher,
+    RunQueueUnavailableError,
+    get_run_dispatcher,
+)
+from app.services.leases import db_now, lease_deadline
 from app.services.notifications import NotificationService
 from app.services.run_paths import RunPathError, resolve_run_cwd
+from app.services.runtime import (
+    EventBus,
+    InMemoryEventBus,
+    InMemoryRunRegistry,
+    RunRegistry,
+    event_bus,
+    run_registry,
+)
 from app.services.workspace_env import build_template_context, redactable_env_values
 from app.services.workspace_env import resolve as _resolve_env
 from app.services.workspaces import WorkspaceNotFoundError
@@ -54,33 +69,46 @@ class CustomCommandInvalidError(Exception):
 
 
 class CommandRuntime:
-    def __init__(self) -> None:
-        self.subscribers: dict[UUID, set[asyncio.Queue[dict]]] = defaultdict(set)
-        self.tasks: dict[UUID, asyncio.Task] = {}
+    """Command-run view over the process-local run state seam (see ``app.services.runtime``)."""
+
+    def __init__(
+        self, registry: RunRegistry | None = None, bus: EventBus | None = None
+    ) -> None:
+        self.registry = registry if registry is not None else InMemoryRunRegistry()
+        self.bus = bus if bus is not None else InMemoryEventBus()
+
+    @staticmethod
+    def _topic(run_id: UUID) -> str:
+        return f"command_run:{run_id}"
 
     def register_run(self, run_id: UUID, task: asyncio.Task) -> None:
-        self.tasks[run_id] = task
-        task.add_done_callback(lambda _task: self.tasks.pop(run_id, None))
+        self.registry.register(run_id, task)
+
+    def get_task(self, run_id: UUID) -> asyncio.Task | None:
+        return self.registry.get_task(run_id)
 
     def subscribe(self, run_id: UUID) -> asyncio.Queue[dict]:
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        self.subscribers[run_id].add(queue)
-        return queue
+        return self.bus.subscribe(self._topic(run_id))
 
     def unsubscribe(self, run_id: UUID, queue: asyncio.Queue[dict]) -> None:
-        queues = self.subscribers.get(run_id)
-        if not queues:
-            return
-        queues.discard(queue)
-        if not queues:
-            self.subscribers.pop(run_id, None)
+        self.bus.unsubscribe(self._topic(run_id), queue)
 
     async def publish(self, run_id: UUID, payload: dict) -> None:
-        for queue in list(self.subscribers.get(run_id, set())):
-            await queue.put(payload)
+        await self.bus.publish(self._topic(run_id), payload)
+
+    async def wait_ready(self, run_id: UUID) -> bool:
+        return await self.bus.wait_ready(self._topic(run_id))
 
 
-command_runtime = CommandRuntime()
+command_runtime = CommandRuntime(run_registry, event_bus)
+
+
+def command_status_frame(run: CommandRun) -> dict:
+    """The terminal frame of a command-run stream."""
+    frame = {"type": "status", "status": run.status, "exit_code": run.exit_code}
+    if run.error_reason:
+        frame["reason"] = run.error_reason
+    return frame
 
 
 class CommandService:
@@ -91,12 +119,18 @@ class CommandService:
         settings: Settings,
         runtime: CommandRuntime = command_runtime,
         daytona_runtime: DaytonaRuntime | None = None,
+        dispatcher: RunDispatcher | None = None,
     ) -> None:
         self.session = session
         self.session_maker = session_maker
         self.settings = settings
         self.runtime = runtime
         self.daytona_runtime = daytona_runtime or get_daytona_runtime()
+        self._dispatcher = dispatcher
+
+    @property
+    def dispatcher(self) -> RunDispatcher:
+        return self._dispatcher if self._dispatcher is not None else get_run_dispatcher()
 
     async def create_command(
         self,
@@ -356,6 +390,7 @@ class CommandService:
         confirmed: bool,
         worktree_id: UUID | None = None,
     ) -> CommandRun:
+        lifecycle.ensure_accepting_work()
         workspace = await self._get_workspace(workspace_id, user_id)
         custom_command = await self._get_command(workspace_id, command_id, user_id)
         if custom_command.requires_confirmation and not confirmed:
@@ -402,8 +437,11 @@ class CommandService:
             },
         )
 
-        task = asyncio.create_task(self._execute_run(run.id, confirmed))
-        self.runtime.register_run(run.id, task)
+        if self.settings.run_execution_mode == "queue":
+            await self._enqueue_run(run)
+        else:
+            task = asyncio.create_task(self._execute_run(run.id, confirmed))
+            self.runtime.register_run(run.id, task)
         logger.info(
             "custom_command_run_start",
             command_run_id=str(run.id),
@@ -412,6 +450,105 @@ class CommandService:
             user_id=str(user_id),
         )
         return run
+
+    async def _enqueue_run(self, run: CommandRun) -> None:
+        run.enqueued_at = datetime.now(UTC)
+        self.session.add(run)
+        await self.session.commit()
+        try:
+            await self.dispatcher.enqueue_command_run(run.id)
+        except Exception as error:
+            await self.fail_active_run(
+                run.id, ENQUEUE_FAILED, "The run could not be queued for execution."
+            )
+            raise RunQueueUnavailableError from error
+        await self.session.refresh(run)
+
+    async def claim_run(self, run_id: UUID, worker_id: str, attempt: int) -> str:
+        """Atomically take ownership of a queued run (see ``AgentService.claim_run``)."""
+        async with self.session_maker() as session:
+            claimed = await session.execute(
+                update(CommandRun)
+                .where(
+                    CommandRun.id == run_id,
+                    CommandRun.status == "running",
+                    CommandRun.claimed_at.is_(None),
+                )
+                .values(
+                    claimed_at=datetime.now(UTC),
+                    worker_id=worker_id,
+                    attempt=attempt,
+                    heartbeat_at=db_now(),
+                    lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
+                )
+                .returning(CommandRun.id)
+            )
+            if claimed.scalar_one_or_none() is not None:
+                await session.commit()
+                return "claimed"
+            status = await session.scalar(
+                select(CommandRun.status).where(CommandRun.id == run_id)
+            )
+            if status is None:
+                return "missing"
+            return "already_claimed" if status == "running" else "already_terminal"
+
+    async def renew_lease(self, run_id: UUID, worker_id: str) -> bool:
+        """Extend the lease of a run this worker owns (see ``AgentService.renew_lease``)."""
+        async with self.session_maker() as session:
+            renewed = await session.execute(
+                update(CommandRun)
+                .where(
+                    CommandRun.id == run_id,
+                    CommandRun.worker_id == worker_id,
+                    CommandRun.status == "running",
+                )
+                .values(
+                    heartbeat_at=db_now(),
+                    lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
+                )
+                .returning(CommandRun.id)
+            )
+            if renewed.scalar_one_or_none() is None:
+                return False
+            await session.commit()
+            return True
+
+    async def fail_active_run(
+        self, run_id: UUID, reason: str, message: str, *, lease_expired: bool = False
+    ) -> bool:
+        """End a still-running run as ``error``/``reason``; a no-op if it already finished.
+
+        ``lease_expired`` also requires that no worker holds a live lease at write time (see
+        ``AgentService.fail_active_run``).
+        """
+        async with self.session_maker() as session:
+            conditions = [CommandRun.id == run_id, CommandRun.status == "running"]
+            if lease_expired:
+                conditions.append(
+                    or_(
+                        CommandRun.lease_expires_at.is_(None),
+                        CommandRun.lease_expires_at < db_now(),
+                    )
+                )
+            result = await session.execute(
+                update(CommandRun)
+                .where(*conditions)
+                .values(
+                    status="error",
+                    error_reason=reason,
+                    completed_at=datetime.now(UTC),
+                    output=CommandRun.output + f"\n{message}\n",
+                    lease_expires_at=None,
+                )
+                .returning(CommandRun.id)
+            )
+            if result.scalar_one_or_none() is None:
+                return False  # nothing written; closing the session ends the transaction
+            await session.commit()
+            run = await session.get(CommandRun, run_id)
+            await self.runtime.publish(run_id, command_status_frame(run))
+            return True
 
     async def list_runs(
         self,
@@ -572,13 +709,20 @@ class CommandService:
         if not content:
             return
         max_chars = self.settings.agent_max_command_output_chars
-        next_output = f"{run.output or ''}{content}"
-        run.output = next_output[:max_chars]
+        previous = run.output or ""
+        run.output = f"{previous}{content}"[:max_chars]
+        # Publish exactly what was persisted, at its offset into ``run.output``: a stream can then
+        # trim what it already sent and re-read from Postgres whatever the bus dropped.
+        persisted = run.output[len(previous) :]
+        if not persisted:
+            return
         session.add(run)
         await session.flush()
         await session.commit()
         await session.refresh(run)
-        await self.runtime.publish(run.id, {"type": "output", "content": content})
+        await self.runtime.publish(
+            run.id, {"type": "output", "content": persisted, "offset": len(previous)}
+        )
 
     async def _mark_finished(
         self,
@@ -587,17 +731,32 @@ class CommandService:
         status: str,
         exit_code: int | None,
     ) -> None:
+        # Conditional, like AgentService._transition: a run already ended elsewhere (the reaper,
+        # an enqueue failure) keeps that outcome, and nothing is published or notified again.
+        completed_at = datetime.now(UTC)
+        finished = await session.execute(
+            update(CommandRun)
+            .where(CommandRun.id == run.id, CommandRun.status == "running")
+            .values(
+                status=status,
+                exit_code=exit_code,
+                completed_at=completed_at,
+                lease_expires_at=None,
+            )
+            .returning(CommandRun.id)
+            .execution_options(synchronize_session=False)
+        )
+        if finished.scalar_one_or_none() is None:
+            return
         run.status = status
         run.exit_code = exit_code
-        run.completed_at = datetime.now(UTC)
+        run.completed_at = completed_at
+        run.lease_expires_at = None
         session.add(run)
         await session.flush()
         await session.commit()
         await session.refresh(run)
-        await self.runtime.publish(
-            run.id,
-            {"type": "status", "status": run.status, "exit_code": run.exit_code},
-        )
+        await self.runtime.publish(run.id, command_status_frame(run))
         logger.info(
             "custom_command_run_finish",
             command_run_id=str(run.id),

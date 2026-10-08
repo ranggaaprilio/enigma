@@ -1,6 +1,9 @@
+import socket
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import urlsplit
 
+from cryptography.fernet import Fernet
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -8,6 +11,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # validator below refuses to boot when these are still in place and environment != "local".
 _DEFAULT_AUTH_SECRET_KEY = "local-development-auth-secret-change-me"
 _DEFAULT_ENV_ENCRYPTION_KEY = "SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc="
+# HMAC key length floor outside local: 32 chars ~ 256 bits of a random token.
+_MIN_AUTH_SECRET_LENGTH = 32
 
 
 class Settings(BaseSettings):
@@ -15,6 +20,20 @@ class Settings(BaseSettings):
     environment: str = "local"
     database_url: str = "postgresql+asyncpg://execute:execute@localhost:5432/execute_dashboard"
     redis_url: str = "redis://localhost:6379/0"
+    # Epic 05: per-process SQLAlchemy pool. Each process can open up to pool_size +
+    # max_overflow connections, so keep (api_replicas + workers) x that sum below Postgres'
+    # max_connections with headroom (docs/horizontal-scale/05-data-layer-scaling.md).
+    db_pool_size: int = Field(default=5, gt=0)
+    db_max_overflow: int = Field(default=10, ge=0)
+    db_pool_timeout: float = Field(default=30.0, gt=0)
+    db_pool_recycle: int = Field(default=1800, gt=0)
+    # DATABASE_URL points at PgBouncer in transaction mode: no app-side pool, no cached
+    # prepared statements (the pool_* settings above are then ignored).
+    db_pgbouncer: bool = False
+    # A dead or partitioned Redis must surface as an error, not a request that never returns.
+    redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
+    redis_connect_timeout_seconds: float = Field(default=5.0, gt=0)
+    redis_health_check_interval_seconds: int = Field(default=30, ge=0)
     auth_secret_key: str = _DEFAULT_AUTH_SECRET_KEY
     auth_cookie_name: str = "execute_session"
     auth_session_ttl_seconds: int = 60 * 60 * 24 * 7
@@ -27,6 +46,45 @@ class Settings(BaseSettings):
     agent_run_rate_limit_attempts: int = 30
     agent_run_rate_limit_window_seconds: int = 60
     workspace_env_encryption_key: str = _DEFAULT_ENV_ENCRYPTION_KEY
+    # Graceful shutdown (see app/core/lifecycle.py). After SIGTERM the instance keeps serving
+    # with /ready=503 for the drain delay so the load balancer stops routing, then gives
+    # in-flight runs the grace window before cancelling them. Keep the orchestrator's stop
+    # timeout above the sum of both.
+    shutdown_drain_delay_seconds: float = 5.0
+    shutdown_run_grace_seconds: float = 15.0
+    # Epic 02: where runs execute. "inline" runs them as asyncio tasks inside the API process
+    # (one replica only); "queue" enqueues the run id on Redis for `app.worker` processes (arq)
+    # and fans events/stop signals out over Redis pub/sub. Switch modes only with no active runs.
+    run_execution_mode: Literal["inline", "queue"] = "inline"
+    run_queue_name: str = "enigma:runs"
+    # Stable identity of a worker process, stamped on the runs it claims so its next
+    # incarnation can reconcile what it left behind. Must be unique per live worker.
+    worker_id: str = Field(default_factory=socket.gethostname, min_length=1)
+    worker_max_jobs: int = Field(default=10, gt=0)
+    worker_max_tries: int = Field(default=3, gt=0)
+    # A run gets this long on a worker; arq's own job timeout sits above it so the handler
+    # (which can record the timeout on the run) always fires first.
+    agent_run_timeout_seconds: int = Field(default=2 * 60 * 60, gt=0)
+    worker_job_timeout_seconds: int = Field(default=2 * 60 * 60 + 5 * 60, gt=0)
+    spec_finalize_poll_seconds: float = Field(default=5.0, gt=0)
+    # Epic 04: a worker owns a claimed run only while its lease is fresh. It renews every
+    # `run_heartbeat_seconds`; once `lease_expires_at` passes, any worker's reaper (every
+    # `run_reaper_interval_seconds`) ends the run as `interrupted_worker_died`.
+    run_lease_seconds: float = Field(default=60.0, gt=0)
+    run_heartbeat_seconds: float = Field(default=15.0, gt=0)
+    run_reaper_interval_seconds: float = Field(default=30.0, gt=0)
+    # Epic 05 retention, in days; 0 keeps rows forever (the default). Agent events and command
+    # output of finished runs are dropped (the run rows, with their token/cost totals, stay);
+    # notifications are deleted once read for `read_…` days, or regardless after
+    # `retention_notifications_days` (budget warnings are always kept).
+    retention_agent_events_days: int = Field(default=0, ge=0)
+    retention_command_output_days: int = Field(default=0, ge=0)
+    retention_read_notifications_days: int = Field(default=0, ge=0)
+    retention_notifications_days: int = Field(default=0, ge=0)
+    retention_interval_seconds: float = Field(default=3600.0, gt=0)
+    # Runs (or notifications) handled per transaction, so one pass never holds long locks. A
+    # long run can have thousands of events, so keep it small.
+    retention_batch_size: int = Field(default=50, gt=0)
     daytona_api_key: str | None = None
     daytona_api_url: str | None = None
     daytona_target: str | None = None
@@ -133,7 +191,26 @@ class Settings(BaseSettings):
         env_file=".env",
         env_file_encoding="utf-8",
         extra="ignore",
+        # Validation errors must not echo secrets into crash logs: pydantic would otherwise
+        # append `input_value=` (the rejected key, or the whole settings dict for model-level
+        # checks such as `enforce_secure_defaults`).
+        hide_input_in_errors=True,
     )
+
+    @field_validator("workspace_env_encryption_key")
+    @classmethod
+    def validate_fernet_key(cls, value: str) -> str:
+        # Checked in every environment: a malformed key otherwise only fails on the first
+        # encrypt/decrypt, long after boot.
+        try:
+            Fernet(value.encode("utf-8"))
+        except (ValueError, TypeError) as error:
+            raise ValueError(
+                "workspace_env_encryption_key must be a valid Fernet key (32 url-safe "
+                "base64-encoded bytes). Generate one with: python -c 'from cryptography.fernet "
+                "import Fernet; print(Fernet.generate_key().decode())'"
+            ) from error
+        return value
 
     @field_validator("backend_cors_origins", mode="before")
     @classmethod
@@ -162,6 +239,15 @@ class Settings(BaseSettings):
         return value
 
     @model_validator(mode="after")
+    def check_lease_timing(self) -> "Settings":
+        if self.run_heartbeat_seconds >= self.run_lease_seconds:
+            raise ValueError(
+                "run_heartbeat_seconds must be shorter than run_lease_seconds, or a live "
+                "worker's lease expires between renewals and the reaper ends its run."
+            )
+        return self
+
+    @model_validator(mode="after")
     def enforce_secure_defaults(self) -> "Settings":
         """Refuse to boot with insecure defaults outside a local environment.
 
@@ -175,6 +261,12 @@ class Settings(BaseSettings):
         insecure = []
         if self.auth_secret_key == _DEFAULT_AUTH_SECRET_KEY:
             insecure.append("auth_secret_key")
+        elif len(self.auth_secret_key) < _MIN_AUTH_SECRET_LENGTH:
+            raise ValueError(
+                f"auth_secret_key must be at least {_MIN_AUTH_SECRET_LENGTH} characters when "
+                f"environment={self.environment!r}. Generate one with: "
+                "python -c 'import secrets; print(secrets.token_urlsafe(48))'"
+            )
         if self.workspace_env_encryption_key == _DEFAULT_ENV_ENCRYPTION_KEY:
             insecure.append("workspace_env_encryption_key")
         # `/metrics` reports per-route request volumes and workspace-level counters; it must

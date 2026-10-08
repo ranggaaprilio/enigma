@@ -1,7 +1,11 @@
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { useReconnectingWebSocket } from "./useReconnectingWebSocket";
+import {
+  READY_POLL_INTERVAL_MS,
+  READY_WAIT_LIMIT_MS,
+  useReconnectingWebSocket,
+} from "./useReconnectingWebSocket";
 
 class MockWebSocket {
   static instances: MockWebSocket[] = [];
@@ -135,4 +139,136 @@ describe("useReconnectingWebSocket", () => {
     unmount();
     expect(socket.readyState).toBe(3);
   });
+
+  describe("with a readinessCheck (deploys)", () => {
+    it("holds the reconnect while the server is not ready, without spending retries", async () => {
+      vi.useFakeTimers();
+      stubWebSocket();
+      const readinessCheck = vi
+        .fn<() => Promise<boolean>>()
+        .mockResolvedValueOnce(false)
+        .mockResolvedValueOnce(false)
+        .mockResolvedValue(true);
+      const { result } = renderHook(() => useReconnectingWebSocket(URL, { readinessCheck }));
+
+      act(() => latestSocket().close());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000); // backoff elapses, server still draining
+      });
+      expect(MockWebSocket.instances.length).toBe(1);
+      expect(result.current.connectionState).toBe("reconnecting");
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(READY_POLL_INTERVAL_MS); // still not ready
+      });
+      expect(MockWebSocket.instances.length).toBe(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(READY_POLL_INTERVAL_MS); // ready -> reconnect
+      });
+      expect(MockWebSocket.instances.length).toBe(2);
+      expect(readinessCheck).toHaveBeenCalledTimes(3);
+      expect(result.current.reconnectAttempt).toBe(1);
+      expect(result.current.connectionState).toBe("reconnecting");
+    });
+
+    it("gives up waiting for readiness after the limit and reconnects anyway", async () => {
+      vi.useFakeTimers();
+      stubWebSocket();
+      const readinessCheck = vi.fn<() => Promise<boolean>>().mockResolvedValue(false);
+      renderHook(() => useReconnectingWebSocket(URL, { readinessCheck }));
+
+      act(() => latestSocket().close());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000 + READY_WAIT_LIMIT_MS);
+      });
+
+      expect(MockWebSocket.instances.length).toBe(2);
+    });
+
+    it("treats a failing readiness probe as not ready", async () => {
+      vi.useFakeTimers();
+      stubWebSocket();
+      const readinessCheck = vi
+        .fn<() => Promise<boolean>>()
+        .mockRejectedValueOnce(new Error("network down"))
+        .mockResolvedValue(true);
+      renderHook(() => useReconnectingWebSocket(URL, { readinessCheck }));
+
+      act(() => latestSocket().close());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(MockWebSocket.instances.length).toBe(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(READY_POLL_INTERVAL_MS);
+      });
+      expect(MockWebSocket.instances.length).toBe(2);
+    });
+
+    it("does not reconnect when unmounted during a readiness wait", async () => {
+      vi.useFakeTimers();
+      stubWebSocket();
+      const readinessCheck = vi.fn<() => Promise<boolean>>().mockResolvedValue(false);
+      const { unmount } = renderHook(() => useReconnectingWebSocket(URL, { readinessCheck }));
+
+      act(() => latestSocket().close());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      unmount();
+      readinessCheck.mockResolvedValue(true);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(READY_WAIT_LIMIT_MS);
+      });
+
+      expect(MockWebSocket.instances.length).toBe(1);
+    });
+
+    it("drops a readiness probe that resolves after unmount", async () => {
+      vi.useFakeTimers();
+      stubWebSocket();
+      let resolveProbe: (ready: boolean) => void = () => {};
+      const readinessCheck = vi.fn(
+        () => new Promise<boolean>((resolve) => (resolveProbe = resolve)),
+      );
+      const { unmount } = renderHook(() => useReconnectingWebSocket(URL, { readinessCheck }));
+
+      act(() => latestSocket().close());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000); // probe now in flight
+      });
+      expect(readinessCheck).toHaveBeenCalledTimes(1);
+      unmount();
+      await act(async () => {
+        resolveProbe(true);
+      });
+
+      expect(MockWebSocket.instances.length).toBe(1);
+    });
+
+    it("grants a fresh readiness budget after the url changes", async () => {
+      vi.useFakeTimers();
+      stubWebSocket();
+      const readinessCheck = vi.fn<() => Promise<boolean>>().mockResolvedValue(false);
+      const { rerender } = renderHook(
+        ({ url }) => useReconnectingWebSocket(url, { readinessCheck }),
+        { initialProps: { url: URL } },
+      );
+
+      act(() => latestSocket().close());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(50_000); // most of the first budget spent
+      });
+      rerender({ url: `${URL}/other` });
+      const socketsAfterSwitch = MockWebSocket.instances.length;
+      act(() => latestSocket().close());
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(30_000); // past the old budget, within a fresh one
+      });
+
+      expect(MockWebSocket.instances.length).toBe(socketsAfterSwitch);
+    });
+  });
 });
+

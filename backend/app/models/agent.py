@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -78,6 +79,21 @@ class AgentRun(Base):
         Index("ix_agent_runs_status", "status"),
         Index("ix_agent_runs_created_at", "started_at"),
         Index("ix_agent_runs_session_id", "session_id"),
+        Index("ix_agent_runs_status_workspace_id", "status", "workspace_id"),
+        # Retention scan (Epic 05): finished runs whose events are still there.
+        Index(
+            "ix_agent_runs_events_retention",
+            "completed_at",
+            postgresql_where=text("events_pruned_at IS NULL AND completed_at IS NOT NULL"),
+        ),
+        # One active run per workspace, enforced by Postgres so concurrent API replicas cannot
+        # both start one (the in-process RunLock only serialises a single process).
+        Index(
+            "uq_agent_runs_one_active_per_workspace",
+            "workspace_id",
+            unique=True,
+            postgresql_where=text("status IN ('thinking', 'executing')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -116,6 +132,27 @@ class AgentRun(Base):
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Stable code for why the run ended in `error` (e.g. "interrupted_by_restart").
+    error_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Where the agent's tools run (a worktree or spec-worktree path); persisted so a queued job,
+    # which only carries the run id, can recover it.
+    working_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Queue bookkeeping (Epic 02). `claimed_at` is set exactly once, by the worker that wins the
+    # conditional claim; `started_at` remains the row's creation time.
+    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Ownership lease (Epic 04): stamped at claim, renewed by the owning worker's heartbeat,
+    # cleared when the run ends. NULL on an active run means it was never leased (inline mode).
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Set when retention deleted this run's events; the run row and its totals are kept.
+    events_pruned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     session: Mapped["AgentSession | None"] = relationship(back_populates="runs")
     events: Mapped[list["AgentEvent"]] = relationship(
@@ -137,9 +174,11 @@ class AgentEvent(Base):
             "event_type in ('status', 'output_text', 'tool_call', 'tool_result', 'error')",
             name="ck_agent_events_event_type",
         ),
-        Index("ix_agent_events_agent_run_id", "agent_run_id"),
         Index("ix_agent_events_created_at", "created_at"),
         Index("ix_agent_events_tool_call_id", "tool_call_id"),
+        # Backfill-then-tail: a run's events in stream order, from a high-water mark on. Its
+        # leading column also serves every by-run lookup and the run FK's cascade delete.
+        Index("ix_agent_events_run_created_id", "agent_run_id", "created_at", "id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

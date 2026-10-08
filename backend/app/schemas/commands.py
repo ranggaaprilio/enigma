@@ -206,6 +206,7 @@ class CommandRunResponse(BaseModel):
     output: str
     started_at: datetime
     completed_at: datetime | None
+    error_reason: str | None = None
 
     model_config = ConfigDict(from_attributes=True)
 
