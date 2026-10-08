@@ -41,6 +41,8 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
 ### Utility
 ```bash
 ./scripts/clean_data.sh --yes    # flush Redis + recreate Postgres schema + re-migrate
+./scripts/backup_db.sh           # pg_dump -Fc -> backups/<db>-<timestamp>.dump
+./scripts/restore_db.sh <dump> --drop-after  # test-restore into a scratch DB, verify, drop it
 ```
 
 ## Architecture
@@ -53,7 +55,7 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
   - Connection string must be `postgresql+asyncpg://…`
   - Session: `async_session_maker` with `expire_on_commit=False`
   - All DB access MUST use async/await
-- **Migrations**: Alembic with async engine, 33 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0033_run_leases`)
+- **Migrations**: Alembic with async engine, 34 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0034_data_retention`)
 - **Auth**: Cookie-based sessions (`execute_session` cookie), NOT JWT. Set-Cookie on login, cleared on logout.
 - **Logging**: `structlog` (configured in `core/logging.py`)
 - **Testing**: `pytest` with `pytest-asyncio` (auto mode), tests at `backend/tests/`
@@ -147,6 +149,7 @@ OpenAI-compatible base URL, model, and a Fernet-encrypted API key. Owner-only, g
 19. **`RUN_EXECUTION_MODE=inline|queue`** (default `inline`). In `queue` mode, create-run endpoints enqueue the run id (`services/jobs.py`, arq) and `app/worker.py` executes it. The event bus becomes `RedisEventBus`, and stop travels on `agent_run_control:{id}`. The API then skips the startup sweep, and each worker reconciles only its own `worker_id`. Workers claim runs with a conditional UPDATE on `claimed_at`, so a redelivered job never re-runs a run. A duplicate active run is blocked by the partial unique index `uq_agent_runs_one_active_per_workspace`, so a test fixture with two `thinking`/`executing` runs in one workspace fails. `redis` is pinned `<6` because arq requires it. Details: `docs/horizontal-scale/02-distributed-job-execution.md`.
 20. **Streams are backfill-then-tail; Postgres is authoritative, the bus is an at-most-once hint.** A stream subscribes, waits for `wait_ready`, *then* reads persisted state, and re-reads on idle ticks and at the end. Agent frames de-dupe by event id (`catch_up`, high-water `created_at`); command `output` frames carry an `offset` into `run.output` (`tail_command_run`); notifications backfill from `GET /notifications` on reconnect. Persist before you publish, and never publish anything a reader could not re-derive from the DB. Details: `docs/horizontal-scale/03-distributed-event-streaming.md`.
 21. **Runs are leased; status writes are conditional** (Epic 04). A worker's claim stamps `lease_expires_at` (Postgres `clock_timestamp()`, never the worker's clock); `heartbeat()` (`services/leases.py`) renews it every `RUN_HEARTBEAT_SECONDS` while the run executes, and only the owning `worker_id` can renew. Every worker runs the reaper (`services/reaper.py`), which ends active runs with an expired lease as `error`/`interrupted_worker_died`; inline runs have no lease and are never reaped. Agent status changes go through `AgentService._transition` (`UPDATE … WHERE status IN active`): terminal is final, `stop_run` is idempotent, and a write that loses the race returns `False` and must not publish. `create_run` also takes `pg_advisory_xact_lock` on `agent_run:workspace:{id}`. Details: `docs/horizontal-scale/04-run-lifecycle-and-coordination.md`.
+22. **Pools are sized; retention is opt-in; WebSockets never hold a session** (Epic 05). `engine_options()` (`db/session.py`) builds the pool from `DB_POOL_*`; with `DB_PGBOUNCER=true` it is `NullPool` with asyncpg statement caching off. Use only transaction-scoped Postgres state (`pg_advisory_xact_lock`, never session advisory locks, `SET`, or `LISTEN`), or it breaks behind PgBouncer. `services/retention.py` prunes old events, command output and notifications when a `RETENTION_*_DAYS` is set (workers in queue mode, the API in inline mode), in `FOR UPDATE SKIP LOCKED` batches; pruned runs keep their row and token totals and get `events_pruned_at` / `output_pruned_at`. `tests/test_data_layer.py` fails any WebSocket handler that calls `accept()` inside `async with async_session_maker()`. Redis clients get read timeouts, except the client a long-lived `pubsub.listen()` runs on (`get_redis_client(subscriber=True)`), which a read timeout would kill when idle; keep commands off that client (see `PresenceService`). Retention never deletes `budget_warning` notifications (budget de-dupe). Retention tests seed rows ~25 years old because the suite shares the dev database. Details: `docs/horizontal-scale/05-data-layer-scaling.md`.
 
 ## Implementation Plan Reference
 
