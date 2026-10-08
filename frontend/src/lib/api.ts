@@ -401,6 +401,23 @@ export type AgentRunResponse = {
 /** `error_reason` of a run the server closed out because its process restarted mid-run. */
 export const INTERRUPTED_BY_RESTART = "interrupted_by_restart";
 
+/** `error_reason` of a run the reaper closed out because its worker stopped renewing its lease. */
+export const INTERRUPTED_WORKER_DIED = "interrupted_worker_died";
+
+/**
+ * The retry prompt for a run that infrastructure (not the agent or command) ended, or `null`
+ * when `reason` is an ordinary failure. These runs are safe to simply start again.
+ */
+export function interruptionMessage(reason: unknown): string | null {
+  if (reason === INTERRUPTED_BY_RESTART) {
+    return "Run interrupted by a server restart — please retry.";
+  }
+  if (reason === INTERRUPTED_WORKER_DIED) {
+    return "Run interrupted because its worker stopped responding — please retry.";
+  }
+  return null;
+}
+
 export type AgentRunDetailResponse = AgentRunResponse & {
   events: AgentEventResponse[];
 };

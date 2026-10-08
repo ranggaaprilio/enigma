@@ -79,6 +79,55 @@ describe("TurnView interruption", () => {
     expect(screen.queryByText(/Agent error/)).not.toBeInTheDocument();
   });
 
+  it("shows a retry notice when the run's worker died", () => {
+    render(
+      <TurnView
+        turn={turn({
+          error_message: "The worker running this run stopped responding. Please retry.",
+          error_reason: "interrupted_worker_died",
+        })}
+        events={[]}
+        isActive={false}
+        workspaceId="ws-1"
+      />,
+    );
+
+    expect(screen.getByTestId("turn-interrupted")).toHaveTextContent(
+      "Run interrupted because its worker stopped responding — please retry.",
+    );
+    expect(screen.queryByTestId("turn-error-message")).not.toBeInTheDocument();
+  });
+
+  it("recognises a dead worker from the live stream's terminal error event", () => {
+    render(
+      <TurnView
+        turn={turn({ status: "executing", completed_at: null })}
+        events={[errorEvent({ status: "error", reason: "interrupted_worker_died" }, "gone")]}
+        isActive={false}
+        workspaceId="ws-1"
+        agentError="gone"
+      />,
+    );
+
+    expect(screen.getByTestId("turn-interrupted")).toHaveTextContent(/worker stopped responding/);
+    expect(screen.queryByText(/Agent error/)).not.toBeInTheDocument();
+  });
+
+  it("marks a stopped run as stopped, not as an error", () => {
+    render(
+      <TurnView
+        turn={turn({ status: "stopped" })}
+        events={[]}
+        isActive={false}
+        workspaceId="ws-1"
+      />,
+    );
+
+    expect(screen.getByTestId("turn-stopped")).toHaveTextContent("This run was stopped.");
+    expect(screen.queryByTestId("turn-interrupted")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("turn-error-message")).not.toBeInTheDocument();
+  });
+
   it("still shows ordinary run errors as errors", () => {
     render(
       <TurnView

@@ -17,7 +17,7 @@ import {
   createCustomCommand,
   deleteCustomCommand,
   getCommandRunStreamUrl,
-  INTERRUPTED_BY_RESTART,
+  interruptionMessage,
   isServerReady,
   listCustomCommandRuns,
   listCustomCommands,
@@ -702,14 +702,14 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                     <h5 className="font-semibold">Output</h5>
                     <StatusPill status={activeRun?.status ?? "idle"} />
                   </div>
-                  {activeRun?.error_reason === INTERRUPTED_BY_RESTART && (
+                  {interruptionMessage(activeRun?.error_reason) && (
                     <div
                       className="mb-3 flex items-center gap-2 rounded-md border border-warn/30 bg-[#fffbf0] px-3 py-2 text-sm text-warn"
                       data-testid="command-run-interrupted"
                       role="status"
                     >
                       <RotateCcw className="h-4 w-4" aria-hidden="true" />
-                      Run interrupted by a server restart — please retry.
+                      {interruptionMessage(activeRun?.error_reason)}
                     </div>
                   )}
                   <pre className="min-h-[360px] max-h-[520px] overflow-auto whitespace-pre-wrap break-words rounded-lg border border-line bg-panel p-4 font-mono text-xs leading-5 text-ink">
