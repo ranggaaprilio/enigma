@@ -27,11 +27,37 @@ services:
       timeout: 5s
       retries: 10
 
+  # Epic 05: transaction-mode PgBouncer, opt-in with `--profile pgbouncer`. Point the app at it
+  # with DATABASE_URL=postgresql+asyncpg://execute:execute@pgbouncer:5432/execute_dashboard and
+  # DB_PGBOUNCER=true; run migrations against postgres directly. No host port: only services on
+  # the compose network reach it, and it authenticates every client (scram-sha-256).
+  pgbouncer:
+    profiles: ["pgbouncer"]
+    image: docker.io/edoburu/pgbouncer:v1.25.2-p0
+    environment:
+      DB_HOST: postgres
+      DB_USER: ${POSTGRES_USER:-execute}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-execute}
+      DB_NAME: ${POSTGRES_DB:-execute_dashboard}
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      # Server connections per database/user pair; the sum over pairs must fit max_connections.
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-20}
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-1000}
+      # asyncpg prepares uniquely named statements; reset each server connection when it goes
+      # back to the pool so they don't pile up (SQLAlchemy's asyncpg + PgBouncer guidance).
+      SERVER_RESET_QUERY: DISCARD ALL
+      SERVER_RESET_QUERY_ALWAYS: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   backend:
     build:
       context: ./backend
     environment: &backend-env
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
+      DB_PGBOUNCER: ${DB_PGBOUNCER:-false}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
       # No fallbacks: secrets must come from .env (see .env.example for how to generate them).
@@ -84,6 +110,10 @@ services:
       context: ./backend
     environment:
       <<: *backend-env
+      # Epic 05: a smaller pool per worker, so a run surge cannot take the connections the API
+      # needs (ignored behind PgBouncer, which pools for everyone).
+      DB_POOL_SIZE: ${WORKER_DB_POOL_SIZE:-3}
+      DB_MAX_OVERFLOW: ${WORKER_DB_MAX_OVERFLOW:-2}
     # Above SHUTDOWN_RUN_GRACE_SECONDS (arq's job_completion_wait) plus the shutdown sweep.
     stop_grace_period: 30s
     depends_on:

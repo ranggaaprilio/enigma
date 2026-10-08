@@ -19,3 +19,6 @@ frontend/.vite/
 postgres_data/
 redis_data/
 .venv/
+
+# Postgres dumps from scripts/backup_db.sh (as sensitive as the database)
+backups/
