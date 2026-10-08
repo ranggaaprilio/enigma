@@ -3,7 +3,7 @@ from typing import Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
@@ -21,6 +21,7 @@ from app.schemas.agents import (
 )
 from app.services.access import WorkspaceAccessDeniedError, can_drive, require_workspace_access
 from app.services.agents import (
+    ACTIVE_RUN_STATUSES,
     AgentConfigurationError,
     AgentRunAlreadyActiveError,
     AgentRunNotFoundError,
@@ -346,26 +347,51 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
     await websocket.send_json(
         {"type": "role", "content": "driver" if can_drive(viewer_role) else "observer"}
     )
+    sent_ids: set[str] = set()
     for event in events:
         await websocket.send_json(event_payload(event))
+        sent_ids.add(str(event.id))
 
     if run.status not in ("thinking", "executing"):
         await websocket.close()
         return
 
     queue = agent_runtime.subscribe(run_id)
+
+    async def close_if_ended() -> bool:
+        # With runs on workers, events persisted between the history read above and the
+        # subscription going live (or lost by the at-most-once bus) would never arrive here.
+        missed, ended = await catch_up(
+            async_session_maker, settings, workspace_id, run_id, user.id, sent_ids
+        )
+        for payload in missed:
+            await websocket.send_json(payload)
+            sent_ids.add(payload["id"])
+        if ended:
+            await websocket.close()
+        return ended
+
     try:
+        await agent_runtime.wait_ready(run_id)
+        if await close_if_ended():
+            return
         while True:
             try:
                 payload = await asyncio.wait_for(
                     queue.get(), timeout=STREAM_PING_INTERVAL_SECONDS
                 )
             except TimeoutError:
+                if await close_if_ended():
+                    return
                 # No agent activity in a while; send a keepalive so the socket
                 # stays open through long thinking pauses. The client ignores
                 # frames of type "ping".
                 await websocket.send_json({"type": "ping"})
                 continue
+            payload_id = payload.get("id")
+            if not isinstance(payload_id, str) or payload_id in sent_ids:
+                continue
+            sent_ids.add(payload_id)
             await websocket.send_json(payload)
             status_value = payload.get("metadata", {}).get("status")
             if status_value in {"completed", "error", "stopped"}:
@@ -375,6 +401,23 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
         return
     finally:
         agent_runtime.unsubscribe(run_id, queue)
+
+
+async def catch_up(
+    session_maker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    workspace_id: UUID,
+    run_id: UUID,
+    user_id: UUID,
+    sent_ids: set[str],
+) -> tuple[list[dict], bool]:
+    """The persisted events this socket has not sent yet, and whether the run has ended."""
+    async with session_maker() as session:
+        service = AgentService(session=session, session_maker=session_maker, settings=settings)
+        run = await service.get_run(workspace_id, run_id, user_id)
+        events = await service.list_events(workspace_id, run_id, user_id)
+    missed = [event_payload(event) for event in events if str(event.id) not in sent_ids]
+    return missed, run.status not in ACTIVE_RUN_STATUSES
 
 
 async def websocket_user(

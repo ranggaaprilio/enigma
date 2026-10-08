@@ -15,6 +15,12 @@ from app.services.audit import AuditLogService
 from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
 from app.services.env_templates import enigma_exports, substitute
 from app.services.git_providers import redact_secrets
+from app.services.jobs import (
+    ENQUEUE_FAILED,
+    RunDispatcher,
+    RunQueueUnavailableError,
+    get_run_dispatcher,
+)
 from app.services.notifications import NotificationService
 from app.services.run_paths import RunPathError, resolve_run_cwd
 from app.services.runtime import (
@@ -89,6 +95,9 @@ class CommandRuntime:
     async def publish(self, run_id: UUID, payload: dict) -> None:
         await self.bus.publish(self._topic(run_id), payload)
 
+    async def wait_ready(self, run_id: UUID) -> bool:
+        return await self.bus.wait_ready(self._topic(run_id))
+
 
 command_runtime = CommandRuntime(run_registry, event_bus)
 
@@ -109,12 +118,18 @@ class CommandService:
         settings: Settings,
         runtime: CommandRuntime = command_runtime,
         daytona_runtime: DaytonaRuntime | None = None,
+        dispatcher: RunDispatcher | None = None,
     ) -> None:
         self.session = session
         self.session_maker = session_maker
         self.settings = settings
         self.runtime = runtime
         self.daytona_runtime = daytona_runtime or get_daytona_runtime()
+        self._dispatcher = dispatcher
+
+    @property
+    def dispatcher(self) -> RunDispatcher:
+        return self._dispatcher if self._dispatcher is not None else get_run_dispatcher()
 
     async def create_command(
         self,
@@ -421,8 +436,11 @@ class CommandService:
             },
         )
 
-        task = asyncio.create_task(self._execute_run(run.id, confirmed))
-        self.runtime.register_run(run.id, task)
+        if self.settings.run_execution_mode == "queue":
+            await self._enqueue_run(run)
+        else:
+            task = asyncio.create_task(self._execute_run(run.id, confirmed))
+            self.runtime.register_run(run.id, task)
         logger.info(
             "custom_command_run_start",
             command_run_id=str(run.id),
@@ -431,6 +449,64 @@ class CommandService:
             user_id=str(user_id),
         )
         return run
+
+    async def _enqueue_run(self, run: CommandRun) -> None:
+        run.enqueued_at = datetime.now(UTC)
+        self.session.add(run)
+        await self.session.commit()
+        try:
+            await self.dispatcher.enqueue_command_run(run.id)
+        except Exception as error:
+            await self.fail_active_run(
+                run.id, ENQUEUE_FAILED, "The run could not be queued for execution."
+            )
+            raise RunQueueUnavailableError from error
+        await self.session.refresh(run)
+
+    async def claim_run(self, run_id: UUID, worker_id: str, attempt: int) -> str:
+        """Atomically take ownership of a queued run (see ``AgentService.claim_run``)."""
+        async with self.session_maker() as session:
+            claimed = await session.execute(
+                update(CommandRun)
+                .where(
+                    CommandRun.id == run_id,
+                    CommandRun.status == "running",
+                    CommandRun.claimed_at.is_(None),
+                )
+                .values(claimed_at=datetime.now(UTC), worker_id=worker_id, attempt=attempt)
+                .returning(CommandRun.id)
+            )
+            if claimed.scalar_one_or_none() is not None:
+                await session.commit()
+                return "claimed"
+            status = await session.scalar(
+                select(CommandRun.status).where(CommandRun.id == run_id)
+            )
+            if status is None:
+                return "missing"
+            return "already_claimed" if status == "running" else "already_terminal"
+
+    async def fail_active_run(self, run_id: UUID, reason: str, message: str) -> bool:
+        """End a still-running run as ``error``/``reason``; a no-op if it already finished."""
+        async with self.session_maker() as session:
+            result = await session.execute(
+                update(CommandRun)
+                .where(CommandRun.id == run_id, CommandRun.status == "running")
+                .values(
+                    status="error",
+                    error_reason=reason,
+                    completed_at=datetime.now(UTC),
+                    output=CommandRun.output + f"\n{message}\n",
+                )
+                .returning(CommandRun.id)
+            )
+            if result.scalar_one_or_none() is None:
+                await session.rollback()
+                return False
+            await session.commit()
+            run = await session.get(CommandRun, run_id)
+            await self.runtime.publish(run_id, command_status_frame(run))
+            return True
 
     async def list_runs(
         self,

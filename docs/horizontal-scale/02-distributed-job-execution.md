@@ -103,3 +103,41 @@ Operators scale "how many runs at once" (workers) separately from "how much web 
   lock holds).
 - Worker count can be scaled up/down independently and throughput tracks worker count.
 - At-least-once delivery causes no double-execution (idempotency verified by test).
+
+## Implementation Notes (shipped)
+
+Shipped together with the smallest slice of epic 03 that queue mode needs to work end to end (a Redis event bus and a stop control channel). Everything is behind **`RUN_EXECUTION_MODE=inline|queue`**, default `inline`, which behaves exactly as before. Where the code differed from "Current State" above: epic 01 had already replaced `agent_runtime`'s dicts with the `runtime.py` seam; Spec Kit phases are ordinary agent runs (only the phase *finalizer* is separate work); custom commands have no one-active-run rule; and `started_at` on both run tables is really the creation time.
+
+- **Queue: arq 0.28** (Redis-backed, async). arq caps `redis<6`, so `redis` is pinned `>=5.1,<6` (it was resolving 7.4; our code only uses 5.x APIs). arq is in maintenance-only mode — all enqueueing goes through one seam (`services/jobs.py`: `RunDispatcher` / `ArqDispatcher`), so swapping it touches one file.
+- **Enqueue** — `AgentService.create_run` / `CommandService.create_run` keep validation, budget check, insert and audit in the request, stamp `enqueued_at`, then enqueue the **run id only** (job ids `agent_run:{id}`, `command_run:{id}` so arq dedupes). If the enqueue fails the run is ended `error`/`enqueue_failed` (so the workspace is not wedged) and the API answers **503 + `Retry-After`** (`RunQueueUnavailableError`, global handler).
+- **Single active run across replicas** — migration `0031_run_job_queue` adds the partial unique index `uq_agent_runs_one_active_per_workspace` on `agent_runs(workspace_id) WHERE status IN ('thinking','executing')` (cleaning up any pre-existing duplicates first). The insert runs in a savepoint; a violation maps to the existing `AgentRunAlreadyActiveError` → 409. The in-process `RunLock` stays as the cheap first check.
+- **Worker** — `app/worker.py`, run with `uv run arq app.worker.WorkerSettings` (compose service `worker`, profile `queue`). Jobs: `run_agent_job`, `run_command_job`, `finalize_spec_phase_job`. The worker refuses to start unless `RUN_EXECUTION_MODE=queue`.
+- **At-least-once delivery, at-most-once execution** — a worker *claims* a run with a conditional `UPDATE … WHERE status is active AND claimed_at IS NULL` that stamps `claimed_at`, `worker_id`, `attempt` (new columns). Outcomes:
+  - claimed → execute;
+  - already terminal (e.g. stopped while queued) or missing → exit cleanly;
+  - **active but already claimed** → a redelivery after the owning worker died: the run is ended `error`/`worker_lost`, never re-run (agent and command runs have side effects).
+- **Failures** — arq only retries a job that raises `Retry` (or is cancelled); any other exception drops it. So:
+  - a failed claim raises `Retry`, and on the last try the run is ended `error`/`dead_letter`;
+  - a run that exceeds `AGENT_RUN_TIMEOUT_SECONDS` is ended `error`/`job_timeout` by the handler itself (arq's `job_timeout` sits above it as a backstop); a command gets the same treatment past `COMMAND_RUN_MAX_TIMEOUT_SECONDS` + 60 s;
+  - anything else escaping a command run ends it `error`/`worker_error`;
+  - on a worker, cancellation never marks a run `stopped` (`leave_active_on_cancel`).
+- **Spec Kit finalizer** — in queue mode `run_phase` enqueues `finalize_spec_phase_job(phase_id, run_id)` instead of an in-process task. The job checks the run once and `Retry`s itself every `SPEC_FINALIZE_POLL_SECONDS` (no worker slot is held while a phase waits); after the old 2 h budget it fails the phase. It is a no-op if the phase is no longer `running` for that run. The constitution → specify auto-chain enqueues through the same path.
+- **Events and stop (epic 03 slice)** — `RedisEventBus` (`services/runtime.py`) implements the `EventBus` protocol over Redis pub/sub: one pub/sub connection and one reader task per process, fanning out to local queues; `wait_ready(topic)` returns once Redis confirms the subscription. It is selected by the flag, so in queue mode notifications also cross processes. `stop_run` publishes `{"action": "stop"}` on `agent_run_control:{id}` after its commit; the worker watches that topic for the run it executes and applies it to its local registry (stop event + `provider.pause()`). Because the bus is at-most-once, the worker also re-reads the run's status every 5 s and stops it if it is no longer active; it also checks once right after subscribing, so a stop that landed before then is not missed. `RedisEventBus.publish` is best-effort: it logs and swallows Redis errors, so a blip never fails the run that is publishing. A failed SUBSCRIBE is retried while anyone still listens.
+- **Streams** — the agent WebSocket waits for its subscription to be live, then sends any persisted events it has not sent yet (deduplicated by event id), and repeats on every idle ping tick. It closes once the run has ended. The command WebSocket waits for its subscription before its existing re-check.
+- **Restarts** — in queue mode the API owns no runs and skips the startup sweep. A worker reconciles **only rows with its own `worker_id`** at startup (left by a crash) and at shutdown. On SIGTERM arq stops taking jobs and gives running ones `job_completion_wait` (= `SHUTDOWN_RUN_GRACE_SECONDS`) to finish.
+
+### Production notes
+
+- **Redis is now a trust boundary.**
+  - Jobs are serialized as JSON, not arq's default pickle, so write access to Redis does not give code execution on a worker.
+  - Write access to Redis can still stop runs or inject fake frames into live streams. Postgres stays authoritative, and the end-of-run catch-up replays from the database.
+  - Run production Redis with auth and TLS (`rediss://user:pass@…` in `REDIS_URL`), on a private network only.
+  - The dev compose file publishes an unauthenticated Redis on the host port; do not reuse it outside a workstation.
+- **Switch modes only with no active runs.** Inline-mode rows have no `worker_id`, and the queue-mode API does not sweep at startup.
+- **`WORKER_ID` must be unique per live worker and stable across its restarts** (default: hostname). A worker that never comes back leaves its claimed runs active until arq redelivers the job (bounded by `WORKER_JOB_TIMEOUT_SECONDS`, which then ends them `worker_lost`), or until epic 04's lease reaper.
+- **Not covered yet (epics 03/04):**
+  - A run whose job is lost from Redis (e.g. a flush) or never picked up has no age-based sweep, so it holds its workspace until stopped.
+  - Command output written between a WebSocket's first read and its live subscription is not re-sent (no offsets yet; epic 03).
+  - `stop_run` vs. the worker's own terminal write is still last-writer-wins (conditional transitions are epic 04).
+  - When a worker shuts down while a run is still active, the run's recorded reason can come out as `worker_lost` instead of `interrupted_by_restart`, if a peer worker picks up the re-queued job before the shutdown sweep runs.
+- **Scaling** — throughput scales with `worker replicas × WORKER_MAX_JOBS`. Queue depth (`ZCARD` of `RUN_QUEUE_NAME`) is the autoscaling signal for epic 08.

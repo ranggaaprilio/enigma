@@ -21,8 +21,13 @@ from app.core.logging import configure_logging
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.db.session import async_session_maker, engine
 from app.services.daytona_runtime import get_daytona_runtime
+from app.services.jobs import (
+    RunQueueUnavailableError,
+    close_run_dispatcher,
+    run_queue_unavailable_handler,
+)
 from app.services.reconciliation import reconcile_interrupted_runs
-from app.services.runtime import run_registry
+from app.services.runtime import RedisEventBus, event_bus, run_registry
 
 logger = structlog.get_logger(__name__)
 
@@ -49,8 +54,10 @@ async def lifespan(_app: FastAPI):
     settings = get_settings()
     # Runs left active by a previous process (crash, deploy) have no owner any more; close
     # them out before serving so their workspaces are not blocked. Fails startup if Postgres
-    # is unreachable, which /ready would report as not ready anyway.
-    await reconcile_interrupted_runs(async_session_maker)
+    # is unreachable, which /ready would report as not ready anyway. In queue mode the API owns
+    # no runs -- active rows belong to live workers, which reconcile their own (app.worker).
+    if settings.run_execution_mode == "inline":
+        await reconcile_interrupted_runs(async_session_maker)
     restore_sigterm = install_sigterm_drain(
         asyncio.get_running_loop(), settings.shutdown_drain_delay_seconds
     )
@@ -68,7 +75,11 @@ async def lifespan(_app: FastAPI):
         logger.exception("shutdown_drain_failed")
     finally:
         await get_daytona_runtime().close()
-        # Redis needs no step here: every caller opens and closes its own client.
+        # The queue-mode Redis clients (dispatcher pool, event bus); every other caller opens
+        # and closes its own client.
+        await close_run_dispatcher()
+        if isinstance(event_bus, RedisEventBus):
+            await event_bus.aclose()
         await engine.dispose()
         restore_sigterm()
 
@@ -92,6 +103,7 @@ def create_app() -> FastAPI:
 
     app.add_exception_handler(Exception, unhandled_exception_handler)
     app.add_exception_handler(ServiceDrainingError, service_draining_handler)
+    app.add_exception_handler(RunQueueUnavailableError, run_queue_unavailable_handler)
 
     app.include_router(api_router)
 

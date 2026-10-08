@@ -10,6 +10,10 @@ while a single backend replica runs at a time (see
 docs/horizontal-scale/01-stateless-control-plane.md). Once runs carry leases (epic 04) it must
 key off expired leases instead. Shutdown passes ``run_ids`` -- the runs this process owned --
 so it never touches another live replica's work.
+
+In ``RUN_EXECUTION_MODE=queue`` (Epic 02) the API owns no runs and skips the unscoped sweep;
+each worker passes its own ``worker_id`` instead, reclaiming only the runs it claimed. Spec
+phases are then advanced by DB-driven finalizer jobs, so a worker sweep leaves them alone.
 """
 
 from collections.abc import Collection
@@ -48,9 +52,11 @@ async def reconcile_interrupted_runs(
     agent_runtime: AgentRuntime = agent_runtime,
     command_runtime: CommandRuntime = command_runtime,
     run_ids: Collection[UUID] | None = None,
+    worker_id: str | None = None,
 ) -> ReconciliationResult:
     """Mark orphaned runs interrupted. ``run_ids`` limits the sweep to those agent/command run
-    ids and spec phase ids; ``None`` sweeps every active row."""
+    ids and spec phase ids; ``worker_id`` to the runs that worker claimed (and no spec phases);
+    neither sweeps every active row."""
     result = ReconciliationResult()
     events: list[AgentEvent] = []
     now = datetime.now(UTC)
@@ -64,6 +70,10 @@ async def reconcile_interrupted_runs(
             agent_query = agent_query.where(AgentRun.id.in_(ids))
             command_query = command_query.where(CommandRun.id.in_(ids))
             phase_query = phase_query.where(SpecPhase.id.in_(ids))
+        if worker_id is not None:
+            agent_query = agent_query.where(AgentRun.worker_id == worker_id)
+            command_query = command_query.where(CommandRun.worker_id == worker_id)
+            phase_query = phase_query.where(False)
 
         agent_runs = (await session.execute(agent_query.with_for_update())).scalars().all()
         for run in agent_runs:

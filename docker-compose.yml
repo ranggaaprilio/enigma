@@ -30,7 +30,7 @@ services:
   backend:
     build:
       context: ./backend
-    environment:
+    environment: &backend-env
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
@@ -57,6 +57,9 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
       AGENT_ALLOW_MOCK_PROVIDER: ${AGENT_ALLOW_MOCK_PROVIDER:-false}
+      # inline: runs execute inside this API process. queue: runs are enqueued for the `worker`
+      # service (start it with `--profile queue`). Switch only with no runs active.
+      RUN_EXECUTION_MODE: ${RUN_EXECUTION_MODE:-inline}
     ports:
       - "8000:8000"
     # Above SHUTDOWN_DRAIN_DELAY_SECONDS + SHUTDOWN_RUN_GRACE_SECONDS (5 + 15) plus pool close,
@@ -71,6 +74,27 @@ services:
       - ./backend:/app
       - backend_venv:/app/.venv
     command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+  # Epic 02: executes agent/command runs and Spec Kit finalizers when RUN_EXECUTION_MODE=queue.
+  # `podman compose --profile queue up` (scale with `--scale worker=N`). WORKER_ID defaults to
+  # the container hostname, which is unique per replica and stable across a restart.
+  worker:
+    profiles: ["queue"]
+    build:
+      context: ./backend
+    environment:
+      <<: *backend-env
+    # Above SHUTDOWN_RUN_GRACE_SECONDS (arq's job_completion_wait) plus the shutdown sweep.
+    stop_grace_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - worker_venv:/app/.venv
+    command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && exec uv run arq app.worker.WorkerSettings"
 
   preview-proxy:
     build:
@@ -112,5 +136,6 @@ volumes:
   postgres_data:
   redis_data:
   backend_venv:
+  worker_venv:
   preview_proxy_venv:
   frontend_node_modules:

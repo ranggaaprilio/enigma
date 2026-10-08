@@ -429,6 +429,9 @@ async def stream_command_run(websocket: WebSocket, workspace_id: UUID, run_id: U
 
     queue = command_runtime.subscribe(run.id)
     try:
+        # The re-read below only closes the subscribe gap once the subscription is live (with
+        # runs on workers the status frame comes from another process).
+        await command_runtime.wait_ready(run.id)
         async with async_session_maker() as session:
             service = CommandService(
                 session=session,

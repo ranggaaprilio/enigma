@@ -366,3 +366,50 @@ async def phase_of(session, workflow) -> SpecPhase:
     return (
         await session.execute(select(SpecPhase).where(SpecPhase.workflow_id == workflow.id))
     ).scalar_one()
+
+
+async def test_worker_scoped_sweep_only_touches_that_workers_runs(db_session):
+    """A restarting worker reclaims what *it* left behind -- never another worker's live runs,
+    and never spec phases (in queue mode those are advanced by DB-driven finalizer jobs)."""
+    session, session_maker = db_session
+    user, workspace = await seed_workspace(session)
+    other_user, other_workspace = await seed_workspace(session)
+    mine = agent_run(user, workspace, "executing")
+    mine.worker_id = "worker-a"
+    theirs = agent_run(other_user, other_workspace, "executing")
+    theirs.worker_id = "worker-b"
+    session.add_all([mine, theirs])
+    my_command = await command_run(session, user, workspace, "running")
+    my_command.worker_id = "worker-a"
+    their_command = await command_run(session, other_user, other_workspace, "running")
+    their_command.worker_id = "worker-b"
+    workflow = SpecWorkflow(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        feature_name="F",
+        feature_slug=f"f-{uuid4().hex[:6]}",
+        description="d",
+        branch="f",
+        spec_dir="specs/f",
+        worktree_path="worktrees/f",
+        status="running",
+    )
+    session.add(workflow)
+    await session.flush()
+    phase = SpecPhase(workflow_id=workflow.id, phase="specify", status="running")
+    session.add(phase)
+    await session.commit()
+
+    agents, commands = runtimes()
+    result = await reconcile_interrupted_runs(
+        session_maker, agent_runtime=agents, command_runtime=commands, worker_id="worker-a"
+    )
+
+    assert result.agent_run_ids == [mine.id]
+    assert result.command_run_ids == [my_command.id]
+    assert result.spec_phase_ids == []
+    for row in (theirs, their_command, phase):
+        await session.refresh(row)
+    assert theirs.status == "executing"
+    assert their_command.status == "running"
+    assert phase.status == "running"
