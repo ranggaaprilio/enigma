@@ -26,6 +26,7 @@ uv run pytest                    # all tests (async auto-mode)
 uv run ruff check .              # lint (E, F, I, UP, B rules)
 uv run alembic upgrade head      # run migrations
 uv run alembic revision -m "…"   # create migration
+uv run arq app.worker.WorkerSettings  # run worker (only with RUN_EXECUTION_MODE=queue)
 ```
 
 ### Frontend (`frontend/`)
@@ -52,7 +53,7 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
   - Connection string must be `postgresql+asyncpg://…`
   - Session: `async_session_maker` with `expire_on_commit=False`
   - All DB access MUST use async/await
-- **Migrations**: Alembic with async engine, 30 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0030_run_interruption`)
+- **Migrations**: Alembic with async engine, 31 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0031_run_job_queue`)
 - **Auth**: Cookie-based sessions (`execute_session` cookie), NOT JWT. Set-Cookie on login, cleared on logout.
 - **Logging**: `structlog` (configured in `core/logging.py`)
 - **Testing**: `pytest` with `pytest-asyncio` (auto mode), tests at `backend/tests/`
@@ -143,6 +144,7 @@ OpenAI-compatible base URL, model, and a Fernet-encrypted API key. Owner-only, g
 16. **Process-local run state goes through `services/runtime.py`** — run tasks/stop events/providers (`RunRegistry`), stream fan-out (`EventBus`, topics `agent_run:` / `command_run:` / `notifications:`) and the one-active-run-per-workspace guard (`RunLock`). Never add a module-level dict of in-flight work; `tests/test_run_runtime.py` greps for it.
 17. **Startup marks every active run `error`/`interrupted_by_restart`** (`services/reconciliation.py`, called from the lifespan; the post-drain shutdown sweep is scoped to the runs this process owned). The startup sweep assumes **one backend replica**: a second live replica would have its runs killed. Spec Kit finalizers are registered in `run_registry` (keyed by phase id) so the drain covers them. `--reload` restarts count too. New work is refused with 503 while `lifecycle.draining` (`core/lifecycle.py`); `/live` is the dependency-free liveness probe, `/ready` the traffic gate, `/health` diagnostics.
 18. **Compose requires `AUTH_SECRET_KEY` and `WORKSPACE_ENV_ENCRYPTION_KEY` in `.env`** (no fallbacks). The encryption key must be a valid Fernet key in every environment; changing it makes stored credentials undecryptable.
+19. **`RUN_EXECUTION_MODE=inline|queue`** (default `inline`). In `queue` mode, create-run endpoints enqueue the run id (`services/jobs.py`, arq) and `app/worker.py` executes it. The event bus becomes `RedisEventBus`, and stop travels on `agent_run_control:{id}`. The API then skips the startup sweep, and each worker reconciles only its own `worker_id`. Workers claim runs with a conditional UPDATE on `claimed_at`, so a redelivered job never re-runs a run. A duplicate active run is blocked by the partial unique index `uq_agent_runs_one_active_per_workspace`, so a test fixture with two `thinking`/`executing` runs in one workspace fails. `redis` is pinned `<6` because arq requires it. Details: `docs/horizontal-scale/02-distributed-job-execution.md`.
 
 ## Implementation Plan Reference
 

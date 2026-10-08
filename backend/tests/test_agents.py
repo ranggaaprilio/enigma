@@ -2595,12 +2595,13 @@ class TestAgentSessions:
             assert "Assistant: I created notes.txt" in context
             assert "Files changed: notes.txt (created)" in context
 
-            # A one-shot run (no session) gets no context.
+            # A one-shot run (no session) gets no context. Terminal: `current` is still the
+            # workspace's one active run (uq_agent_runs_one_active_per_workspace).
             one_shot = AgentRun(
                 workspace_id=workspace.id,
                 user_id=user.id,
                 prompt="standalone",
-                status="thinking",
+                status="completed",
                 provider="mock",
                 model="mock-model",
             )

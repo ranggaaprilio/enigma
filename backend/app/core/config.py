@@ -1,4 +1,6 @@
+import socket
 from functools import lru_cache
+from typing import Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
@@ -36,6 +38,21 @@ class Settings(BaseSettings):
     # timeout above the sum of both.
     shutdown_drain_delay_seconds: float = 5.0
     shutdown_run_grace_seconds: float = 15.0
+    # Epic 02: where runs execute. "inline" runs them as asyncio tasks inside the API process
+    # (one replica only); "queue" enqueues the run id on Redis for `app.worker` processes (arq)
+    # and fans events/stop signals out over Redis pub/sub. Switch modes only with no active runs.
+    run_execution_mode: Literal["inline", "queue"] = "inline"
+    run_queue_name: str = "enigma:runs"
+    # Stable identity of a worker process, stamped on the runs it claims so its next
+    # incarnation can reconcile what it left behind. Must be unique per live worker.
+    worker_id: str = Field(default_factory=socket.gethostname, min_length=1)
+    worker_max_jobs: int = Field(default=10, gt=0)
+    worker_max_tries: int = Field(default=3, gt=0)
+    # A run gets this long on a worker; arq's own job timeout sits above it so the handler
+    # (which can record the timeout on the run) always fires first.
+    agent_run_timeout_seconds: int = Field(default=2 * 60 * 60, gt=0)
+    worker_job_timeout_seconds: int = Field(default=2 * 60 * 60 + 5 * 60, gt=0)
+    spec_finalize_poll_seconds: float = Field(default=5.0, gt=0)
     daytona_api_key: str | None = None
     daytona_api_url: str | None = None
     daytona_target: str | None = None

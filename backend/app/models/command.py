@@ -173,5 +173,10 @@ class CommandRun(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     # Stable code for why the run ended in `error` (e.g. "interrupted_by_restart").
     error_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Queue bookkeeping (Epic 02); see AgentRun.
+    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempt: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
 
     custom_command: Mapped[CustomCommand] = relationship(back_populates="runs")

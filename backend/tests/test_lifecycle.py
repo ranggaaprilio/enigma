@@ -10,6 +10,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app import main as main_module
 from app.api import health as health_module
+from app.core.config import Settings
 from app.core.lifecycle import (
     AppLifecycle,
     ServiceDrainingError,
@@ -332,3 +333,40 @@ async def test_lifespan_still_closes_pools_when_the_drain_fails(monkeypatch):
 
     assert closed == ["daytona", "engine", "sigterm"]
 
+
+
+async def test_queue_mode_api_does_not_sweep_runs_it_does_not_own(monkeypatch):
+    """With runs on workers, an API restart must not mark the workers' live runs interrupted."""
+    calls: list[str] = []
+
+    async def reconcile(session_maker, run_ids=None):
+        calls.append("reconcile" if run_ids is None else f"reconcile:{sorted(run_ids)}")
+
+    class FakeRegistry:
+        def active_run_ids(self):
+            return []
+
+    async def drain(registry, grace_seconds):
+        return 0
+
+    class FakeDaytona:
+        async def close(self):
+            return None
+
+    class FakeEngine:
+        async def dispose(self):
+            return None
+
+    monkeypatch.setattr(main_module, "get_settings", lambda: Settings(run_execution_mode="queue"))
+    monkeypatch.setattr(main_module, "reconcile_interrupted_runs", reconcile)
+    monkeypatch.setattr(main_module, "drain_in_flight_runs", drain)
+    monkeypatch.setattr(main_module, "get_daytona_runtime", lambda: FakeDaytona())
+    monkeypatch.setattr(main_module, "engine", FakeEngine())
+    monkeypatch.setattr(main_module, "install_sigterm_drain", lambda *a, **k: lambda: None)
+    monkeypatch.setattr(main_module, "run_registry", FakeRegistry())
+    monkeypatch.setattr(lifecycle, "draining", False)
+
+    async with main_module.lifespan(app):
+        pass
+
+    assert "reconcile" not in calls

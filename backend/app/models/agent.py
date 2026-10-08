@@ -12,6 +12,7 @@ from sqlalchemy import (
     String,
     Text,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -79,6 +80,14 @@ class AgentRun(Base):
         Index("ix_agent_runs_created_at", "started_at"),
         Index("ix_agent_runs_session_id", "session_id"),
         Index("ix_agent_runs_status_workspace_id", "status", "workspace_id"),
+        # One active run per workspace, enforced by Postgres so concurrent API replicas cannot
+        # both start one (the in-process RunLock only serialises a single process).
+        Index(
+            "uq_agent_runs_one_active_per_workspace",
+            "workspace_id",
+            unique=True,
+            postgresql_where=text("status IN ('thinking', 'executing')"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -119,6 +128,15 @@ class AgentRun(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Stable code for why the run ended in `error` (e.g. "interrupted_by_restart").
     error_reason: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Where the agent's tools run (a worktree or spec-worktree path); persisted so a queued job,
+    # which only carries the run id, can recover it.
+    working_dir: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Queue bookkeeping (Epic 02). `claimed_at` is set exactly once, by the worker that wins the
+    # conditional claim; `started_at` remains the row's creation time.
+    enqueued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     session: Mapped["AgentSession | None"] = relationship(back_populates="runs")
     events: Mapped[list["AgentEvent"]] = relationship(
