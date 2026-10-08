@@ -1,13 +1,17 @@
 import asyncio
-from collections import defaultdict
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
+from typing import NamedTuple
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
+from app.core.lifecycle import lifecycle
 from app.core.pricing import estimate_cost
 from app.models import AgentEvent, AgentFileChange, AgentRun, AgentSession, Workspace
 from app.services.access import require_workspace_access
@@ -16,11 +20,32 @@ from app.services.agent_tools import WorkspaceTools
 from app.services.audit import AuditLogService
 from app.services.budgets import BudgetService
 from app.services.daytona_runtime import get_daytona_runtime
+from app.services.jobs import (
+    ENQUEUE_FAILED,
+    JOB_TIMEOUT,
+    RunDispatcher,
+    RunQueueUnavailableError,
+    get_run_dispatcher,
+)
+from app.services.leases import db_now, lease_deadline
 from app.services.notifications import NotificationService
 from app.services.repositories import RepositoryService
+from app.services.runtime import (
+    EventBus,
+    InMemoryEventBus,
+    InMemoryRunRegistry,
+    RunLock,
+    RunRegistry,
+    event_bus,
+    run_registry,
+)
+from app.services.runtime import run_lock as default_run_lock
 from app.services.workspaces import WorkspaceSecretCipher
 
 ACTIVE_RUN_STATUSES = ("thinking", "executing")
+TERMINAL_RUN_STATUSES = ("completed", "error", "stopped")
+# Partial unique index backing the one-active-run-per-workspace rule across replicas.
+ONE_ACTIVE_RUN_INDEX = "uq_agent_runs_one_active_per_workspace"
 SESSION_TITLE_MAX_CHARS = 80
 
 
@@ -48,51 +73,85 @@ class AgentSessionArchivedError(Exception):
     pass
 
 
+class RunClaim(NamedTuple):
+    # "claimed" | "already_claimed" (active, owned by an earlier delivery) | "already_terminal"
+    # | "missing"
+    outcome: str
+    working_dir: str | None = None
+
+
 class AgentRuntime:
-    def __init__(self) -> None:
-        self.stop_events: dict[UUID, asyncio.Event] = {}
-        self.subscribers: dict[UUID, set[asyncio.Queue[dict]]] = defaultdict(set)
-        self.tasks: dict[UUID, asyncio.Task] = {}
-        self.providers: dict[UUID, AgentProvider] = {}
+    """Agent-run view over the process-local run state seam (see ``app.services.runtime``)."""
+
+    def __init__(
+        self, registry: RunRegistry | None = None, bus: EventBus | None = None
+    ) -> None:
+        self.registry = registry if registry is not None else InMemoryRunRegistry()
+        self.bus = bus if bus is not None else InMemoryEventBus()
+
+    @staticmethod
+    def _topic(run_id: UUID) -> str:
+        return f"agent_run:{run_id}"
 
     def register_run(self, run_id: UUID, task: asyncio.Task, stop_event: asyncio.Event) -> None:
-        self.tasks[run_id] = task
-        self.stop_events[run_id] = stop_event
-        task.add_done_callback(lambda _task: self.forget_run(run_id))
+        self.registry.register(run_id, task, stop_event)
 
     def forget_run(self, run_id: UUID) -> None:
-        self.tasks.pop(run_id, None)
-        self.stop_events.pop(run_id, None)
-        self.providers.pop(run_id, None)
+        self.registry.forget(run_id)
 
     def register_provider(self, run_id: UUID, provider: AgentProvider) -> None:
-        self.providers[run_id] = provider
+        self.registry.register_provider(run_id, provider)
 
     def request_stop(self, run_id: UUID) -> None:
-        if stop_event := self.stop_events.get(run_id):
-            stop_event.set()
-        if provider := self.providers.get(run_id):
-            provider.pause()
+        self.registry.request_stop(run_id)
 
     def subscribe(self, run_id: UUID) -> asyncio.Queue[dict]:
-        queue: asyncio.Queue[dict] = asyncio.Queue()
-        self.subscribers[run_id].add(queue)
-        return queue
+        return self.bus.subscribe(self._topic(run_id))
 
     def unsubscribe(self, run_id: UUID, queue: asyncio.Queue[dict]) -> None:
-        queues = self.subscribers.get(run_id)
-        if not queues:
-            return
-        queues.discard(queue)
-        if not queues:
-            self.subscribers.pop(run_id, None)
+        self.bus.unsubscribe(self._topic(run_id), queue)
 
     async def publish(self, run_id: UUID, payload: dict) -> None:
-        for queue in list(self.subscribers.get(run_id, set())):
-            await queue.put(payload)
+        await self.bus.publish(self._topic(run_id), payload)
+
+    async def wait_ready(self, run_id: UUID) -> bool:
+        return await self.bus.wait_ready(self._topic(run_id))
+
+    # Control signals (stop) travel over the bus too, so they reach the run on whichever worker
+    # executes it. The executing side applies them to its local registry.
+
+    @staticmethod
+    def _control_topic(run_id: UUID) -> str:
+        return f"agent_run_control:{run_id}"
+
+    async def publish_control(self, run_id: UUID, action: str) -> None:
+        await self.bus.publish(self._control_topic(run_id), {"action": action})
+
+    @asynccontextmanager
+    async def watch_control(self, run_id: UUID) -> AsyncIterator[None]:
+        """Apply control signals for ``run_id`` to this process's registry while inside."""
+        topic = self._control_topic(run_id)
+        queue = self.bus.subscribe(topic)
+        try:
+            await self.bus.wait_ready(topic)
+            watcher = asyncio.create_task(self._apply_control(run_id, queue))
+            try:
+                yield
+            finally:
+                watcher.cancel()
+                with suppress(asyncio.CancelledError):
+                    await watcher
+        finally:
+            self.bus.unsubscribe(topic, queue)
+
+    async def _apply_control(self, run_id: UUID, queue: asyncio.Queue[dict]) -> None:
+        while True:
+            message = await queue.get()
+            if message.get("action") == "stop":
+                self.registry.request_stop(run_id)
 
 
-agent_runtime = AgentRuntime()
+agent_runtime = AgentRuntime(run_registry, event_bus)
 
 
 def event_payload(event: AgentEvent) -> dict:
@@ -191,11 +250,32 @@ class AgentService:
         session_maker: async_sessionmaker[AsyncSession],
         settings: Settings,
         runtime: AgentRuntime = agent_runtime,
+        run_lock: RunLock = default_run_lock,
+        dispatcher: RunDispatcher | None = None,
+        leave_active_on_cancel: bool = False,
     ) -> None:
         self.session = session
         self.session_maker = session_maker
         self.settings = settings
         self.runtime = runtime
+        self.run_lock = run_lock
+        self._dispatcher = dispatcher
+        # On a worker a cancel means shutdown or timeout, never a user stop: leave the row active
+        # for whoever handles that (the shutdown sweep, the timeout handler) to finish it.
+        self.leave_active_on_cancel = leave_active_on_cancel
+
+    @property
+    def dispatcher(self) -> RunDispatcher:
+        return self._dispatcher if self._dispatcher is not None else get_run_dispatcher()
+
+    async def _find_active_run_id(self, workspace_id: UUID) -> UUID | None:
+        active = await self.session.execute(
+            select(AgentRun.id).where(
+                AgentRun.workspace_id == workspace_id,
+                AgentRun.status.in_(ACTIVE_RUN_STATUSES),
+            )
+        )
+        return active.scalar_one_or_none()
 
     async def create_run(
         self,
@@ -206,44 +286,58 @@ class AgentService:
         worktree_id: UUID | None = None,
         session_id: UUID | None = None,
     ) -> AgentRun:
+        lifecycle.ensure_accepting_work()
         workspace = await self._get_workspace(workspace_id, user_id, require_drive=True)
-        active = await self.session.execute(
-            select(AgentRun.id).where(
-                AgentRun.workspace_id == workspace.id,
-                AgentRun.status.in_(ACTIVE_RUN_STATUSES),
+        # Check-then-insert under the per-workspace lock so two concurrent requests cannot both
+        # pass the "no active run" guard: the in-process lock serialises this replica, and a
+        # transaction-scoped Postgres advisory lock (released at the commit below) serialises
+        # replicas. It fails closed -- a lock error fails the request before anything is
+        # inserted. The partial unique index stays the guarantee if the lock is ever bypassed.
+        lock_key = f"agent_run:workspace:{workspace.id}"
+        async with self.run_lock.hold(lock_key):
+            await self.session.execute(
+                select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0)))
             )
-        )
-        if active.scalar_one_or_none() is not None:
-            raise AgentRunAlreadyActiveError
+            if await self._find_active_run_id(workspace.id) is not None:
+                raise AgentRunAlreadyActiveError
 
-        # Block/warn before spending: an enforcing budget over its limit stops the run here.
-        await BudgetService(self.session).assert_within_budget(workspace, user_id)
+            # Block/warn before spending: an enforcing budget over its limit stops the run here.
+            await BudgetService(self.session).assert_within_budget(workspace, user_id)
 
-        provider = await provider_for_run(self.session, self.settings)
-        run = AgentRun(
-            workspace_id=workspace.id,
-            user_id=user_id,
-            worktree_id=worktree_id,
-            session_id=session_id,
-            prompt=prompt,
-            status="thinking",
-            provider=provider.provider_name,
-            model=provider.model_name,
-        )
-        self.session.add(run)
-        await self.session.flush()
+            provider = await provider_for_run(self.session, self.settings)
+            run = AgentRun(
+                workspace_id=workspace.id,
+                user_id=user_id,
+                worktree_id=worktree_id,
+                session_id=session_id,
+                prompt=prompt,
+                status="thinking",
+                provider=provider.provider_name,
+                model=provider.model_name,
+                working_dir=working_dir,
+            )
+            try:
+                # Savepoint: a violation rolls back only this insert, leaving the session usable.
+                async with self.session.begin_nested():
+                    self.session.add(run)
+                    await self.session.flush()
+            except IntegrityError as error:
+                if ONE_ACTIVE_RUN_INDEX in str(error.orig):
+                    raise AgentRunAlreadyActiveError from None
+                raise
 
-        if session_id is not None:
-            agent_session = await self.session.get(AgentSession, session_id)
-            if agent_session is not None:
-                # Auto-title from the first turn's prompt, and bump updated_at so the session
-                # sorts as recently active (onupdate only fires when a column actually changes).
-                if not agent_session.title:
-                    agent_session.title = prompt[:SESSION_TITLE_MAX_CHARS]
-                agent_session.updated_at = datetime.now(UTC)
-                self.session.add(agent_session)
+            if session_id is not None:
+                agent_session = await self.session.get(AgentSession, session_id)
+                if agent_session is not None:
+                    # Auto-title from the first turn's prompt, and bump updated_at so the
+                    # session sorts as recently active (onupdate only fires when a column
+                    # actually changes).
+                    if not agent_session.title:
+                        agent_session.title = prompt[:SESSION_TITLE_MAX_CHARS]
+                    agent_session.updated_at = datetime.now(UTC)
+                    self.session.add(agent_session)
 
-        await self.session.commit()
+            await self.session.commit()
         await self.session.refresh(run)
         await AuditLogService(self.session).record(
             user_id=user_id,
@@ -254,10 +348,148 @@ class AgentService:
             metadata={"provider": run.provider, "model": run.model},
         )
 
+        if self.settings.run_execution_mode == "queue":
+            await self._enqueue_run(run)
+            return run
+
         stop_event = asyncio.Event()
         task = asyncio.create_task(self._execute_run(run.id, stop_event, working_dir))
         self.runtime.register_run(run.id, task, stop_event)
         return run
+
+    async def _enqueue_run(self, run: AgentRun) -> None:
+        run.enqueued_at = datetime.now(UTC)
+        self.session.add(run)
+        await self.session.commit()
+        try:
+            await self.dispatcher.enqueue_agent_run(run.id)
+        except Exception as error:
+            # The committed `thinking` row would otherwise block the workspace forever.
+            await self.fail_active_run(
+                run.id, ENQUEUE_FAILED, "The run could not be queued for execution."
+            )
+            raise RunQueueUnavailableError from error
+        await self.session.refresh(run)
+
+    async def claim_run(self, run_id: UUID, worker_id: str, attempt: int) -> RunClaim:
+        """Atomically take ownership of a queued run; at most one delivery ever wins.
+
+        ``claimed_at IS NULL`` is the guard: arq delivers at least once, but only the first
+        claim of an active run succeeds, so a redelivered job can never re-run the agent.
+        The claim also takes the run's lease, which the worker then keeps renewing.
+        """
+        async with self.session_maker() as session:
+            claimed = await session.execute(
+                update(AgentRun)
+                .where(
+                    AgentRun.id == run_id,
+                    AgentRun.status.in_(ACTIVE_RUN_STATUSES),
+                    AgentRun.claimed_at.is_(None),
+                )
+                .values(
+                    claimed_at=datetime.now(UTC),
+                    worker_id=worker_id,
+                    attempt=attempt,
+                    heartbeat_at=db_now(),
+                    lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
+                )
+                .returning(AgentRun.working_dir)
+            )
+            row = claimed.first()
+            if row is not None:
+                await session.commit()
+                return RunClaim("claimed", row.working_dir)
+            status = await session.scalar(select(AgentRun.status).where(AgentRun.id == run_id))
+            if status is None:
+                return RunClaim("missing")
+            if status in ACTIVE_RUN_STATUSES:
+                return RunClaim("already_claimed")
+            return RunClaim("already_terminal")
+
+    async def renew_lease(self, run_id: UUID, worker_id: str) -> bool:
+        """Extend the lease of a run this worker owns; False once it is no longer ours to run.
+
+        Only the owning worker matches, and only while the run is active: the reaper never takes
+        over a live lease, and an owner can never revive a run that was already ended.
+        """
+        async with self.session_maker() as session:
+            renewed = await session.execute(
+                update(AgentRun)
+                .where(
+                    AgentRun.id == run_id,
+                    AgentRun.worker_id == worker_id,
+                    AgentRun.status.in_(ACTIVE_RUN_STATUSES),
+                )
+                .values(
+                    heartbeat_at=db_now(),
+                    lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
+                )
+                .returning(AgentRun.id)
+            )
+            if renewed.scalar_one_or_none() is None:
+                return False
+            await session.commit()
+            return True
+
+    async def execute_claimed_run(
+        self,
+        run_id: UUID,
+        working_dir: str | None,
+        stop_event: asyncio.Event,
+        timeout_seconds: float,
+    ) -> str:
+        """Run a claimed job to its end on this worker; returns the run's final status."""
+        try:
+            async with asyncio.timeout(timeout_seconds):
+                await self._execute_run(run_id, stop_event, working_dir)
+        except TimeoutError:
+            await self.fail_active_run(
+                run_id, JOB_TIMEOUT, f"The run exceeded its {timeout_seconds:g}s time limit."
+            )
+            return JOB_TIMEOUT
+        async with self.session_maker() as session:
+            status = await session.scalar(select(AgentRun.status).where(AgentRun.id == run_id))
+        return status or "missing"
+
+    async def fail_active_run(
+        self, run_id: UUID, reason: str, message: str, *, lease_expired: bool = False
+    ) -> bool:
+        """End a still-active run as ``error``/``reason``; a no-op if it already finished.
+
+        The UPDATE is conditional on the run being active, so it never overwrites a terminal
+        status written concurrently (e.g. a stop). ``lease_expired`` (the reaper, a redelivered
+        job) additionally requires that no worker holds a live lease *at write time* -- it ran
+        out, or was never stamped (claimed before leases existed) -- so a renewal that raced the
+        check wins. Returns whether this call ended the run.
+        """
+        async with self.session_maker() as session:
+            conditions = [AgentRun.id == run_id, AgentRun.status.in_(ACTIVE_RUN_STATUSES)]
+            if lease_expired:
+                conditions.append(
+                    or_(AgentRun.lease_expires_at.is_(None), AgentRun.lease_expires_at < db_now())
+                )
+            result = await session.execute(
+                update(AgentRun)
+                .where(*conditions)
+                .values(
+                    status="error",
+                    error_reason=reason,
+                    error_message=message,
+                    completed_at=datetime.now(UTC),
+                    lease_expires_at=None,
+                )
+                .returning(AgentRun.id)
+            )
+            if result.scalar_one_or_none() is None:
+                return False  # nothing written; closing the session ends the transaction
+            await session.flush()
+            await self._persist_event(
+                session, run_id, "error", message, {"status": "error", "reason": reason}
+            )
+            run = await session.get(AgentRun, run_id)
+            await self._record_run_finished(session, run)
+            await session.commit()
+            return True
 
     # ------------------------------------------------------------------
     # Sessions (multi-turn conversations grouping runs)
@@ -437,32 +669,67 @@ class AgentService:
         workspace_id: UUID,
         run_id: UUID,
         user_id: UUID,
+        *,
+        since: datetime | None = None,
     ) -> list[AgentEvent]:
-        run = await self.get_run(workspace_id, run_id, user_id)
-        return list(run.events)
+        """The run's persisted events in stream order, optionally only those at or after
+        ``since`` (inclusive: an event sharing the caller's high-water mark may be unsent)."""
+        await self._get_workspace(workspace_id, user_id)
+        run_exists = await self.session.scalar(
+            select(AgentRun.id).where(
+                AgentRun.id == run_id,
+                AgentRun.workspace_id == workspace_id,
+            )
+        )
+        if run_exists is None:
+            raise AgentRunNotFoundError
+        query = select(AgentEvent).where(AgentEvent.agent_run_id == run_id)
+        if since is not None:
+            query = query.where(AgentEvent.created_at >= since)
+        result = await self.session.execute(query.order_by(AgentEvent.created_at, AgentEvent.id))
+        return list(result.scalars().all())
 
     async def stop_run(self, workspace_id: UUID, run_id: UUID, user_id: UUID) -> AgentRun:
+        """Stop an active run. Idempotent: stopping a run that already ended (or a second click)
+        changes nothing and returns the run as it is."""
         run = await self.get_run(workspace_id, run_id, user_id, require_drive=True)
-        if run.status in ACTIVE_RUN_STATUSES:
+        if await self._transition(self.session, run.id, "stopped"):
             self.runtime.request_stop(run.id)
-            run.status = "stopped"
-            run.completed_at = datetime.now(UTC)
-            self.session.add(run)
-            await self.session.flush()
-            event = AgentEvent(
-                agent_run_id=run.id,
-                event_type="status",
-                content="stopped",
-                event_metadata={"status": "stopped"},
+            await self._persist_event(
+                self.session, run.id, "status", "stopped", {"status": "stopped"}
             )
-            self.session.add(event)
-            await self.session.flush()
-            await self.session.commit()
-            await self.session.refresh(event)
+            # The run may be executing on a worker process; after the commit, so the worker
+            # sees `stopped` when it unwinds instead of writing its own terminal status.
+            await self.runtime.publish_control(run.id, "stop")
             await self.session.refresh(run)
-            await self.runtime.publish(run.id, event_payload(event))
             await self._record_run_finished(self.session, run)
+        else:
+            await self.session.refresh(run)  # it ended concurrently; report how
         return run
+
+    async def _transition(
+        self, session: AsyncSession, run_id: UUID, status: str, **values
+    ) -> bool:
+        """Move an active run to ``status``; False, writing nothing, once it has already ended.
+
+        The run state machine: ``thinking``/``executing`` move freely between each other and to
+        a terminal status (``completed``/``error``/``stopped``), and a terminal status is final.
+        Conditional on the row still being active, so concurrent actors -- a stop on another
+        replica, the reaper, the executing worker -- cannot clobber each other, and a replayed
+        transition is a no-op. Ending a run also releases its lease. In-memory ORM copies of the
+        run are left stale; callers refresh what they read afterwards.
+        """
+        if status in TERMINAL_RUN_STATUSES:
+            values.setdefault("completed_at", datetime.now(UTC))
+            values["lease_expires_at"] = None
+        result = await session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id, AgentRun.status.in_(ACTIVE_RUN_STATUSES))
+            .values(status=status, **values)
+            .returning(AgentRun.id)
+            .execution_options(synchronize_session=False)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def create_file_change(
         self,
@@ -755,12 +1022,14 @@ class AgentService:
                         break
                     if provider_event.event_type == "status":
                         status_value = provider_event.metadata.get("status")
-                        if status_value in ACTIVE_RUN_STATUSES + ("completed", "error", "stopped"):
-                            run.status = status_value
-                            if status_value not in ACTIVE_RUN_STATUSES:
-                                run.completed_at = datetime.now(UTC)
+                        if status_value in ACTIVE_RUN_STATUSES + TERMINAL_RUN_STATUSES:
+                            if not await self._transition(session, run.id, status_value):
+                                # Ended elsewhere (stopped on another replica, reaped):
+                                # that outcome stands, so stop the provider too.
+                                stop_event.set()
+                                break
+                            if status_value in TERMINAL_RUN_STATUSES:
                                 terminal_event_received = True
-                            session.add(run)
                     if (tokens_used := provider_event.metadata.get("tokens_used")) is not None:
                         run.tokens_used = int(tokens_used)
                         session.add(run)
@@ -784,21 +1053,24 @@ class AgentService:
                         session, run, baseline, worktree_path=working_dir
                     )
                 elif run.status in ACTIVE_RUN_STATUSES:
-                    run.status = "stopped" if stop_event.is_set() else "completed"
-                    run.completed_at = datetime.now(UTC)
-                    session.add(run)
-                    await session.flush()
-                    await self._persist_event(
-                        session,
-                        run.id,
-                        "status",
-                        run.status,
-                        {"status": run.status},
-                    )
-                    await self._record_run_finished(
-                        session, run, baseline, worktree_path=working_dir
-                    )
+                    final_status = "stopped" if stop_event.is_set() else "completed"
+                    if await self._transition(session, run.id, final_status):
+                        await self._persist_event(
+                            session,
+                            run.id,
+                            "status",
+                            final_status,
+                            {"status": final_status},
+                        )
+                        await session.refresh(run)
+                        await self._record_run_finished(
+                            session, run, baseline, worktree_path=working_dir
+                        )
             except asyncio.CancelledError:
+                if lifecycle.draining or self.leave_active_on_cancel:
+                    # Shutdown (or a worker-side timeout) cancelled us: leave the row active for
+                    # the reconciliation sweep / timeout handler to record why it ended.
+                    raise
                 await self._mark_stopped(run_id)
             except Exception as error:
                 await self._mark_error(run_id, str(error))
@@ -829,29 +1101,18 @@ class AgentService:
 
     async def _mark_stopped(self, run_id: UUID) -> None:
         async with self.session_maker() as session:
-            run = await session.get(AgentRun, run_id)
-            if run is None or run.status not in ACTIVE_RUN_STATUSES:
+            if not await self._transition(session, run_id, "stopped"):
                 return
-            run.status = "stopped"
-            run.completed_at = datetime.now(UTC)
-            session.add(run)
-            await session.flush()
-            await self._persist_event(session, run.id, "status", "stopped", {"status": "stopped"})
-            await session.commit()
+            await self._persist_event(session, run_id, "status", "stopped", {"status": "stopped"})
+            run = await session.get(AgentRun, run_id)
             await self._record_run_finished(session, run)
 
     async def _mark_error(self, run_id: UUID, message: str) -> None:
         async with self.session_maker() as session:
-            run = await session.get(AgentRun, run_id)
-            if run is None:
+            if not await self._transition(session, run_id, "error", error_message=message):
                 return
-            run.status = "error"
-            run.error_message = message
-            run.completed_at = datetime.now(UTC)
-            session.add(run)
-            await session.flush()
-            await self._persist_event(session, run.id, "error", message, {"status": "error"})
-            await session.commit()
+            await self._persist_event(session, run_id, "error", message, {"status": "error"})
+            run = await session.get(AgentRun, run_id)
             await self._record_run_finished(session, run)
 
     async def _record_run_finished(

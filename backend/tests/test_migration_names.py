@@ -94,3 +94,20 @@ def test_platform_llm_settings_constraint_names_match_migration():
     migration_names = _names_in(_PLATFORM_LLM_MIGRATION_PATH)
     missing = model_names - migration_names
     assert not missing, f"Names in model but not migration: {missing}"
+
+
+_RUN_INTERRUPTION_MIGRATION_PATH = (
+    Path(__file__).resolve().parent.parent / "alembic" / "versions" / "0030_run_interruption.py"
+)
+
+
+def test_run_interruption_index_names_match_migration():
+    """The reconciliation indexes added to existing run models must be created, by the same
+    name, in the migration that introduces them."""
+    migration_names = _names_in(_RUN_INTERRUPTION_MIGRATION_PATH)
+    expected = {"ix_agent_runs_status_workspace_id", "ix_command_runs_status_workspace_id"}
+    assert expected <= migration_names
+
+    models = Path(__file__).resolve().parent.parent / "app" / "models"
+    assert "ix_agent_runs_status_workspace_id" in _names_in(models / "agent.py")
+    assert "ix_command_runs_status_workspace_id" in _names_in(models / "command.py")

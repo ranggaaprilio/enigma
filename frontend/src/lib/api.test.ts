@@ -34,6 +34,8 @@ import {
   getCurrentUser,
   getEditorStatus,
   getHealth,
+  isServerReady,
+  READY_PROBE_TIMEOUT_MS,
   getNotificationStreamUrl,
   getRepositoryDiff,
   getRepositoryStatus,
@@ -76,6 +78,38 @@ import {
 describe("getHealth", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+  });
+
+  it("reports the server ready only on a 200 from /ready", async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, status: 200 })
+      .mockResolvedValueOnce({ ok: false, status: 503 })
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"));
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(isServerReady()).resolves.toBe(true);
+    await expect(isServerReady()).resolves.toBe(false);
+    await expect(isServerReady()).resolves.toBe(false);
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/ready$/);
+  });
+
+  it("treats a hung /ready probe as not ready after its timeout", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        (_url: string, init?: RequestInit) =>
+          new Promise((_resolve, reject) =>
+            init?.signal?.addEventListener("abort", () => reject(new DOMException("aborted"))),
+          ),
+      ),
+    );
+
+    const ready = isServerReady();
+    await vi.advanceTimersByTimeAsync(READY_PROBE_TIMEOUT_MS);
+    await expect(ready).resolves.toBe(false);
+    vi.useRealTimers();
   });
 
   it("returns successful health payloads", async () => {

@@ -1,5 +1,6 @@
 # ruff: noqa: E501
 
+import asyncio
 from datetime import UTC, datetime
 from uuid import uuid4
 
@@ -11,6 +12,7 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.api import auth as auth_module
 from app.api import specs as specs_module
 from app.core.config import Settings, get_settings
+from app.core.lifecycle import ServiceDrainingError
 from app.core.security import hash_password
 from app.main import app
 from app.models import AgentRun, AuditLog, Notification, SpecPhase, SpecWorkflow, User, Workspace
@@ -368,6 +370,75 @@ async def test_constitution_finalizer_auto_chains_to_specify(db_session, monkeyp
         ).scalar_one()
         assert constitution.status == "completed"
         assert specify.status == "running"
+
+
+async def test_phase_finalizer_is_registered_for_the_shutdown_drain(db_session, monkeypatch):
+    """Finalizers live in the shared run registry so shutdown waits for (or cancels and sweeps)
+    them instead of erroring a phase whose agent run finished during the grace window."""
+    from app.services.runtime import run_registry
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"reg-{uuid4()}@example.com")
+    await session.commit()
+    release = asyncio.Event()
+
+    async def blocking_finalize(self, *args, **kwargs):
+        await release.wait()
+
+    monkeypatch.setattr("app.services.agents.AgentService.create_run", _fake_create_run())
+    monkeypatch.setattr(SpecKitService, "_finalize_phase", blocking_finalize)
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    workflow = await service.start_workflow(workspace.id, user.id, "Add Auth", "We need login")
+    constitution = next(p for p in workflow.phases if p.phase == "constitution")
+
+    task = run_registry.get_task(constitution.id)
+    assert task is not None and not task.done()
+    release.set()
+    await task
+
+
+async def test_auto_chain_refused_by_a_drain_leaves_specify_pending(db_session, monkeypatch):
+    """A deploy defers the chained specify; it is not a failure to report."""
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"drain-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user, phase_status={"constitution": "running"})
+    run = AgentRun(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        prompt="generate constitution",
+        status="completed",
+        provider="mock",
+        model="mock-agent",
+    )
+    session.add(run)
+    await session.commit()
+
+    async def refused_run_phase(self, *args, **kwargs):
+        raise ServiceDrainingError
+
+    monkeypatch.setattr(SpecKitService, "run_phase", refused_run_phase)
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    await service._finalize_phase(workflow.id, "constitution", run.id, user.id)
+
+    async with session_maker() as verify:
+        phases = {
+            p.phase: p.status
+            for p in (
+                await verify.execute(select(SpecPhase).where(SpecPhase.workflow_id == workflow.id))
+            ).scalars()
+        }
+        refreshed = await verify.get(SpecWorkflow, workflow.id)
+        errors = (
+            await verify.execute(
+                select(Notification).where(
+                    Notification.user_id == user.id, Notification.notification_type == "spec_phase_error"
+                )
+            )
+        ).scalars().all()
+    assert phases["constitution"] == "completed"
+    assert phases["specify"] == "pending"
+    assert refreshed.status != "error"
+    assert errors == []
 
 
 # --- approval gate transitions -----------------------------------------------------------

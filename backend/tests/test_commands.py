@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -253,6 +254,10 @@ class FakeSession:
 
     async def refresh(self, _value) -> None:
         return None
+
+    async def execute(self, _statement):
+        # The conditional "finish a running run" UPDATE always matches its (running) row.
+        return SimpleNamespace(scalar_one_or_none=lambda: uuid4())
 
 
 @pytest.fixture
@@ -1328,7 +1333,7 @@ async def test_real_db_command_run_gets_enigma_exports_in_its_env(real_db_sessio
     )
 
     run = await service.create_run(workspace.id, custom_command.id, user.id, confirmed=True)
-    task = service.runtime.tasks.get(run.id)
+    task = service.runtime.get_task(run.id)
     assert task is not None
     await task
 
@@ -1367,7 +1372,7 @@ async def test_real_db_command_run_with_a_bad_template_fails_the_run_cleanly(rea
     )
 
     run = await service.create_run(workspace.id, custom_command.id, user.id, confirmed=True)
-    task = service.runtime.tasks.get(run.id)
+    task = service.runtime.get_task(run.id)
     assert task is not None
     await task
 

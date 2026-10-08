@@ -1,9 +1,12 @@
 import asyncio
+from contextlib import suppress
+from datetime import datetime
 from typing import Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
@@ -21,6 +24,7 @@ from app.schemas.agents import (
 )
 from app.services.access import WorkspaceAccessDeniedError, can_drive, require_workspace_access
 from app.services.agents import (
+    ACTIVE_RUN_STATUSES,
     AgentConfigurationError,
     AgentRunAlreadyActiveError,
     AgentRunNotFoundError,
@@ -159,6 +163,7 @@ def agent_run_detail_response(run: AgentRun) -> AgentRunDetailResponse:
         started_at=run.started_at,
         completed_at=run.completed_at,
         error_message=run.error_message,
+        error_reason=run.error_reason,
         events=[agent_event_response(event) for event in run.events],
     )
 
@@ -335,8 +340,10 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
             _workspace, viewer_role = await require_workspace_access(
                 session, workspace_id, user.id
             )
-            events = await service.list_events(workspace_id, run_id, user.id)
+            # Status before events (as in ``catch_up``): a run that reads as ended has every
+            # event committed, so closing right after this snapshot cannot drop its tail.
             run = await service.get_run(workspace_id, run_id, user.id)
+            events = await service.list_events(workspace_id, run_id, user.id)
         except (WorkspaceNotFoundError, AgentRunNotFoundError):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
@@ -345,35 +352,111 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
     await websocket.send_json(
         {"type": "role", "content": "driver" if can_drive(viewer_role) else "observer"}
     )
+    sent_ids: set[str] = set()
+    # Newest ``created_at`` sent so far: idle-tick catch-ups read only from here on.
+    high_water: datetime | None = None
+
+    async def send_event(payload: dict) -> None:
+        nonlocal high_water
+        await websocket.send_json(payload)
+        sent_ids.add(payload["id"])
+        with suppress(KeyError, TypeError, ValueError):
+            created_at = datetime.fromisoformat(payload["created_at"])
+            if high_water is None or created_at > high_water:
+                high_water = created_at
+
     for event in events:
-        await websocket.send_json(event_payload(event))
+        await send_event(event_payload(event))
 
     if run.status not in ("thinking", "executing"):
         await websocket.close()
         return
 
     queue = agent_runtime.subscribe(run_id)
+
+    async def close_if_ended(*, final: bool = False) -> bool:
+        # With runs on workers, events persisted between the history read above and the
+        # subscription going live (or lost by the at-most-once bus) would never arrive here.
+        # ``final`` (a terminal frame arrived live) re-reads everything before closing.
+        missed, ended = await catch_up(
+            async_session_maker,
+            settings,
+            workspace_id,
+            run_id,
+            user.id,
+            sent_ids,
+            since=None if final else high_water,
+        )
+        for payload in missed:
+            await send_event(payload)
+        if ended or final:
+            await websocket.close()
+        return ended or final
+
     try:
+        await agent_runtime.wait_ready(run_id)
+        if await close_if_ended():
+            return
         while True:
             try:
                 payload = await asyncio.wait_for(
                     queue.get(), timeout=STREAM_PING_INTERVAL_SECONDS
                 )
             except TimeoutError:
+                if await close_if_ended():
+                    return
                 # No agent activity in a while; send a keepalive so the socket
                 # stays open through long thinking pauses. The client ignores
                 # frames of type "ping".
                 await websocket.send_json({"type": "ping"})
                 continue
-            await websocket.send_json(payload)
+            payload_id = payload.get("id")
+            if not isinstance(payload_id, str) or payload_id in sent_ids:
+                continue
+            await send_event(payload)
             status_value = payload.get("metadata", {}).get("status")
             if status_value in {"completed", "error", "stopped"}:
-                await websocket.close()
+                await close_if_ended(final=True)
                 return
     except WebSocketDisconnect:
         return
+    except (WorkspaceNotFoundError, AgentRunNotFoundError):
+        # Access revoked or run deleted mid-stream: the re-read in ``catch_up`` re-checks both.
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
     finally:
         agent_runtime.unsubscribe(run_id, queue)
+
+
+async def catch_up(
+    session_maker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    workspace_id: UUID,
+    run_id: UUID,
+    user_id: UUID,
+    sent_ids: set[str],
+    *,
+    since: datetime | None = None,
+) -> tuple[list[dict], bool]:
+    """The persisted events this socket has not sent yet, and whether the run has ended.
+
+    ``since`` limits the read to the socket's high-water mark, except once the run has ended:
+    then everything is re-read, because a commit from another process (a stop accepted on
+    another replica) can land late with an older ``created_at``.
+    """
+    async with session_maker() as session:
+        service = AgentService(session=session, session_maker=session_maker, settings=settings)
+        # Status before events: once it reads as ended, every event of the run is committed.
+        run_status = await session.scalar(
+            select(AgentRun.status).where(
+                AgentRun.id == run_id, AgentRun.workspace_id == workspace_id
+            )
+        )
+        ended = run_status not in ACTIVE_RUN_STATUSES
+        events = await service.list_events(
+            workspace_id, run_id, user_id, since=None if ended else since
+        )
+    missed = [event_payload(event) for event in events if str(event.id) not in sent_ids]
+    return missed, ended
 
 
 async def websocket_user(

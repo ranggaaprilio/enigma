@@ -102,3 +102,67 @@ replicas.
 - Killing the client's replica and reconnecting to another replica resumes the stream with no
   missing events (backfill + de-dupe verified).
 - Notifications reach all of a user's open tabs regardless of replica.
+
+## Implementation Notes (shipped)
+
+Most of the transport landed with epic 02 (its "epic 03 slice"): `RedisEventBus` behind the
+`EventBus` protocol (`services/runtime.py`), selected by `RUN_EXECUTION_MODE=queue`; the stop
+control channel `agent_run_control:{id}` with a 5 s status re-check on the worker; and the agent
+WebSocket's subscribe → `wait_ready` → catch-up. Topic names stayed as shipped
+(`agent_run:{id}`, `command_run:{id}`, `notifications:{user_id}`) rather than the `run:`/`cmd:`/
+`user:` names above. This epic closed the remaining gaps:
+
+- **Invariant: Postgres is authoritative, the bus is an at-most-once hint.** Every stream
+  subscribes, waits until the subscription is live, *then* reads persisted state, and re-reads on
+  idle ticks and before closing. Publishers persist first and publish after the commit.
+- **Agent events** — `AgentService.list_events` is now an indexed SQL query ordered by
+  `(created_at, id)` with an optional inclusive `since`. The WebSocket keeps a high-water
+  `created_at` and idle-tick catch-ups read only from it; once the run has ended (or a terminal
+  frame arrives live) the catch-up re-reads everything, because a commit from another process (a
+  stop accepted on another replica) can land late with an older timestamp. Migration
+  `0032_agent_events_stream_index` adds `ix_agent_events_run_created_id` on
+  `(agent_run_id, created_at, id)`.
+- **Command output** — live `output` frames carry `offset`, their start in `run.output`, and
+  contain exactly what was persisted. `tail_command_run` (`api/commands.py`) tracks how much it
+  has sent: overlap is trimmed, a frame starting past it (an earlier one dropped) triggers a
+  re-read, and a 5 s idle timeout re-reads too, so a lost status frame still ends the stream.
+  Behaviour change: output past `AGENT_MAX_COMMAND_OUTPUT_CHARS` is no longer streamed live —
+  live viewers now see exactly what a reconnect or a reload shows. No Redis Streams were needed.
+- **Notifications** — on every reconnect after the first open, the bell re-fetches
+  `GET /notifications` and merges by id (`NotificationBell` in `DashboardShell.tsx`), so anything
+  created while the socket was down appears. The list endpoint is the durable record.
+- **Frontend reconnect** was already in place (`useReconnectingWebSocket`: backoff, `/ready`
+  gating during deploys, reconnecting banner). Agent and command streams clear their buffer on
+  every (re)connect and rely on the backend replaying from Postgres.
+- **Terminal** — confirmed replica-agnostic: the PTY WebSocket is a duplex bridge from whichever
+  replica accepts it to the sandbox via `DaytonaRuntime`; terminal sessions are DB rows and no
+  process-local session map exists. If per-session state is ever added, route it through the bus.
+- **Security** — unchanged: each WebSocket authenticates the session cookie and checks
+  workspace access (and run ownership, for commands) before subscribing; topics are exact
+  `SUBSCRIBE`s on UUID-keyed channels (no pattern subscriptions), and access is re-checked on
+  every Postgres re-read, so revoked access ends a command stream with 1008.
+- **Tests** — `tests/test_event_streaming.py`: ordered/incremental backfill, the late-commit
+  case, command offset trimming/gap fill/lost status frame, and acceptance tests over three
+  `RedisEventBus` instances on one fakeredis server (output reaches replica B, survives a hop to
+  replica C with no gaps or duplicates; one notification reaches tabs on two replicas). Stop
+  across replicas is covered by
+  `tests/test_redis_event_bus.py::test_stop_published_by_the_api_pauses_the_worker_provider`.
+  Frontend: `NotificationBell.test.tsx`.
+
+### Not covered
+
+- **Stop for command runs, and pause/resume for any run** — no such endpoints exist; the control
+  channel carries only `stop` for agent runs.
+- **Live agent frames can arrive out of order** when the bus drops one and a later one arrives
+  live: the dropped frame is delivered on the next catch-up (≤ 20 s), after it. Fixing that needs
+  per-run sequence numbers (epic 04).
+- **`agent_events.created_at` is `now()` (transaction start), not commit order.** An event from
+  a long transaction can carry an older timestamp than ones already sent; if the bus also drops
+  its frame, it arrives only with the final full re-read when the run ends (self-healing, but
+  late). A monotonic per-run sequence column as the cursor would fix it (epic 04).
+- **Revocation takes effect on the next re-read**: while frames flow, live frames are forwarded
+  without re-checking access (≤ 20 s idle for agents, 5 s for commands). Same as before.
+- **A command stream has no upper bound** while its run row stays `running`; it re-reads every
+  5 s until the client leaves or reconciliation ends the run.
+- **Agent stream handler is not unit-extracted** like `tail_command_run`; its acceptance rests on
+  `catch_up` tests plus the bus tests.

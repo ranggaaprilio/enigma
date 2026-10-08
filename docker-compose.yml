@@ -27,15 +27,42 @@ services:
       timeout: 5s
       retries: 10
 
+  # Epic 05: transaction-mode PgBouncer, opt-in with `--profile pgbouncer`. Point the app at it
+  # with DATABASE_URL=postgresql+asyncpg://execute:execute@pgbouncer:5432/execute_dashboard and
+  # DB_PGBOUNCER=true; run migrations against postgres directly. No host port: only services on
+  # the compose network reach it, and it authenticates every client (scram-sha-256).
+  pgbouncer:
+    profiles: ["pgbouncer"]
+    image: docker.io/edoburu/pgbouncer:v1.25.2-p0
+    environment:
+      DB_HOST: postgres
+      DB_USER: ${POSTGRES_USER:-execute}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-execute}
+      DB_NAME: ${POSTGRES_DB:-execute_dashboard}
+      AUTH_TYPE: scram-sha-256
+      POOL_MODE: transaction
+      # Server connections per database/user pair; the sum over pairs must fit max_connections.
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-20}
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-1000}
+      # asyncpg prepares uniquely named statements; reset each server connection when it goes
+      # back to the pool so they don't pile up (SQLAlchemy's asyncpg + PgBouncer guidance).
+      SERVER_RESET_QUERY: DISCARD ALL
+      SERVER_RESET_QUERY_ALWAYS: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   backend:
     build:
       context: ./backend
-    environment:
+    environment: &backend-env
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
+      DB_PGBOUNCER: ${DB_PGBOUNCER:-false}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       BACKEND_CORS_ORIGINS: ${BACKEND_CORS_ORIGINS:-http://localhost:5173,http://127.0.0.1:5173}
-      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-local-development-auth-secret-change-me}
-      WORKSPACE_ENV_ENCRYPTION_KEY: ${WORKSPACE_ENV_ENCRYPTION_KEY:-SDJ5GYTawwnCZRYJ3wc8UNvbcmitbdkswaq14sV1phc=}
+      # No fallbacks: secrets must come from .env (see .env.example for how to generate them).
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?set AUTH_SECRET_KEY in .env}
+      WORKSPACE_ENV_ENCRYPTION_KEY: ${WORKSPACE_ENV_ENCRYPTION_KEY:?set WORKSPACE_ENV_ENCRYPTION_KEY in .env}
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
       DAYTONA_API_URL: ${DAYTONA_API_URL:-https://app.daytona.io/api}
       DAYTONA_TARGET: ${DAYTONA_TARGET:-}
@@ -56,8 +83,14 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-4.1-mini}
       AGENT_ALLOW_MOCK_PROVIDER: ${AGENT_ALLOW_MOCK_PROVIDER:-false}
+      # inline: runs execute inside this API process. queue: runs are enqueued for the `worker`
+      # service (start it with `--profile queue`). Switch only with no runs active.
+      RUN_EXECUTION_MODE: ${RUN_EXECUTION_MODE:-inline}
     ports:
       - "8000:8000"
+    # Above SHUTDOWN_DRAIN_DELAY_SECONDS + SHUTDOWN_RUN_GRACE_SECONDS (5 + 15) plus pool close,
+    # so SIGKILL never lands mid-drain.
+    stop_grace_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,12 +101,37 @@ services:
       - backend_venv:/app/.venv
     command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
 
+  # Epic 02: executes agent/command runs and Spec Kit finalizers when RUN_EXECUTION_MODE=queue.
+  # `podman compose --profile queue up` (scale with `--scale worker=N`). WORKER_ID defaults to
+  # the container hostname, which is unique per replica and stable across a restart.
+  worker:
+    profiles: ["queue"]
+    build:
+      context: ./backend
+    environment:
+      <<: *backend-env
+      # Epic 05: a smaller pool per worker, so a run surge cannot take the connections the API
+      # needs (ignored behind PgBouncer, which pools for everyone).
+      DB_POOL_SIZE: ${WORKER_DB_POOL_SIZE:-3}
+      DB_MAX_OVERFLOW: ${WORKER_DB_MAX_OVERFLOW:-2}
+    # Above SHUTDOWN_RUN_GRACE_SECONDS (arq's job_completion_wait) plus the shutdown sweep.
+    stop_grace_period: 30s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app
+      - worker_venv:/app/.venv
+    command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && exec uv run arq app.worker.WorkerSettings"
+
   preview-proxy:
     build:
       context: ./backend
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
-      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:-local-development-auth-secret-change-me}
+      AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?set AUTH_SECRET_KEY in .env}
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
       DAYTONA_API_URL: ${DAYTONA_API_URL:-https://app.daytona.io/api}
       DAYTONA_TARGET: ${DAYTONA_TARGET:-}
@@ -108,5 +166,6 @@ volumes:
   postgres_data:
   redis_data:
   backend_venv:
+  worker_venv:
   preview_proxy_venv:
   frontend_node_modules:
