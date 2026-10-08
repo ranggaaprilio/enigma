@@ -7,13 +7,14 @@ workspace. This sweep marks them ``error`` with ``error_reason = "interrupted_by
 
 Startup calls it unscoped: *every* active row is treated as orphaned, which is only correct
 while a single backend replica runs at a time (see
-docs/horizontal-scale/01-stateless-control-plane.md). Once runs carry leases (epic 04) it must
-key off expired leases instead. Shutdown passes ``run_ids`` -- the runs this process owned --
-so it never touches another live replica's work.
+docs/horizontal-scale/01-stateless-control-plane.md). Shutdown passes ``run_ids`` -- the runs
+this process owned -- so it never touches another live replica's work.
 
 In ``RUN_EXECUTION_MODE=queue`` (Epic 02) the API owns no runs and skips the unscoped sweep;
 each worker passes its own ``worker_id`` instead, reclaiming only the runs it claimed. Spec
 phases are then advanced by DB-driven finalizer jobs, so a worker sweep leaves them alone.
+Runs whose worker never comes back are ended by their expired leases (Epic 04,
+``app.services.reaper``), so this sweep only speeds up the common restart case.
 """
 
 from collections.abc import Collection
@@ -81,6 +82,7 @@ async def reconcile_interrupted_runs(
             run.error_reason = INTERRUPTED_BY_RESTART
             run.error_message = INTERRUPTED_MESSAGE
             run.completed_at = now
+            run.lease_expires_at = None
             event = AgentEvent(
                 agent_run_id=run.id,
                 event_type="error",
@@ -96,6 +98,7 @@ async def reconcile_interrupted_runs(
             run.status = "error"
             run.error_reason = INTERRUPTED_BY_RESTART
             run.completed_at = now
+            run.lease_expires_at = None
             run.output = f"{run.output}\n{INTERRUPTED_MESSAGE}\n"
             result.command_run_ids.append(run.id)
 

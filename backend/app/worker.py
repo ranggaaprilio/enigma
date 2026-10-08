@@ -8,6 +8,8 @@ that was claimed but never finished means its worker died, so it is ended rather
 
 import asyncio
 import math
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 from uuid import UUID
 
@@ -37,6 +39,8 @@ from app.services.jobs import (
     serialize_job_payload,
     set_run_dispatcher,
 )
+from app.services.leases import heartbeat
+from app.services.reaper import run_reaper
 from app.services.reconciliation import reconcile_interrupted_runs
 from app.services.runtime import RedisEventBus, event_bus
 from app.services.speckit import (
@@ -81,6 +85,23 @@ async def _claim(claim, fail, *, job_try: int, settings: Settings, log) -> Any |
         return None
 
 
+@asynccontextmanager
+async def _holding_lease(
+    renew: Callable[[], Awaitable[bool]],
+    settings: Settings,
+    on_lost: Callable[[], None] | None = None,
+) -> AsyncIterator[None]:
+    """Keep renewing the run's lease (taken at claim) while the job executes it."""
+    beat = asyncio.create_task(
+        heartbeat(renew, interval=settings.run_heartbeat_seconds, on_lost=on_lost)
+    )
+    try:
+        yield
+    finally:
+        beat.cancel()
+        await asyncio.gather(beat, return_exceptions=True)
+
+
 async def _status(session_maker, model, run_id: UUID) -> str | None:
     async with session_maker() as session:
         return await session.scalar(select(model.status).where(model.id == run_id))
@@ -121,9 +142,14 @@ async def run_agent_job(ctx: dict[str, Any], run_id: str) -> str:
         if claim is None:
             return DEAD_LETTER
         if claim.outcome == "already_claimed":
-            log.warning("agent_job_worker_lost")
-            await service.fail_active_run(run_uuid, WORKER_LOST, WORKER_LOST_MESSAGE)
-            return WORKER_LOST
+            # A live lease means the first delivery is still running it: leave it be.
+            if await service.fail_active_run(
+                run_uuid, WORKER_LOST, WORKER_LOST_MESSAGE, lease_expired=True
+            ):
+                log.warning("agent_job_worker_lost")
+                return WORKER_LOST
+            log.info("agent_job_redelivered_while_running")
+            return "already_claimed"
         if claim.outcome != "claimed":
             log.info("agent_job_skipped", outcome=claim.outcome)
             return claim.outcome
@@ -131,7 +157,12 @@ async def run_agent_job(ctx: dict[str, Any], run_id: str) -> str:
         stop_event = asyncio.Event()
         runtime.register_run(run_uuid, asyncio.current_task(), stop_event)
         try:
-            async with runtime.watch_control(run_uuid):
+            # A lost lease means the reaper already ended the run: stop executing it.
+            async with _holding_lease(
+                lambda: service.renew_lease(run_uuid, settings.worker_id),
+                settings,
+                on_lost=lambda: runtime.request_stop(run_uuid),
+            ), runtime.watch_control(run_uuid):
                 # Stopped between the claim and the watch: that signal never reached us.
                 status = await _status(session_maker, AgentRun, run_uuid)
                 if status not in ACTIVE_RUN_STATUSES:
@@ -175,9 +206,14 @@ async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
         if outcome is None:
             return DEAD_LETTER
         if outcome == "already_claimed":
-            log.warning("command_job_worker_lost")
-            await service.fail_active_run(run_uuid, WORKER_LOST, WORKER_LOST_MESSAGE)
-            return WORKER_LOST
+            # A live lease means the first delivery is still running it: leave it be.
+            if await service.fail_active_run(
+                run_uuid, WORKER_LOST, WORKER_LOST_MESSAGE, lease_expired=True
+            ):
+                log.warning("command_job_worker_lost")
+                return WORKER_LOST
+            log.info("command_job_redelivered_while_running")
+            return "already_claimed"
         if outcome != "claimed":
             log.info("command_job_skipped", outcome=outcome)
             return outcome
@@ -186,7 +222,17 @@ async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
         # final, so whatever escapes is recorded on the run here rather than leaving it running.
         timeout = settings.command_run_max_timeout_seconds + COMMAND_TIMEOUT_MARGIN_SECONDS
         try:
-            async with asyncio.timeout(timeout):
+            # Commands have no stop signal: a lost lease (the run was reaped) cancels the job,
+            # and arq's redelivery then finds the run terminal.
+            job = asyncio.current_task()
+            async with (
+                _holding_lease(
+                    lambda: service.renew_lease(run_uuid, settings.worker_id),
+                    settings,
+                    on_lost=lambda: job.cancel(),
+                ),
+                asyncio.timeout(timeout),
+            ):
                 await service._execute_run(run_uuid, confirmed=True)
         except TimeoutError:
             await service.fail_active_run(
@@ -270,12 +316,17 @@ async def startup(ctx: dict[str, Any]) -> None:
     set_run_dispatcher(ArqDispatcher(settings, pool=ctx["redis"]))
     # Runs this worker identity claimed in a previous life (crash, OOM, kill -9) have no owner.
     await reconcile_interrupted_runs(async_session_maker, worker_id=settings.worker_id)
+    # Runs any *other* worker left behind are found by their expired leases (Epic 04).
+    ctx["reaper"] = asyncio.create_task(run_reaper(async_session_maker, settings))
     logger.info("worker_started", worker_id=settings.worker_id, queue=settings.run_queue_name)
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     settings: Settings = ctx.get("settings") or get_settings()
     lifecycle.begin_drain()
+    if (reaper := ctx.get("reaper")) is not None:
+        reaper.cancel()
+        await asyncio.gather(reaper, return_exceptions=True)
     try:
         # arq has already waited `job_completion_wait` and cancelled what was still running;
         # cancelled runs were left active, so record them as interrupted now rather than when

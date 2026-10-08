@@ -137,6 +137,12 @@ class AgentRun(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # Ownership lease (Epic 04): stamped at claim, renewed by the owning worker's heartbeat,
+    # cleared when the run ends. NULL on an active run means it was never leased (inline mode).
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     session: Mapped["AgentSession | None"] = relationship(back_populates="runs")
     events: Mapped[list["AgentEvent"]] = relationship(

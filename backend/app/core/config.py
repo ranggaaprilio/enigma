@@ -53,6 +53,12 @@ class Settings(BaseSettings):
     agent_run_timeout_seconds: int = Field(default=2 * 60 * 60, gt=0)
     worker_job_timeout_seconds: int = Field(default=2 * 60 * 60 + 5 * 60, gt=0)
     spec_finalize_poll_seconds: float = Field(default=5.0, gt=0)
+    # Epic 04: a worker owns a claimed run only while its lease is fresh. It renews every
+    # `run_heartbeat_seconds`; once `lease_expires_at` passes, any worker's reaper (every
+    # `run_reaper_interval_seconds`) ends the run as `interrupted_worker_died`.
+    run_lease_seconds: float = Field(default=60.0, gt=0)
+    run_heartbeat_seconds: float = Field(default=15.0, gt=0)
+    run_reaper_interval_seconds: float = Field(default=30.0, gt=0)
     daytona_api_key: str | None = None
     daytona_api_url: str | None = None
     daytona_target: str | None = None
@@ -205,6 +211,15 @@ class Settings(BaseSettings):
 
             return json.loads(stripped)
         return value
+
+    @model_validator(mode="after")
+    def check_lease_timing(self) -> "Settings":
+        if self.run_heartbeat_seconds >= self.run_lease_seconds:
+            raise ValueError(
+                "run_heartbeat_seconds must be shorter than run_lease_seconds, or a live "
+                "worker's lease expires between renewals and the reaper ends its run."
+            )
+        return self
 
     @model_validator(mode="after")
     def enforce_secure_defaults(self) -> "Settings":

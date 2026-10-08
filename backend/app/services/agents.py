@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import NamedTuple
 from uuid import UUID
 
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
@@ -27,6 +27,7 @@ from app.services.jobs import (
     RunQueueUnavailableError,
     get_run_dispatcher,
 )
+from app.services.leases import db_now, lease_deadline
 from app.services.notifications import NotificationService
 from app.services.repositories import RepositoryService
 from app.services.runtime import (
@@ -42,6 +43,7 @@ from app.services.runtime import run_lock as default_run_lock
 from app.services.workspaces import WorkspaceSecretCipher
 
 ACTIVE_RUN_STATUSES = ("thinking", "executing")
+TERMINAL_RUN_STATUSES = ("completed", "error", "stopped")
 # Partial unique index backing the one-active-run-per-workspace rule across replicas.
 ONE_ACTIVE_RUN_INDEX = "uq_agent_runs_one_active_per_workspace"
 SESSION_TITLE_MAX_CHARS = 80
@@ -286,10 +288,16 @@ class AgentService:
     ) -> AgentRun:
         lifecycle.ensure_accepting_work()
         workspace = await self._get_workspace(workspace_id, user_id, require_drive=True)
-        # Check-then-insert under the per-workspace lock so two concurrent requests in this
-        # process cannot both pass the "no active run" guard. Across replicas the partial
-        # unique index is the guard; the check just turns the common case into a cheap 409.
-        async with self.run_lock.hold(f"agent_run:workspace:{workspace.id}"):
+        # Check-then-insert under the per-workspace lock so two concurrent requests cannot both
+        # pass the "no active run" guard: the in-process lock serialises this replica, and a
+        # transaction-scoped Postgres advisory lock (released at the commit below) serialises
+        # replicas. It fails closed -- a lock error fails the request before anything is
+        # inserted. The partial unique index stays the guarantee if the lock is ever bypassed.
+        lock_key = f"agent_run:workspace:{workspace.id}"
+        async with self.run_lock.hold(lock_key):
+            await self.session.execute(
+                select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0)))
+            )
             if await self._find_active_run_id(workspace.id) is not None:
                 raise AgentRunAlreadyActiveError
 
@@ -368,6 +376,7 @@ class AgentService:
 
         ``claimed_at IS NULL`` is the guard: arq delivers at least once, but only the first
         claim of an active run succeeds, so a redelivered job can never re-run the agent.
+        The claim also takes the run's lease, which the worker then keeps renewing.
         """
         async with self.session_maker() as session:
             claimed = await session.execute(
@@ -377,7 +386,13 @@ class AgentService:
                     AgentRun.status.in_(ACTIVE_RUN_STATUSES),
                     AgentRun.claimed_at.is_(None),
                 )
-                .values(claimed_at=datetime.now(UTC), worker_id=worker_id, attempt=attempt)
+                .values(
+                    claimed_at=datetime.now(UTC),
+                    worker_id=worker_id,
+                    attempt=attempt,
+                    heartbeat_at=db_now(),
+                    lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
+                )
                 .returning(AgentRun.working_dir)
             )
             row = claimed.first()
@@ -390,6 +405,31 @@ class AgentService:
             if status in ACTIVE_RUN_STATUSES:
                 return RunClaim("already_claimed")
             return RunClaim("already_terminal")
+
+    async def renew_lease(self, run_id: UUID, worker_id: str) -> bool:
+        """Extend the lease of a run this worker owns; False once it is no longer ours to run.
+
+        Only the owning worker matches, and only while the run is active: the reaper never takes
+        over a live lease, and an owner can never revive a run that was already ended.
+        """
+        async with self.session_maker() as session:
+            renewed = await session.execute(
+                update(AgentRun)
+                .where(
+                    AgentRun.id == run_id,
+                    AgentRun.worker_id == worker_id,
+                    AgentRun.status.in_(ACTIVE_RUN_STATUSES),
+                )
+                .values(
+                    heartbeat_at=db_now(),
+                    lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
+                )
+                .returning(AgentRun.id)
+            )
+            if renewed.scalar_one_or_none() is None:
+                return False
+            await session.commit()
+            return True
 
     async def execute_claimed_run(
         self,
@@ -411,29 +451,41 @@ class AgentService:
             status = await session.scalar(select(AgentRun.status).where(AgentRun.id == run_id))
         return status or "missing"
 
-    async def fail_active_run(self, run_id: UUID, reason: str, message: str) -> bool:
+    async def fail_active_run(
+        self, run_id: UUID, reason: str, message: str, *, lease_expired: bool = False
+    ) -> bool:
         """End a still-active run as ``error``/``reason``; a no-op if it already finished.
 
         The UPDATE is conditional on the run being active, so it never overwrites a terminal
-        status written concurrently (e.g. a stop). Returns whether this call ended the run.
+        status written concurrently (e.g. a stop). ``lease_expired`` (the reaper, a redelivered
+        job) additionally requires that no worker holds a live lease *at write time* -- it ran
+        out, or was never stamped (claimed before leases existed) -- so a renewal that raced the
+        check wins. Returns whether this call ended the run.
         """
         async with self.session_maker() as session:
+            conditions = [AgentRun.id == run_id, AgentRun.status.in_(ACTIVE_RUN_STATUSES)]
+            if lease_expired:
+                conditions.append(
+                    or_(AgentRun.lease_expires_at.is_(None), AgentRun.lease_expires_at < db_now())
+                )
             result = await session.execute(
                 update(AgentRun)
-                .where(AgentRun.id == run_id, AgentRun.status.in_(ACTIVE_RUN_STATUSES))
+                .where(*conditions)
                 .values(
                     status="error",
                     error_reason=reason,
                     error_message=message,
                     completed_at=datetime.now(UTC),
+                    lease_expires_at=None,
                 )
                 .returning(AgentRun.id)
             )
             if result.scalar_one_or_none() is None:
-                await session.rollback()
-                return False
+                return False  # nothing written; closing the session ends the transaction
             await session.flush()
-            await self._persist_event(session, run_id, "error", message, {"status": "error"})
+            await self._persist_event(
+                session, run_id, "error", message, {"status": "error", "reason": reason}
+            )
             run = await session.get(AgentRun, run_id)
             await self._record_run_finished(session, run)
             await session.commit()
@@ -638,30 +690,46 @@ class AgentService:
         return list(result.scalars().all())
 
     async def stop_run(self, workspace_id: UUID, run_id: UUID, user_id: UUID) -> AgentRun:
+        """Stop an active run. Idempotent: stopping a run that already ended (or a second click)
+        changes nothing and returns the run as it is."""
         run = await self.get_run(workspace_id, run_id, user_id, require_drive=True)
-        if run.status in ACTIVE_RUN_STATUSES:
+        if await self._transition(self.session, run.id, "stopped"):
             self.runtime.request_stop(run.id)
-            run.status = "stopped"
-            run.completed_at = datetime.now(UTC)
-            self.session.add(run)
-            await self.session.flush()
-            event = AgentEvent(
-                agent_run_id=run.id,
-                event_type="status",
-                content="stopped",
-                event_metadata={"status": "stopped"},
+            await self._persist_event(
+                self.session, run.id, "status", "stopped", {"status": "stopped"}
             )
-            self.session.add(event)
-            await self.session.flush()
-            await self.session.commit()
-            await self.session.refresh(event)
-            await self.session.refresh(run)
-            await self.runtime.publish(run.id, event_payload(event))
             # The run may be executing on a worker process; after the commit, so the worker
             # sees `stopped` when it unwinds instead of writing its own terminal status.
             await self.runtime.publish_control(run.id, "stop")
+            await self.session.refresh(run)
             await self._record_run_finished(self.session, run)
+        else:
+            await self.session.refresh(run)  # it ended concurrently; report how
         return run
+
+    async def _transition(
+        self, session: AsyncSession, run_id: UUID, status: str, **values
+    ) -> bool:
+        """Move an active run to ``status``; False, writing nothing, once it has already ended.
+
+        The run state machine: ``thinking``/``executing`` move freely between each other and to
+        a terminal status (``completed``/``error``/``stopped``), and a terminal status is final.
+        Conditional on the row still being active, so concurrent actors -- a stop on another
+        replica, the reaper, the executing worker -- cannot clobber each other, and a replayed
+        transition is a no-op. Ending a run also releases its lease. In-memory ORM copies of the
+        run are left stale; callers refresh what they read afterwards.
+        """
+        if status in TERMINAL_RUN_STATUSES:
+            values.setdefault("completed_at", datetime.now(UTC))
+            values["lease_expires_at"] = None
+        result = await session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id, AgentRun.status.in_(ACTIVE_RUN_STATUSES))
+            .values(status=status, **values)
+            .returning(AgentRun.id)
+            .execution_options(synchronize_session=False)
+        )
+        return result.scalar_one_or_none() is not None
 
     async def create_file_change(
         self,
@@ -954,12 +1022,14 @@ class AgentService:
                         break
                     if provider_event.event_type == "status":
                         status_value = provider_event.metadata.get("status")
-                        if status_value in ACTIVE_RUN_STATUSES + ("completed", "error", "stopped"):
-                            run.status = status_value
-                            if status_value not in ACTIVE_RUN_STATUSES:
-                                run.completed_at = datetime.now(UTC)
+                        if status_value in ACTIVE_RUN_STATUSES + TERMINAL_RUN_STATUSES:
+                            if not await self._transition(session, run.id, status_value):
+                                # Ended elsewhere (stopped on another replica, reaped):
+                                # that outcome stands, so stop the provider too.
+                                stop_event.set()
+                                break
+                            if status_value in TERMINAL_RUN_STATUSES:
                                 terminal_event_received = True
-                            session.add(run)
                     if (tokens_used := provider_event.metadata.get("tokens_used")) is not None:
                         run.tokens_used = int(tokens_used)
                         session.add(run)
@@ -983,20 +1053,19 @@ class AgentService:
                         session, run, baseline, worktree_path=working_dir
                     )
                 elif run.status in ACTIVE_RUN_STATUSES:
-                    run.status = "stopped" if stop_event.is_set() else "completed"
-                    run.completed_at = datetime.now(UTC)
-                    session.add(run)
-                    await session.flush()
-                    await self._persist_event(
-                        session,
-                        run.id,
-                        "status",
-                        run.status,
-                        {"status": run.status},
-                    )
-                    await self._record_run_finished(
-                        session, run, baseline, worktree_path=working_dir
-                    )
+                    final_status = "stopped" if stop_event.is_set() else "completed"
+                    if await self._transition(session, run.id, final_status):
+                        await self._persist_event(
+                            session,
+                            run.id,
+                            "status",
+                            final_status,
+                            {"status": final_status},
+                        )
+                        await session.refresh(run)
+                        await self._record_run_finished(
+                            session, run, baseline, worktree_path=working_dir
+                        )
             except asyncio.CancelledError:
                 if lifecycle.draining or self.leave_active_on_cancel:
                     # Shutdown (or a worker-side timeout) cancelled us: leave the row active for
@@ -1032,29 +1101,18 @@ class AgentService:
 
     async def _mark_stopped(self, run_id: UUID) -> None:
         async with self.session_maker() as session:
-            run = await session.get(AgentRun, run_id)
-            if run is None or run.status not in ACTIVE_RUN_STATUSES:
+            if not await self._transition(session, run_id, "stopped"):
                 return
-            run.status = "stopped"
-            run.completed_at = datetime.now(UTC)
-            session.add(run)
-            await session.flush()
-            await self._persist_event(session, run.id, "status", "stopped", {"status": "stopped"})
-            await session.commit()
+            await self._persist_event(session, run_id, "status", "stopped", {"status": "stopped"})
+            run = await session.get(AgentRun, run_id)
             await self._record_run_finished(session, run)
 
     async def _mark_error(self, run_id: UUID, message: str) -> None:
         async with self.session_maker() as session:
-            run = await session.get(AgentRun, run_id)
-            if run is None:
+            if not await self._transition(session, run_id, "error", error_message=message):
                 return
-            run.status = "error"
-            run.error_message = message
-            run.completed_at = datetime.now(UTC)
-            session.add(run)
-            await session.flush()
-            await self._persist_event(session, run.id, "error", message, {"status": "error"})
-            await session.commit()
+            await self._persist_event(session, run_id, "error", message, {"status": "error"})
+            run = await session.get(AgentRun, run_id)
             await self._record_run_finished(session, run)
 
     async def _record_run_finished(

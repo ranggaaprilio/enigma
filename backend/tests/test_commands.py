@@ -1,4 +1,5 @@
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -253,6 +254,10 @@ class FakeSession:
 
     async def refresh(self, _value) -> None:
         return None
+
+    async def execute(self, _statement):
+        # The conditional "finish a running run" UPDATE always matches its (running) row.
+        return SimpleNamespace(scalar_one_or_none=lambda: uuid4())
 
 
 @pytest.fixture

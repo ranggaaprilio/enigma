@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from sqlalchemy import func, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
@@ -21,6 +21,7 @@ from app.services.jobs import (
     RunQueueUnavailableError,
     get_run_dispatcher,
 )
+from app.services.leases import db_now, lease_deadline
 from app.services.notifications import NotificationService
 from app.services.run_paths import RunPathError, resolve_run_cwd
 from app.services.runtime import (
@@ -473,7 +474,13 @@ class CommandService:
                     CommandRun.status == "running",
                     CommandRun.claimed_at.is_(None),
                 )
-                .values(claimed_at=datetime.now(UTC), worker_id=worker_id, attempt=attempt)
+                .values(
+                    claimed_at=datetime.now(UTC),
+                    worker_id=worker_id,
+                    attempt=attempt,
+                    heartbeat_at=db_now(),
+                    lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
+                )
                 .returning(CommandRun.id)
             )
             if claimed.scalar_one_or_none() is not None:
@@ -486,23 +493,58 @@ class CommandService:
                 return "missing"
             return "already_claimed" if status == "running" else "already_terminal"
 
-    async def fail_active_run(self, run_id: UUID, reason: str, message: str) -> bool:
-        """End a still-running run as ``error``/``reason``; a no-op if it already finished."""
+    async def renew_lease(self, run_id: UUID, worker_id: str) -> bool:
+        """Extend the lease of a run this worker owns (see ``AgentService.renew_lease``)."""
         async with self.session_maker() as session:
+            renewed = await session.execute(
+                update(CommandRun)
+                .where(
+                    CommandRun.id == run_id,
+                    CommandRun.worker_id == worker_id,
+                    CommandRun.status == "running",
+                )
+                .values(
+                    heartbeat_at=db_now(),
+                    lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
+                )
+                .returning(CommandRun.id)
+            )
+            if renewed.scalar_one_or_none() is None:
+                return False
+            await session.commit()
+            return True
+
+    async def fail_active_run(
+        self, run_id: UUID, reason: str, message: str, *, lease_expired: bool = False
+    ) -> bool:
+        """End a still-running run as ``error``/``reason``; a no-op if it already finished.
+
+        ``lease_expired`` also requires that no worker holds a live lease at write time (see
+        ``AgentService.fail_active_run``).
+        """
+        async with self.session_maker() as session:
+            conditions = [CommandRun.id == run_id, CommandRun.status == "running"]
+            if lease_expired:
+                conditions.append(
+                    or_(
+                        CommandRun.lease_expires_at.is_(None),
+                        CommandRun.lease_expires_at < db_now(),
+                    )
+                )
             result = await session.execute(
                 update(CommandRun)
-                .where(CommandRun.id == run_id, CommandRun.status == "running")
+                .where(*conditions)
                 .values(
                     status="error",
                     error_reason=reason,
                     completed_at=datetime.now(UTC),
                     output=CommandRun.output + f"\n{message}\n",
+                    lease_expires_at=None,
                 )
                 .returning(CommandRun.id)
             )
             if result.scalar_one_or_none() is None:
-                await session.rollback()
-                return False
+                return False  # nothing written; closing the session ends the transaction
             await session.commit()
             run = await session.get(CommandRun, run_id)
             await self.runtime.publish(run_id, command_status_frame(run))
@@ -689,9 +731,27 @@ class CommandService:
         status: str,
         exit_code: int | None,
     ) -> None:
+        # Conditional, like AgentService._transition: a run already ended elsewhere (the reaper,
+        # an enqueue failure) keeps that outcome, and nothing is published or notified again.
+        completed_at = datetime.now(UTC)
+        finished = await session.execute(
+            update(CommandRun)
+            .where(CommandRun.id == run.id, CommandRun.status == "running")
+            .values(
+                status=status,
+                exit_code=exit_code,
+                completed_at=completed_at,
+                lease_expires_at=None,
+            )
+            .returning(CommandRun.id)
+            .execution_options(synchronize_session=False)
+        )
+        if finished.scalar_one_or_none() is None:
+            return
         run.status = status
         run.exit_code = exit_code
-        run.completed_at = datetime.now(UTC)
+        run.completed_at = completed_at
+        run.lease_expires_at = None
         session.add(run)
         await session.flush()
         await session.commit()
