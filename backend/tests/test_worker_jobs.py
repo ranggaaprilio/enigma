@@ -767,3 +767,38 @@ async def test_worker_startup_and_shutdown_reconcile_only_its_own_runs(monkeypat
     assert ctx["reaper"].cancelled()
     assert swept == ["w-9", "w-9"]
     assert lifecycle.draining
+    assert ctx["retention"] is None  # retention is off unless a window is configured
+
+
+async def test_worker_runs_retention_when_configured_and_cancels_it_on_shutdown(monkeypatch):
+    import app.worker as worker_module
+    from app.core.lifecycle import lifecycle
+
+    async def idle(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
+    async def reconcile(*_args, **_kwargs):
+        return None
+
+    class FakeEngine:
+        async def dispose(self):
+            return None
+
+    monkeypatch.setattr(
+        worker_module,
+        "get_settings",
+        lambda: queue_settings(worker_id="w-9", retention_command_output_days=7),
+    )
+    monkeypatch.setattr(worker_module, "reconcile_interrupted_runs", reconcile)
+    monkeypatch.setattr(worker_module, "run_reaper", idle)
+    monkeypatch.setattr("app.services.retention.run_retention", idle)
+    monkeypatch.setattr(worker_module, "get_daytona_runtime", lambda: FakeDaytona())
+    monkeypatch.setattr(worker_module, "engine", FakeEngine())
+    monkeypatch.setattr(lifecycle, "draining", False)  # shutdown() begins a drain
+    ctx: dict = {"redis": object()}
+
+    await worker_module.startup(ctx)
+    assert not ctx["retention"].done()
+    await worker_module.shutdown(ctx)
+
+    assert ctx["retention"].cancelled()

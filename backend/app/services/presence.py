@@ -20,8 +20,11 @@ class PresenceService:
     reaps it, so a crashed replica cannot leave ghost viewers behind forever.
     """
 
-    def __init__(self, redis: Redis) -> None:
+    def __init__(self, redis: Redis, *, subscriber: Redis | None = None) -> None:
         self.redis = redis
+        # ``listen()`` blocks while a channel is quiet, so it runs on a client without a read
+        # timeout; every command stays on ``redis`` and fails fast if Redis is gone.
+        self.subscriber = subscriber or redis
 
     def _viewers_key(self, scope: str) -> str:
         return f"presence:{scope}:viewers"
@@ -43,9 +46,7 @@ class PresenceService:
         # Liveness key first: `list_viewers` reaps any hash entry without one, so writing
         # the hash first opens a window in which a concurrent listing sees this connection
         # as dead and deletes it — the viewer then never appears at all.
-        await self.redis.setex(
-            self._conn_key(connection_id), PRESENCE_CONNECTION_TTL_SECONDS, "1"
-        )
+        await self.redis.setex(self._conn_key(connection_id), PRESENCE_CONNECTION_TTL_SECONDS, "1")
         await self.redis.hset(self._viewers_key(scope), connection_id, json.dumps(entry))
         return entry
 
@@ -60,9 +61,7 @@ class PresenceService:
         # SETEX, not EXPIRE: `EXPIRE` is a no-op on a missing key, so a connection whose
         # liveness key had already lapsed (a slow tick, a Redis restart) could never come
         # back — it stayed reapable forever while its WebSocket was still open.
-        await self.redis.setex(
-            self._conn_key(connection_id), PRESENCE_CONNECTION_TTL_SECONDS, "1"
-        )
+        await self.redis.setex(self._conn_key(connection_id), PRESENCE_CONNECTION_TTL_SECONDS, "1")
 
     async def list_viewers(self, scope: str) -> list[dict]:
         raw = await self.redis.hgetall(self._viewers_key(scope))
@@ -98,7 +97,7 @@ class PresenceService:
         while the caller is still assembling its snapshot are buffered by the connection and
         delivered in order once iteration begins.
         """
-        pubsub = self.redis.pubsub()
+        pubsub = self.subscriber.pubsub()
         await pubsub.subscribe(self._channel(scope))
         if ready is not None:
             ready.set()

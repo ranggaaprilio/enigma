@@ -20,6 +20,20 @@ class Settings(BaseSettings):
     environment: str = "local"
     database_url: str = "postgresql+asyncpg://execute:execute@localhost:5432/execute_dashboard"
     redis_url: str = "redis://localhost:6379/0"
+    # Epic 05: per-process SQLAlchemy pool. Each process can open up to pool_size +
+    # max_overflow connections, so keep (api_replicas + workers) x that sum below Postgres'
+    # max_connections with headroom (docs/horizontal-scale/05-data-layer-scaling.md).
+    db_pool_size: int = Field(default=5, gt=0)
+    db_max_overflow: int = Field(default=10, ge=0)
+    db_pool_timeout: float = Field(default=30.0, gt=0)
+    db_pool_recycle: int = Field(default=1800, gt=0)
+    # DATABASE_URL points at PgBouncer in transaction mode: no app-side pool, no cached
+    # prepared statements (the pool_* settings above are then ignored).
+    db_pgbouncer: bool = False
+    # A dead or partitioned Redis must surface as an error, not a request that never returns.
+    redis_socket_timeout_seconds: float = Field(default=5.0, gt=0)
+    redis_connect_timeout_seconds: float = Field(default=5.0, gt=0)
+    redis_health_check_interval_seconds: int = Field(default=30, ge=0)
     auth_secret_key: str = _DEFAULT_AUTH_SECRET_KEY
     auth_cookie_name: str = "execute_session"
     auth_session_ttl_seconds: int = 60 * 60 * 24 * 7
@@ -59,6 +73,18 @@ class Settings(BaseSettings):
     run_lease_seconds: float = Field(default=60.0, gt=0)
     run_heartbeat_seconds: float = Field(default=15.0, gt=0)
     run_reaper_interval_seconds: float = Field(default=30.0, gt=0)
+    # Epic 05 retention, in days; 0 keeps rows forever (the default). Agent events and command
+    # output of finished runs are dropped (the run rows, with their token/cost totals, stay);
+    # notifications are deleted once read for `read_…` days, or regardless after
+    # `retention_notifications_days` (budget warnings are always kept).
+    retention_agent_events_days: int = Field(default=0, ge=0)
+    retention_command_output_days: int = Field(default=0, ge=0)
+    retention_read_notifications_days: int = Field(default=0, ge=0)
+    retention_notifications_days: int = Field(default=0, ge=0)
+    retention_interval_seconds: float = Field(default=3600.0, gt=0)
+    # Runs (or notifications) handled per transaction, so one pass never holds long locks. A
+    # long run can have thousands of events, so keep it small.
+    retention_batch_size: int = Field(default=50, gt=0)
     daytona_api_key: str | None = None
     daytona_api_url: str | None = None
     daytona_target: str | None = None

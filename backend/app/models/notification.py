@@ -11,7 +11,8 @@ from app.db.base import Base
 class Notification(Base):
     __tablename__ = "notifications"
     __table_args__ = (
-        Index("ix_notifications_user_id", "user_id"),
+        # A user's notifications newest first (the bell); also serves user_id lookups.
+        Index("ix_notifications_user_created", "user_id", "created_at"),
         Index("ix_notifications_workspace_id", "workspace_id"),
         Index("ix_notifications_type", "type"),
         Index("ix_notifications_created_at", "created_at"),
