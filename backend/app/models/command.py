@@ -178,5 +178,10 @@ class CommandRun(Base):
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     attempt: Mapped[int] = mapped_column(nullable=False, default=0, server_default="0")
+    # Ownership lease (Epic 04); see AgentRun.
+    heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     custom_command: Mapped[CustomCommand] = relationship(back_populates="runs")

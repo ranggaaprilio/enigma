@@ -1,7 +1,7 @@
 """Epic 02: worker job handlers, called directly with an arq-style ``ctx`` (no live worker)."""
 
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -121,7 +121,11 @@ async def test_redelivery_of_a_claimed_active_run_marks_it_worker_lost(db_sessio
     """A worker died mid-run and arq redelivered: never re-run side effects, end the run."""
     session, session_maker = db_session
     run = await seed_run(
-        session, status="executing", claimed_at=datetime.now(UTC), worker_id="worker-dead"
+        session,
+        status="executing",
+        claimed_at=datetime.now(UTC),
+        worker_id="worker-dead",
+        lease_expires_at=datetime.now(UTC) - timedelta(seconds=5),
     )
 
     assert await run_agent_job(make_ctx(session_maker), str(run.id)) == WORKER_LOST
@@ -365,6 +369,7 @@ async def test_command_job_redelivered_after_claim_is_worker_lost(
 ):
     session, session_maker = db_session
     run = await seed_command_run(session, claimed_at=datetime.now(UTC), worker_id="gone")
+    # Claimed before leases existed: no live lease, so the redelivery may end it.
     ctx = command_ctx(session_maker)
     frames = ctx["command_runtime"].subscribe(run.id)
 
@@ -739,12 +744,16 @@ async def test_worker_startup_and_shutdown_reconcile_only_its_own_runs(monkeypat
     async def reconcile(session_maker, *, worker_id=None, **_kwargs):
         swept.append(worker_id)
 
+    async def reaper(*_args, **_kwargs):
+        await asyncio.Event().wait()
+
     class FakeEngine:
         async def dispose(self):
             return None
 
     monkeypatch.setattr(worker_module, "get_settings", lambda: queue_settings(worker_id="w-9"))
     monkeypatch.setattr(worker_module, "reconcile_interrupted_runs", reconcile)
+    monkeypatch.setattr(worker_module, "run_reaper", reaper)
     monkeypatch.setattr(worker_module, "get_daytona_runtime", lambda: FakeDaytona())
     monkeypatch.setattr(worker_module, "engine", FakeEngine())
     monkeypatch.setattr(lifecycle, "draining", False)
@@ -752,7 +761,9 @@ async def test_worker_startup_and_shutdown_reconcile_only_its_own_runs(monkeypat
 
     await worker_module.startup(ctx)
     assert {"settings", "session_maker", "agent_runtime", "command_runtime"} <= ctx.keys()
+    assert not ctx["reaper"].done()  # the lease reaper runs for the worker's lifetime
     await worker_module.shutdown(ctx)
 
+    assert ctx["reaper"].cancelled()
     assert swept == ["w-9", "w-9"]
     assert lifecycle.draining

@@ -12,7 +12,8 @@ The in-memory implementations serve ``RUN_EXECUTION_MODE=inline`` (one process d
 everything). In ``queue`` mode runs execute on worker processes (Epic 02), so the bus is
 ``RedisEventBus``: a worker publishes run events and an API replica's WebSocket receives them,
 and stop signals travel the other way. The registry stays process-local in both modes -- a
-worker registers the runs *it* executes -- and the lock is backed by the partial unique index.
+worker registers the runs *it* executes -- and across replicas the lock is backed by a Postgres
+advisory lock plus the partial unique index (see ``AgentService.create_run``).
 
 Deliberately *not* behind this seam: ``openhands_tools._BRIDGES``. Each bridge holds the event
 loop of the run that owns it so OpenHands' worker thread can call back into it; it lives and

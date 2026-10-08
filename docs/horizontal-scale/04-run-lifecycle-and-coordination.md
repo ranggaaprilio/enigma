@@ -93,3 +93,83 @@ are live.
 - Replaying a job (at-least-once delivery) or double-clicking stop causes no invalid state
   transition.
 - No run can be left active with an expired lease for longer than the reaper interval.
+
+## Implementation Notes (shipped)
+
+Epic 02 had already delivered part of this: the conditional claim (`claimed_at IS NULL`), so a
+replayed job never re-runs; the `uq_agent_runs_one_active_per_workspace` backstop; and
+`worker_lost` for a redelivered job. The per-job bridge lifecycle also already existed:
+`OpenHandsAgentProvider.stream_response` registers its `DaytonaToolBridge` at stream start and
+unregisters it in `finally`, so no change was needed. This epic added:
+
+- **Leases** — migration `0033_run_leases` adds `heartbeat_at` and `lease_expires_at` to
+  `agent_runs` and `command_runs`. Deviation: there is **no** `(status, lease_expires_at)`
+  index. The reaper compares against the volatile `clock_timestamp()`, so an index on the lease
+  could not serve as an index condition. The scan is already narrow (active rows only, at most
+  one agent run per workspace). An indexed lease would also turn every heartbeat into a non-HOT
+  update across all of the table's indexes. `claim_run` stamps the lease.
+  `renew_lease` extends it, but only for the owning `worker_id` and only while the run is
+  active. Every lease time is Postgres `clock_timestamp()`, never the worker's clock.
+  Settings: `RUN_LEASE_SECONDS=60`, `RUN_HEARTBEAT_SECONDS=15` (validated to be shorter than
+  the lease) and `RUN_REAPER_INTERVAL_SECONDS=30`.
+- **Heartbeat** — `heartbeat()` (`services/leases.py`) runs beside each agent and command job
+  (`_holding_lease` in `app/worker.py`). A renewal that raises is retried on the next beat. A
+  renewal that matches no row means the run was already ended: an agent job stops its provider,
+  and a command job, which has no stop signal, is cancelled. arq then redelivers it, and the
+  redelivery finds the run terminal. A redelivered job that finds its run already claimed now
+  ends it as `worker_lost` only if no live lease is held. A live lease means the first delivery
+  is still running, and that delivery is left alone.
+- **Reaper** — `services/reaper.py`. Each worker starts `run_reaper` at startup (it reaps once,
+  then every interval) and cancels it at shutdown. It ends active runs with an expired lease as
+  `error`/`interrupted_worker_died` through `fail_active_run(..., lease_expired=True)`, and that
+  UPDATE re-checks the expiry. A renewal that races the scan therefore wins, and concurrent
+  reapers end a run exactly once. Each reaped run gets the usual flow: the error event is
+  persisted, then published with `metadata.reason`, and the user gets a notification. Runs with
+  no lease (inline mode) are never touched.
+- **State machine** — `AgentService._transition` is the single conditional status write
+  (`… WHERE status IN ('thinking','executing')`). Active statuses move freely, terminal statuses
+  are final, and ending a run clears its lease. `stop_run`, `_mark_stopped`, `_mark_error`,
+  provider `status` events and the final completion all go through it. A write that loses the
+  race persists and publishes nothing, and a provider still streaming for a run that was ended
+  elsewhere is abandoned. `stop_run` on a run that has already ended is a no-op that returns the
+  run. `CommandService._mark_finished` is conditional in the same way.
+- **Cross-replica lock** — `create_run` takes `pg_advisory_xact_lock(hashtextextended(
+  'agent_run:workspace:{id}', 0))` inside the existing in-process lock, and holds it until its
+  commit. This uses Postgres rather than Redis, so it works the same in inline and queue mode
+  and adds no new failure dependency. If the lock call errors, the request fails before any
+  insert, so it fails closed. The workspace UUID is the namespace; a hash collision between two
+  workspaces would only serialise them. The unique index remains the guarantee.
+- **Frontend** — `interruptionMessage()` (`lib/api.ts`) maps `interrupted_by_restart` and
+  `interrupted_worker_died` to a retry prompt in `TurnView` and `CustomCommandsPanel`. A
+  `stopped` turn now shows a neutral "This run was stopped." notice instead of no notice.
+- **Tests** — `tests/test_run_leases.py` covers:
+  - idempotent stop;
+  - a late provider `completed` after a stop on another replica;
+  - `_mark_error` and a command finish not overwriting a terminal run;
+  - lease stamping and owner-only renewal;
+  - the heartbeat loop, and a worker that loses its lease stopping its run;
+  - the reaper on agent and command runs, ignoring live and unleased runs, never taking over a
+    renewed lease, and two concurrent reapers on separate connections;
+  - the workspace being reusable after a reap;
+  - two "replicas" racing `create_run` (exactly one wins) and `create_run` blocking on the
+    advisory lock.
+
+  Frontend coverage is in `TurnView.test.tsx` and `CustomCommandsPanel.test.tsx`.
+
+### Not covered
+
+- **The `kill -9` acceptance test is simulated, not run against a live worker.** The tests
+  expire a lease and reap it. Nothing kills an arq process.
+- **Command creation is not locked.** Command runs have no single-active invariant, so there is
+  nothing to serialise.
+- **Inline-mode runs have no lease.** Inline is single-replica, and its startup sweep still
+  covers it.
+- **The API does not run a reaper.** If every worker is dead, nothing reaps until a worker
+  starts, and that worker reaps on startup.
+- **A cancelled command job does not kill its sandbox process.** The job stops streaming and
+  writing, but the command itself runs on in the sandbox until its own timeout.
+- **Per-run event sequence numbers**, which epic 03 deferred to this epic, are not implemented.
+- **A run that is never claimed is never reaped.** If its arq job is lost before any worker
+  claims it, the row stays `thinking`/`running` with no lease and blocks the workspace, as it
+  did after epic 02. A queue-age cutoff would also reap runs that are legitimately waiting
+  behind a busy pool, so it needs a deliberate threshold. This is the remaining stuck-run case.
