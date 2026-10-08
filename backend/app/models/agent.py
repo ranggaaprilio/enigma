@@ -161,6 +161,8 @@ class AgentEvent(Base):
         Index("ix_agent_events_agent_run_id", "agent_run_id"),
         Index("ix_agent_events_created_at", "created_at"),
         Index("ix_agent_events_tool_call_id", "tool_call_id"),
+        # Backfill-then-tail: a run's events in stream order, from a high-water mark on.
+        Index("ix_agent_events_run_created_id", "agent_run_id", "created_at", "id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)

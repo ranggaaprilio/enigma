@@ -53,7 +53,7 @@ pnpm test                        # Vitest (jsdom, @testing-library/react)
   - Connection string must be `postgresql+asyncpg://…`
   - Session: `async_session_maker` with `expire_on_commit=False`
   - All DB access MUST use async/await
-- **Migrations**: Alembic with async engine, 31 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0031_run_job_queue`)
+- **Migrations**: Alembic with async engine, 32 migrations in `alembic/versions/` (`NNNN_snake_case.py`, `revision` = filename stem; head `0032_agent_events_stream_index`)
 - **Auth**: Cookie-based sessions (`execute_session` cookie), NOT JWT. Set-Cookie on login, cleared on logout.
 - **Logging**: `structlog` (configured in `core/logging.py`)
 - **Testing**: `pytest` with `pytest-asyncio` (auto mode), tests at `backend/tests/`
@@ -145,6 +145,7 @@ OpenAI-compatible base URL, model, and a Fernet-encrypted API key. Owner-only, g
 17. **Startup marks every active run `error`/`interrupted_by_restart`** (`services/reconciliation.py`, called from the lifespan; the post-drain shutdown sweep is scoped to the runs this process owned). The startup sweep assumes **one backend replica**: a second live replica would have its runs killed. Spec Kit finalizers are registered in `run_registry` (keyed by phase id) so the drain covers them. `--reload` restarts count too. New work is refused with 503 while `lifecycle.draining` (`core/lifecycle.py`); `/live` is the dependency-free liveness probe, `/ready` the traffic gate, `/health` diagnostics.
 18. **Compose requires `AUTH_SECRET_KEY` and `WORKSPACE_ENV_ENCRYPTION_KEY` in `.env`** (no fallbacks). The encryption key must be a valid Fernet key in every environment; changing it makes stored credentials undecryptable.
 19. **`RUN_EXECUTION_MODE=inline|queue`** (default `inline`). In `queue` mode, create-run endpoints enqueue the run id (`services/jobs.py`, arq) and `app/worker.py` executes it. The event bus becomes `RedisEventBus`, and stop travels on `agent_run_control:{id}`. The API then skips the startup sweep, and each worker reconciles only its own `worker_id`. Workers claim runs with a conditional UPDATE on `claimed_at`, so a redelivered job never re-runs a run. A duplicate active run is blocked by the partial unique index `uq_agent_runs_one_active_per_workspace`, so a test fixture with two `thinking`/`executing` runs in one workspace fails. `redis` is pinned `<6` because arq requires it. Details: `docs/horizontal-scale/02-distributed-job-execution.md`.
+20. **Streams are backfill-then-tail; Postgres is authoritative, the bus is an at-most-once hint.** A stream subscribes, waits for `wait_ready`, *then* reads persisted state, and re-reads on idle ticks and at the end. Agent frames de-dupe by event id (`catch_up`, high-water `created_at`); command `output` frames carry an `offset` into `run.output` (`tail_command_run`); notifications backfill from `GET /notifications` on reconnect. Persist before you publish, and never publish anything a reader could not re-derive from the DB. Details: `docs/horizontal-scale/03-distributed-event-streaming.md`.
 
 ## Implementation Plan Reference
 

@@ -1,8 +1,10 @@
-from typing import Protocol
+import asyncio
+from collections.abc import Awaitable, Callable
+from typing import Any, Protocol
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, status
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
@@ -42,6 +44,8 @@ router = APIRouter(prefix="/workspaces/{workspace_id}", tags=["commands"])
 
 DB_SESSION_DEP = Depends(get_db_session)
 SETTINGS_DEP = Depends(get_settings)
+# Without bus traffic for this long, a command stream re-reads the run from Postgres.
+COMMAND_STREAM_IDLE_SECONDS = 5.0
 
 
 async def enforce_command_run_rate_limit(
@@ -420,43 +424,96 @@ async def stream_command_run(websocket: WebSocket, workspace_id: UUID, run_id: U
             return
 
     await websocket.accept()
-    if run.output:
-        await websocket.send_json({"type": "output", "content": run.output})
-    if run.status != "running":
-        await websocket.send_json(command_status_frame(run))
-        await websocket.close()
-        return
-
-    queue = command_runtime.subscribe(run.id)
     try:
-        # The re-read below only closes the subscribe gap once the subscription is live (with
-        # runs on workers the status frame comes from another process).
-        await command_runtime.wait_ready(run.id)
-        async with async_session_maker() as session:
-            service = CommandService(
-                session=session,
-                session_maker=async_session_maker,
-                settings=settings,
+        if run.status != "running":
+            if run.output:
+                await websocket.send_json({"type": "output", "content": run.output})
+            await websocket.send_json(command_status_frame(run))
+        else:
+            await tail_command_run(
+                websocket.send_json,
+                command_runtime,
+                async_session_maker,
+                settings,
+                workspace_id,
+                run_id,
+                user_id,
             )
-            try:
-                current_run = await service.get_run(workspace_id, run_id, user_id)
-            except (WorkspaceNotFoundError, CommandRunNotFoundError):
-                await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-                return
-            if current_run.status != "running":
-                await websocket.send_json(command_status_frame(current_run))
-                await websocket.close()
-                return
-        while True:
-            payload = await queue.get()
-            await websocket.send_json(payload)
-            if payload.get("type") == "status":
-                await websocket.close()
-                return
     except WebSocketDisconnect:
         return
+    except (WorkspaceNotFoundError, CommandRunNotFoundError):
+        await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+        return
+    await websocket.close()
+
+
+class CommandStreamRuntime(Protocol):
+    def subscribe(self, run_id: UUID) -> Any: ...
+
+    def unsubscribe(self, run_id: UUID, queue: Any) -> None: ...
+
+    async def wait_ready(self, run_id: UUID) -> bool: ...
+
+
+async def tail_command_run(
+    send: Callable[[dict], Awaitable[None]],
+    runtime: CommandStreamRuntime,
+    session_maker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    workspace_id: UUID,
+    run_id: UUID,
+    user_id: UUID,
+    *,
+    idle_seconds: float = COMMAND_STREAM_IDLE_SECONDS,
+) -> None:
+    """Stream a command run's output with no gaps or duplicates, ending with its status frame.
+
+    Postgres is authoritative; the bus only says "there is more". The subscription goes live
+    *before* the first read, so output written in between is not missed. Live frames carry their
+    ``offset`` into ``run.output``: overlap with what was already sent is trimmed, and a frame
+    starting past it (an earlier frame dropped by the at-most-once bus) triggers a re-read. An idle
+    timeout re-reads too, so a lost status frame still ends the stream.
+    """
+    queue = runtime.subscribe(run_id)
+    sent = 0
+
+    async def catch_up() -> CommandRun:
+        nonlocal sent
+        async with session_maker() as session:
+            service = CommandService(
+                session=session, session_maker=session_maker, settings=settings
+            )
+            run = await service.get_run(workspace_id, run_id, user_id)
+        output = run.output or ""
+        if len(output) > sent:
+            await send({"type": "output", "content": output[sent:]})
+            sent = len(output)
+        return run
+
+    try:
+        await runtime.wait_ready(run_id)
+        run = await catch_up()
+        while run.status == "running":
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=idle_seconds)
+            except TimeoutError:
+                run = await catch_up()
+                continue
+            offset, content = payload.get("offset"), payload.get("content")
+            if payload.get("type") != "output" or not isinstance(content, str):
+                # A status frame: the run's row is final, so read the rest from it.
+                run = await catch_up()
+                continue
+            if not isinstance(offset, int) or offset > sent:
+                run = await catch_up()
+                continue
+            unsent = content[sent - offset :]
+            if unsent:
+                await send({"type": "output", "content": unsent})
+                sent += len(unsent)
+        await send(command_status_frame(run))
     finally:
-        command_runtime.unsubscribe(run.id, queue)
+        runtime.unsubscribe(run_id, queue)
 
 
 async def websocket_user(

@@ -617,9 +617,25 @@ class AgentService:
         workspace_id: UUID,
         run_id: UUID,
         user_id: UUID,
+        *,
+        since: datetime | None = None,
     ) -> list[AgentEvent]:
-        run = await self.get_run(workspace_id, run_id, user_id)
-        return list(run.events)
+        """The run's persisted events in stream order, optionally only those at or after
+        ``since`` (inclusive: an event sharing the caller's high-water mark may be unsent)."""
+        await self._get_workspace(workspace_id, user_id)
+        run_exists = await self.session.scalar(
+            select(AgentRun.id).where(
+                AgentRun.id == run_id,
+                AgentRun.workspace_id == workspace_id,
+            )
+        )
+        if run_exists is None:
+            raise AgentRunNotFoundError
+        query = select(AgentEvent).where(AgentEvent.agent_run_id == run_id)
+        if since is not None:
+            query = query.where(AgentEvent.created_at >= since)
+        result = await self.session.execute(query.order_by(AgentEvent.created_at, AgentEvent.id))
+        return list(result.scalars().all())
 
     async def stop_run(self, workspace_id: UUID, run_id: UUID, user_id: UUID) -> AgentRun:
         run = await self.get_run(workspace_id, run_id, user_id, require_drive=True)

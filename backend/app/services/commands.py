@@ -667,13 +667,20 @@ class CommandService:
         if not content:
             return
         max_chars = self.settings.agent_max_command_output_chars
-        next_output = f"{run.output or ''}{content}"
-        run.output = next_output[:max_chars]
+        previous = run.output or ""
+        run.output = f"{previous}{content}"[:max_chars]
+        # Publish exactly what was persisted, at its offset into ``run.output``: a stream can then
+        # trim what it already sent and re-read from Postgres whatever the bus dropped.
+        persisted = run.output[len(previous) :]
+        if not persisted:
+            return
         session.add(run)
         await session.flush()
         await session.commit()
         await session.refresh(run)
-        await self.runtime.publish(run.id, {"type": "output", "content": content})
+        await self.runtime.publish(
+            run.id, {"type": "output", "content": persisted, "offset": len(previous)}
+        )
 
     async def _mark_finished(
         self,
