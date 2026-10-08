@@ -137,7 +137,7 @@ Shipped together with the smallest slice of epic 03 that queue mode needs to wor
 - **`WORKER_ID` must be unique per live worker and stable across its restarts** (default: hostname). A worker that never comes back leaves its claimed runs active until arq redelivers the job (bounded by `WORKER_JOB_TIMEOUT_SECONDS`, which then ends them `worker_lost`), or until epic 04's lease reaper.
 - **Not covered yet (epics 03/04):**
   - A run whose job is lost from Redis (e.g. a flush) or never picked up has no age-based sweep, so it holds its workspace until stopped.
-  - Command output written between a WebSocket's first read and its live subscription is not re-sent (no offsets yet; epic 03).
+  - ~~Command output written between a WebSocket's first read and its live subscription is not re-sent.~~ Fixed in epic 03 (output offsets).
   - `stop_run` vs. the worker's own terminal write is still last-writer-wins (conditional transitions are epic 04).
   - When a worker shuts down while a run is still active, the run's recorded reason can come out as `worker_lost` instead of `interrupted_by_restart`, if a peer worker picks up the re-queued job before the shutdown sweep runs.
 - **Scaling** — throughput scales with `worker replicas × WORKER_MAX_JOBS`. Queue depth (`ZCARD` of `RUN_QUEUE_NAME`) is the autoscaling signal for epic 08.
