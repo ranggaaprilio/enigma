@@ -139,7 +139,13 @@ describe("CustomCommandsPanel run stream", () => {
     StreamSocket.instances = [];
   });
 
-  it("tells the user to retry when the run was interrupted by a server restart", async () => {
+  it.each([
+    ["interrupted_by_restart", "Run interrupted by a server restart — please retry."],
+    [
+      "interrupted_worker_died",
+      "Run interrupted because its worker stopped responding — please retry.",
+    ],
+  ])("tells the user to retry when the run ended as %s", async (reason, message) => {
     vi.stubGlobal("WebSocket", StreamSocket as unknown as typeof WebSocket);
     stubFetch((url) => {
       if (url.endsWith("/run")) {
@@ -173,12 +179,12 @@ describe("CustomCommandsPanel run stream", () => {
         type: "status",
         status: "error",
         exit_code: null,
-        reason: "interrupted_by_restart",
+        reason,
       });
     });
 
     const notice = await screen.findByTestId("command-run-interrupted");
-    expect(notice).toHaveTextContent("Run interrupted by a server restart — please retry.");
+    expect(notice).toHaveTextContent(message);
     expect(notice).toHaveAttribute("role", "status");
   });
 });

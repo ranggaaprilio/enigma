@@ -7,10 +7,11 @@ import {
   FileDiff,
   MessageSquare,
   RotateCcw,
+  Square,
 } from "lucide-react";
 
 import {
-  INTERRUPTED_BY_RESTART,
+  interruptionMessage,
   type AgentEventResponse,
   type AgentRunResponse,
 } from "../../lib/api";
@@ -48,14 +49,17 @@ export function TurnView({
   const outputEvents = events.filter((event) => event.event_type === "output_text");
   const outputText = outputEvents.map((event) => event.content).join("");
   const hasProcess = paired.length > 0 || outputEvents.length > 0;
-  // A server restart closed the run out, from the persisted turn or the live terminal event.
-  // That is not the agent's failure, so it gets a retry prompt instead of the error notices.
-  const interrupted =
-    turn.error_reason === INTERRUPTED_BY_RESTART ||
-    events.some(
-      (event) =>
-        event.event_type === "error" && event.metadata?.reason === INTERRUPTED_BY_RESTART,
-    );
+  // A server restart or a dead worker closed the run out, from the persisted turn or the live
+  // terminal event. That is not the agent's failure, so it gets a retry prompt instead of the
+  // error notices.
+  const interruption =
+    interruptionMessage(turn.error_reason) ??
+    events
+      .filter((event) => event.event_type === "error")
+      .map((event) => interruptionMessage(event.metadata?.reason))
+      .find((message) => message !== null) ??
+    null;
+  const interrupted = interruption !== null;
 
   return (
     <article className="flex flex-col gap-3" data-testid="agent-turn">
@@ -74,7 +78,14 @@ export function TurnView({
         {interrupted && (
           <Notice tone="warn" testId="turn-interrupted">
             <RotateCcw className="h-4 w-4" aria-hidden="true" />
-            Run interrupted by a server restart — please retry.
+            {interruption}
+          </Notice>
+        )}
+
+        {!isActive && turn.status === "stopped" && (
+          <Notice tone="neutral" testId="turn-stopped">
+            <Square className="h-4 w-4" aria-hidden="true" />
+            This run was stopped.
           </Notice>
         )}
 
