@@ -80,6 +80,12 @@ class AgentRun(Base):
         Index("ix_agent_runs_created_at", "started_at"),
         Index("ix_agent_runs_session_id", "session_id"),
         Index("ix_agent_runs_status_workspace_id", "status", "workspace_id"),
+        # Retention scan (Epic 05): finished runs whose events are still there.
+        Index(
+            "ix_agent_runs_events_retention",
+            "completed_at",
+            postgresql_where=text("events_pruned_at IS NULL AND completed_at IS NOT NULL"),
+        ),
         # One active run per workspace, enforced by Postgres so concurrent API replicas cannot
         # both start one (the in-process RunLock only serialises a single process).
         Index(
@@ -143,6 +149,10 @@ class AgentRun(Base):
     lease_expires_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Set when retention deleted this run's events; the run row and its totals are kept.
+    events_pruned_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     session: Mapped["AgentSession | None"] = relationship(back_populates="runs")
     events: Mapped[list["AgentEvent"]] = relationship(
@@ -164,10 +174,10 @@ class AgentEvent(Base):
             "event_type in ('status', 'output_text', 'tool_call', 'tool_result', 'error')",
             name="ck_agent_events_event_type",
         ),
-        Index("ix_agent_events_agent_run_id", "agent_run_id"),
         Index("ix_agent_events_created_at", "created_at"),
         Index("ix_agent_events_tool_call_id", "tool_call_id"),
-        # Backfill-then-tail: a run's events in stream order, from a high-water mark on.
+        # Backfill-then-tail: a run's events in stream order, from a high-water mark on. Its
+        # leading column also serves every by-run lookup and the run FK's cascade delete.
         Index("ix_agent_events_run_created_id", "agent_run_id", "created_at", "id"),
     )
 

@@ -27,6 +27,7 @@ from app.services.jobs import (
     run_queue_unavailable_handler,
 )
 from app.services.reconciliation import reconcile_interrupted_runs
+from app.services.retention import start_retention
 from app.services.runtime import RedisEventBus, event_bus, run_registry
 
 logger = structlog.get_logger(__name__)
@@ -58,6 +59,12 @@ async def lifespan(_app: FastAPI):
     # no runs -- active rows belong to live workers, which reconcile their own (app.worker).
     if settings.run_execution_mode == "inline":
         await reconcile_interrupted_runs(async_session_maker)
+    # Retention (Epic 05) runs where runs do: here in inline mode, on the workers in queue mode.
+    retention = (
+        start_retention(async_session_maker, settings)
+        if settings.run_execution_mode == "inline"
+        else None
+    )
     restore_sigterm = install_sigterm_drain(
         asyncio.get_running_loop(), settings.shutdown_drain_delay_seconds
     )
@@ -65,6 +72,9 @@ async def lifespan(_app: FastAPI):
     yield
 
     lifecycle.begin_drain()
+    if retention is not None:
+        retention.cancel()
+        await asyncio.gather(retention, return_exceptions=True)
     try:
         # Only the runs this process owns: an overlapping replica's live runs are not ours.
         owned_run_ids = run_registry.active_run_ids()

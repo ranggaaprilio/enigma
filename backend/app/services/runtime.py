@@ -32,6 +32,7 @@ import structlog
 from redis.asyncio import Redis
 
 from app.core.config import get_settings
+from app.services.redis import redis_client_options
 
 logger = structlog.get_logger(__name__)
 
@@ -314,7 +315,11 @@ class InMemoryRunLock:
 def _default_event_bus() -> EventBus:
     settings = get_settings()
     if settings.run_execution_mode == "queue":
-        return RedisEventBus(Redis.from_url(settings.redis_url, decode_responses=True))
+        return RedisEventBus(
+            Redis.from_url(
+                settings.redis_url, decode_responses=True, **redis_client_options(settings)
+            )
+        )
     return InMemoryEventBus()
 
 

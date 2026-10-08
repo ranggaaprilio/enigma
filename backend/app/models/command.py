@@ -136,6 +136,12 @@ class CommandRun(Base):
         Index("ix_command_runs_created_at", "started_at"),
         Index("ix_command_runs_worktree_id", "worktree_id"),
         Index("ix_command_runs_status_workspace_id", "status", "workspace_id"),
+        # Retention scan (Epic 05): finished runs whose output is still there.
+        Index(
+            "ix_command_runs_output_retention",
+            "completed_at",
+            postgresql_where=text("output_pruned_at IS NULL AND completed_at IS NOT NULL"),
+        ),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -181,6 +187,10 @@ class CommandRun(Base):
     # Ownership lease (Epic 04); see AgentRun.
     heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Set when retention emptied `output`; status, exit code and timings are kept.
+    output_pruned_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
 

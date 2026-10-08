@@ -54,6 +54,14 @@ class RunDispatcher(Protocol):
     async def enqueue_spec_finalize(self, phase_id: UUID, run_id: UUID) -> None: ...
 
 
+def arq_redis_settings(settings: Settings) -> RedisSettings:
+    redis_settings = RedisSettings.from_dsn(settings.redis_url)
+    # arq applies this as the socket connect timeout; enqueueing against an unreachable Redis
+    # then fails (and the run is ended as ``enqueue_failed``) instead of hanging the request.
+    redis_settings.conn_timeout = settings.redis_connect_timeout_seconds
+    return redis_settings
+
+
 class ArqDispatcher:
     def __init__(self, settings: Settings, pool: ArqRedis | None = None) -> None:
         self.settings = settings
@@ -64,7 +72,7 @@ class ArqDispatcher:
         async with self._pool_lock:
             if self._pool is None:
                 self._pool = await create_pool(
-                    RedisSettings.from_dsn(self.settings.redis_url),
+                    arq_redis_settings(self.settings),
                     default_queue_name=self.settings.run_queue_name,
                     job_serializer=serialize_job_payload,
                     job_deserializer=deserialize_job_payload,

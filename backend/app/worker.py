@@ -14,7 +14,6 @@ from typing import Any
 from uuid import UUID
 
 import structlog
-from arq.connections import RedisSettings
 from arq.worker import Retry, func
 from sqlalchemy import select
 
@@ -35,6 +34,7 @@ from app.services.jobs import (
     WORKER_ERROR,
     WORKER_LOST,
     ArqDispatcher,
+    arq_redis_settings,
     deserialize_job_payload,
     serialize_job_payload,
     set_run_dispatcher,
@@ -42,6 +42,7 @@ from app.services.jobs import (
 from app.services.leases import heartbeat
 from app.services.reaper import run_reaper
 from app.services.reconciliation import reconcile_interrupted_runs
+from app.services.retention import start_retention
 from app.services.runtime import RedisEventBus, event_bus
 from app.services.speckit import (
     _TERMINAL_RUN_STATUSES,
@@ -318,15 +319,18 @@ async def startup(ctx: dict[str, Any]) -> None:
     await reconcile_interrupted_runs(async_session_maker, worker_id=settings.worker_id)
     # Runs any *other* worker left behind are found by their expired leases (Epic 04).
     ctx["reaper"] = asyncio.create_task(run_reaper(async_session_maker, settings))
+    # Epic 05: every worker prunes; SKIP LOCKED batches split the work between them.
+    ctx["retention"] = start_retention(async_session_maker, settings)
     logger.info("worker_started", worker_id=settings.worker_id, queue=settings.run_queue_name)
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     settings: Settings = ctx.get("settings") or get_settings()
     lifecycle.begin_drain()
-    if (reaper := ctx.get("reaper")) is not None:
-        reaper.cancel()
-        await asyncio.gather(reaper, return_exceptions=True)
+    for name in ("reaper", "retention"):
+        if (task := ctx.get(name)) is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
     try:
         # arq has already waited `job_completion_wait` and cancelled what was still running;
         # cancelled runs were left active, so record them as interrupted now rather than when
@@ -369,7 +373,7 @@ class WorkerSettings:
             keep_result=0,
         ),
     ]
-    redis_settings = RedisSettings.from_dsn(_settings.redis_url)
+    redis_settings = arq_redis_settings(_settings)
     job_serializer = serialize_job_payload
     job_deserializer = deserialize_job_payload
     queue_name = _settings.run_queue_name
