@@ -8,6 +8,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api import auth as auth_module
 from app.api import files as files_module
+from app.api.rate_limits import enforce_sandbox_rate_limit
 from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
@@ -176,6 +177,7 @@ def file_context(tmp_path):
 
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
     app.dependency_overrides[auth_module.get_login_rate_limiter] = lambda: FakeRateLimiter()
+    app.dependency_overrides[enforce_sandbox_rate_limit] = lambda: None
     app.dependency_overrides[files_module.get_file_service] = lambda: service
     yield user, workspace, workspace_path
     app.dependency_overrides.clear()
@@ -443,6 +445,7 @@ def worktree_context(tmp_path):
 
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
     app.dependency_overrides[auth_module.get_login_rate_limiter] = lambda: FakeRateLimiter()
+    app.dependency_overrides[enforce_sandbox_rate_limit] = lambda: None
     app.dependency_overrides[files_module.get_file_service] = lambda: service
     yield user, workspace, worktree, base_path, worktree_dir
     app.dependency_overrides.clear()

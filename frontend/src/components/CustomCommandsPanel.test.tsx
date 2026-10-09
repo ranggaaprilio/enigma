@@ -323,6 +323,28 @@ describe("CustomCommandsPanel registry", () => {
     expect(fetchMock.mock.calls.filter(runsUrl).length).toBe(before);
   });
 
+  it("disables Run command with a countdown when the command run is rate limited", async () => {
+    stubFetch((url) => {
+      if (url.endsWith("/run")) {
+        return {
+          ...jsonResponse({ detail: "Too many requests. Please slow down." }, 429),
+          headers: new Headers({ "Retry-After": "30" }),
+        } as Response;
+      }
+      return undefined;
+    });
+    render(<CustomCommandsPanel workspace={workspace} />);
+    await screen.findAllByText("Install deps");
+
+    await userEvent.click(screen.getByRole("button", { name: "Run command" }));
+
+    const notice = "Too many requests. Please slow down. Retry in 30s.";
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    const run = screen.getByRole("button", { name: "Run command" });
+    expect(run).toBeDisabled();
+    expect(run).toHaveAttribute("title", notice);
+  });
+
   it("runs against the active worktree", async () => {
     setActiveWorktree(WORKSPACE_ID, { id: "wt-1", branch: "feature-x" });
     const fetchMock = stubFetch((url) => {

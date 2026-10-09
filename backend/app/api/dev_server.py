@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
+from app.api.rate_limits import SANDBOX_RATE_LIMIT_DEP
 from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.models import User
@@ -56,7 +57,11 @@ def not_found() -> HTTPException:
     return HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Workspace not found")
 
 
-@router.post("/setup", response_model=DevServerActionResponse)
+@router.post(
+    "/setup",
+    response_model=DevServerActionResponse,
+    dependencies=[SANDBOX_RATE_LIMIT_DEP],
+)
 async def setup_dev_server(
     workspace_id: UUID,
     worktree_id: UUID | None = None,
@@ -80,7 +85,7 @@ async def setup_dev_server(
     return DevServerActionResponse(ok=True, status=state.status, message=state.message)
 
 
-@router.post("/run", response_model=DevServerActionResponse)
+@router.post("/run", response_model=DevServerActionResponse, dependencies=[SANDBOX_RATE_LIMIT_DEP])
 async def run_dev_server(
     workspace_id: UUID,
     worktree_id: UUID | None = None,
@@ -127,7 +132,11 @@ async def get_dev_server_status(
     )
 
 
-@router.post("/ensure", response_model=DevServerStatusResponse)
+@router.post(
+    "/ensure",
+    response_model=DevServerStatusResponse,
+    dependencies=[SANDBOX_RATE_LIMIT_DEP],
+)
 async def ensure_dev_server(
     workspace_id: UUID,
     current_user: User = CURRENT_USER_DEP,

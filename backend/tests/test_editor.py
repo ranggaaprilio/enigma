@@ -6,6 +6,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api import auth as auth_module
 from app.api import editor as editor_module
+from app.api.rate_limits import enforce_sandbox_rate_limit
 from app.core.config import get_settings
 from app.core.security import hash_password
 from app.main import app
@@ -124,6 +125,7 @@ def editor_context(tmp_path):
 
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
     app.dependency_overrides[auth_module.get_login_rate_limiter] = lambda: FakeRateLimiter()
+    app.dependency_overrides[enforce_sandbox_rate_limit] = lambda: None
     app.dependency_overrides[editor_module.get_editor_service] = lambda: service
     yield user, workspace, service
     app.dependency_overrides.clear()

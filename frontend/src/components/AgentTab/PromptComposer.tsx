@@ -1,6 +1,7 @@
 import { useState, useCallback } from "react";
 import { ArrowUp, Square } from "lucide-react";
 import type { AgentRunResponse } from "../../lib/api";
+import { useRetryCountdown } from "../../lib/useRetryCountdown";
 
 interface PromptComposerProps {
   /** Submit the typed prompt; resolves with the created run. Throwing surfaces an error. */
@@ -26,10 +27,11 @@ export function PromptComposer({
   const [prompt, setPrompt] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const { waiting: retryWaiting, notice: retryNotice, arm: armRetry } = useRetryCountdown();
 
   const handleSubmit = useCallback(async () => {
     const trimmed = prompt.trim();
-    if (!trimmed || isRunning || submitting) return;
+    if (!trimmed || isRunning || submitting || retryWaiting) return;
 
     setError(null);
     setSubmitting(true);
@@ -38,11 +40,12 @@ export function PromptComposer({
       setPrompt(""); // clear only on success
       onRunCreated?.(run);
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Failed to start run");
+      // A rate limit / capacity refusal is shown as a countdown instead of a plain error.
+      if (!armRetry(err)) setError(err instanceof Error ? err.message : "Failed to start run");
     } finally {
       setSubmitting(false);
     }
-  }, [prompt, isRunning, submitting, submitPrompt, onRunCreated]);
+  }, [prompt, isRunning, submitting, submitPrompt, onRunCreated, retryWaiting, armRetry]);
 
   const handleStop = useCallback(async () => {
     try {
@@ -63,7 +66,7 @@ export function PromptComposer({
   );
 
   const inputDisabled = isRunning || disabled;
-  const shownError = error ?? externalError ?? null;
+  const shownError = retryNotice ?? error ?? externalError ?? null;
 
   return (
     <div className="rounded-lg border border-line-strong bg-white p-2 transition focus-within:border-ink">
@@ -97,7 +100,8 @@ export function PromptComposer({
           <button
             type="button"
             onClick={handleSubmit}
-            disabled={!prompt.trim() || disabled || submitting}
+            disabled={!prompt.trim() || disabled || submitting || retryWaiting}
+            title={retryNotice ?? undefined}
             className="inline-flex h-8 items-center gap-1.5 rounded-md bg-primary px-3 text-sm font-medium text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
           >
             <ArrowUp className="h-3.5 w-3.5" aria-hidden="true" />

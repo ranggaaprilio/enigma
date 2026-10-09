@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
+from app.api.rate_limits import SPEC_RUN_RATE_LIMIT_DEP
 from app.core.config import Settings, get_settings
 from app.db.session import async_session_maker, get_db_session
 from app.models import User
@@ -22,6 +23,7 @@ from app.schemas.specs import (
 )
 from app.services.access import WorkspaceAccessDeniedError
 from app.services.agents import AgentConfigurationError, AgentRunAlreadyActiveError
+from app.services.budgets import BudgetExceededError
 from app.services.speckit import (
     InvalidArtifactPathError,
     InvalidSpecPhaseError,
@@ -87,6 +89,8 @@ def _map_spec_error(error: Exception) -> HTTPException:
             status_code=status.HTTP_409_CONFLICT,
             detail="Workspace already has an active agent run",
         )
+    if isinstance(error, BudgetExceededError):
+        return HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(error))
     if isinstance(error, SpecKitNotReadyError):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
     if isinstance(error, AgentConfigurationError):
@@ -99,6 +103,7 @@ def _map_spec_error(error: Exception) -> HTTPException:
 
 @router.post(
     "/workflows",
+    dependencies=[SPEC_RUN_RATE_LIMIT_DEP],
     response_model=SpecWorkflowResponse,
     status_code=status.HTTP_201_CREATED,
 )
@@ -214,6 +219,7 @@ async def get_analyze_questions(
 
 @router.post(
     "/workflows/{workflow_id}/phases/analyze/answers",
+    dependencies=[SPEC_RUN_RATE_LIMIT_DEP],
     response_model=SpecPhaseResponse,
 )
 async def submit_analyze_answers(
@@ -237,6 +243,7 @@ async def submit_analyze_answers(
 
 @router.post(
     "/workflows/{workflow_id}/phases/{phase}/run",
+    dependencies=[SPEC_RUN_RATE_LIMIT_DEP],
     response_model=SpecPhaseResponse,
 )
 async def run_spec_phase(
@@ -273,6 +280,7 @@ async def approve_spec_phase(
 
 @router.post(
     "/workflows/{workflow_id}/phases/{phase}/request-changes",
+    dependencies=[SPEC_RUN_RATE_LIMIT_DEP],
     response_model=SpecPhaseResponse,
 )
 async def request_spec_changes(

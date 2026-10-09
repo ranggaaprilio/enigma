@@ -2,6 +2,7 @@ import pytest
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
+from redis.exceptions import ConnectionError as RedisConnectionError
 
 from app.core.config import (
     _DEFAULT_AUTH_SECRET_KEY,
@@ -136,6 +137,9 @@ class FakeRedis:
         self.store.pop(key, None)
         self.ttls.pop(key, None)
 
+    async def ttl(self, key: str) -> int:
+        return self.ttls.get(key, -1)
+
     def pipeline(self, transaction: bool = True) -> "FakePipeline":
         return FakePipeline(self)
 
@@ -160,6 +164,10 @@ class FakePipeline:
 
     def expire(self, key: str, ttl: int, nx: bool = False) -> "FakePipeline":
         self.queued.append(("expire", (key, ttl), {"nx": nx}))
+        return self
+
+    def ttl(self, key: str) -> "FakePipeline":
+        self.queued.append(("ttl", (key,), {}))
         return self
 
     async def execute(self) -> list:
@@ -213,6 +221,35 @@ async def test_redis_rate_limiter_keys_are_isolated_per_identity(monkeypatch):
 
     with pytest.raises(HTTPException):
         await limiter.check("user-a:ws")  # user-a's second call is rejected
+
+
+async def test_redis_rate_limiter_429_carries_retry_after_from_the_window(monkeypatch):
+    store: dict[str, int] = {}
+    redis = FakeRedis(store)
+    monkeypatch.setattr(rate_limit_module, "get_redis_client", lambda: redis)
+
+    limiter = RedisRateLimiter(prefix="agent:run", scope="agent_run", attempts=1, window_seconds=60)
+    await limiter.check("user:workspace")
+    redis.ttls[next(iter(redis.ttls))] = 17  # 17s left in the window
+
+    with pytest.raises(HTTPException) as exc:
+        await limiter.check("user:workspace")
+    assert exc.value.status_code == 429
+    assert exc.value.headers == {"Retry-After": "17"}
+
+
+async def test_redis_rate_limiter_fails_closed_with_503_when_redis_errors(monkeypatch):
+    class BrokenRedis(FakeRedis):
+        def pipeline(self, transaction: bool = True):
+            raise RedisConnectionError("redis is down")
+
+    monkeypatch.setattr(rate_limit_module, "get_redis_client", lambda: BrokenRedis({}))
+
+    limiter = RedisRateLimiter(prefix="agent:run", scope="agent_run", attempts=5, window_seconds=60)
+    with pytest.raises(HTTPException) as exc:
+        await limiter.check("user:workspace")
+    assert exc.value.status_code == 503
+    assert "Retry-After" in exc.value.headers
 
 
 async def test_unhandled_exception_still_carries_request_id():

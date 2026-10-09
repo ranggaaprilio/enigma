@@ -857,3 +857,12 @@ async def test_submit_analyze_answers_rejects_when_not_awaiting_review(db_sessio
         await service.submit_analyze_answers(
             workspace.id, workflow.id, user.id, [{"id": "A1", "answer": "x"}]
         )
+
+
+def test_spec_budget_exceeded_maps_to_402():
+    """An enforcing budget over its limit must surface as 402 from the spec routes, like the
+    agent run route -- not fall through to a 500."""
+    from app.services.budgets import BudgetExceededError
+
+    error = specs_module._map_spec_error(BudgetExceededError("workspace", "monthly"))
+    assert error.status_code == 402
