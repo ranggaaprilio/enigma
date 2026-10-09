@@ -35,6 +35,7 @@ import {
   type WorkspaceResponse,
 } from "../../lib/api";
 import { useAgentRunStream } from "../../lib/useAgentRunStream";
+import { useRetryCountdown } from "../../lib/useRetryCountdown";
 import { ToolCard, pairToolEvents } from "../AgentTab/ToolCard";
 import { CommentThread } from "../comments/CommentThread";
 import { ConfirmModal } from "../ui/ConfirmModal";
@@ -190,6 +191,7 @@ function CreateWorkflowForm({
   const [description, setDescription] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const { waiting: retryWaiting, notice: retryNotice, arm: armRetry } = useRetryCountdown();
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
@@ -205,7 +207,7 @@ function CreateWorkflowForm({
       setFeatureName("");
       setDescription("");
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : "Failed to start workflow");
+      if (!armRetry(err)) setError(err instanceof ApiError ? err.message : "Failed to start workflow");
     } finally {
       setSubmitting(false);
     }
@@ -225,10 +227,11 @@ function CreateWorkflowForm({
         value={description}
         onChange={(event) => setDescription(event.target.value)}
       />
-      {error && <p className="text-xs text-danger">{error}</p>}
+      {(retryNotice ?? error) && <p className="text-xs text-danger">{retryNotice ?? error}</p>}
       <button
         type="submit"
-        disabled={submitting || !featureName.trim() || !description.trim()}
+        disabled={submitting || retryWaiting || !featureName.trim() || !description.trim()}
+        title={retryNotice ?? undefined}
         className="inline-flex items-center justify-center gap-2 rounded-md bg-primary px-3 py-2 text-sm font-semibold text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:opacity-50"
       >
         {submitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
@@ -251,6 +254,7 @@ function WorkflowDetail({
   const [activePhase, setActivePhase] = useState<SpecPhaseName>(initialWorkflow.current_phase);
   const [actionError, setActionError] = useState<string | null>(null);
   const [busyPhase, setBusyPhase] = useState<SpecPhaseName | null>(null);
+  const { waiting: retryWaiting, notice: retryNotice, arm: armRetry } = useRetryCountdown();
 
   const refresh = useCallback(async () => {
     try {
@@ -275,7 +279,7 @@ function WorkflowDetail({
 
   const isApproved = (name: SpecPhaseName) => phaseByName(name)?.status === "approved";
   const canRun = (name: SpecPhaseName) =>
-    PREREQUISITES[name].every(isApproved) && busyPhase === null;
+    PREREQUISITES[name].every(isApproved) && busyPhase === null && !retryWaiting;
 
   async function handleRun(name: SpecPhaseName) {
     setBusyPhase(name);
@@ -285,7 +289,9 @@ function WorkflowDetail({
       await refresh();
       setActivePhase(name);
     } catch (error) {
-      setActionError(error instanceof ApiError ? error.message : "Failed to run phase");
+      if (!armRetry(error)) {
+        setActionError(error instanceof ApiError ? error.message : "Failed to run phase");
+      }
     } finally {
       setBusyPhase(null);
     }
@@ -312,7 +318,9 @@ function WorkflowDetail({
       await refresh();
       setActivePhase(name);
     } catch (error) {
-      setActionError(error instanceof ApiError ? error.message : "Failed to request changes");
+      if (!armRetry(error)) {
+        setActionError(error instanceof ApiError ? error.message : "Failed to request changes");
+      }
     } finally {
       setBusyPhase(null);
     }
@@ -326,7 +334,9 @@ function WorkflowDetail({
       await refresh();
       setActivePhase("analyze");
     } catch (error) {
-      setActionError(error instanceof ApiError ? error.message : "Failed to submit answers");
+      if (!armRetry(error)) {
+        setActionError(error instanceof ApiError ? error.message : "Failed to submit answers");
+      }
     } finally {
       setBusyPhase(null);
     }
@@ -372,10 +382,10 @@ function WorkflowDetail({
         </ol>
       </div>
 
-      {actionError && (
+      {(retryNotice ?? actionError) && (
         <div className="flex items-center gap-2 rounded-md border border-danger/30 bg-[#fff5f2] px-3 py-2 text-sm text-danger">
           <AlertCircle className="h-4 w-4" />
-          {actionError}
+          {retryNotice ?? actionError}
         </div>
       )}
 
@@ -386,6 +396,7 @@ function WorkflowDetail({
           phase={activePhaseRow}
           busy={busyPhase === activePhase}
           canRun={canRun(activePhase)}
+          retryNotice={retryNotice}
           implementUnlocked={isApproved("plan") && isApproved("tasks")}
           onRun={() => handleRun(activePhase)}
           onApprove={() => handleApprove(activePhase)}
@@ -403,6 +414,7 @@ function PhaseDetail({
   phase,
   busy,
   canRun,
+  retryNotice,
   implementUnlocked,
   onRun,
   onApprove,
@@ -414,6 +426,8 @@ function PhaseDetail({
   phase: SpecPhaseResponse;
   busy: boolean;
   canRun: boolean;
+  /** Set while a rate limit / capacity refusal counts down; explains the disabled Run. */
+  retryNotice: string | null;
   implementUnlocked: boolean;
   onRun: () => void;
   onApprove: () => void;
@@ -545,7 +559,7 @@ function PhaseDetail({
               title={
                 isImplement && !implementUnlocked
                   ? "Approve the plan and tasks phases first"
-                  : undefined
+                  : (retryNotice ?? undefined)
               }
               className="inline-flex items-center gap-1.5 rounded-md bg-ink px-3 py-1.5 text-sm font-semibold text-white transition hover:opacity-90 disabled:cursor-not-allowed disabled:opacity-50"
             >

@@ -141,6 +141,39 @@ describe("getHealth", () => {
     });
   });
 
+  it("exposes Retry-After on rate-limited requests", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 429,
+        headers: new Headers({ "Retry-After": "12" }),
+        json: async () => ({ detail: "Too many requests. Please retry in 12s." }),
+      }),
+    );
+
+    const error = await createAgentRun("ws-1", { prompt: "hi" }).catch((err: unknown) => err);
+
+    expect(error).toBeInstanceOf(ApiError);
+    expect((error as ApiError).status).toBe(429);
+    expect((error as ApiError).retryAfter).toBe(12);
+  });
+
+  it("leaves retryAfter unset when the response has no Retry-After", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: false,
+        status: 409,
+        json: async () => ({ detail: "busy" }),
+      }),
+    );
+
+    const error = await createAgentRun("ws-1", { prompt: "hi" }).catch((err: unknown) => err);
+
+    expect((error as ApiError).retryAfter).toBeUndefined();
+  });
+
   it("sends credentialed auth requests", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,

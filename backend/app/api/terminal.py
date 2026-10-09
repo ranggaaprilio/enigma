@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, WebSocket, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
+from app.api.rate_limits import SANDBOX_RATE_LIMIT_DEP
 from app.core.config import Settings, get_settings
 from app.core.security import verify_session_token
 from app.db.session import async_session_maker, get_db_session
@@ -74,6 +75,7 @@ def terminal_error(error: Exception) -> HTTPException:
 
 @router.post(
     "/sessions",
+    dependencies=[SANDBOX_RATE_LIMIT_DEP],
     response_model=TerminalSessionResponse,
     status_code=status.HTTP_201_CREATED,
 )

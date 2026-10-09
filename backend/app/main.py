@@ -20,6 +20,7 @@ from app.core.lifecycle import (
 from app.core.logging import configure_logging
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.db.session import async_session_maker, engine
+from app.services.capacity import RunCapacityExceededError, run_capacity_exceeded_handler
 from app.services.daytona_runtime import get_daytona_runtime
 from app.services.jobs import (
     RunQueueUnavailableError,
@@ -114,6 +115,7 @@ def create_app() -> FastAPI:
     app.add_exception_handler(Exception, unhandled_exception_handler)
     app.add_exception_handler(ServiceDrainingError, service_draining_handler)
     app.add_exception_handler(RunQueueUnavailableError, run_queue_unavailable_handler)
+    app.add_exception_handler(RunCapacityExceededError, run_capacity_exceeded_handler)
 
     app.include_router(api_router)
 

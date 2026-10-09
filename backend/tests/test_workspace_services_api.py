@@ -10,6 +10,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.api import auth as auth_module
 from app.api import workspace_services as workspace_services_module
+from app.api.rate_limits import enforce_sandbox_rate_limit
 from app.core.security import hash_password
 from app.main import app
 from app.models import User, Workspace, WorkspaceService
@@ -212,6 +213,7 @@ def workspace_services_context():
 
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
     app.dependency_overrides[auth_module.get_login_rate_limiter] = lambda: FakeRateLimiter()
+    app.dependency_overrides[enforce_sandbox_rate_limit] = lambda: None
     app.dependency_overrides[workspace_services_module.get_workspace_service_manager] = (
         lambda: manager
     )
