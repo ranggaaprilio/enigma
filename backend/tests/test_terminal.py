@@ -8,6 +8,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from app.api import auth as auth_module
 from app.api import terminal as terminal_module
+from app.api.rate_limits import enforce_sandbox_rate_limit
 from app.core.security import hash_password
 from app.main import app
 from app.models import TerminalSession, User, Workspace
@@ -118,6 +119,7 @@ def terminal_context(tmp_path):
 
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
     app.dependency_overrides[auth_module.get_login_rate_limiter] = lambda: FakeRateLimiter()
+    app.dependency_overrides[enforce_sandbox_rate_limit] = lambda: None
     app.dependency_overrides[terminal_module.get_terminal_service] = lambda: service
     yield user, workspace, service
     app.dependency_overrides.clear()

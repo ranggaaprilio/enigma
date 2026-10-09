@@ -33,6 +33,7 @@ import {
   type WorkspaceResponse,
 } from "../lib/api";
 import { useReconnectingWebSocket } from "../lib/useReconnectingWebSocket";
+import { useRetryCountdown } from "../lib/useRetryCountdown";
 import { usePermissions } from "../auth/permissions";
 import { useActiveWorktree } from "../lib/activeWorktree";
 import { RunConfigurationTab } from "./RunConfigurationTab";
@@ -108,6 +109,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
   const [pendingConfirmation, setPendingConfirmation] =
     useState<CustomCommandResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const { waiting: retryWaiting, notice: retryNotice, arm: armRetry } = useRetryCountdown();
   const [isSaving, setIsSaving] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
   // Non-null while a freshly-started run should be streamed; drives the reconnecting socket.
@@ -332,6 +334,7 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
   }
 
   function requestRun(command: CustomCommandResponse) {
+    if (retryWaiting) return; // rate limited / at capacity; the countdown re-enables it
     if (command.requires_confirmation) {
       setPendingConfirmation(command);
       return;
@@ -357,7 +360,9 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
       // Drive the reconnecting stream off state; the hook opens/closes the socket.
       setStreamingRunId(run.id);
     } catch (caughtError) {
-      setError(caughtError instanceof ApiError ? caughtError.message : "Unable to run command.");
+      if (!armRetry(caughtError)) {
+        setError(caughtError instanceof ApiError ? caughtError.message : "Unable to run command.");
+      }
     } finally {
       setIsRunning(false);
     }
@@ -516,9 +521,9 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
         </p>
       )}
 
-      {error && (
+      {(retryNotice ?? error) && (
         <div className="mb-4 rounded-md border border-danger/30 bg-[#fff5f2] p-3 text-sm text-danger">
-          {error}
+          {retryNotice ?? error}
         </div>
       )}
 
@@ -665,8 +670,14 @@ export function CustomCommandsPanel({ workspace }: { workspace: WorkspaceRespons
                     aria-label="Run command"
                     className="flex h-10 w-10 items-center justify-center rounded-md bg-primary text-white transition hover:bg-primary-active disabled:cursor-not-allowed disabled:bg-primary/45"
                     type="button"
-                    disabled={isRunning || activeRun?.status === "running" || !canRunCommand}
-                    title={canRunCommand ? "Run command" : "You do not have permission to run commands"}
+                    disabled={
+                      isRunning || activeRun?.status === "running" || !canRunCommand || retryWaiting
+                    }
+                    title={
+                      !canRunCommand
+                        ? "You do not have permission to run commands"
+                        : (retryNotice ?? "Run command")
+                    }
                     onClick={() => requestRun(selectedCommand)}
                   >
                     <Play className="h-4 w-4" aria-hidden="true" />

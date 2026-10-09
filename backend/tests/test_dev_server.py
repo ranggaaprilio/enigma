@@ -7,6 +7,7 @@ from httpx import ASGITransport, AsyncClient
 
 from app.api import auth as auth_module
 from app.api import dev_server as dev_server_module
+from app.api.rate_limits import enforce_sandbox_rate_limit
 from app.core.config import get_settings
 from app.core.security import hash_password
 from app.main import app
@@ -752,6 +753,7 @@ def dev_server_context():
 
     app.dependency_overrides[auth_module.get_user_store] = lambda: FakeUserStore(user)
     app.dependency_overrides[auth_module.get_login_rate_limiter] = lambda: FakeRateLimiter()
+    app.dependency_overrides[enforce_sandbox_rate_limit] = lambda: None
     app.dependency_overrides[dev_server_module.get_dev_server_service] = lambda: service
     yield user, workspace, service
     app.dependency_overrides.clear()

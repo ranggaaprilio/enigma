@@ -146,6 +146,19 @@ class Settings(BaseSettings):
     command_run_max_timeout_seconds: int = 3600
     command_run_rate_limit_attempts: int = 30
     command_run_rate_limit_window_seconds: int = 60
+    # Epic 06: per-(user, workspace) limits for Spec Kit run triggers and sandbox actions
+    # (uploads/writes, editor/dev-server/service start, terminal create).
+    spec_run_rate_limit_attempts: int = Field(default=10, gt=0)
+    spec_run_rate_limit_window_seconds: int = Field(default=60, gt=0)
+    sandbox_rate_limit_attempts: int = Field(default=20, gt=0)
+    sandbox_rate_limit_window_seconds: int = Field(default=60, gt=0)
+    # Epic 06: concurrency caps on active (thinking/executing) agent runs, counted in Postgres.
+    # 0 disables a cap. Team-less workspaces are only subject to the global cap.
+    run_cap_global: int = Field(default=0, ge=0)
+    run_cap_per_team: int = Field(default=0, ge=0)
+    # Queue mode only: refuse new runs (503) once this many runs wait unclaimed. 0 disables.
+    run_queue_max_depth: int = Field(default=0, ge=0)
+    run_capacity_retry_after_seconds: int = Field(default=15, gt=0)
     # Epic 11: multi-service preview. A sandbox is a shared, sized resource, so the number of
     # concurrently running services per workspace is capped.
     max_running_services_per_workspace: int = 4

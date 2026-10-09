@@ -19,6 +19,7 @@ from app.services.agent_providers import AgentProvider, MockAgentProvider, OpenA
 from app.services.agent_tools import WorkspaceTools
 from app.services.audit import AuditLogService
 from app.services.budgets import BudgetService
+from app.services.capacity import ACTIVE_RUN_STATUSES, enforce_queue_depth, enforce_run_caps
 from app.services.daytona_runtime import get_daytona_runtime
 from app.services.jobs import (
     ENQUEUE_FAILED,
@@ -42,7 +43,6 @@ from app.services.runtime import (
 from app.services.runtime import run_lock as default_run_lock
 from app.services.workspaces import WorkspaceSecretCipher
 
-ACTIVE_RUN_STATUSES = ("thinking", "executing")
 TERMINAL_RUN_STATUSES = ("completed", "error", "stopped")
 # Partial unique index backing the one-active-run-per-workspace rule across replicas.
 ONE_ACTIVE_RUN_INDEX = "uq_agent_runs_one_active_per_workspace"
@@ -300,6 +300,10 @@ class AgentService:
             )
             if await self._find_active_run_id(workspace.id) is not None:
                 raise AgentRunAlreadyActiveError
+
+            # Fair use (Epic 06): team/global concurrency caps, then queue backpressure.
+            await enforce_run_caps(self.session, self.settings, workspace)
+            await enforce_queue_depth(self.session, self.settings)
 
             # Block/warn before spending: an enforcing budget over its limit stops the run here.
             await BudgetService(self.session).assert_within_budget(workspace, user_id)

@@ -167,6 +167,45 @@ describe("SessionThread", () => {
     await waitFor(() => expect(screen.getByText("Working on it")).toBeInTheDocument());
   });
 
+  it("disables Run with a countdown when a turn is rate limited", async () => {
+    stubWebSocket();
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      if (url.endsWith(`/agent/sessions/sess-1/turns`) && init?.method === "POST")
+        return Promise.resolve({
+          ...jsonResponse(
+            { detail: "Your team is at its limit of concurrent agent runs.", scope: "team" },
+            false,
+            429,
+          ),
+          headers: new Headers({ "Retry-After": "15" }),
+        });
+      if (url.includes(`/agent/sessions/sess-1`)) return Promise.resolve(jsonResponse(detailWith([])));
+      return Promise.resolve(jsonResponse({}));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    render(
+      <SessionThread
+        workspaceId={WS}
+        session={makeSession()}
+        worktreeId={null}
+        worktreeBranch={null}
+        onSessionUpdated={vi.fn()}
+      />,
+    );
+
+    const input = await screen.findByPlaceholderText(/Describe what you want the agent to do/i);
+    await userEvent.type(input, "Add tests");
+    await userEvent.click(screen.getByRole("button", { name: "Run" }));
+
+    const notice = "Your team is at its limit of concurrent agent runs. Retry in 15s.";
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    const run = screen.getByRole("button", { name: "Run" });
+    expect(run).toBeDisabled();
+    expect(run).toHaveAttribute("title", notice);
+    expect(input).toHaveValue("Add tests");
+  });
+
   it("keeps the prompt and shows an error when a turn is rejected with 409", async () => {
     stubWebSocket();
     const fetchMock = vi.fn((url: string, init?: RequestInit) => {

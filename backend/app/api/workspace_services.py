@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
 from app.api.commands import websocket_user
+from app.api.rate_limits import SANDBOX_RATE_LIMIT_DEP
 from app.core.config import Settings, get_settings
 from app.db.session import async_session_maker, get_db_session
 from app.models import User, Workspace, WorkspaceService
@@ -165,7 +166,11 @@ async def list_workspace_services(
     return await _aggregate_response(manager, workspace_id, current_user.id, rows, primary)
 
 
-@router.post("/ensure", response_model=WorkspaceServicesResponse)
+@router.post(
+    "/ensure",
+    response_model=WorkspaceServicesResponse,
+    dependencies=[SANDBOX_RATE_LIMIT_DEP],
+)
 async def ensure_workspace_services(
     workspace_id: UUID,
     current_user: User = CURRENT_USER_DEP,
@@ -182,7 +187,11 @@ async def ensure_workspace_services(
     return await _aggregate_response(manager, workspace_id, current_user.id, rows, primary)
 
 
-@router.post("/{service_id}/start", response_model=ServiceActionResponse)
+@router.post(
+    "/{service_id}/start",
+    response_model=ServiceActionResponse,
+    dependencies=[SANDBOX_RATE_LIMIT_DEP],
+)
 async def start_workspace_service(
     workspace_id: UUID,
     service_id: UUID,
@@ -232,7 +241,11 @@ async def stop_workspace_service(
     return await _service_response(manager, workspace_id, current_user.id, row)
 
 
-@router.post("/{service_id}/restart", response_model=ServiceActionResponse)
+@router.post(
+    "/{service_id}/restart",
+    response_model=ServiceActionResponse,
+    dependencies=[SANDBOX_RATE_LIMIT_DEP],
+)
 async def restart_workspace_service(
     workspace_id: UUID,
     service_id: UUID,
