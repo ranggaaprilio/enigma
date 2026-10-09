@@ -12,6 +12,7 @@ from app.core.lifecycle import lifecycle
 from app.models import CommandRun, CustomCommand, Workspace
 from app.services.agent_tools import DangerousCommandError
 from app.services.audit import AuditLogService
+from app.services.capacity import enforce_queue_depth
 from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
 from app.services.env_templates import enigma_exports, substitute
 from app.services.git_providers import redact_secrets
@@ -409,6 +410,9 @@ class CommandService:
             )
         except RunPathError as error:
             raise CommandWorkspacePathError(str(error)) from error
+
+        # Command runs are not capped, but a backed-up queue refuses them too (Epic 06).
+        await enforce_queue_depth(self.session, self.settings)
 
         run = CommandRun(
             custom_command_id=custom_command.id,

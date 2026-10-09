@@ -1,10 +1,13 @@
 import { render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { SpecPanel } from "./index";
 import {
+  ApiError,
   getSpecArtifact,
   listSpecWorkflows,
+  runSpecPhase,
   type SpecPhaseName,
   type SpecPhaseResponse,
   type SpecPhaseStatus,
@@ -128,6 +131,26 @@ describe("SpecPanel", () => {
 
     await waitFor(() => expect(screen.getAllByText("Add SSO login").length).toBeGreaterThan(0));
     expect(screen.getByRole("button", { name: "Run" })).toBeEnabled();
+  });
+
+  it("disables Run with a countdown when a phase run is rate limited", async () => {
+    vi.mocked(listSpecWorkflows).mockResolvedValue([
+      makeWorkflow("specify", { constitution: "approved", specify: "pending" }),
+    ]);
+    vi.mocked(runSpecPhase).mockRejectedValue(
+      new ApiError("Too many requests. Please slow down.", 429, 20),
+    );
+
+    render(<SpecPanel workspace={workspace} />);
+
+    await waitFor(() => expect(screen.getAllByText("Add SSO login").length).toBeGreaterThan(0));
+    await userEvent.click(screen.getByRole("button", { name: "Run" }));
+
+    const notice = "Too many requests. Please slow down. Retry in 20s.";
+    expect(await screen.findByText(notice)).toBeInTheDocument();
+    const runButton = screen.getByRole("button", { name: "Run" });
+    expect(runButton).toBeDisabled();
+    expect(runButton).toHaveAttribute("title", notice);
   });
 
   it("shows approve and request-changes controls for a phase awaiting review", async () => {

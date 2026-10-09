@@ -6,6 +6,7 @@ from fastapi.responses import Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
+from app.api.rate_limits import SANDBOX_RATE_LIMIT_DEP
 from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.models import User
@@ -232,7 +233,7 @@ async def read_file(
         raise translate_file_error(error) from None
 
 
-@router.post("/write", response_model=FileOperationResponse)
+@router.post("/write", response_model=FileOperationResponse, dependencies=[SANDBOX_RATE_LIMIT_DEP])
 async def write_file(
     workspace_id: UUID,
     payload: FileWriteRequest,
@@ -263,7 +264,7 @@ async def write_file(
     return FileOperationResponse(ok=True, path=payload.path)
 
 
-@router.post("/upload", response_model=FileOperationResponse)
+@router.post("/upload", response_model=FileOperationResponse, dependencies=[SANDBOX_RATE_LIMIT_DEP])
 async def upload_file(
     workspace_id: UUID,
     request: Request,

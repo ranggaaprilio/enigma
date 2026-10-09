@@ -823,12 +823,20 @@ export type LlmSettingsDeleteResponse = {
 
 export class ApiError extends Error {
   status: number;
+  /** Seconds to wait before retrying, from a 429/503 `Retry-After` header. */
+  retryAfter?: number;
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, retryAfter?: number) {
     super(message);
     this.name = "ApiError";
     this.status = status;
+    this.retryAfter = retryAfter;
   }
+}
+
+function parseRetryAfter(response: Response): number | undefined {
+  const seconds = Number(response.headers?.get("Retry-After"));
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
 }
 
 const fallbackApiBaseUrl = "http://localhost:8000";
@@ -950,7 +958,7 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
       payload && typeof payload === "object" && "detail" in payload && payload.detail
         ? payload.detail
         : "Request failed";
-    throw new ApiError(message, response.status);
+    throw new ApiError(message, response.status, parseRetryAfter(response));
   }
 
   return payload as T;
@@ -973,7 +981,7 @@ async function requestText(path: string, init: RequestInit = {}): Promise<string
       payload && typeof payload === "object" && "detail" in payload && payload.detail
         ? payload.detail
         : "Request failed";
-    throw new ApiError(message, response.status);
+    throw new ApiError(message, response.status, parseRetryAfter(response));
   }
 
   return response.text();
@@ -1494,7 +1502,7 @@ export async function uploadWorkspaceFile(
       payload && typeof payload === "object" && "detail" in payload && payload.detail
         ? payload.detail
         : "Request failed";
-    throw new ApiError(message, response.status);
+    throw new ApiError(message, response.status, parseRetryAfter(response));
   }
 
   return payload as WorkspaceFileOperationResponse;
