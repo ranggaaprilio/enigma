@@ -122,7 +122,7 @@ OpenAI-compatible base URL, model, and a Fernet-encrypted API key. Owner-only, g
 
 ## CI/CD
 
-**Two workflows**: `.github/workflows/ci.yml` (backend: postgres + redis services → `alembic upgrade head` → `ruff` → `pytest`; frontend: lint + test + build) and `.github/workflows/ai-code-review.yml` — runs `scripts/ai_code_review.py` on non-draft PRs. Posts an AI review comment. Uses LangChain + LangGraph + OpenAI. Requires `OPENAI_API_KEY` secret.
+**Two workflows**: `.github/workflows/ci.yml` (backend: postgres + redis services → `alembic upgrade head` → `ruff` → `pytest`; frontend: lint + test + build) and `.github/workflows/ai-code-review.yml` — **currently disabled** (PR trigger commented out); when enabled it runs `scripts/ai_code_review.py` on non-draft PRs. Posts an AI review comment. Uses LangChain + LangGraph + OpenAI. Requires `OPENAI_API_KEY` secret.
 
 **No pre-commit hooks, no lint-staged, no Makefile.**
 
