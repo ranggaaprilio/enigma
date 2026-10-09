@@ -1,12 +1,14 @@
 name: AI Code Review
 
+# Disabled: no longer runs on pull requests. Restore the pull_request trigger to re-enable.
 "on":
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-      - ready_for_review
+  workflow_dispatch:
+  # pull_request:
+  #   types:
+  #     - opened
+  #     - synchronize
+  #     - reopened
+  #     - ready_for_review
 
 permissions:
   contents: read
