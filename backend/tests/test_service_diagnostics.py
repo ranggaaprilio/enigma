@@ -1,6 +1,7 @@
 """Epic 13: service_diagnostics recorder (queue + throttle + batch upsert + resolve +
 retention) and reader, against real Postgres."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
@@ -382,3 +383,94 @@ async def test_service_diagnostics_service_only_returns_unresolved_rows(db_sessi
     unresolved = await reader.for_workspace(workspace.id)
     origins = {row.origin for row in unresolved}
     assert origins == {"https://open.example.com"}
+
+
+async def test_prune_throttle_forgets_keys_whose_window_has_passed(db_session, monkeypatch):
+    """Epic 07: the per-key throttle must not grow without bound on a long-lived proxy replica."""
+    _session, session_maker = db_session
+    recorder = _recorder(session_maker)
+    window = recorder.settings.service_diagnostic_throttle_seconds
+    clock = [1000.0]
+    monkeypatch.setattr("app.services.service_diagnostics.time.monotonic", lambda: clock[0])
+
+    for index in range(5):
+        recorder.record(
+            DiagnosticEvent(
+                workspace_id=uuid4(),
+                service_id=uuid4(),
+                kind="cors_missing_allow_origin",
+                origin=f"https://{index}.example.com",
+            )
+        )
+    clock[0] += window / 2
+    fresh_key = DiagnosticEvent(
+        workspace_id=uuid4(),
+        service_id=uuid4(),
+        kind="cors_missing_allow_origin",
+        origin="https://fresh.example.com",
+    )
+    recorder.record(fresh_key)
+    clock[0] += window / 2 + 1
+
+    recorder.prune_throttle()
+
+    assert set(recorder._last_enqueued) == {fresh_key.key}  # noqa: SLF001
+
+
+async def test_stop_flushes_events_still_queued(db_session):
+    """Epic 07: a draining proxy replica applies what it already accepted before it exits."""
+    session, session_maker = db_session
+    workspace, service_row = await _make_service(session)
+    recorder = _recorder(session_maker)
+    await recorder.start()
+    recorder.record(
+        DiagnosticEvent(
+            workspace_id=workspace.id,
+            service_id=service_row.id,
+            kind="cors_missing_allow_origin",
+            origin="https://web.example.com",
+        )
+    )
+
+    await recorder.stop()
+
+    rows = (
+        await session.execute(
+            select(ServiceDiagnostic).where(ServiceDiagnostic.service_id == service_row.id)
+        )
+    ).scalars().all()
+    assert len(rows) == 1
+
+
+async def test_stop_swallows_a_flush_failure(db_session):
+    _session, _session_maker = db_session
+
+    class BrokenFactory:
+        def __call__(self):
+            raise OSError("database is gone")
+
+    recorder = ServiceDiagnosticsRecorder(get_settings(), session_factory=BrokenFactory())
+    await recorder.start()
+    recorder.record(
+        DiagnosticEvent(
+            workspace_id=uuid4(),
+            service_id=uuid4(),
+            kind="cors_missing_allow_origin",
+            origin="https://web.example.com",
+        )
+    )
+
+    await recorder.stop()  # must not raise: diagnostics are best-effort
+
+
+async def test_stop_survives_a_consumer_that_already_died(db_session):
+    _session, session_maker = db_session
+    recorder = _recorder(session_maker)
+
+    async def crashed() -> None:
+        raise OSError("database went away")
+
+    recorder._task = asyncio.create_task(crashed())  # noqa: SLF001
+    await asyncio.sleep(0)
+
+    await recorder.stop()  # must not raise into the proxy's lifespan
