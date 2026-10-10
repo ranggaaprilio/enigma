@@ -126,11 +126,17 @@ services:
       - worker_venv:/app/.venv
     command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && exec uv run arq app.worker.WorkerSettings"
 
+  # Epic 07: stateless -- scale with `--scale preview-proxy=N` behind a load balancer, no sticky
+  # sessions (drop the host port mapping then). Probes (/live, /ready, /health, /metrics) answer
+  # only on a non-preview Host, e.g. http://localhost:8001/ready.
   preview-proxy:
     build:
       context: ./backend
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+asyncpg://execute:execute@postgres:5432/execute_dashboard}
+      DB_PGBOUNCER: ${DB_PGBOUNCER:-false}
+      # Every replica must share the API's secret: signed preview URLs and alias grants are
+      # verified with it alone, so any replica accepts what any other (or the API) minted.
       AUTH_SECRET_KEY: ${AUTH_SECRET_KEY:?set AUTH_SECRET_KEY in .env}
       DAYTONA_API_KEY: ${DAYTONA_API_KEY:-}
       DAYTONA_API_URL: ${DAYTONA_API_URL:-https://app.daytona.io/api}
@@ -139,13 +145,17 @@ services:
       DAYTONA_PREVIEW_PROXY_BASE_URL: ${DAYTONA_PREVIEW_PROXY_BASE_URL:-http://localhost:8001}
     ports:
       - "8001:8001"
+    # SHUTDOWN_DRAIN_DELAY_SECONDS (5) for the LB to stop routing, then up to 20s
+    # (--timeout-graceful-shutdown) for in-flight proxied HTTP streams; open WebSockets are
+    # closed with 1012 straight away and reconnect through another replica.
+    stop_grace_period: 30s
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - ./backend:/app
       - preview_proxy_venv:/app/.venv
-    command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && uv run uvicorn app.preview_proxy:app --host 0.0.0.0 --port 8001 --reload"
+    command: sh -lc "git config --global --replace-all safe.directory '*' && uv sync --locked --no-dev && exec uv run uvicorn app.preview_proxy:app --host 0.0.0.0 --port 8001 --reload --timeout-graceful-shutdown 20"
 
   frontend:
     build:
