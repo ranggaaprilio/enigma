@@ -352,6 +352,7 @@ class SpecKitService:
 
         if phase_name != "constitution":
             await self._ensure_worktree(workspace, workflow)
+            await self._write_feature_pointer(workspace, workflow)
         working_dir = self._working_dir(workspace, workflow, phase_name)
         plan = PHASE_PLANS[phase_name]
         artifact_path = plan.artifact.format(spec_dir=workflow.spec_dir) if plan.artifact else None
@@ -682,6 +683,32 @@ class SpecKitService:
         self.session.add(workflow)
         await self.session.commit()
         await self.session.refresh(workflow)
+
+    async def _write_feature_pointer(self, workspace: Workspace, workflow: SpecWorkflow) -> None:
+        # Spec Kit scripts (check-prerequisites.sh) resolve the active feature from
+        # .specify/feature.json, which `create-new-feature.sh` normally writes. We create the
+        # branch/worktree ourselves, so write it here. It is per-checkout state, so it goes in
+        # git's info/exclude (shared by all worktrees) rather than being committed, which would
+        # conflict across feature branches and leave a stale pointer on the default branch.
+        pointer = json.dumps({"feature_directory": workflow.spec_dir})
+        script = (
+            "mkdir -p .specify && "
+            f"printf '%s\\n' {shlex.quote(pointer)} > .specify/feature.json && "
+            'exclude="$(git rev-parse --git-path info/exclude)" && '
+            'mkdir -p "$(dirname "$exclude")" && '
+            "{ grep -qxF .specify/feature.json \"$exclude\" 2>/dev/null || "
+            "echo .specify/feature.json >> \"$exclude\"; }"
+        )
+        result = await self.runtime.exec(
+            workspace,
+            f"sh -c {shlex.quote(script)}",
+            cwd=self._working_dir(workspace, workflow, "specify"),
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            raise SpecKitError(
+                f"writing .specify/feature.json failed: {result.stderr or result.stdout}".strip()
+            )
 
     async def _build_prompt(
         self,
