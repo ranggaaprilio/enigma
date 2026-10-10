@@ -9,14 +9,22 @@ from uuid import UUID
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, WebSocket, status
-from fastapi.responses import JSONResponse, Response, StreamingResponse
-from sqlalchemy import select
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
+from sqlalchemy import select, text
 from starlette.background import BackgroundTask
 from websockets.asyncio.client import connect as ws_connect
 
 from app.core.config import Settings, get_settings
+from app.core.lifecycle import RETRY_AFTER_SECONDS, AppLifecycle, install_sigterm_drain
 from app.core.logging import configure_logging
-from app.db.session import async_session_maker
+from app.core.metrics import (
+    metrics_token_authorized,
+    preview_proxy_active_websockets,
+    preview_proxy_requests_total,
+    preview_proxy_upstream_errors_total,
+)
+from app.db.session import async_session_maker, engine
 from app.models import (
     EditorSession,
     PreviewSession,
@@ -62,6 +70,9 @@ HOP_BY_HOP_HEADERS = {
 REQUEST_HEADERS_TO_STRIP = HOP_BY_HOP_HEADERS | {
     "accept-encoding",
     "host",
+    # The proxy sets its own; forwarding the client's too would let it poison the host an
+    # upstream app builds absolute URLs from (it would see "evil.example, <real host>").
+    "x-forwarded-host",
     "x-daytona-preview-token",
     "x-daytona-skip-preview-warning",
 }
@@ -84,6 +95,11 @@ class PreviewProxyTarget:
     # working unmodified.
     kind: str = "capability"
     alias: str | None = None
+
+
+class PreviewUpstreamUnavailableError(Exception):
+    """The sandbox's preview endpoint could not be reached (connect/read failure) -- typically
+    a sandbox still waking from auto-stop."""
 
 
 class PreviewTargetNotRunningError(Exception):
@@ -295,6 +311,11 @@ def create_preview_proxy_app(
     proxy_resolver = resolver or PreviewProxyResolver(proxy_settings)
     proxy_diagnostics = diagnostics or ServiceDiagnosticsRecorder(proxy_settings)
     owns_http_client = http_client is None
+    # Without an injected resolver the app resolves through the shared engine, so it owns it.
+    owns_engine = resolver is None
+    # Its own drain flag, not the API's `lifecycle` singleton: the proxy is a separate process,
+    # and a shared flag would let one proxy app's shutdown mark every app in the process draining.
+    proxy_lifecycle = AppLifecycle()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -303,11 +324,25 @@ def create_preview_proxy_app(
             timeout=None,
         )
         await proxy_diagnostics.start()
+        # SIGTERM flips `/ready` to 503 and keeps serving for the drain delay so the load
+        # balancer moves away; uvicorn then closes open WebSockets (1012, clients reconnect
+        # through another replica) and waits out in-flight HTTP streams.
+        restore_sigterm = install_sigterm_drain(
+            asyncio.get_running_loop(),
+            proxy_settings.shutdown_drain_delay_seconds,
+            state=proxy_lifecycle,
+        )
         yield
-        await proxy_diagnostics.stop()
-        if owns_http_client:
-            await app.state.http_client.aclose()
-        await proxy_runtime.close()
+        proxy_lifecycle.begin_drain()
+        try:
+            await proxy_diagnostics.stop()
+            if owns_http_client:
+                await app.state.http_client.aclose()
+            await proxy_runtime.close()
+            if owns_engine:
+                await engine.dispose()
+        finally:
+            restore_sigterm()
 
     configure_logging()
     app = FastAPI(
@@ -322,8 +357,76 @@ def create_preview_proxy_app(
     app.state.resolver = proxy_resolver
     app.state.runtime = proxy_runtime
     app.state.diagnostics = proxy_diagnostics
+    app.state.lifecycle = proxy_lifecycle
     if http_client is not None:
         app.state.http_client = http_client
+
+    # Probes and metrics answer only on a host that is *not* a preview host (the bare proxy
+    # hostname, or the pod IP a load balancer probes). Every preview host routes every path to
+    # the previewed app, so its own `/health` or `/metrics` is never shadowed.
+    async def check_database() -> str:
+        try:
+            async with proxy_resolver.session_factory() as session:
+                await session.execute(text("SELECT 1"))
+        except Exception:
+            return "error"
+        return "ok"
+
+    async def live(_request: Request) -> Response:
+        return JSONResponse({"status": "ok"})
+
+    async def ready(_request: Request) -> Response:
+        if proxy_lifecycle.draining:
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"status": "draining", "database": "skipped"},
+            )
+        database = await check_database()
+        if database != "ok":
+            return JSONResponse(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                content={"status": "not_ready", "database": database},
+            )
+        return JSONResponse({"status": "ready", "database": database})
+
+    def unauthorized() -> Response:
+        return JSONResponse(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            content={"detail": "Not authenticated"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    def scrape_authorized(request: Request) -> bool:
+        return metrics_token_authorized(
+            request.headers.get("authorization", ""), proxy_settings.metrics_token
+        )
+
+    async def health(request: Request) -> Response:
+        # Token-gated like /metrics: each call is a live Daytona API request, and the bare
+        # proxy host is reachable from the internet. /live and /ready stay open for the LB.
+        if not scrape_authorized(request):
+            return unauthorized()
+        database = await check_database()
+        try:
+            daytona = await proxy_runtime.health()
+        except Exception:
+            daytona = "error"
+        healthy = database == "ok" and daytona == "ok"
+        return JSONResponse(
+            status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={
+                "status": "ok" if healthy else "degraded",
+                "database": database,
+                "daytona": daytona,
+            },
+        )
+
+    async def metrics(request: Request) -> Response:
+        if not scrape_authorized(request):
+            return unauthorized()
+        return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    probes = {"live": live, "ready": ready, "health": health, "metrics": metrics}
 
     async def proxy_http(request: Request, path: str = "") -> Response:
         original_host = request.headers.get("host", "")
@@ -332,7 +435,11 @@ def create_preview_proxy_app(
                 original_host, base_url=proxy_settings.daytona_preview_proxy_base_url
             )
         except InvalidPreviewCapabilityError:
-            raise HTTPException(status_code=404, detail="Preview not found") from None
+            probe = probes.get(path) if request.method in ("GET", "HEAD") else None
+            if probe is None:
+                raise HTTPException(status_code=404, detail="Preview not found") from None
+            return await probe(request)
+        preview_proxy_requests_total.labels(protocol="http").inc()
 
         grant_to_set: str | None = None
         editor_grant_to_set: str | None = None
@@ -394,7 +501,7 @@ def create_preview_proxy_app(
                 editor_session = editor_target.require_session()
             except PreviewTargetNotRunningError:
                 # Carries the cookie even though it failed -- see `_editor_unavailable`.
-                return _editor_unavailable(proxy_settings, editor_grant_to_set)
+                return _editor_unavailable(request, proxy_settings, editor_grant_to_set)
             upstream_workspace = editor_target.workspace
             upstream_port = editor_session.bind_port
         elif is_alias_label(label):
@@ -445,10 +552,7 @@ def create_preview_proxy_app(
             try:
                 target = resolution.require_target()
             except PreviewTargetNotRunningError:
-                raise HTTPException(
-                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                    detail="Preview is unavailable",
-                ) from None
+                return _preview_unavailable(request)
             upstream_workspace = target.workspace
             upstream_port = target.preview_session.port
         else:
@@ -469,13 +573,11 @@ def create_preview_proxy_app(
                 query=query,
                 original_host=original_host,
             )
-        except DaytonaRuntimeError:
+        except (DaytonaRuntimeError, PreviewUpstreamUnavailableError):
+            preview_proxy_upstream_errors_total.labels(protocol="http").inc()
             if is_editor:
-                return _editor_unavailable(proxy_settings, editor_grant_to_set)
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Preview is unavailable",
-            ) from None
+                return _editor_unavailable(request, proxy_settings, editor_grant_to_set)
+            return _preview_unavailable(request)
 
         if not is_editor and target is not None:
             _maybe_record_cors_diagnosis(
@@ -519,6 +621,7 @@ def create_preview_proxy_app(
         except InvalidPreviewCapabilityError:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
+        preview_proxy_requests_total.labels(protocol="websocket").inc()
 
         if is_editor_alias_label(label):
             # Same cookie-only rule as the preview alias below. In practice this is never the
@@ -600,10 +703,12 @@ def create_preview_proxy_app(
                 original_host=original_host,
             )
         except Exception:
+            preview_proxy_upstream_errors_total.labels(protocol="websocket").inc()
             await websocket.close(code=status.WS_1013_TRY_AGAIN_LATER)
             return
 
         await websocket.accept(subprotocol=upstream.subprotocol)
+        preview_proxy_active_websockets.inc()
         try:
             browser_to_upstream = asyncio.create_task(
                 _browser_to_upstream(websocket, upstream)
@@ -623,6 +728,7 @@ def create_preview_proxy_app(
         except Exception:
             pass
         finally:
+            preview_proxy_active_websockets.dec()
             await upstream.close()
             try:
                 await websocket.close()
@@ -832,22 +938,73 @@ def _set_editor_cookie(response: Response, settings: Settings, value: str) -> No
     response.raw_headers.append((b"set-cookie", "; ".join(parts).encode("latin-1")))
 
 
-def _editor_unavailable(settings: Settings, grant_to_set: str | None) -> Response:
+def _editor_unavailable(
+    request: Request, settings: Settings, grant_to_set: str | None
+) -> Response:
     """A 503 for the editor that still sets the grant cookie.
 
     The grant in the URL is one-shot: the dashboard mints it per response and the iframe's `src`
     is fixed for the life of the frame. If a transient upstream failure on the very first
     (priming) navigation returned a bare 503, the browser would have spent its grant without
     getting a cookie, and every retry inside the frame would 404 until the panel was reloaded.
-    Attaching the cookie here means a retry succeeds as soon as the sandbox comes back.
+    Attaching the cookie here means a retry succeeds as soon as the sandbox comes back -- which
+    the waking page's own reload now does on its own.
     """
-    response = JSONResponse(
-        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-        content={"detail": "Editor is unavailable"},
-    )
+    response = _unavailable(request, "Editor is unavailable")
     if grant_to_set is not None:
         _set_editor_cookie(response, settings, grant_to_set)
     return response
+
+
+def _preview_unavailable(request: Request) -> Response:
+    return _unavailable(request, "Preview is unavailable")
+
+
+# Served in place of a 503 to a navigation: the iframe (or tab) cannot see a status code, so a
+# bare JSON body would strand it on an error. The page reloads itself with backoff (2s doubling
+# to 30s, reset after a quiet minute) until the sandbox answers.
+_WAKING_PAGE = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Waking preview…</title>
+<noscript><meta http-equiv="refresh" content="5"></noscript>
+<style>
+body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+background:#f7f7f4;color:#26251e;font:14px/1.5 Inter,system-ui,sans-serif;text-align:center}
+p{margin:0}p+p{color:#6b6a63;margin-top:4px}
+</style>
+</head>
+<body>
+<main><p>Waking preview…</p><p>The sandbox is starting. This page retries on its own.</p></main>
+<script>
+(function () {
+  var key = "enigma-preview-waking", attempt = 0;
+  try {
+    var last = JSON.parse(sessionStorage.getItem(key) || "null");
+    if (last && Date.now() - last.at < 60000) attempt = last.attempt + 1;
+    sessionStorage.setItem(key, JSON.stringify({ attempt: attempt, at: Date.now() }));
+  } catch (error) {}
+  setTimeout(function () { location.reload(); }, Math.min(2000 * Math.pow(2, attempt), 30000));
+})();
+</script>
+</body>
+</html>
+"""
+
+
+def _unavailable(request: Request, detail: str) -> Response:
+    headers = {"Retry-After": str(RETRY_AFTER_SECONDS), "Cache-Control": "no-store"}
+    if _is_navigation(request):
+        return HTMLResponse(
+            _WAKING_PAGE, status_code=status.HTTP_503_SERVICE_UNAVAILABLE, headers=headers
+        )
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": detail},
+        headers=headers,
+    )
 
 
 async def _origin_belongs_to_workspace(
@@ -946,11 +1103,8 @@ async def _send_http_attempt(
     )
     try:
         return await client.send(upstream_request, stream=True)
-    except httpx.HTTPError:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Preview is unavailable",
-        ) from None
+    except httpx.HTTPError as error:
+        raise PreviewUpstreamUnavailableError from error
 
 
 async def _connect_websocket(

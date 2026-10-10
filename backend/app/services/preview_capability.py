@@ -115,7 +115,12 @@ def proxy_host_label(host: str, *, base_url: str) -> str:
     this exact function -- unmodified -- rather than duplicating the hardening.
     """
     parsed = parse_proxy_base_url(base_url)
-    hostname = host.split(":", 1)[0].rstrip(".").lower()
+    hostname, _, port = host.partition(":")
+    # Anything after the first `:` must be a plain port: the raw Host is forwarded upstream as
+    # `X-Forwarded-Host`, so `<label>.<base>:x.evil.com` must not pass as a preview host.
+    if port and not (port.isascii() and port.isdigit()):
+        raise InvalidPreviewCapabilityError("Invalid preview proxy host")
+    hostname = hostname.rstrip(".").lower()
     suffix = f".{parsed.hostname.lower()}"
     if not hostname.endswith(suffix):
         raise InvalidPreviewCapabilityError("Invalid preview proxy host")

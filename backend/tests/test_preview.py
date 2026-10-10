@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,6 +12,11 @@ from app.core.security import hash_password
 from app.main import app
 from app.models import PreviewSession, User, Workspace
 from app.services.preview import PreviewNotFoundError, PreviewService, PreviewSessionNotFoundError
+from app.services.preview_capability import (
+    capability_from_host,
+    create_preview_proxy_url,
+    decode_preview_capability,
+)
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -316,3 +322,40 @@ def test_preview_service_reuses_a_valid_proxy_url(preview_context):
     preview.public_url = first_url
 
     assert service._proxy_url(preview) == first_url
+
+
+def test_preview_service_re_mints_a_proxy_url_inside_the_renewal_window(preview_context):
+    """Epic 07: the signed URL is refreshed *before* it expires. Within the last minute of its
+    life `_proxy_url` mints a new one, which the panel's 15s poll swaps into the iframe."""
+    _user, _workspace, fake_service = preview_context
+    preview = fake_service._session("active")
+    settings = Settings(
+        auth_secret_key="preview-secret",
+        daytona_preview_proxy_base_url="http://localhost:8001",
+    )
+    service = PreviewService(
+        session=None,  # type: ignore[arg-type]
+        settings=settings,
+        runtime=object(),  # type: ignore[arg-type]
+    )
+    ttl = min(settings.daytona_preview_proxy_ttl_seconds, settings.daytona_preview_url_ttl_seconds)
+    # Minted long enough ago that only 30 seconds of its life remain.
+    preview.public_url = create_preview_proxy_url(
+        preview.id,
+        preview.port,
+        base_url=settings.daytona_preview_proxy_base_url,
+        secret_key=settings.auth_secret_key,
+        ttl_seconds=ttl,
+        now=datetime.now(UTC) - timedelta(seconds=ttl - 30),
+    )
+
+    renewed = service._proxy_url(preview)
+
+    assert renewed != preview.public_url
+    capability = decode_preview_capability(
+        capability_from_host(
+            urlsplit(renewed).netloc, base_url=settings.daytona_preview_proxy_base_url
+        ),
+        secret_key=settings.auth_secret_key,
+    )
+    assert capability.expires_at - datetime.now(UTC) > timedelta(seconds=ttl - 60)

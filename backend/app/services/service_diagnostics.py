@@ -100,9 +100,15 @@ class ServiceDiagnosticsRecorder:
     async def stop(self) -> None:
         if self._task is not None:
             self._task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
+            # A consumer that already died on a DB error re-raises here; that must not abort the
+            # rest of the proxy's shutdown.
+            with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._task
             self._task = None
+        # A draining proxy replica applies what it already accepted -- still best-effort, so a
+        # database that is gone by shutdown time must not fail the lifespan.
+        with contextlib.suppress(Exception):
+            await self.flush()
 
     async def run(self) -> None:
         """The single consumer loop. Runs until cancelled (`stop()`)."""
@@ -110,6 +116,17 @@ class ServiceDiagnosticsRecorder:
             batch = await self._collect_batch()
             if batch:
                 await self._apply_batch(batch)
+            self.prune_throttle()
+
+    def prune_throttle(self) -> None:
+        """Forget keys whose throttle window has passed. Without this the map gains one entry
+        per distinct (workspace, service, kind, origin) for the life of the process."""
+        cutoff = time.monotonic() - self.settings.service_diagnostic_throttle_seconds
+        self._last_enqueued = {
+            key: enqueued_at
+            for key, enqueued_at in self._last_enqueued.items()
+            if enqueued_at > cutoff
+        }
 
     async def flush(self) -> None:
         """Test seam: drain and apply whatever is currently queued, synchronously, without the

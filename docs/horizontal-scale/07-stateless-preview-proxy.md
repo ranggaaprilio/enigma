@@ -73,3 +73,63 @@ proxy tier can scale independently of the API and workers.
   another replica seamlessly.
 - Signed-URL verification is identical across replicas; expired/tampered URLs are rejected.
 - Proxy connection count and error rate are visible in metrics (epic 09).
+
+## Implementation Notes (shipped)
+
+Decisions: probes answer only on a **non-preview Host** (no reserved path); a page load that
+would 503 gets a self-retrying **"Waking preview…" page** served by the proxy (an iframe cannot
+see a status code); the **Redis preview-link cache is deferred**. No load balancer is added to
+compose; ≥2 replicas without stickiness is proven at test level (multi-replica deploy is epic 08).
+
+- **Audit result**: the request/WS path was already stateless — every check is HMAC over
+  `AUTH_SECRET_KEY` plus Postgres, and the WS bridge tasks and upstream socket end with the
+  connection. `tests/test_preview_proxy_scaling.py` keeps it that way: an AST guard fails any
+  function in `preview_proxy.py` that writes a module-level binding (or uses `global`), and two
+  independently built apps must accept the same capability / alias grant and reject the same
+  expired or tampered one. The one leak was `ServiceDiagnosticsRecorder._last_enqueued`, a
+  per-key throttle map that never shrank; the consumer loop now prunes keys whose window has
+  passed. Per-replica throttling means up to N upserts per key per window, which is harmless
+  (they are idempotent). `stop()` now flushes what is still queued (best-effort).
+- **Probes** (`create_preview_proxy_app`): `/live` (dependency-free), `/ready` (Postgres only;
+  503 `draining` after SIGTERM), `/health` (Postgres + Daytona) and `/metrics` (Prometheus).
+  The last two need the `METRICS_TOKEN` bearer, because `/health` makes a live Daytona call and the bare
+  host is reachable from the internet. They answer only when the Host is *not* a label under
+  `DAYTONA_PREVIEW_PROXY_BASE_URL` (the bare proxy host or the pod IP); on a preview host every
+  path, `/health` included, still goes to the previewed app.
+- **Drain**: each proxy app owns an `AppLifecycle` (never the API's `lifecycle` singleton, which
+  a proxy app's shutdown would otherwise flip for the whole process) wired to
+  `install_sigterm_drain`. Shutdown: diagnostics flush → HTTP client → Daytona client →
+  `engine.dispose()` (only when the app uses the shared engine). Compose runs uvicorn with
+  `--timeout-graceful-shutdown 20` and `stop_grace_period: 30s`; uvicorn closes open WebSockets
+  with 1012 and the browser reconnects through another replica.
+- **Pooling**: the proxy already built its engine from `engine_options()`; compose now passes
+  `DB_PGBOUNCER` so it can sit behind PgBouncer like the API. Pool sizing is shared via `DB_POOL_*`.
+- **Metrics** (`core/metrics.py`): `preview_proxy_requests_total{protocol}`,
+  `preview_proxy_upstream_errors_total{protocol}` (Daytona error or upstream connect failure;
+  error rate = errors / requests), `preview_proxy_active_websockets`. The bearer check is now
+  shared with the API as `metrics_token_authorized`.
+- **Waking page**: when a page load (`Sec-Fetch-Mode: navigate` or `Accept: text/html`) would be
+  a 503 — sandbox waking (Daytona error), upstream unreachable, alias service not running, editor
+  not running — the proxy serves a small HTML page that reloads itself with backoff (2s doubling
+  to 30s) and sends `Retry-After` and `Cache-Control: no-store`. XHR/fetch keep the JSON 503. The
+  editor 503 still sets its grant cookie, and an upstream connect failure on the editor now does
+  too (it used to be a cookieless 503). Unauthorised requests still get the uniform 404.
+- **Signed-URL refresh** needed no code: `PreviewService._proxy_url` re-mints in the last
+  ≤60s of a URL's life and the panel polls every 15s, so the iframe `src` rotates before
+  expiry. A test now pins the re-mint.
+- **Security**: the client's `X-Forwarded-Host` was forwarded upstream alongside the proxy's own
+  (the app saw `evil.example, <real host>`); it is now stripped. Because the raw Host is what
+  gets forwarded, `proxy_host_label` now rejects a Host whose port is not numeric
+  (`<label>.<base>:x.evil.com`). The metrics bearer is compared as bytes, so a non-ASCII token
+  is a 401, not a 500. Client `X-Forwarded-For`/`-Proto`/`Forwarded` still pass through; they
+  only reach the tenant's own sandbox. Tests pin that no request path
+  (`//host`, `@host`, encoded `?`, `..%2F`, `\\`) changes the upstream host, that a spoofed
+  Daytona token never wins, and that upstream redirects are not followed and a foreign
+  `Location` is not rewritten.
+- **Deferred**: the Redis cache of Daytona preview links. Today every proxied request makes about
+  3 Daytona calls (`get`, `refresh_data`/start, `get_preview_link`). A cached link would not wake
+  an auto-stopped sandbox, and it would put Daytona tokens in Redis. Revisit with epic 09 load data.
+- **Ops**: put the proxy tier behind an L7 LB with **no** sticky sessions, a wildcard cert for
+  `*.<DAYTONA_PREVIEW_PROXY_BASE_URL host>`, WebSocket upgrade enabled, an idle timeout ≥ the
+  longest expected quiet period of a preview socket (HMR sockets idle for minutes; ≥ 3600s
+  is safe), and health checks on `/ready` with a non-preview Host.

@@ -1,5 +1,4 @@
 import asyncio
-import secrets
 from contextlib import asynccontextmanager
 
 import structlog
@@ -18,6 +17,7 @@ from app.core.lifecycle import (
     service_draining_handler,
 )
 from app.core.logging import configure_logging
+from app.core.metrics import metrics_token_authorized
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.db.session import async_session_maker, engine
 from app.services.capacity import RunCapacityExceededError, run_capacity_exceeded_handler
@@ -135,13 +135,9 @@ def create_app() -> FastAPI:
 
 async def require_metrics_token(request: Request) -> None:
     """Authorise a /metrics scrape against ``settings.metrics_token``."""
-    expected = get_settings().metrics_token
-    if not expected:
-        return
-    header = request.headers.get("authorization", "")
-    scheme, _, presented = header.partition(" ")
-    # Constant-time compare so the token cannot be recovered by timing the endpoint.
-    if scheme.lower() != "bearer" or not secrets.compare_digest(presented, expected):
+    if not metrics_token_authorized(
+        request.headers.get("authorization", ""), get_settings().metrics_token
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Not authenticated",
