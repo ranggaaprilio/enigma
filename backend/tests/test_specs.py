@@ -531,6 +531,45 @@ async def test_request_changes_bumps_attempt_and_reruns(db_session, monkeypatch)
     assert len(audits) >= 1
 
 
+async def test_run_phase_writes_untracked_feature_pointer_in_worktree(db_session, monkeypatch):
+    # Spec Kit's check-prerequisites.sh fails with "Feature directory not found" unless
+    # .specify/feature.json names the feature dir; it must stay out of git (info/exclude).
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"fp-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user, phase_status={"specify": "approved"})
+    await session.commit()
+
+    async def fake_create_run(self, workspace_id, user_id, prompt, working_dir=None):
+        run = AgentRun(
+            workspace_id=workspace_id,
+            user_id=user_id,
+            prompt=prompt,
+            status="thinking",
+            provider="mock",
+            model="mock-agent",
+        )
+        self.session.add(run)
+        await self.session.flush()
+        return run
+
+    async def noop_finalize(self, *args, **kwargs):
+        return None
+
+    monkeypatch.setattr("app.services.agents.AgentService.create_run", fake_create_run)
+    monkeypatch.setattr(SpecKitService, "_finalize_phase", noop_finalize)
+
+    runtime = FakeRuntime()
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+    await service.run_phase(workspace.id, workflow.id, "plan", user.id)
+
+    pointer_calls = [(cmd, cwd) for cmd, cwd in runtime.calls if ".specify/feature.json" in cmd]
+    assert len(pointer_calls) == 1
+    command, cwd = pointer_calls[0]
+    assert cwd == "worktrees/001-add-auth"
+    assert '{"feature_directory": "specs/001-add-auth"}' in command
+    assert "info/exclude" in command
+
+
 # --- authorization -----------------------------------------------------------------------
 
 
