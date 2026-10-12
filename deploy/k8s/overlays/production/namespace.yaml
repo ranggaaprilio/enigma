@@ -1,0 +1,10 @@
+# Pod Security Admission "restricted": the cluster itself rejects a pod that runs as root,
+# escalates privileges or keeps capabilities, whatever a later edit to the manifests says.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: enigma
+  labels:
+    enigma/phase: pre-deploy
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest

@@ -1,0 +1,21 @@
+# Production overlay. The release pipeline pins the image tags per release:
+#   kustomize edit set image enigma-backend=<registry>/enigma-backend:<git-sha>
+#   kustomize edit set image enigma-frontend=<registry>/enigma-frontend:<git-sha>
+# Replace the example.com hosts in base (ConfigMap, Ingress) with a patch here, and narrow the
+# NetworkPolicy egress to the managed Postgres/Redis CIDRs. Release order: deploy/README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: enigma
+
+resources:
+  - namespace.yaml
+  - ../../base
+
+images:
+  - name: enigma-backend
+    newName: ghcr.io/ranggaaprilio/enigma-backend
+    newTag: "0.1.0"
+  - name: enigma-frontend
+    newName: ghcr.io/ranggaaprilio/enigma-frontend
+    newTag: "0.1.0"

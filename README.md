@@ -19,6 +19,7 @@ the sandbox; the platform only orchestrates them.
 - [Services](#services)
 - [Development](#development)
 - [Environment](#environment)
+- [Production deployment](#production-deployment)
 - [Sandbox snapshot](#sandbox-snapshot)
 
 ## Features
@@ -323,6 +324,14 @@ Copy `.env.example` to `.env`. Key variables:
 | `EDITOR_AUTO_INSTALL` | No | `false` when `code-server` is baked into the snapshot |
 
 Full list of variables: see `.env.example` and `backend/app/core/config.py`.
+
+## Production deployment
+
+Compose is the dev setup (`--reload`, bind mounts). Production runs on Kubernetes from
+`deploy/k8s` (Kustomize), using the default (last) stage of each Dockerfile: separate API,
+worker (KEDA, scales on queue depth) and preview-proxy deployments, a static nginx frontend,
+zero-downtime rolling updates, and a migrate Job before every rollout. Secrets, release steps,
+rollback and scaling knobs: [`deploy/README.md`](deploy/README.md).
 
 ## Sandbox snapshot
 

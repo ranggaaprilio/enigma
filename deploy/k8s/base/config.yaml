@@ -1,0 +1,34 @@
+# Non-secret settings shared by every backend process (API, worker, preview proxy, migrations).
+# Secrets are NOT here: they come from the `enigma-secrets` Secret, which the cluster's secret
+# store (External Secrets, Sealed Secrets, or `kubectl create secret`) provides -- see
+# deploy/README.md for the required keys. The example.com hosts are placeholders an overlay
+# replaces.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: enigma-config
+  labels:
+    # Applied in release step 1 with the migrate Job (deploy/README.md).
+    enigma/phase: pre-deploy
+data:
+  # Any value but "local" turns on the fail-fast secret checks and Secure cookies.
+  ENVIRONMENT: production
+  # More than one API replica requires queue mode: inline start-up reconciliation assumes it is
+  # the only replica and would end every other replica's runs (AGENTS.md gotcha 17).
+  RUN_EXECUTION_MODE: queue
+  AUTH_COOKIE_SECURE: "true"
+  BACKEND_CORS_ORIGINS: https://app.enigma.example.com
+  DAYTONA_API_URL: https://app.daytona.io/api
+  DAYTONA_DEFAULT_SNAPSHOT: enigma-mise-code
+  # A separate registrable domain from the app/API, never a subdomain of it: preview pages are
+  # tenant code, and on the same site the SameSite=Lax session cookie would ride along on their
+  # requests to the API (CSRF, cross-site WebSocket hijacking of the terminal/agent sockets).
+  DAYTONA_PREVIEW_PROXY_BASE_URL: https://enigma-preview.example.net
+  AGENT_PROVIDER: auto
+  OPENHANDS_SUPPRESS_BANNER: "1"
+  # Long enough for ingress-nginx to observe /ready=503 and drop the endpoint before the
+  # listener closes (readiness probes: 3s period x 2 failures).
+  SHUTDOWN_DRAIN_DELAY_SECONDS: "10"
+  SHUTDOWN_RUN_GRACE_SECONDS: "15"
+  # Refuse new runs (503 + Retry-After) rather than queue without bound while workers scale.
+  RUN_QUEUE_MAX_DEPTH: "200"
