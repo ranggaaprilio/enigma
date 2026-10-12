@@ -1,3 +1,4 @@
+import re
 import time
 import uuid
 
@@ -7,8 +8,19 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 REQUEST_ID_HEADER = "X-Request-ID"
+# What a caller-supplied id may look like. Anything else is replaced, never trimmed: the id
+# lands in every log line, on run rows and in stream frames, so it must be short and inert.
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 logger = structlog.get_logger("app.request")
+
+
+def sanitize_request_id(raw: str | None) -> str:
+    """Return ``raw`` when it is a well-formed request id, otherwise a fresh one."""
+    candidate = raw.strip() if raw else ""
+    if candidate and _REQUEST_ID_RE.match(candidate):
+        return candidate
+    return uuid.uuid4().hex
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -22,8 +34,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        incoming = request.headers.get(REQUEST_ID_HEADER)
-        request_id = incoming.strip() if incoming and incoming.strip() else uuid.uuid4().hex
+        request_id = sanitize_request_id(request.headers.get(REQUEST_ID_HEADER))
         request.state.request_id = request_id
 
         structlog.contextvars.clear_contextvars()

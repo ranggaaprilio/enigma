@@ -193,5 +193,8 @@ class CommandRun(Base):
     output_pruned_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Correlation (Epic 09); see AgentRun.
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    traceparent: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     custom_command: Mapped[CustomCommand] = relationship(back_populates="runs")
