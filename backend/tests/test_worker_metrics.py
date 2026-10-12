@@ -6,6 +6,9 @@ import socket
 
 import httpx
 
+# The worker imports the engine module, which registers the pool collector; this test must
+# too, or run alone it would scrape a registry without it.
+import app.db.session  # noqa: F401
 from app.worker_metrics import WorkerMetricsServer, _ThreadingWSGIServer, start_if_possible
 from tests.test_job_queue import queue_settings
 
