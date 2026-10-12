@@ -482,9 +482,10 @@ def test_network_policies_are_least_privilege(manifests):
     proxy = _get(manifests, "NetworkPolicy", "enigma-preview-proxy")
     frontend = _get(manifests, "NetworkPolicy", "enigma-frontend")
 
-    # Postgres (direct or PgBouncer), Redis, DNS and HTTPS to Daytona / the LLM / GitHub.
+    # Postgres (direct or PgBouncer), Redis, DNS, HTTPS to Daytona / the LLM / GitHub, and
+    # OTLP/HTTP traces to the collector.
     for policy in (api, worker):
-        assert _egress_ports(policy) == {53, 5432, 6432, 6379, 443}
+        assert _egress_ports(policy) == {53, 5432, 6432, 6379, 443, 4318}
     # The proxy never talks to Redis.
     assert _egress_ports(proxy) == {53, 5432, 6432, 443}
     assert _egress_ports(frontend) == set()
@@ -525,6 +526,10 @@ def test_network_policies_are_least_privilege(manifests):
                 # DNS only to the cluster resolver: no tunnelling out through port 53.
                 (peer,) = rule["to"]
                 assert peer["podSelector"]["matchLabels"] == {"k8s-app": "kube-dns"}
+            if 4318 in ports:
+                # Traces go to specific collector pods, never to an address range.
+                (peer,) = rule["to"]
+                assert peer["podSelector"]["matchLabels"] and peer["namespaceSelector"]
             if 443 in ports:
                 # HTTPS is for the internet (Daytona, LLM, GitHub), not the cluster's own API
                 # server, private ranges or cloud metadata.

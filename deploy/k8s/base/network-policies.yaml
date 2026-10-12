@@ -76,6 +76,18 @@ spec:
       ports:
         - port: 443
           protocol: TCP
+    # Epic 09: traces to an OpenTelemetry Collector in `monitoring` (inert until
+    # OTEL_EXPORTER_OTLP_ENDPOINT is set; relabel the pod selector to your collector's).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+      ports:
+        - port: 4318
+          protocol: TCP
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -131,6 +143,18 @@ spec:
             except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
       ports:
         - port: 443
+          protocol: TCP
+    # Epic 09: traces to an OpenTelemetry Collector in `monitoring` (inert until
+    # OTEL_EXPORTER_OTLP_ENDPOINT is set; relabel the pod selector to your collector's).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+      ports:
+        - port: 4318
           protocol: TCP
 ---
 apiVersion: networking.k8s.io/v1

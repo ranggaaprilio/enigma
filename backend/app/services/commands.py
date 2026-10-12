@@ -11,6 +11,7 @@ from app.core.config import Settings
 from app.core.lifecycle import lifecycle
 from app.core.metrics import observe_queue_wait, observe_run_finished, observe_run_start
 from app.core.middleware import current_request_id
+from app.core.tracing import current_traceparent
 from app.models import CommandRun, CustomCommand, Workspace
 from app.services.agent_tools import DangerousCommandError
 from app.services.audit import AuditLogService
@@ -427,6 +428,7 @@ class CommandService:
             status="running",
             output="",
             request_id=current_request_id(),
+            traceparent=current_traceparent(),
         )
         self.session.add(run)
         await self.session.flush()

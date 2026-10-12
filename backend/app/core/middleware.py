@@ -11,6 +11,7 @@ from starlette.responses import Response
 from starlette.websockets import WebSocket
 
 from app.core.metrics import ws_connections
+from app.core.tracing import bind_trace_context
 
 REQUEST_ID_HEADER = "X-Request-ID"
 # What a caller-supplied id may look like. Anything else is replaced, never trimmed: the id
@@ -58,6 +59,7 @@ def websocket_context(kind: str) -> Callable[[WebSocketHandler], WebSocketHandle
             request_id = sanitize_request_id(websocket.headers.get(REQUEST_ID_HEADER))
             structlog.contextvars.clear_contextvars()
             structlog.contextvars.bind_contextvars(request_id=request_id, ws_kind=kind)
+            bind_trace_context(request_id)
             ws_connections.labels(kind=kind).inc()
             try:
                 await handler(websocket=websocket, **kwargs)
@@ -86,6 +88,7 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(request_id=request_id)
+        bind_trace_context(request_id)
 
         start = time.perf_counter()
         logger.info("request.start", method=request.method, path=request.url.path)

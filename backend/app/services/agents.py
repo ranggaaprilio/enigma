@@ -23,6 +23,7 @@ from app.core.metrics import (
 )
 from app.core.middleware import current_request_id
 from app.core.pricing import estimate_cost
+from app.core.tracing import current_traceparent
 from app.models import AgentEvent, AgentFileChange, AgentRun, AgentSession, Workspace
 from app.services.access import require_workspace_access
 from app.services.agent_providers import AgentProvider, MockAgentProvider, OpenAIResponsesProvider
@@ -334,6 +335,7 @@ class AgentService:
                 model=provider.model_name,
                 working_dir=working_dir,
                 request_id=current_request_id(),
+                traceparent=current_traceparent(),
             )
             try:
                 # Savepoint: a violation rolls back only this insert, leaving the session usable.

@@ -20,6 +20,7 @@ from sqlalchemy import select
 from app.core.config import Settings, get_settings
 from app.core.lifecycle import lifecycle
 from app.core.logging import configure_logging
+from app.core.tracing import configure_tracing, run_span, shutdown_tracing
 from app.db.session import async_session_maker, engine
 from app.models import AgentRun, CommandRun, SpecPhase, SpecWorkflow
 from app.services.agents import ACTIVE_RUN_STATUSES, AgentService, agent_runtime
@@ -121,9 +122,12 @@ async def _correlation(session_maker, model, run_id: UUID) -> dict[str, str]:
                 select(model.request_id, model.traceparent).where(model.id == run_id)
             )
         ).first()
-    if row is None or not row.request_id:
-        return {}
-    return {"request_id": row.request_id}
+    found: dict[str, str] = {}
+    if row is not None and row.request_id:
+        found["request_id"] = row.request_id
+    if row is not None and row.traceparent:
+        found["traceparent"] = row.traceparent
+    return found
 
 
 async def _stop_when_inactive(session_maker, runtime, run_id: UUID) -> None:
@@ -174,34 +178,41 @@ async def run_agent_job(ctx: dict[str, Any], run_id: str) -> str:
             return claim.outcome
 
         correlation = await _correlation(session_maker, AgentRun, run_uuid)
+        traceparent = correlation.pop("traceparent", None)
         structlog.contextvars.bind_contextvars(**correlation)
         log = log.bind(**correlation)
-        stop_event = asyncio.Event()
-        runtime.register_run(run_uuid, asyncio.current_task(), stop_event)
-        try:
-            # A lost lease means the reaper already ended the run: stop executing it.
-            async with _holding_lease(
-                lambda: service.renew_lease(run_uuid, settings.worker_id),
-                settings,
-                on_lost=lambda: runtime.request_stop(run_uuid),
-            ), runtime.watch_control(run_uuid):
-                # Stopped between the claim and the watch: that signal never reached us.
-                status = await _status(session_maker, AgentRun, run_uuid)
-                if status not in ACTIVE_RUN_STATUSES:
-                    return status or "missing"
-                poller = asyncio.create_task(
-                    _stop_when_inactive(session_maker, runtime, run_uuid)
-                )
-                try:
-                    return await service.execute_claimed_run(
-                        run_uuid, claim.working_dir, stop_event, settings.agent_run_timeout_seconds
+        with run_span(
+            "agent_run", traceparent, run_id=run_id, worker_id=settings.worker_id, job_try=job_try
+        ):
+            stop_event = asyncio.Event()
+            runtime.register_run(run_uuid, asyncio.current_task(), stop_event)
+            try:
+                # A lost lease means the reaper already ended the run: stop executing it.
+                async with _holding_lease(
+                    lambda: service.renew_lease(run_uuid, settings.worker_id),
+                    settings,
+                    on_lost=lambda: runtime.request_stop(run_uuid),
+                ), runtime.watch_control(run_uuid):
+                    # Stopped between the claim and the watch: that signal never reached us.
+                    status = await _status(session_maker, AgentRun, run_uuid)
+                    if status not in ACTIVE_RUN_STATUSES:
+                        return status or "missing"
+                    poller = asyncio.create_task(
+                        _stop_when_inactive(session_maker, runtime, run_uuid)
                     )
-                finally:
-                    poller.cancel()
-                    await asyncio.gather(poller, return_exceptions=True)
-        finally:
-            runtime.forget_run(run_uuid)
-            structlog.contextvars.unbind_contextvars(*correlation)
+                    try:
+                        return await service.execute_claimed_run(
+                            run_uuid,
+                            claim.working_dir,
+                            stop_event,
+                            settings.agent_run_timeout_seconds,
+                        )
+                    finally:
+                        poller.cancel()
+                        await asyncio.gather(poller, return_exceptions=True)
+            finally:
+                runtime.forget_run(run_uuid)
+                structlog.contextvars.unbind_contextvars(*correlation)
 
 
 async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
@@ -242,35 +253,39 @@ async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
             return outcome
 
         correlation = await _correlation(session_maker, CommandRun, run_uuid)
+        traceparent = correlation.pop("traceparent", None)
         structlog.contextvars.bind_contextvars(**correlation)
         log = log.bind(**correlation)
         # Confirmation was enforced when the API accepted the run. arq treats any exception as
         # final, so whatever escapes is recorded on the run here rather than leaving it running.
-        timeout = settings.command_run_max_timeout_seconds + COMMAND_TIMEOUT_MARGIN_SECONDS
-        try:
-            # Commands have no stop signal: a lost lease (the run was reaped) cancels the job,
-            # and arq's redelivery then finds the run terminal.
-            job = asyncio.current_task()
-            async with (
-                _holding_lease(
-                    lambda: service.renew_lease(run_uuid, settings.worker_id),
-                    settings,
-                    on_lost=lambda: job.cancel(),
-                ),
-                asyncio.timeout(timeout),
-            ):
-                await service._execute_run(run_uuid, confirmed=True)
-        except TimeoutError:
-            await service.fail_active_run(
-                run_uuid, JOB_TIMEOUT, f"The command exceeded its {timeout}s time limit."
-            )
-            return JOB_TIMEOUT
-        except Exception:
-            log.exception("command_job_failed")
-            await service.fail_active_run(run_uuid, WORKER_ERROR, WORKER_ERROR_MESSAGE)
-            return WORKER_ERROR
-        finally:
-            structlog.contextvars.unbind_contextvars(*correlation)
+        with run_span(
+            "command_run", traceparent, run_id=run_id, worker_id=settings.worker_id, job_try=job_try
+        ):
+            timeout = settings.command_run_max_timeout_seconds + COMMAND_TIMEOUT_MARGIN_SECONDS
+            try:
+                # Commands have no stop signal: a lost lease (the run was reaped) cancels the job,
+                # and arq's redelivery then finds the run terminal.
+                job = asyncio.current_task()
+                async with (
+                    _holding_lease(
+                        lambda: service.renew_lease(run_uuid, settings.worker_id),
+                        settings,
+                        on_lost=lambda: job.cancel(),
+                    ),
+                    asyncio.timeout(timeout),
+                ):
+                    await service._execute_run(run_uuid, confirmed=True)
+            except TimeoutError:
+                await service.fail_active_run(
+                    run_uuid, JOB_TIMEOUT, f"The command exceeded its {timeout}s time limit."
+                )
+                return JOB_TIMEOUT
+            except Exception:
+                log.exception("command_job_failed")
+                await service.fail_active_run(run_uuid, WORKER_ERROR, WORKER_ERROR_MESSAGE)
+                return WORKER_ERROR
+            finally:
+                structlog.contextvars.unbind_contextvars(*correlation)
     return await _status(session_maker, CommandRun, run_uuid) or "missing"
 
 
@@ -334,6 +349,7 @@ async def finalize_spec_phase_job(ctx: dict[str, Any], phase_id: str, run_id: st
 async def startup(ctx: dict[str, Any]) -> None:
     configure_logging()
     settings = get_settings()
+    ctx["tracing"] = configure_tracing(settings, "enigma-worker", instance_id=settings.worker_id)
     if settings.run_execution_mode != "queue":
         # Inline mode keeps the in-memory bus, so nothing this worker published would ever
         # reach an API WebSocket.
@@ -379,6 +395,8 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         if isinstance(event_bus, RedisEventBus):
             await event_bus.aclose()
         await engine.dispose()
+        # After the drain, so the spans of the runs that just finished are exported.
+        shutdown_tracing(ctx.get("tracing"))
 
 
 _settings = get_settings()

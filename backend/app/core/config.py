@@ -166,6 +166,11 @@ class Settings(BaseSettings):
     metrics_port: int = Field(default=9102, gt=0, lt=65536)
     metrics_sample_interval_seconds: float = Field(default=15.0, gt=0)
     metrics_tenant_label_limit: int = Field(default=20, ge=0)
+    # Epic 09: tracing is off until an OTLP/HTTP collector base URL is set (the standard
+    # OpenTelemetry variable name; `/v1/traces` is appended). The ratio samples new traces;
+    # a worker follows the decision recorded in the run's traceparent.
+    otel_exporter_otlp_endpoint: str | None = None
+    otel_traces_sample_ratio: float = Field(default=0.1, ge=0.0, le=1.0)
     # Epic 11: multi-service preview. A sandbox is a shared, sized resource, so the number of
     # concurrently running services per workspace is capped.
     max_running_services_per_workspace: int = 4
