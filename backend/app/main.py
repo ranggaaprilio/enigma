@@ -22,6 +22,7 @@ from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.db.session import async_session_maker, engine
 from app.services.capacity import RunCapacityExceededError, run_capacity_exceeded_handler
 from app.services.daytona_runtime import get_daytona_runtime
+from app.services.fleet_metrics import start_fleet_sampler
 from app.services.jobs import (
     RunQueueUnavailableError,
     close_run_dispatcher,
@@ -66,6 +67,8 @@ async def lifespan(_app: FastAPI):
         if settings.run_execution_mode == "inline"
         else None
     )
+    # Epic 09: fleet-wide gauges (queue depth, active runs and spend by team) on /metrics.
+    fleet_sampler = start_fleet_sampler(async_session_maker, settings)
     restore_sigterm = install_sigterm_drain(
         asyncio.get_running_loop(), settings.shutdown_drain_delay_seconds
     )
@@ -73,6 +76,8 @@ async def lifespan(_app: FastAPI):
     yield
 
     lifecycle.begin_drain()
+    fleet_sampler.cancel()
+    await asyncio.gather(fleet_sampler, return_exceptions=True)
     if retention is not None:
         retention.cancel()
         await asyncio.gather(retention, return_exceptions=True)

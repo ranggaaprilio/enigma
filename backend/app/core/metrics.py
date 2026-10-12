@@ -6,9 +6,14 @@ application-specific counters we increment by hand from the relevant code paths.
 """
 
 import secrets
+from collections.abc import Iterator
 from datetime import datetime
 
 from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client.core import GaugeMetricFamily, Metric
+from prometheus_client.registry import Collector
+from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.pool import NullPool
 
 agent_runs_created_total = Counter(
     "agent_runs_created_total",
@@ -117,6 +122,87 @@ llm_cost_usd_total = Counter(
     "Estimated cost (USD) of finished agent runs, by provider and model (core.pricing).",
     labelnames=("provider", "model"),
 )
+
+
+# Epic 09: fleet-wide gauges sampled from Postgres by every API replica
+# (``app.services.fleet_metrics``). Each replica reports the same numbers, so aggregate them
+# with max() or avg() across replicas, never sum(). ``team`` is a team id, "none" (team-less
+# workspaces) or "other" (teams beyond ``METRICS_TENANT_LABEL_LIMIT``); series are rebuilt
+# on every sample, so a team that goes quiet disappears rather than lingering at zero.
+_FLEET_TEAM_HELP = " Same on every API replica: aggregate with max(), not sum()."
+
+fleet_queue_depth = Gauge(
+    "fleet_queue_depth",
+    "Runs enqueued but not yet claimed by a worker, by kind." + _FLEET_TEAM_HELP,
+    labelnames=("kind",),
+)
+
+fleet_active_runs = Gauge(
+    "fleet_active_runs",
+    "Agent runs currently thinking/executing, by team." + _FLEET_TEAM_HELP,
+    labelnames=("team",),
+)
+
+fleet_tokens_last_hour = Gauge(
+    "fleet_tokens_last_hour",
+    "Tokens used by agent runs that finished in the last hour, by team." + _FLEET_TEAM_HELP,
+    labelnames=("team",),
+)
+
+fleet_cost_usd_last_hour = Gauge(
+    "fleet_cost_usd_last_hour",
+    "Estimated cost (USD) of agent runs that finished in the last hour, by team."
+    + _FLEET_TEAM_HELP,
+    labelnames=("team",),
+)
+
+fleet_sample_timestamp_seconds = Gauge(
+    "fleet_sample_timestamp_seconds",
+    "Unix time of this replica's last successful fleet sample; stale means the sampler is stuck.",
+)
+
+redis_ping_seconds = Histogram(
+    "redis_ping_seconds",
+    "Round-trip time of a Redis PING from this process, by role (api|worker).",
+    labelnames=("role",),
+    buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+)
+
+redis_ping_errors_total = Counter(
+    "redis_ping_errors_total",
+    "Redis PINGs that failed or timed out, by role.",
+    labelnames=("role",),
+)
+
+
+class DbPoolCollector(Collector):
+    """SQLAlchemy pool occupancy of this process's engine, read at scrape time.
+
+    The pool's counters are plain attributes, so no database round trip happens on a scrape.
+    Under PgBouncer (``DB_PGBOUNCER=true``) the engine has no pool to report, and this emits
+    nothing rather than zeros.
+    """
+
+    def __init__(self, engine: AsyncEngine) -> None:
+        self._engine = engine
+
+    def collect(self) -> Iterator[Metric]:
+        pool = self._engine.pool
+        if isinstance(pool, NullPool):
+            return
+        yield GaugeMetricFamily(
+            "db_pool_size", "Connections the pool keeps open (DB_POOL_SIZE).", value=pool.size()
+        )
+        yield GaugeMetricFamily(
+            "db_pool_checked_out",
+            "Connections currently in use by this process.",
+            value=pool.checkedout(),
+        )
+        yield GaugeMetricFamily(
+            "db_pool_overflow",
+            "Connections open beyond the pool size (bounded by DB_MAX_OVERFLOW).",
+            value=max(pool.overflow(), 0),
+        )
 
 
 def _seconds_between(start: datetime | None, end: datetime | None) -> float | None:

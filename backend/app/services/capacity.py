@@ -68,13 +68,12 @@ async def enforce_run_caps(session: AsyncSession, settings: Settings, workspace:
             raise _reject("global", settings)
 
 
-async def enforce_queue_depth(session: AsyncSession, settings: Settings) -> None:
-    """Refuse new runs while too many queued runs wait for a worker (queue mode only).
+async def waiting_run_counts(session: AsyncSession) -> tuple[int, int]:
+    """Agent and command runs enqueued but not yet claimed by a worker.
 
-    Unlocked on purpose: a soft brake, not an invariant, so a burst may overshoot slightly.
+    The one definition of queue depth: admission (below), the fleet gauges (Epic 09) and the
+    KEDA worker trigger (``deploy/k8s``) must all count these rows.
     """
-    if settings.run_execution_mode != "queue" or not settings.run_queue_max_depth:
-        return
     waiting_agents = await session.scalar(
         select(func.count(AgentRun.id)).where(
             AgentRun.status.in_(ACTIVE_RUN_STATUSES),
@@ -89,6 +88,17 @@ async def enforce_queue_depth(session: AsyncSession, settings: Settings) -> None
             CommandRun.claimed_at.is_(None),
         )
     )
+    return waiting_agents or 0, waiting_commands or 0
+
+
+async def enforce_queue_depth(session: AsyncSession, settings: Settings) -> None:
+    """Refuse new runs while too many queued runs wait for a worker (queue mode only).
+
+    Unlocked on purpose: a soft brake, not an invariant, so a burst may overshoot slightly.
+    """
+    if settings.run_execution_mode != "queue" or not settings.run_queue_max_depth:
+        return
+    waiting_agents, waiting_commands = await waiting_run_counts(session)
     depth = waiting_agents + waiting_commands
     run_queue_depth.set(depth)
     if depth >= settings.run_queue_max_depth:

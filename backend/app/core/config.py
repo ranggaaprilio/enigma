@@ -159,6 +159,13 @@ class Settings(BaseSettings):
     # Queue mode only: refuse new runs (503) once this many runs wait unclaimed. 0 disables.
     run_queue_max_depth: int = Field(default=0, ge=0)
     run_capacity_retry_after_seconds: int = Field(default=15, gt=0)
+    # Epic 09: observability. Workers serve ``/metrics`` on their own port (the API serves it on
+    # its HTTP port). The API samples fleet-wide gauges from Postgres every
+    # `metrics_sample_interval_seconds`; per-team series are bounded to the busiest
+    # `metrics_tenant_label_limit` teams, the rest summed into ``team="other"`` (0 = all other).
+    metrics_port: int = Field(default=9102, gt=0, lt=65536)
+    metrics_sample_interval_seconds: float = Field(default=15.0, gt=0)
+    metrics_tenant_label_limit: int = Field(default=20, ge=0)
     # Epic 11: multi-service preview. A sandbox is a shared, sized resource, so the number of
     # concurrently running services per workspace is capped.
     max_running_services_per_workspace: int = 4
