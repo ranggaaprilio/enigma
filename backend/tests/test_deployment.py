@@ -443,6 +443,25 @@ def test_ingress_routes_each_host_to_its_tier(manifests):
     assert "http_503" not in annotations.get(f"{NGINX}/proxy-next-upstream", "")
 
 
+def _site(host: str) -> str:
+    """Registrable domain, by the last two labels (enough for the placeholder hosts)."""
+    return ".".join(host.lstrip("*.").split(".")[-2:])
+
+
+def test_previews_are_cross_site_from_the_app(manifests):
+    # Preview pages are tenant-controlled. On the app's own site, SameSite=Lax session cookies
+    # ride along on their requests -- a preview could open the API's terminal WebSocket as the
+    # visitor (cross-site WebSocket hijacking) or POST to it (CSRF). A separate registrable
+    # domain makes every such request cross-site, so the browser drops the cookie.
+    app_sites = {_site(h) for h in _backends(_get(manifests, "Ingress", "enigma"))}
+    preview_sites = {_site(h) for h in _backends(_get(manifests, "Ingress", "enigma-preview"))}
+    proxy_base = _config(manifests)["DAYTONA_PREVIEW_PROXY_BASE_URL"].split("://", 1)[1]
+    assert preview_sites == {_site(proxy_base)}
+    assert not app_sites & preview_sites
+    origins = _config(manifests)["BACKEND_CORS_ORIGINS"].split(",")
+    assert not {_site(o.split("://", 1)[1]) for o in origins} & preview_sites
+
+
 def test_network_policies_default_deny(manifests):
     policy = _get(manifests, "NetworkPolicy", "default-deny")
     assert policy["spec"]["podSelector"] == {}
@@ -483,6 +502,14 @@ def test_network_policies_are_least_privilege(manifests):
     for policy in (api, worker, proxy, migrate):
         for rule in policy["spec"]["egress"]:
             ports = {p["port"] for p in rule["ports"]}
+            # A port-only rule reaches every host on that port, internet and cluster alike:
+            # an SSRF/exfiltration path around the HTTPS restriction below.
+            assert rule.get("to"), f"{policy['metadata']['name']} egress {ports} has no `to:`"
+            if ports & {5432, 6432, 6379}:
+                # Managed Postgres/Redis over private networking; never the public internet.
+                for peer in rule["to"]:
+                    cidr = peer["ipBlock"]["cidr"]
+                    assert cidr != "0.0.0.0/0" and "except" not in peer["ipBlock"], cidr
             if 53 in ports:
                 # DNS only to the cluster resolver: no tunnelling out through port 53.
                 (peer,) = rule["to"]

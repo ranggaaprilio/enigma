@@ -31,7 +31,14 @@ validates it with kubeconform, then builds and Trivy-scans both images.
   cloud LB and in the controller. Otherwise every user shares the LB's IP and a handful of
   failed logins locks everyone out. Do **not** turn on `use-forwarded-headers` to "fix" this,
   because the entry then becomes client-controlled.
-- A TLS certificate `enigma-tls` covering the app, API and `*.preview` hosts (cert-manager).
+- Two TLS certificates (cert-manager): `enigma-tls` for the app and API hosts, and
+  `enigma-preview-tls`, a wildcard for the preview domain.
+- A **separate registrable domain for previews** (e.g. `enigma-preview.example.net`, never
+  `*.preview.<your app domain>`). Preview pages are tenant code. On the app's own site, the
+  `SameSite=Lax` session cookie would ride along on their requests to the API, so a preview
+  could CSRF the API or hijack a visitor's terminal/agent WebSocket.
+  `test_previews_are_cross_site_from_the_app` enforces this for the base hosts; keep it true
+  when an overlay sets real ones.
 - Managed **Postgres** (+ optional PgBouncer, epic 05) and **Redis**, outside the cluster.
 - Prometheus in namespace `monitoring` if you scrape `/metrics` (bearer `METRICS_TOKEN`).
 
@@ -143,11 +150,13 @@ front (`DB_PGBOUNCER=true`).
   capabilities dropped, no privilege escalation, no service-account token. The namespace
   enforces Pod Security `restricted`.
 - NetworkPolicy: default deny. API and worker egress goes only to kube-dns, Postgres
-  (5432/6432), Redis (6379) and **public** HTTPS (Daytona, LLM, GitHub). Private, CGNAT and
+  (5432/6432) and Redis (6379) on **private** addresses only, and **public** HTTPS (Daytona,
+  LLM, GitHub). Private, CGNAT and
   link-local ranges are excluded, so the cluster API server and cloud metadata are unreachable.
   A self-hosted Daytona or LLM on a private IP needs an overlay rule. The proxy has no Redis;
   workers accept no ingress; `/metrics` is open only to `app.kubernetes.io/name: prometheus` pods
-  in `monitoring`. Add your managed Postgres/Redis CIDRs as `to:` in the overlay.
+  in `monitoring`. Every egress rule names its destinations. Narrow the Postgres/Redis `to:`
+  from "any private address" to your providers' CIDRs in the overlay.
 - Edge: two Ingresses. `enigma` (app + API) caps uploads at 12m and retries 502/503 on another
   pod. `enigma-preview` streams requests and responses, allows 100m bodies, and never retries a
   503 (that is the proxy's self-retrying "Waking preview…" page).

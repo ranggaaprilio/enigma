@@ -124,12 +124,17 @@ with a **long grace** so a rollout or scale-in never interrupts a run. Runbook:
 - **Edge**: two ingress-nginx Ingresses. Both force TLS, set no affinity and use 3600s read/send
   timeouts for WebSockets. `enigma` (app + API) caps bodies at 12m and retries the next upstream
   on error/502/503 (nginx never retries a non-idempotent request that reached an upstream).
-  `enigma-preview` (`*.preview.`) streams requests and responses, allows 100m bodies, and never
-  retries a 503, because that is the proxy's self-retrying "Waking preview…" page. The bare preview
+  `enigma-preview` serves previews on a **separate registrable domain** (`*.enigma-preview.example.net`)
+  with its own wildcard cert. On the app's site, the `SameSite=Lax` session cookie would reach the
+  API from tenant preview pages: CSRF, and hijacking of the terminal/agent WebSockets, which do
+  not check `Origin` (an Origin check in those handlers is a recommended follow-up). It
+  streams requests and responses, allows 100m bodies, and never retries a 503, because that is the proxy's self-retrying "Waking preview…" page. The bare preview
   host is not exposed. The runbook requires real client IPs at the controller
   (`externalTrafficPolicy: Local` or PROXY protocol), since the login limiter keys on them.
-- **Network policy**: default deny. DNS goes only to kube-dns. API and worker egress is 5432/6432,
-  6379, and 443 to **public** addresses only (RFC1918, CGNAT and link-local excluded, so the
+- **Network policy**: default deny. Every egress rule names its destinations. DNS goes only to
+  kube-dns. API and worker egress is 5432/6432 and 6379 to **private** addresses only (managed
+  datastores over private networking; the overlay narrows them to the provider CIDRs), and 443
+  to **public** addresses only (RFC1918, CGNAT and link-local excluded, so the
   cluster API server and cloud metadata are out of SSRF reach). The proxy gets the same minus
   Redis; the frontend gets none; the migrate Job gets DNS + 5432. Ingress comes only from the
   `ingress-nginx` namespace (plus Prometheus pods in `monitoring` for the API and proxy
