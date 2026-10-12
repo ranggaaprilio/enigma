@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
 from app.core.metrics import agent_runs_created_total
+from app.core.middleware import websocket_context
 from app.core.security import verify_session_token
 from app.db.session import async_session_maker, get_db_session
 from app.models import AgentEvent, AgentFileChange, AgentRun, User
@@ -323,6 +324,7 @@ async def stop_agent_run(
 
 
 @router.websocket("/runs/{run_id}/stream")
+@websocket_context("agent")
 async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUID) -> None:
     settings = get_settings()
     async with async_session_maker() as session:
@@ -366,7 +368,7 @@ async def stream_agent_run(websocket: WebSocket, workspace_id: UUID, run_id: UUI
                 high_water = created_at
 
     for event in events:
-        await send_event(event_payload(event))
+        await send_event(event_payload(event, run.request_id))
 
     if run.status not in ("thinking", "executing"):
         await websocket.close()
@@ -446,16 +448,21 @@ async def catch_up(
     async with session_maker() as session:
         service = AgentService(session=session, session_maker=session_maker, settings=settings)
         # Status before events: once it reads as ended, every event of the run is committed.
-        run_status = await session.scalar(
-            select(AgentRun.status).where(
-                AgentRun.id == run_id, AgentRun.workspace_id == workspace_id
+        run_row = (
+            await session.execute(
+                select(AgentRun.status, AgentRun.request_id).where(
+                    AgentRun.id == run_id, AgentRun.workspace_id == workspace_id
+                )
             )
-        )
+        ).first()
+        run_status, request_id = (run_row.status, run_row.request_id) if run_row else (None, None)
         ended = run_status not in ACTIVE_RUN_STATUSES
         events = await service.list_events(
             workspace_id, run_id, user_id, since=None if ended else since
         )
-    missed = [event_payload(event) for event in events if str(event.id) not in sent_ids]
+    missed = [
+        event_payload(event, request_id) for event in events if str(event.id) not in sent_ids
+    ]
     return missed, ended
 
 

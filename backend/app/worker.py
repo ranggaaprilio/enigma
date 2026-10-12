@@ -108,6 +108,23 @@ async def _status(session_maker, model, run_id: UUID) -> str | None:
         return await session.scalar(select(model.status).where(model.id == run_id))
 
 
+async def _correlation(session_maker, model, run_id: UUID) -> dict[str, str]:
+    """The request id (and trace context) stamped on the run at creation (Epic 09).
+
+    Bound into the job's log context so a run reads as one story across API and worker. The
+    job payload carries only the run id, so this comes off the row after the claim.
+    """
+    async with session_maker() as session:
+        row = (
+            await session.execute(
+                select(model.request_id, model.traceparent).where(model.id == run_id)
+            )
+        ).first()
+    if row is None or not row.request_id:
+        return {}
+    return {"request_id": row.request_id}
+
+
 async def _stop_when_inactive(session_maker, runtime, run_id: UUID) -> None:
     while True:
         await asyncio.sleep(RUN_STATUS_POLL_SECONDS)
@@ -155,6 +172,9 @@ async def run_agent_job(ctx: dict[str, Any], run_id: str) -> str:
             log.info("agent_job_skipped", outcome=claim.outcome)
             return claim.outcome
 
+        correlation = await _correlation(session_maker, AgentRun, run_uuid)
+        structlog.contextvars.bind_contextvars(**correlation)
+        log = log.bind(**correlation)
         stop_event = asyncio.Event()
         runtime.register_run(run_uuid, asyncio.current_task(), stop_event)
         try:
@@ -180,6 +200,7 @@ async def run_agent_job(ctx: dict[str, Any], run_id: str) -> str:
                     await asyncio.gather(poller, return_exceptions=True)
         finally:
             runtime.forget_run(run_uuid)
+            structlog.contextvars.unbind_contextvars(*correlation)
 
 
 async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
@@ -219,6 +240,9 @@ async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
             log.info("command_job_skipped", outcome=outcome)
             return outcome
 
+        correlation = await _correlation(session_maker, CommandRun, run_uuid)
+        structlog.contextvars.bind_contextvars(**correlation)
+        log = log.bind(**correlation)
         # Confirmation was enforced when the API accepted the run. arq treats any exception as
         # final, so whatever escapes is recorded on the run here rather than leaving it running.
         timeout = settings.command_run_max_timeout_seconds + COMMAND_TIMEOUT_MARGIN_SECONDS
@@ -244,6 +268,8 @@ async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
             log.exception("command_job_failed")
             await service.fail_active_run(run_uuid, WORKER_ERROR, WORKER_ERROR_MESSAGE)
             return WORKER_ERROR
+        finally:
+            structlog.contextvars.unbind_contextvars(*correlation)
     return await _status(session_maker, CommandRun, run_uuid) or "missing"
 
 
@@ -276,26 +302,28 @@ async def finalize_spec_phase_job(ctx: dict[str, Any], phase_id: str, run_id: st
         run_status = run.status if run is not None else "error"
         user_id = run.user_id if run is not None else workflow.user_id
         workflow_id, phase_name = workflow.id, phase.phase
+        correlation = {"request_id": run.request_id} if run and run.request_id else {}
 
     # A fresh session: finalizing runs git in the sandbox, too long to hold the read open.
-    async with session_maker() as session:
-        service = SpecKitService(
-            session,
-            session_maker,
-            settings,
-            runtime=ctx.get("daytona_runtime"),
-            dispatcher=ctx.get("dispatcher"),
-        )
-        if run_status not in _TERMINAL_RUN_STATUSES:
-            if job_try < spec_finalize_max_tries(settings) - FINALIZE_RETRY_SLACK:
-                raise Retry(defer=settings.spec_finalize_poll_seconds)
-            await service._mark_phase_failed(
-                workflow_id, phase_name, user_id, "its agent run did not finish in time"
+    with structlog.contextvars.bound_contextvars(**correlation):
+        async with session_maker() as session:
+            service = SpecKitService(
+                session,
+                session_maker,
+                settings,
+                runtime=ctx.get("daytona_runtime"),
+                dispatcher=ctx.get("dispatcher"),
             )
-            return "error"
-        await service._finalize_phase(
-            workflow_id, phase_name, run_uuid, user_id, run_status=run_status
-        )
+            if run_status not in _TERMINAL_RUN_STATUSES:
+                if job_try < spec_finalize_max_tries(settings) - FINALIZE_RETRY_SLACK:
+                    raise Retry(defer=settings.spec_finalize_poll_seconds)
+                await service._mark_phase_failed(
+                    workflow_id, phase_name, user_id, "its agent run did not finish in time"
+                )
+                return "error"
+            await service._finalize_phase(
+                workflow_id, phase_name, run_uuid, user_id, run_status=run_status
+            )
     return await _status(session_maker, SpecPhase, phase_uuid) or "stale"
 
 

@@ -12,6 +12,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
 from app.core.lifecycle import lifecycle
+from app.core.middleware import current_request_id
 from app.core.pricing import estimate_cost
 from app.models import AgentEvent, AgentFileChange, AgentRun, AgentSession, Workspace
 from app.services.access import require_workspace_access
@@ -154,8 +155,9 @@ class AgentRuntime:
 agent_runtime = AgentRuntime(run_registry, event_bus)
 
 
-def event_payload(event: AgentEvent) -> dict:
-    return {
+def event_payload(event: AgentEvent, request_id: str | None = None) -> dict:
+    """A stream frame for ``event``; ``request_id`` is the run's (Epic 09), when it has one."""
+    payload = {
         "id": str(event.id),
         "agent_run_id": str(event.agent_run_id),
         "event_type": event.event_type,
@@ -164,6 +166,9 @@ def event_payload(event: AgentEvent) -> dict:
         "metadata": event.event_metadata,
         "created_at": event.created_at.isoformat(),
     }
+    if request_id:
+        payload["request_id"] = request_id
+    return payload
 
 
 def provider_from_settings(settings: Settings) -> AgentProvider:
@@ -319,6 +324,7 @@ class AgentService:
                 provider=provider.provider_name,
                 model=provider.model_name,
                 working_dir=working_dir,
+                request_id=current_request_id(),
             )
             try:
                 # Savepoint: a violation rolls back only this insert, leaving the session usable.
@@ -1100,7 +1106,12 @@ class AgentService:
         await session.flush()
         await session.commit()
         await session.refresh(event)
-        await self.runtime.publish(run_id, event_payload(event))
+        # The run is already in this session's identity map on the execution path, so this
+        # is a lookup, not a query; the terminal paths pay one primary-key read.
+        run = await session.get(AgentRun, run_id)
+        await self.runtime.publish(
+            run_id, event_payload(event, run.request_id if run is not None else None)
+        )
         return event
 
     async def _mark_stopped(self, run_id: UUID) -> None:

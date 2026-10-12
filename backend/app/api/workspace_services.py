@@ -11,6 +11,7 @@ from app.api.auth import CURRENT_USER_DEP
 from app.api.commands import websocket_user
 from app.api.rate_limits import SANDBOX_RATE_LIMIT_DEP
 from app.core.config import Settings, get_settings
+from app.core.middleware import websocket_context
 from app.db.session import async_session_maker, get_db_session
 from app.models import User, Workspace, WorkspaceService
 from app.schemas.workspace_services import (
@@ -291,6 +292,7 @@ async def get_workspace_service_logs(
 
 
 @router.websocket("/{service_id}/logs/stream")
+@websocket_context("service_logs")
 async def stream_workspace_service_logs(
     websocket: WebSocket, workspace_id: UUID, service_id: UUID
 ) -> None:

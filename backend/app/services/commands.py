@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.core.lifecycle import lifecycle
+from app.core.middleware import current_request_id
 from app.models import CommandRun, CustomCommand, Workspace
 from app.services.agent_tools import DangerousCommandError
 from app.services.audit import AuditLogService
@@ -109,6 +110,8 @@ def command_status_frame(run: CommandRun) -> dict:
     frame = {"type": "status", "status": run.status, "exit_code": run.exit_code}
     if run.error_reason:
         frame["reason"] = run.error_reason
+    if run.request_id:
+        frame["request_id"] = run.request_id
     return frame
 
 
@@ -422,6 +425,7 @@ class CommandService:
             cwd=relative_cwd or None,
             status="running",
             output="",
+            request_id=current_request_id(),
         )
         self.session.add(run)
         await self.session.flush()
@@ -724,9 +728,10 @@ class CommandService:
         await session.flush()
         await session.commit()
         await session.refresh(run)
-        await self.runtime.publish(
-            run.id, {"type": "output", "content": persisted, "offset": len(previous)}
-        )
+        frame = {"type": "output", "content": persisted, "offset": len(previous)}
+        if run.request_id:
+            frame["request_id"] = run.request_id
+        await self.runtime.publish(run.id, frame)
 
     async def _mark_finished(
         self,

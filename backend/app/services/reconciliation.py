@@ -127,7 +127,11 @@ async def reconcile_interrupted_runs(
         await session.flush()
         for event in events:
             await session.refresh(event)
-        agent_payloads = [(event.agent_run_id, event_payload(event)) for event in events]
+        request_ids = {run.id: run.request_id for run in agent_runs}
+        agent_payloads = [
+            (event.agent_run_id, event_payload(event, request_ids.get(event.agent_run_id)))
+            for event in events
+        ]
         command_payloads = [(run.id, command_status_frame(run)) for run in command_runs]
         await session.commit()
 

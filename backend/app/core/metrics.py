@@ -32,6 +32,14 @@ run_queue_depth = Gauge(
     "Runs enqueued but not yet claimed by a worker, as last seen at admission.",
 )
 
+# Epic 09: WebSocket handlers in flight on this API replica, from handshake to close
+# (``app.core.middleware.websocket_context``).
+ws_connections = Gauge(
+    "ws_connections",
+    "WebSocket connections open on this replica, by stream kind.",
+    labelnames=("kind",),
+)
+
 # Epic 07: the preview proxy (its own process, scraped separately from the API).
 preview_proxy_requests_total = Counter(
     "preview_proxy_requests_total",

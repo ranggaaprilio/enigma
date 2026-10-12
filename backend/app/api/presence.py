@@ -5,6 +5,7 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
+from app.core.middleware import websocket_context
 from app.core.security import verify_session_token
 from app.db.session import async_session_maker
 from app.models import User
@@ -23,6 +24,7 @@ PRESENCE_SUBSCRIBE_TIMEOUT_SECONDS = 5
 
 
 @router.websocket("/stream")
+@websocket_context("presence")
 async def stream_presence(websocket: WebSocket, workspace_id: UUID) -> None:
     settings = get_settings()
     async with async_session_maker() as session:
