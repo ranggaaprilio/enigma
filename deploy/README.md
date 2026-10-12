@@ -40,7 +40,9 @@ validates it with kubeconform, then builds and Trivy-scans both images.
   `test_previews_are_cross_site_from_the_app` enforces this for the base hosts; keep it true
   when an overlay sets real ones.
 - Managed **Postgres** (+ optional PgBouncer, epic 05) and **Redis**, outside the cluster.
-- Prometheus in namespace `monitoring` if you scrape `/metrics` (bearer `METRICS_TOKEN`).
+- Prometheus in namespace `monitoring` if you scrape `/metrics` (bearer `METRICS_TOKEN`): the
+  API and proxy on their HTTP ports, workers on `METRICS_PORT` (9102). Optionally an
+  OpenTelemetry Collector there too (`OTEL_EXPORTER_OTLP_ENDPOINT`, port 4318); see Epic 09.
 
 ## Secrets
 

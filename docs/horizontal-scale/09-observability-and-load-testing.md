@@ -81,3 +81,63 @@ span replicas and workers, and trust capacity numbers instead of guessing.
 - A capacity model document exists with concrete scaling guidance and is linked from
   `00-index.md`.
 - SLO-based alerting is live.
+
+## Implementation Notes (shipped: correlation, metrics, tracing)
+
+The "Current State" above predates `improvement-epics/07`: request-id middleware
+(`core/middleware.py`), the API `/metrics` (`prometheus-fastapi-instrumentator` in `app.main`,
+custom series in `core/metrics.py`), the proxy's hand-rolled `/metrics` and the
+Prometheus-gated NetworkPolicy already existed. This pass shipped the three observability
+items; dashboards/alert rules, the load/chaos harness (**k6** is the chosen tool: single binary,
+native WebSockets, thresholds map onto SLOs) and the capacity model are the open follow-ups.
+
+- **Correlation.** Migration `0035_run_correlation` adds nullable `request_id` and
+  `traceparent` to `agent_runs` and `command_runs`. `create_run` stamps both from the current
+  context (`current_request_id()` reads the structlog contextvars that the HTTP middleware,
+  `websocket_context` and the worker bind). The job payload still carries only the run id: the
+  worker reads the pair off the row after claiming (`worker._correlation`) and binds
+  `request_id` into its log context for the job, unbinding on exit. Agent event frames and
+  command status/output frames carry `request_id` on both the live and the backfill path, so a
+  frame stays re-derivable from Postgres (gotcha 20); the key is present only when the run has
+  one, so the existing exact-frame tests held. A caller-supplied `X-Request-ID` must match
+  `[A-Za-z0-9._-]{1,64}` or is regenerated (it lands in logs, rows and frames). WebSocket
+  handlers are wrapped in `websocket_context(kind)` (handshake `X-Request-ID`, per-connection log
+  context, the `ws_connections{kind}` gauge); the preview proxy is untouched.
+- **Metrics, worker side** (`core/metrics.py`, observed where runs execute): queue wait
+  (`enqueued_at → claimed_at`), run-start latency (enqueue → first event/output), run duration,
+  `runs_finished_total{kind,status,reason}`, LLM request and time-to-first-token histograms,
+  `llm_tokens_total` and `llm_cost_usd_total` by provider/model (from `_record_run_finished`,
+  i.e. `core/pricing`), `run_lease_lost_total`, `reaper_runs_ended_total{kind}`,
+  `reaper_sweeps_total{result}`. Workers now serve `/metrics` on `METRICS_PORT` (9102) from a
+  token-gated threaded WSGI listener (`app/worker_metrics.py`) started in the arq startup hook;
+  it stays off the event loop and never touches signals, which arq owns. `worker.yaml` exposes
+  the port and the worker NetworkPolicy admits only the Prometheus pods on it.
+- **Metrics, fleet side** (`services/fleet_metrics.py`): every API replica runs a sampler task
+  (`METRICS_SAMPLE_INTERVAL_SECONDS`, default 15) that reads Postgres aggregates and rebuilds
+  `fleet_queue_depth{kind}`, `fleet_active_runs{team}`, `fleet_tokens_last_hour{team}` and
+  `fleet_cost_usd_last_hour{team}` from scratch, plus `fleet_sample_timestamp_seconds` for
+  staleness alerts. A scrape never queries the database. Tenant cardinality is bounded: the
+  busiest `METRICS_TENANT_LABEL_LIMIT` (20) teams are labelled by id, the rest are summed into
+  `team="other"`, team-less workspaces are `team="none"`, and a team that goes quiet disappears
+  rather than lingering at zero. Every replica reports the same numbers: **aggregate with
+  `max()`/`avg()`, never `sum()`** (it is in each HELP string). `capacity.waiting_run_counts()`
+  is the one queue-depth definition shared by admission, the sampler and (via its test) the
+  KEDA trigger. `DbPoolCollector` reports pool occupancy at scrape time from the engine's own
+  counters (nothing under `NullPool`/PgBouncer); `ping_redis(role)` times a PING from the API
+  sampler and a worker probe loop.
+- **Tracing** (`core/tracing.py`): off until `OTEL_EXPORTER_OTLP_ENDPOINT` is set, then an SDK
+  provider (`service.name` `enigma-api`/`enigma-worker`, `service.instance.id`,
+  `ParentBased(TraceIdRatioBased(OTEL_TRACES_SAMPLE_RATIO=0.1))`, OTLP/HTTP batch exporter
+  flushed on shutdown) and FastAPI, SQLAlchemy (`sync_engine`, no SQL commenter), redis, httpx
+  and aiohttp-client (the Daytona SDK) instrumentation. It is configured before any middleware
+  and before anything imports OpenHands: the Daytona SDK and Laminar each install a global
+  provider only when their own env flags are set, and OpenTelemetry keeps the first. The run
+  row's `traceparent` is captured under the request's server span; the worker executes each job
+  inside a `CONSUMER` span (`run_span`) that is its child and binds `trace_id` into the log
+  context next to `request_id`, so logs, metrics and spans share ids. API and worker
+  NetworkPolicies allow 4318 to `app.kubernetes.io/name: opentelemetry-collector` pods in
+  `monitoring`; relabel in the overlay. The instrumentation packages are pinned to `0.60b1`,
+  matching the otel 1.39.1 stack `openhands-sdk` already locks.
+- **Tests**: `test_correlation.py`, `test_metrics_runs.py`, `test_fleet_metrics.py`,
+  `test_worker_metrics.py`, `test_tracing.py`; `test_deployment.py` now requires the worker's
+  only ingress to be the scrape port it exposes and the OTLP egress to name collector pods.
