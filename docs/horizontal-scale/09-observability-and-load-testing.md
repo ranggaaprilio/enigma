@@ -112,9 +112,11 @@ native WebSockets, thresholds map onto SLOs) and the capacity model are the open
   `llm_tokens_total` and `llm_cost_usd_total` by provider/model (from `_record_run_finished`,
   i.e. `core/pricing`), `run_lease_lost_total`, `reaper_runs_ended_total{kind}`,
   `reaper_sweeps_total{result}`. Workers now serve `/metrics` on `METRICS_PORT` (9102) from a
-  token-gated thread-per-connection WSGI listener (`app/worker_metrics.py`, 10s request
+  token-gated thread-per-connection WSGI listener (`app/worker_metrics.py`, 3s request
   timeout and at most 8 connections in flight, so a stalled client never blocks the next
-  scrape and a flood never grows the thread count) started in the arq startup hook;
+  scrape and a flood never grows the thread count; a flood of slow connections can still
+  cost a few seconds of scrapes, which is why the NetworkPolicy, not this code, is the
+  boundary) started in the arq startup hook;
   it stays off the event loop, never touches signals (arq owns them), and is best-effort: a
   port that cannot be bound is a warning, not a failed worker. It is stopped last at shutdown,
   off the loop, so the drained runs' final values are still scrapable. It binds IPv4

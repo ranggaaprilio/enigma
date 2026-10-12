@@ -28,8 +28,10 @@ logger = structlog.get_logger(__name__)
 
 
 class _QuietHandler(WSGIRequestHandler):
-    # A client that connects and never sends a request line is dropped after this long.
-    timeout = 10
+    # A client that connects and never sends a request line is dropped after this long. A
+    # scrape's request line arrives within milliseconds, so this is generous; it also bounds
+    # how long stalled connections can hold the server's in-flight slots (see below).
+    timeout = 3
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002 (wsgiref's name)
         return
@@ -39,7 +41,10 @@ class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
     """One thread per connection, but never more than ``max_in_flight`` of them.
 
     A scraper needs one connection at a time; anything beyond a few is a misbehaving client
-    or a flood, and is closed on accept instead of growing the thread count.
+    or a flood, and is closed on accept instead of growing the thread count. Slots held by
+    stalled connections free up within the handler timeout, so the worst a slow-connection
+    flood costs is a few seconds of scrapes. The real boundary is the NetworkPolicy: only the
+    Prometheus pods can reach this port at all.
     """
 
     daemon_threads = True
