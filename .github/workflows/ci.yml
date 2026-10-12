@@ -96,3 +96,46 @@ jobs:
 
       - name: Build + typecheck (tsc -b && vite build)
         run: pnpm --filter execute-dashboard-frontend run build
+
+  # Epic 08: the production images and Kubernetes manifests. Builds and scans only -- nothing is
+  # pushed or deployed from here. Tool images are pinned; Trivy's vulnerability DB is fetched
+  # fresh on every run.
+  deploy:
+    name: Deploy artifacts (manifests + images)
+    runs-on: ubuntu-latest
+    env:
+      KUBECONFORM_IMAGE: ghcr.io/yannh/kubeconform:v0.6.7
+      TRIVY_IMAGE: aquasec/trivy:0.56.2
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Render manifests (kustomize)
+        run: kubectl kustomize deploy/k8s/overlays/production > rendered.yaml
+
+      - name: Validate manifests (kubeconform, incl. KEDA CRDs)
+        run: >-
+          docker run --rm -v "$PWD:/work:ro" "$KUBECONFORM_IMAGE"
+          -strict -summary -kubernetes-version 1.30.0
+          -schema-location default
+          -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+          /work/rendered.yaml
+
+      - name: Build backend image
+        run: docker build -t enigma-backend:ci backend
+
+      - name: Build frontend image
+        run: >-
+          docker build -t enigma-frontend:ci
+          --build-arg VITE_API_BASE_URL=https://api.enigma.example.com frontend
+
+      - name: Scan images (Trivy, HIGH/CRITICAL with a fix available)
+        run: |
+          for image in enigma-backend:ci enigma-frontend:ci; do
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+              --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed --scanners vuln "$image"
+            # Secrets in our own layers only: third-party packages ship PEM-marker constants
+            # and README examples that are not credentials.
+            docker run --rm -v /var/run/docker.sock:/var/run/docker.sock "$TRIVY_IMAGE" image \
+              --exit-code 1 --scanners secret --skip-dirs /app/.venv "$image"
+          done
