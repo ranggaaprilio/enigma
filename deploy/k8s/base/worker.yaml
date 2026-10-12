@@ -1,0 +1,145 @@
+# Run-execution workers (Epic 02, arq). Serve nothing; scale on queue depth via KEDA.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enigma-worker
+  labels:
+    app.kubernetes.io/name: enigma
+    app.kubernetes.io/component: worker
+spec:
+  # No `replicas`: the KEDA ScaledObject's HPA owns the count.
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: enigma
+      app.kubernetes.io/component: worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      # Replacements come up at once and take new jobs while the old pods finish theirs.
+      maxSurge: 100%
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: enigma
+        app.kubernetes.io/component: worker
+    spec:
+      automountServiceAccountToken: false
+      # A rolled or scaled-in worker stops taking jobs and lets in-flight runs finish: the
+      # grace covers SHUTDOWN_RUN_GRACE_SECONDS (= the longest job) plus the shutdown sweep.
+      # Draining pods linger up to this long; that is the price of "no interrupted runs".
+      terminationGracePeriodSeconds: 7620
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: worker
+          image: enigma-backend:dev
+          args: ["arq", "app.worker.WorkerSettings"]
+          envFrom:
+            - configMapRef:
+                name: enigma-config
+            - secretRef:
+                name: enigma-secrets
+          env:
+            # WORKER_ID defaults to the hostname: the pod name, unique per replica.
+            - name: WORKER_MAX_JOBS
+              value: "10"
+            # arq's job_completion_wait. Must stay >= WORKER_JOB_TIMEOUT_SECONDS (default
+            # 7500s = 2h05m, the agent-run backstop) and below terminationGracePeriodSeconds.
+            - name: SHUTDOWN_RUN_GRACE_SECONDS
+              value: "7500"
+            # A smaller pool per worker, so a run surge cannot take the API's connections.
+            - name: DB_POOL_SIZE
+              value: "3"
+            - name: DB_MAX_OVERFLOW
+              value: "2"
+          # No probes: a worker has no port. A crashed worker exits and is restarted; a wedged
+          # run is ended by another worker's reaper once its lease expires (Epic 04).
+          resources:
+            requests:
+              cpu: 500m
+              memory: 1Gi
+            limits:
+              memory: 2Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 1Gi
+---
+# Requires KEDA (https://keda.sh) in the cluster. Postgres is authoritative for the queue
+# (AGENTS.md gotcha 23), so the trigger counts run rows, not arq's Redis keys: every queued run
+# still active -- waiting for a claim or executing on a worker. Mirrors the columns
+# services/capacity.py counts; tests/test_deployment.py keeps the two in step.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: enigma-worker
+spec:
+  scaleTargetRef:
+    name: enigma-worker
+  # One warm worker keeps cold starts off the first run. An overlay may lower this to 0 when
+  # the cold-start budget allows (the trigger still wakes the fleet on the first enqueue).
+  minReplicaCount: 1
+  maxReplicaCount: 20
+  pollingInterval: 15
+  cooldownPeriod: 300
+  # If the trigger itself fails (missing secret, revoked SELECT, Postgres unreachable from
+  # KEDA) hold a working fleet instead of sitting at the minimum while the queue backs up.
+  fallback:
+    failureThreshold: 3
+    replicas: 4
+  advanced:
+    horizontalPodAutoscalerConfig:
+      behavior:
+        scaleUp:
+          stabilizationWindowSeconds: 0
+          policies:
+            - type: Pods
+              value: 4
+              periodSeconds: 30
+        scaleDown:
+          stabilizationWindowSeconds: 600
+          policies:
+            - type: Pods
+              value: 1
+              periodSeconds: 300
+  triggers:
+    - type: postgresql
+      authenticationRef:
+        name: enigma-worker-keda
+      metadata:
+        # Desired workers = ceil(active queued runs / target). Below WORKER_MAX_JOBS (10) to
+        # leave headroom for a burst while new pods start.
+        targetQueryValue: "8"
+        activationTargetQueryValue: "0"
+        query: >-
+          SELECT
+            (SELECT count(*) FROM agent_runs
+              WHERE status IN ('thinking', 'executing') AND enqueued_at IS NOT NULL)
+          + (SELECT count(*) FROM command_runs
+              WHERE status = 'running' AND enqueued_at IS NOT NULL)
+---
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: enigma-worker-keda
+spec:
+  secretTargetRef:
+    # A libpq connection string for a read-only role (SELECT on agent_runs, command_runs):
+    # "postgresql://keda_reader:...@host:5432/execute_dashboard?sslmode=require".
+    - parameter: connection
+      name: enigma-keda-postgres
+      key: connection

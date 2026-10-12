@@ -1,0 +1,20 @@
+# Epic 08: the orchestrated, autoscaling deployment. Apply an overlay, never the base directly:
+#   kubectl apply -k deploy/k8s/overlays/production
+# Runbook (secrets, migrations, rollout, rollback, scaling knobs): deploy/README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: enigma
+    includeSelectors: false
+
+resources:
+  - config.yaml
+  - api.yaml
+  - worker.yaml
+  - preview-proxy.yaml
+  - frontend.yaml
+  - migrate-job.yaml
+  - ingress.yaml
+  - network-policies.yaml

@@ -1,0 +1,85 @@
+# Edge: HTTPS/WSS only, no sticky sessions (every tier is stateless), timeouts sized for the
+# long-lived agent, terminal and preview WebSockets. Written for ingress-nginx; cert-manager (or
+# any other issuer) provides the `enigma-tls` certificate, which must cover the preview wildcard.
+# The login rate limiter keys on the first X-Forwarded-For entry: keep ingress-nginx's default
+# `use-forwarded-headers: false` and make the controller see real client IPs (deploy/README.md).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: enigma
+  annotations:
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    # FILE_MAX_UPLOAD_BYTES (10 MB) plus multipart overhead.
+    nginx.ingress.kubernetes.io/proxy-body-size: "12m"
+    # Retry on another endpoint when a pod goes away mid-rollout (nginx never retries a
+    # non-idempotent request that already reached an upstream).
+    nginx.ingress.kubernetes.io/proxy-next-upstream: "error timeout http_502 http_503"
+    nginx.ingress.kubernetes.io/proxy-next-upstream-tries: "3"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - app.enigma.example.com
+        - api.enigma.example.com
+      secretName: enigma-tls
+  rules:
+    - host: app.enigma.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: enigma-frontend
+                port:
+                  name: http
+    - host: api.enigma.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: enigma-api
+                port:
+                  name: http
+---
+# Previews are a tenant's own dev server, so they get their own edge settings: no API upload
+# cap, streamed (unbuffered) requests and responses for HMR/SSE, and no retry on 503 -- that is
+# the proxy's self-retrying "Waking preview..." page, which a retry would only delay. Every
+# preview host is `<capability-or-alias>.preview...`; the bare proxy host is not exposed (probes
+# answer on the pod IP, /metrics is scraped in-cluster).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: enigma-preview
+  annotations:
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+    nginx.ingress.kubernetes.io/proxy-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-request-buffering: "off"
+    nginx.ingress.kubernetes.io/proxy-next-upstream: "error timeout"
+    nginx.ingress.kubernetes.io/proxy-next-upstream-tries: "3"
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - "*.preview.enigma.example.com"
+      secretName: enigma-tls
+  rules:
+    - host: "*.preview.enigma.example.com"
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: enigma-preview-proxy
+                port:
+                  name: http

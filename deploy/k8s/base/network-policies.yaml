@@ -1,0 +1,212 @@
+# Least privilege between tiers. Everything is denied, then each workload gets exactly what it
+# needs. Requires a CNI that enforces NetworkPolicy (Calico, Cilium, ...).
+#   - DNS only to the cluster resolver (kube-dns), so nothing tunnels out over port 53.
+#   - HTTPS (Daytona, the LLM endpoint, GitHub) only to public addresses: private, CGNAT and
+#     link-local ranges are excluded, which keeps the cluster's own API server, other services
+#     and cloud metadata out of reach of an SSRF through an owner-set LLM URL or git remote. A
+#     self-hosted Daytona or LLM on a private address needs an extra rule in the overlay.
+#   - Postgres/Redis are managed services, often on private addresses, so those rules are port
+#     scoped only; an overlay should add the providers' CIDRs as `to:`.
+# Ingress comes only from the ingress controller's namespace, plus the Prometheus pods for
+# /metrics (which still needs METRICS_TOKEN).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: enigma-api
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: enigma
+      app.kubernetes.io/component: api
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: 8000
+          protocol: TCP
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Postgres (direct, or PgBouncer on 6432) and Redis.
+    - ports:
+        - port: 5432
+          protocol: TCP
+        - port: 6432
+          protocol: TCP
+        - port: 6379
+          protocol: TCP
+    # Daytona API + sandboxes, the LLM endpoint, GitHub.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+      ports:
+        - port: 443
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: enigma-worker
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: enigma
+      app.kubernetes.io/component: worker
+  # Ingress listed with no rules: workers accept no connections at all.
+  policyTypes: ["Ingress", "Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 5432
+          protocol: TCP
+        - port: 6432
+          protocol: TCP
+        - port: 6379
+          protocol: TCP
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+      ports:
+        - port: 443
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: enigma-preview-proxy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: enigma
+      app.kubernetes.io/component: preview-proxy
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: 8001
+          protocol: TCP
+  # No Redis: the proxy is HMAC + Postgres only.
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 5432
+          protocol: TCP
+        - port: 6432
+          protocol: TCP
+    # Daytona API + sandbox preview upstreams.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
+      ports:
+        - port: 443
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: enigma-frontend
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: enigma
+      app.kubernetes.io/component: frontend
+  # Egress listed with no rules: static files need no outbound traffic.
+  policyTypes: ["Ingress", "Egress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: ingress-nginx
+      ports:
+        - port: 8080
+          protocol: TCP
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: enigma-migrate
+  labels:
+    enigma/phase: pre-deploy
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: enigma
+      app.kubernetes.io/component: migrate
+  policyTypes: ["Ingress", "Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - ports:
+        - port: 5432
+          protocol: TCP
