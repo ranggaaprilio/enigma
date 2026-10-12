@@ -36,7 +36,35 @@ class _QuietHandler(WSGIRequestHandler):
 
 
 class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
+    """One thread per connection, but never more than ``max_in_flight`` of them.
+
+    A scraper needs one connection at a time; anything beyond a few is a misbehaving client
+    or a flood, and is closed on accept instead of growing the thread count.
+    """
+
     daemon_threads = True
+    request_queue_size = 8
+    max_in_flight = 8
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        super().__init__(*args, **kwargs)
+        self._slots = threading.BoundedSemaphore(self.max_in_flight)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def metrics_wsgi_app(token: str | None) -> Callable[[dict, Callable], Iterable[bytes]]:

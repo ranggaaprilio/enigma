@@ -6,7 +6,7 @@ import socket
 
 import httpx
 
-from app.worker_metrics import WorkerMetricsServer, start_if_possible
+from app.worker_metrics import WorkerMetricsServer, _ThreadingWSGIServer, start_if_possible
 from tests.test_job_queue import queue_settings
 
 
@@ -65,3 +65,23 @@ def test_a_taken_port_costs_the_worker_its_metrics_not_its_startup() -> None:
         assert start_if_possible(queue_settings(metrics_port=taken)) is None
     finally:
         holder.close()
+
+
+def test_connections_beyond_the_cap_are_dropped_not_threaded() -> None:
+    server = _serve(metrics_token=None)
+    stalled = [
+        socket.create_connection(("127.0.0.1", server.port))
+        for _ in range(_ThreadingWSGIServer.max_in_flight)
+    ]
+    try:
+        extra = socket.create_connection(("127.0.0.1", server.port))
+        extra.settimeout(5)
+        assert extra.recv(1) == b"", "the connection past the cap must be closed on accept"
+        extra.close()
+        # Freeing one slot lets a real scrape through again.
+        stalled.pop().close()
+        assert httpx.get(f"http://127.0.0.1:{server.port}/metrics", timeout=5).status_code == 200
+    finally:
+        for sock in stalled:
+            sock.close()
+        server.stop()
