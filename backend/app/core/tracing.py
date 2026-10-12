@@ -9,13 +9,20 @@ nothing is installed and every helper below is a cheap no-op on the API's non-re
 A run's trace crosses processes through the ``traceparent`` column on its row (migration
 0035): ``current_traceparent()`` captures it in ``create_run`` under the request's server span,
 and the worker's ``run_span`` starts a CONSUMER span as that span's child.
+
+Incoming trace context is never trusted: the global propagator only *injects*, so a
+``traceparent`` header from a browser or an upstream proxy cannot choose our trace ids or force
+sampling, and every API server span is a root sampled by our own ratio. The worker extracts
+the run row's context explicitly, which the API wrote.
 """
 
 from __future__ import annotations
 
 import socket
+import typing
 from collections.abc import Iterator
 from contextlib import contextmanager
+from urllib.parse import urlsplit
 
 import structlog
 from opentelemetry import context as otel_context
@@ -25,6 +32,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 from opentelemetry.trace import SpanKind
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 
 from app.core.config import Settings
 
@@ -33,6 +41,21 @@ logger = structlog.get_logger(__name__)
 TRACEPARENT_HEADER = "traceparent"
 # Health/metrics endpoints are scraped constantly and tell nothing about a request's story.
 UNTRACED_URLS = "live,ready,health,metrics"
+
+# The W3C format itself, used only where *we* wrote the carrier (the run row).
+_W3C = TraceContextTextMapPropagator()
+
+
+class InjectOnlyPropagator(TraceContextTextMapPropagator):
+    """W3C ``traceparent`` out, nothing in: inbound headers never become a span's parent."""
+
+    def extract(
+        self,
+        carrier: typing.Any,
+        context: otel_context.Context | None = None,
+        getter: typing.Any = None,
+    ) -> otel_context.Context:
+        return context if context is not None else otel_context.get_current()
 
 
 def build_tracer_provider(
@@ -84,13 +107,15 @@ def configure_tracing(
     if trace.get_tracer_provider() is not provider:
         # Something (Laminar, the Daytona SDK) got there first; our spans would go nowhere.
         logger.warning("tracing_provider_already_set", service=service_name)
+    propagate.set_global_textmap(InjectOnlyPropagator())
     # The async engine wraps a sync one; that is what the instrumentation hooks. No SQL
     # commenter: behind PgBouncer the comment only defeats statement caching.
     SQLAlchemyInstrumentor().instrument(engine=engine.sync_engine, enable_commenter=False)
     RedisInstrumentor().instrument()
     HTTPXClientInstrumentor().instrument()
     AioHttpClientInstrumentor().instrument()
-    logger.info("tracing_configured", service=service_name, endpoint=endpoint)
+    # The host only: an endpoint URL may carry credentials.
+    logger.info("tracing_configured", service=service_name, collector=urlsplit(endpoint).hostname)
     return provider
 
 
@@ -132,7 +157,7 @@ def run_span(name: str, traceparent: str | None, **attributes: str | int) -> Ite
     and spans join up.
     """
     parent = (
-        propagate.extract({TRACEPARENT_HEADER: traceparent})
+        _W3C.extract({TRACEPARENT_HEADER: traceparent})
         if traceparent
         else otel_context.get_current()
     )

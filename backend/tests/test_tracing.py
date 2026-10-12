@@ -6,7 +6,7 @@ import pytest
 import structlog
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from opentelemetry import trace
+from opentelemetry import propagate, trace
 from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
@@ -15,6 +15,7 @@ from opentelemetry.sdk.trace.sampling import ParentBased, TraceIdRatioBased
 
 from app.core.middleware import RequestContextMiddleware
 from app.core.tracing import (
+    InjectOnlyPropagator,
     build_tracer_provider,
     configure_tracing,
     current_trace_id,
@@ -42,6 +43,7 @@ def recording_provider():
         provider = TracerProvider()
         trace.set_tracer_provider(provider)
     provider.add_span_processor(SimpleSpanProcessor(EXPORTER))
+    propagate.set_global_textmap(InjectOnlyPropagator())  # what configure_tracing installs
     yield provider
 
 
@@ -138,8 +140,11 @@ def test_request_context_middleware_joins_logs_and_spans() -> None:
     async def ping() -> dict:
         return dict(structlog.contextvars.get_contextvars())
 
+    forged = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
     try:
-        response = TestClient(app).get("/ping", headers={"X-Request-ID": "req-traced"})
+        response = TestClient(app).get(
+            "/ping", headers={"X-Request-ID": "req-traced", "traceparent": forged}
+        )
     finally:
         FastAPIInstrumentor.uninstrument_app(app)
 
@@ -150,3 +155,13 @@ def test_request_context_middleware_joins_logs_and_spans() -> None:
     )
     assert body["trace_id"] == format(server_span.context.trace_id, "032x")
     assert server_span.attributes["enigma.request_id"] == "req-traced"
+    # A client-supplied traceparent neither picks our trace id nor becomes the parent.
+    assert server_span.parent is None
+    assert body["trace_id"] != "0af7651916cd43dd8448eb211c80319c"
+
+
+def test_inbound_trace_context_is_never_extracted_but_ours_still_propagates() -> None:
+    forged = {"traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"}
+    assert trace.get_current_span(propagate.extract(forged)).get_span_context().is_valid is False
+    with trace.get_tracer("test").start_as_current_span("ours"):
+        assert current_traceparent().startswith("00-")

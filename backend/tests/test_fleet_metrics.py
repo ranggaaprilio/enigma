@@ -8,17 +8,21 @@ from uuid import uuid4
 
 import fakeredis
 from prometheus_client import REGISTRY
+from sqlalchemy import select, text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.core.config import get_settings
 from app.core.metrics import DbPoolCollector
+from app.models import AgentRun
 from app.services.fleet_metrics import (
     NO_TEAM,
     OTHER_TEAMS,
     FleetMetricsSampler,
     bound_teams,
     ping_redis,
+    spend_by_team,
 )
 from tests.test_job_queue import db_session, make_run, queue_settings
 from tests.test_run_capacity import make_team, seed_workspace
@@ -135,3 +139,17 @@ async def test_ping_redis_observes_latency_or_counts_the_failure() -> None:
     assert await ping_redis("probe", lambda: fakeredis.aioredis.FakeRedis(server=server)) is False
     assert sample("redis_ping_errors_total", role="probe") == errors_before + 1
     assert sample("redis_ping_seconds_count", role="probe") == ok_before + 1
+
+
+async def test_spend_window_is_served_by_the_retention_index(db_session):
+    """Every replica runs this every few seconds: it must not scan the whole run table."""
+    session, _ = db_session
+    # The run-table access path alone: with a handful of rows the planner joins from
+    # workspaces first, which says nothing about how the window predicate is served.
+    window = select(AgentRun.id).where(spend_by_team(datetime.now(UTC)).whereclause)
+    statement = window.compile(
+        dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
+    )
+    await session.execute(text("SET LOCAL enable_seqscan = off"))
+    plan = "\n".join((await session.execute(text(f"EXPLAIN {statement}"))).scalars().all())
+    assert "ix_agent_runs_events_retention" in plan, plan

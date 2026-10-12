@@ -1043,7 +1043,9 @@ class AgentService:
                 async for provider_event in provider.stream_response(
                     prompt_for_provider, tools, stop_event
                 ):
-                    if first_event_at is None:
+                    # Every provider opens with a synthetic "thinking" status before any
+                    # model call; the first *content* event is the first token.
+                    if first_event_at is None and provider_event.event_type != "status":
                         first_event_at = datetime.now(UTC)
                         llm_time_to_first_token_seconds.labels(**llm_labels).observe(
                             time.perf_counter() - llm_started

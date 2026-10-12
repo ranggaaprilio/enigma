@@ -50,7 +50,7 @@ from app.services.speckit import (
     PHASE_FINALIZE_TIMEOUT_SECONDS,
     SpecKitService,
 )
-from app.worker_metrics import WorkerMetricsServer, run_redis_probe
+from app.worker_metrics import run_redis_probe, start_if_possible
 
 logger = structlog.get_logger(__name__)
 
@@ -367,7 +367,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     # Epic 05: every worker prunes; SKIP LOCKED batches split the work between them.
     ctx["retention"] = start_retention(async_session_maker, settings)
     # Epic 09: this worker's run/LLM/reaper metrics on METRICS_PORT, plus its Redis probe.
-    ctx["metrics_server"] = WorkerMetricsServer(settings).start()
+    ctx["metrics_server"] = start_if_possible(settings)
     ctx["redis_probe"] = asyncio.create_task(run_redis_probe(settings))
     logger.info("worker_started", worker_id=settings.worker_id, queue=settings.run_queue_name)
 
@@ -379,8 +379,6 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         if (task := ctx.get(name)) is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
-    if (metrics_server := ctx.get("metrics_server")) is not None:
-        metrics_server.stop()
     try:
         # arq has already waited `job_completion_wait` and cancelled what was still running;
         # cancelled runs were left active, so record them as interrupted now rather than when
@@ -395,8 +393,11 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         if isinstance(event_bus, RedisEventBus):
             await event_bus.aclose()
         await engine.dispose()
-        # After the drain, so the spans of the runs that just finished are exported.
-        shutdown_tracing(ctx.get("tracing"))
+        # Last, so the drained runs' final values are still scrapable and their spans are
+        # exported; both block, so they run off the loop.
+        if (metrics_server := ctx.get("metrics_server")) is not None:
+            await asyncio.to_thread(metrics_server.stop)
+        await asyncio.to_thread(shutdown_tracing, ctx.get("tracing"))
 
 
 _settings = get_settings()

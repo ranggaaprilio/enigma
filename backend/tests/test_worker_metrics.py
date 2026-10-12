@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import socket
+
 import httpx
 
-from app.worker_metrics import WorkerMetricsServer
+from app.worker_metrics import WorkerMetricsServer, start_if_possible
 from tests.test_job_queue import queue_settings
 
 
@@ -41,3 +43,25 @@ def test_worker_metrics_are_open_without_a_token_in_local_development() -> None:
         assert httpx.get(f"http://127.0.0.1:{server.port}/metrics").status_code == 200
     finally:
         server.stop()
+
+
+def test_a_stalled_client_does_not_block_the_next_scrape() -> None:
+    server = _serve(metrics_token=None)
+    stalled = socket.create_connection(("127.0.0.1", server.port))
+    try:
+        # Connected, never sends a request line: the listener must still answer others.
+        assert httpx.get(f"http://127.0.0.1:{server.port}/metrics", timeout=5).status_code == 200
+    finally:
+        stalled.close()
+        server.stop()
+
+
+def test_a_taken_port_costs_the_worker_its_metrics_not_its_startup() -> None:
+    holder = socket.socket()
+    holder.bind(("0.0.0.0", 0))
+    holder.listen()
+    try:
+        taken = holder.getsockname()[1]
+        assert start_if_possible(queue_settings(metrics_port=taken)) is None
+    finally:
+        holder.close()

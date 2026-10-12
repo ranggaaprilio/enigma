@@ -104,13 +104,20 @@ native WebSockets, thresholds map onto SLOs) and the capacity model are the open
   handlers are wrapped in `websocket_context(kind)` (handshake `X-Request-ID`, per-connection log
   context, the `ws_connections{kind}` gauge); the preview proxy is untouched.
 - **Metrics, worker side** (`core/metrics.py`, observed where runs execute): queue wait
-  (`enqueued_at → claimed_at`), run-start latency (enqueue → first event/output), run duration,
-  `runs_finished_total{kind,status,reason}`, LLM request and time-to-first-token histograms,
+  (`enqueued_at → claimed_at`), run-start latency (enqueue → first *content* event or output
+  chunk; the provider's opening "thinking" status does not count, nor does a command that
+  prints nothing), run duration,
+  `runs_finished_total{kind,status,reason}`, LLM time-to-first-token (first content event)
+  and whole-stream wall time (which includes the tool and sandbox calls the model makes),
   `llm_tokens_total` and `llm_cost_usd_total` by provider/model (from `_record_run_finished`,
   i.e. `core/pricing`), `run_lease_lost_total`, `reaper_runs_ended_total{kind}`,
   `reaper_sweeps_total{result}`. Workers now serve `/metrics` on `METRICS_PORT` (9102) from a
-  token-gated threaded WSGI listener (`app/worker_metrics.py`) started in the arq startup hook;
-  it stays off the event loop and never touches signals, which arq owns. `worker.yaml` exposes
+  token-gated thread-per-connection WSGI listener (`app/worker_metrics.py`, 10s request
+  timeout, so a stalled client never blocks the next scrape) started in the arq startup hook;
+  it stays off the event loop, never touches signals (arq owns them), and is best-effort: a
+  port that cannot be bound is a warning, not a failed worker. It is stopped last at shutdown,
+  off the loop, so the drained runs' final values are still scrapable. It binds IPv4
+  (`0.0.0.0`); an IPv6-only cluster needs a host knob. `worker.yaml` exposes
   the port and the worker NetworkPolicy admits only the Prometheus pods on it.
 - **Metrics, fleet side** (`services/fleet_metrics.py`): every API replica runs a sampler task
   (`METRICS_SAMPLE_INTERVAL_SECONDS`, default 15) that reads Postgres aggregates and rebuilds
@@ -131,9 +138,12 @@ native WebSockets, thresholds map onto SLOs) and the capacity model are the open
   flushed on shutdown) and FastAPI, SQLAlchemy (`sync_engine`, no SQL commenter), redis, httpx
   and aiohttp-client (the Daytona SDK) instrumentation. It is configured before any middleware
   and before anything imports OpenHands: the Daytona SDK and Laminar each install a global
-  provider only when their own env flags are set, and OpenTelemetry keeps the first. The run
-  row's `traceparent` is captured under the request's server span; the worker executes each job
-  inside a `CONSUMER` span (`run_span`) that is its child and binds `trace_id` into the log
+  provider only when their own env flags are set, and OpenTelemetry keeps the first. Inbound trace
+  context is never trusted: the global propagator is inject-only (`InjectOnlyPropagator`), so
+  a `traceparent` header from a browser or proxy can neither choose our trace ids nor force
+  sampling, and every API server span is a root sampled by our ratio. The run row's
+  `traceparent` is captured under that span; the worker extracts it explicitly and executes
+  each job inside a `CONSUMER` span (`run_span`) that is its child and binds `trace_id` into the log
   context next to `request_id`, so logs, metrics and spans share ids. API and worker
   NetworkPolicies allow 4318 to `app.kubernetes.io/name: opentelemetry-collector` pods in
   `monitoring`; relabel in the overlay. The instrumentation packages are pinned to `0.60b1`,

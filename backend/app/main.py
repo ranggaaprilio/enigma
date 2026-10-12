@@ -99,7 +99,7 @@ async def lifespan(_app: FastAPI):
             await event_bus.aclose()
         await engine.dispose()
         restore_sigterm()
-        shutdown_tracing(getattr(_app.state, "tracing", None))
+        await asyncio.to_thread(shutdown_tracing, getattr(_app.state, "tracing", None))
 
 
 def create_app() -> FastAPI:

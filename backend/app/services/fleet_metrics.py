@@ -50,9 +50,10 @@ def bound_teams(
     Rank is by the tuple's components in order (active runs first). Team-less workspaces are
     always their own ``none`` series and never count against the limit.
     """
+    # Ties break on the id, so equal-ranked teams never swap labels between samples.
     ranked = sorted(
         ((team, values) for team, values in per_team.items() if team is not None),
-        key=lambda item: item[1],
+        key=lambda item: (item[1], str(item[0])),
         reverse=True,
     )
     labelled: dict[str, tuple[float, ...]] = {}
@@ -67,6 +68,36 @@ def bound_teams(
     if None in per_team:
         labelled[NO_TEAM] = per_team[None]
     return labelled
+
+
+def active_runs_by_team():
+    """``(team_id, active agent runs)`` per team; served by ``ix_agent_runs_status``."""
+    return (
+        select(Workspace.team_id, func.count(AgentRun.id))
+        .join(Workspace, Workspace.id == AgentRun.workspace_id)
+        .where(AgentRun.status.in_(ACTIVE_RUN_STATUSES))
+        .group_by(Workspace.team_id)
+    )
+
+
+def spend_by_team(since: datetime):
+    """``(team_id, tokens, cost)`` of runs finished since ``since``.
+
+    Retention windows are whole days, so nothing finished within the hour has been pruned: the
+    ``events_pruned_at IS NULL`` predicate changes no result and lets the partial retention
+    index (``ix_agent_runs_events_retention``) serve the scan instead of the whole table.
+    ``tests/test_fleet_metrics.py`` checks the plan.
+    """
+    return (
+        select(
+            Workspace.team_id,
+            func.coalesce(func.sum(AgentRun.tokens_used), 0),
+            func.coalesce(func.sum(AgentRun.estimated_cost), 0),
+        )
+        .join(Workspace, Workspace.id == AgentRun.workspace_id)
+        .where(AgentRun.completed_at >= since, AgentRun.events_pruned_at.is_(None))
+        .group_by(Workspace.team_id)
+    )
 
 
 class FleetMetricsSampler:
@@ -94,22 +125,8 @@ class FleetMetricsSampler:
 
     async def _per_team(self, session: AsyncSession) -> dict[UUID | None, tuple[float, ...]]:
         """``{team_id: (active_runs, tokens_last_hour, cost_last_hour)}``; 0.0 where absent."""
-        active_rows = await session.execute(
-            select(Workspace.team_id, func.count(AgentRun.id))
-            .join(Workspace, Workspace.id == AgentRun.workspace_id)
-            .where(AgentRun.status.in_(ACTIVE_RUN_STATUSES))
-            .group_by(Workspace.team_id)
-        )
-        spend_rows = await session.execute(
-            select(
-                Workspace.team_id,
-                func.coalesce(func.sum(AgentRun.tokens_used), 0),
-                func.coalesce(func.sum(AgentRun.estimated_cost), 0),
-            )
-            .join(Workspace, Workspace.id == AgentRun.workspace_id)
-            .where(AgentRun.completed_at >= datetime.now(UTC) - SPEND_WINDOW)
-            .group_by(Workspace.team_id)
-        )
+        active_rows = await session.execute(active_runs_by_team())
+        spend_rows = await session.execute(spend_by_team(datetime.now(UTC) - SPEND_WINDOW))
         per_team: dict[UUID | None, list[float]] = {}
         for team_id, active in active_rows:
             per_team.setdefault(team_id, [0.0, 0.0, 0.0])[0] = float(active)

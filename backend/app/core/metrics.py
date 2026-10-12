@@ -62,7 +62,8 @@ run_queue_wait_seconds = Histogram(
 
 run_start_latency_seconds = Histogram(
     "run_start_latency_seconds",
-    "Time from enqueue to the run's first event or output (queue mode only).",
+    "Time from enqueue to the run's first content event or output chunk (queue mode only; a "
+    "command that prints nothing records none).",
     labelnames=("kind",),
     buckets=_WAIT_BUCKETS,
 )
@@ -99,14 +100,15 @@ reaper_sweeps_total = Counter(
 
 llm_request_seconds = Histogram(
     "llm_request_seconds",
-    "Wall time of a run's provider stream, from the request to its last event.",
+    "Wall time of a run's whole provider stream, first request to last event; it includes the "
+    "tool and sandbox calls the model makes in between.",
     labelnames=("provider", "model"),
     buckets=_LLM_BUCKETS,
 )
 
 llm_time_to_first_token_seconds = Histogram(
     "llm_time_to_first_token_seconds",
-    "Time from the provider request to its first streamed event.",
+    "Time from the provider request to its first content event (status events do not count).",
     labelnames=("provider", "model"),
     buckets=_LLM_BUCKETS,
 )
