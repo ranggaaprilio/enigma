@@ -19,9 +19,11 @@ from app.core.lifecycle import (
 from app.core.logging import configure_logging
 from app.core.metrics import metrics_token_authorized
 from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
+from app.core.tracing import UNTRACED_URLS, configure_tracing, shutdown_tracing
 from app.db.session import async_session_maker, engine
 from app.services.capacity import RunCapacityExceededError, run_capacity_exceeded_handler
 from app.services.daytona_runtime import get_daytona_runtime
+from app.services.fleet_metrics import start_fleet_sampler
 from app.services.jobs import (
     RunQueueUnavailableError,
     close_run_dispatcher,
@@ -66,6 +68,8 @@ async def lifespan(_app: FastAPI):
         if settings.run_execution_mode == "inline"
         else None
     )
+    # Epic 09: fleet-wide gauges (queue depth, active runs and spend by team) on /metrics.
+    fleet_sampler = start_fleet_sampler(async_session_maker, settings)
     restore_sigterm = install_sigterm_drain(
         asyncio.get_running_loop(), settings.shutdown_drain_delay_seconds
     )
@@ -73,6 +77,8 @@ async def lifespan(_app: FastAPI):
     yield
 
     lifecycle.begin_drain()
+    fleet_sampler.cancel()
+    await asyncio.gather(fleet_sampler, return_exceptions=True)
     if retention is not None:
         retention.cancel()
         await asyncio.gather(retention, return_exceptions=True)
@@ -93,6 +99,7 @@ async def lifespan(_app: FastAPI):
             await event_bus.aclose()
         await engine.dispose()
         restore_sigterm()
+        await asyncio.to_thread(shutdown_tracing, getattr(_app.state, "tracing", None))
 
 
 def create_app() -> FastAPI:
@@ -100,6 +107,8 @@ def create_app() -> FastAPI:
     configure_logging()
 
     app = FastAPI(title=settings.app_name, version="0.1.0", lifespan=lifespan)
+    # Epic 09: before any middleware, so the provider exists when the first span starts.
+    app.state.tracing = configure_tracing(settings, "enigma-api")
 
     app.add_middleware(
         CORSMiddleware,
@@ -111,6 +120,12 @@ def create_app() -> FastAPI:
     # Added last so it runs outermost — every request gets a correlation id bound before
     # any other middleware or route handler executes.
     app.add_middleware(RequestContextMiddleware)
+    if app.state.tracing is not None:
+        # Outermost of all (added after the request-context middleware), so the server span
+        # is current when the request id is bound and stamped on it.
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+
+        FastAPIInstrumentor.instrument_app(app, excluded_urls=UNTRACED_URLS)
 
     app.add_exception_handler(Exception, unhandled_exception_handler)
     app.add_exception_handler(ServiceDrainingError, service_draining_handler)

@@ -1,10 +1,12 @@
 from typing import Any
 from uuid import uuid4
 
+from prometheus_client import REGISTRY
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.core.config import Settings, get_settings
+from app.core.metrics import DbPoolCollector
 
 
 def engine_options(settings: Settings) -> dict[str, Any]:
@@ -33,6 +35,8 @@ settings = get_settings()
 
 engine = create_async_engine(settings.database_url, **engine_options(settings))
 async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+# Epic 09: pool occupancy on /metrics (API and workers share this module).
+REGISTRY.register(DbPoolCollector(engine))
 
 
 async def get_db_session():

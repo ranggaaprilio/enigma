@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.auth import CURRENT_USER_DEP
 from app.api.rate_limits import SANDBOX_RATE_LIMIT_DEP
 from app.core.config import Settings, get_settings
+from app.core.middleware import websocket_context
 from app.core.security import verify_session_token
 from app.db.session import async_session_maker, get_db_session
 from app.models import TerminalSession, User
@@ -129,6 +130,7 @@ async def delete_terminal_session(
 
 
 @router.websocket("/sessions/{terminal_session_id}")
+@websocket_context("terminal")
 async def connect_terminal_session(
     websocket: WebSocket,
     workspace_id: UUID,

@@ -32,3 +32,8 @@ data:
   SHUTDOWN_RUN_GRACE_SECONDS: "15"
   # Refuse new runs (503 + Retry-After) rather than queue without bound while workers scale.
   RUN_QUEUE_MAX_DEPTH: "200"
+  # Epic 09: workers serve /metrics here (worker.yaml exposes the same port).
+  METRICS_PORT: "9102"
+  # Tracing stays off until an overlay sets the collector, e.g.
+  #   OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.monitoring.svc:4318
+  # (network-policies.yaml already allows 4318 to the `monitoring` collector pods).

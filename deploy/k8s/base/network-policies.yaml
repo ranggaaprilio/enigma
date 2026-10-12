@@ -9,7 +9,7 @@
 #     open only to private (RFC1918 + CGNAT) addresses, never the internet. That still includes
 #     other private hosts: the overlay should narrow `to:` to the providers' own CIDRs.
 # Ingress comes only from the ingress controller's namespace, plus the Prometheus pods for
-# /metrics (which still needs METRICS_TOKEN).
+# /metrics (which still needs METRICS_TOKEN). Workers admit only those Prometheus pods.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -76,6 +76,18 @@ spec:
       ports:
         - port: 443
           protocol: TCP
+    # Epic 09: traces to an OpenTelemetry Collector in `monitoring` (inert until
+    # OTEL_EXPORTER_OTLP_ENDPOINT is set; relabel the pod selector to your collector's).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+      ports:
+        - port: 4318
+          protocol: TCP
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -86,8 +98,20 @@ spec:
     matchLabels:
       app.kubernetes.io/name: enigma
       app.kubernetes.io/component: worker
-  # Ingress listed with no rules: workers accept no connections at all.
   policyTypes: ["Ingress", "Egress"]
+  # Workers serve no traffic. The one ingress is the metrics scrape (Epic 09), and only from
+  # the Prometheus pods -- never the ingress controller.
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: 9102
+          protocol: TCP
   egress:
     - to:
         - namespaceSelector:
@@ -119,6 +143,18 @@ spec:
             except: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 169.254.0.0/16]
       ports:
         - port: 443
+          protocol: TCP
+    # Epic 09: traces to an OpenTelemetry Collector in `monitoring` (inert until
+    # OTEL_EXPORTER_OTLP_ENDPOINT is set; relabel the pod selector to your collector's).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: opentelemetry-collector
+      ports:
+        - port: 4318
           protocol: TCP
 ---
 apiVersion: networking.k8s.io/v1

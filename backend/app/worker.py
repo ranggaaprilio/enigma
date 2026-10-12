@@ -20,6 +20,7 @@ from sqlalchemy import select
 from app.core.config import Settings, get_settings
 from app.core.lifecycle import lifecycle
 from app.core.logging import configure_logging
+from app.core.tracing import configure_tracing, run_span, shutdown_tracing
 from app.db.session import async_session_maker, engine
 from app.models import AgentRun, CommandRun, SpecPhase, SpecWorkflow
 from app.services.agents import ACTIVE_RUN_STATUSES, AgentService, agent_runtime
@@ -49,6 +50,7 @@ from app.services.speckit import (
     PHASE_FINALIZE_TIMEOUT_SECONDS,
     SpecKitService,
 )
+from app.worker_metrics import run_redis_probe, start_if_possible
 
 logger = structlog.get_logger(__name__)
 
@@ -108,6 +110,26 @@ async def _status(session_maker, model, run_id: UUID) -> str | None:
         return await session.scalar(select(model.status).where(model.id == run_id))
 
 
+async def _correlation(session_maker, model, run_id: UUID) -> dict[str, str]:
+    """The request id (and trace context) stamped on the run at creation (Epic 09).
+
+    Bound into the job's log context so a run reads as one story across API and worker. The
+    job payload carries only the run id, so this comes off the row after the claim.
+    """
+    async with session_maker() as session:
+        row = (
+            await session.execute(
+                select(model.request_id, model.traceparent).where(model.id == run_id)
+            )
+        ).first()
+    found: dict[str, str] = {}
+    if row is not None and row.request_id:
+        found["request_id"] = row.request_id
+    if row is not None and row.traceparent:
+        found["traceparent"] = row.traceparent
+    return found
+
+
 async def _stop_when_inactive(session_maker, runtime, run_id: UUID) -> None:
     while True:
         await asyncio.sleep(RUN_STATUS_POLL_SECONDS)
@@ -155,31 +177,42 @@ async def run_agent_job(ctx: dict[str, Any], run_id: str) -> str:
             log.info("agent_job_skipped", outcome=claim.outcome)
             return claim.outcome
 
-        stop_event = asyncio.Event()
-        runtime.register_run(run_uuid, asyncio.current_task(), stop_event)
-        try:
-            # A lost lease means the reaper already ended the run: stop executing it.
-            async with _holding_lease(
-                lambda: service.renew_lease(run_uuid, settings.worker_id),
-                settings,
-                on_lost=lambda: runtime.request_stop(run_uuid),
-            ), runtime.watch_control(run_uuid):
-                # Stopped between the claim and the watch: that signal never reached us.
-                status = await _status(session_maker, AgentRun, run_uuid)
-                if status not in ACTIVE_RUN_STATUSES:
-                    return status or "missing"
-                poller = asyncio.create_task(
-                    _stop_when_inactive(session_maker, runtime, run_uuid)
-                )
-                try:
-                    return await service.execute_claimed_run(
-                        run_uuid, claim.working_dir, stop_event, settings.agent_run_timeout_seconds
+        correlation = await _correlation(session_maker, AgentRun, run_uuid)
+        traceparent = correlation.pop("traceparent", None)
+        structlog.contextvars.bind_contextvars(**correlation)
+        log = log.bind(**correlation)
+        with run_span(
+            "agent_run", traceparent, run_id=run_id, worker_id=settings.worker_id, job_try=job_try
+        ):
+            stop_event = asyncio.Event()
+            runtime.register_run(run_uuid, asyncio.current_task(), stop_event)
+            try:
+                # A lost lease means the reaper already ended the run: stop executing it.
+                async with _holding_lease(
+                    lambda: service.renew_lease(run_uuid, settings.worker_id),
+                    settings,
+                    on_lost=lambda: runtime.request_stop(run_uuid),
+                ), runtime.watch_control(run_uuid):
+                    # Stopped between the claim and the watch: that signal never reached us.
+                    status = await _status(session_maker, AgentRun, run_uuid)
+                    if status not in ACTIVE_RUN_STATUSES:
+                        return status or "missing"
+                    poller = asyncio.create_task(
+                        _stop_when_inactive(session_maker, runtime, run_uuid)
                     )
-                finally:
-                    poller.cancel()
-                    await asyncio.gather(poller, return_exceptions=True)
-        finally:
-            runtime.forget_run(run_uuid)
+                    try:
+                        return await service.execute_claimed_run(
+                            run_uuid,
+                            claim.working_dir,
+                            stop_event,
+                            settings.agent_run_timeout_seconds,
+                        )
+                    finally:
+                        poller.cancel()
+                        await asyncio.gather(poller, return_exceptions=True)
+            finally:
+                runtime.forget_run(run_uuid)
+                structlog.contextvars.unbind_contextvars(*correlation)
 
 
 async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
@@ -219,31 +252,40 @@ async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
             log.info("command_job_skipped", outcome=outcome)
             return outcome
 
+        correlation = await _correlation(session_maker, CommandRun, run_uuid)
+        traceparent = correlation.pop("traceparent", None)
+        structlog.contextvars.bind_contextvars(**correlation)
+        log = log.bind(**correlation)
         # Confirmation was enforced when the API accepted the run. arq treats any exception as
         # final, so whatever escapes is recorded on the run here rather than leaving it running.
-        timeout = settings.command_run_max_timeout_seconds + COMMAND_TIMEOUT_MARGIN_SECONDS
-        try:
-            # Commands have no stop signal: a lost lease (the run was reaped) cancels the job,
-            # and arq's redelivery then finds the run terminal.
-            job = asyncio.current_task()
-            async with (
-                _holding_lease(
-                    lambda: service.renew_lease(run_uuid, settings.worker_id),
-                    settings,
-                    on_lost=lambda: job.cancel(),
-                ),
-                asyncio.timeout(timeout),
-            ):
-                await service._execute_run(run_uuid, confirmed=True)
-        except TimeoutError:
-            await service.fail_active_run(
-                run_uuid, JOB_TIMEOUT, f"The command exceeded its {timeout}s time limit."
-            )
-            return JOB_TIMEOUT
-        except Exception:
-            log.exception("command_job_failed")
-            await service.fail_active_run(run_uuid, WORKER_ERROR, WORKER_ERROR_MESSAGE)
-            return WORKER_ERROR
+        with run_span(
+            "command_run", traceparent, run_id=run_id, worker_id=settings.worker_id, job_try=job_try
+        ):
+            timeout = settings.command_run_max_timeout_seconds + COMMAND_TIMEOUT_MARGIN_SECONDS
+            try:
+                # Commands have no stop signal: a lost lease (the run was reaped) cancels the job,
+                # and arq's redelivery then finds the run terminal.
+                job = asyncio.current_task()
+                async with (
+                    _holding_lease(
+                        lambda: service.renew_lease(run_uuid, settings.worker_id),
+                        settings,
+                        on_lost=lambda: job.cancel(),
+                    ),
+                    asyncio.timeout(timeout),
+                ):
+                    await service._execute_run(run_uuid, confirmed=True)
+            except TimeoutError:
+                await service.fail_active_run(
+                    run_uuid, JOB_TIMEOUT, f"The command exceeded its {timeout}s time limit."
+                )
+                return JOB_TIMEOUT
+            except Exception:
+                log.exception("command_job_failed")
+                await service.fail_active_run(run_uuid, WORKER_ERROR, WORKER_ERROR_MESSAGE)
+                return WORKER_ERROR
+            finally:
+                structlog.contextvars.unbind_contextvars(*correlation)
     return await _status(session_maker, CommandRun, run_uuid) or "missing"
 
 
@@ -276,26 +318,28 @@ async def finalize_spec_phase_job(ctx: dict[str, Any], phase_id: str, run_id: st
         run_status = run.status if run is not None else "error"
         user_id = run.user_id if run is not None else workflow.user_id
         workflow_id, phase_name = workflow.id, phase.phase
+        correlation = {"request_id": run.request_id} if run and run.request_id else {}
 
     # A fresh session: finalizing runs git in the sandbox, too long to hold the read open.
-    async with session_maker() as session:
-        service = SpecKitService(
-            session,
-            session_maker,
-            settings,
-            runtime=ctx.get("daytona_runtime"),
-            dispatcher=ctx.get("dispatcher"),
-        )
-        if run_status not in _TERMINAL_RUN_STATUSES:
-            if job_try < spec_finalize_max_tries(settings) - FINALIZE_RETRY_SLACK:
-                raise Retry(defer=settings.spec_finalize_poll_seconds)
-            await service._mark_phase_failed(
-                workflow_id, phase_name, user_id, "its agent run did not finish in time"
+    with structlog.contextvars.bound_contextvars(**correlation):
+        async with session_maker() as session:
+            service = SpecKitService(
+                session,
+                session_maker,
+                settings,
+                runtime=ctx.get("daytona_runtime"),
+                dispatcher=ctx.get("dispatcher"),
             )
-            return "error"
-        await service._finalize_phase(
-            workflow_id, phase_name, run_uuid, user_id, run_status=run_status
-        )
+            if run_status not in _TERMINAL_RUN_STATUSES:
+                if job_try < spec_finalize_max_tries(settings) - FINALIZE_RETRY_SLACK:
+                    raise Retry(defer=settings.spec_finalize_poll_seconds)
+                await service._mark_phase_failed(
+                    workflow_id, phase_name, user_id, "its agent run did not finish in time"
+                )
+                return "error"
+            await service._finalize_phase(
+                workflow_id, phase_name, run_uuid, user_id, run_status=run_status
+            )
     return await _status(session_maker, SpecPhase, phase_uuid) or "stale"
 
 
@@ -305,6 +349,7 @@ async def finalize_spec_phase_job(ctx: dict[str, Any], phase_id: str, run_id: st
 async def startup(ctx: dict[str, Any]) -> None:
     configure_logging()
     settings = get_settings()
+    ctx["tracing"] = configure_tracing(settings, "enigma-worker", instance_id=settings.worker_id)
     if settings.run_execution_mode != "queue":
         # Inline mode keeps the in-memory bus, so nothing this worker published would ever
         # reach an API WebSocket.
@@ -321,13 +366,16 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["reaper"] = asyncio.create_task(run_reaper(async_session_maker, settings))
     # Epic 05: every worker prunes; SKIP LOCKED batches split the work between them.
     ctx["retention"] = start_retention(async_session_maker, settings)
+    # Epic 09: this worker's run/LLM/reaper metrics on METRICS_PORT, plus its Redis probe.
+    ctx["metrics_server"] = start_if_possible(settings)
+    ctx["redis_probe"] = asyncio.create_task(run_redis_probe(settings))
     logger.info("worker_started", worker_id=settings.worker_id, queue=settings.run_queue_name)
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     settings: Settings = ctx.get("settings") or get_settings()
     lifecycle.begin_drain()
-    for name in ("reaper", "retention"):
+    for name in ("reaper", "retention", "redis_probe"):
         if (task := ctx.get(name)) is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -345,6 +393,11 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         if isinstance(event_bus, RedisEventBus):
             await event_bus.aclose()
         await engine.dispose()
+        # Last, so the drained runs' final values are still scrapable and their spans are
+        # exported; both block, so they run off the loop.
+        if (metrics_server := ctx.get("metrics_server")) is not None:
+            await asyncio.to_thread(metrics_server.stop)
+        await asyncio.to_thread(shutdown_tracing, ctx.get("tracing"))
 
 
 _settings = get_settings()

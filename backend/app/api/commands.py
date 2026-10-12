@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
+from app.core.middleware import websocket_context
 from app.core.security import verify_session_token
 from app.db.session import async_session_maker, get_db_session
 from app.models import CommandRun, CustomCommand, User
@@ -403,6 +404,7 @@ async def list_custom_command_runs(
 
 
 @router.websocket("/command-runs/{run_id}/stream")
+@websocket_context("command")
 async def stream_command_run(websocket: WebSocket, workspace_id: UUID, run_id: UUID) -> None:
     settings = get_settings()
     async with async_session_maker() as session:
@@ -486,7 +488,10 @@ async def tail_command_run(
             run = await service.get_run(workspace_id, run_id, user_id)
         output = run.output or ""
         if len(output) > sent:
-            await send({"type": "output", "content": output[sent:]})
+            frame = {"type": "output", "content": output[sent:]}
+            if run.request_id:
+                frame["request_id"] = run.request_id
+            await send(frame)
             sent = len(output)
         return run
 

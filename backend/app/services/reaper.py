@@ -21,6 +21,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
+from app.core.metrics import reaper_runs_ended_total, reaper_sweeps_total
 from app.models import AgentRun, CommandRun
 from app.services.agents import ACTIVE_RUN_STATUSES, AgentRuntime, AgentService, agent_runtime
 from app.services.commands import CommandRuntime, CommandService, command_runtime
@@ -74,9 +75,11 @@ async def reap_expired_leases(
         for run_id in agent_ids:
             if await _reap(agents, run_id):
                 result.agent_run_ids.append(run_id)
+                reaper_runs_ended_total.labels(kind="agent").inc()
         for run_id in command_ids:
             if await _reap(commands, run_id):
                 result.command_run_ids.append(run_id)
+                reaper_runs_ended_total.labels(kind="command").inc()
 
     if result.agent_run_ids or result.command_run_ids:
         logger.warning(
@@ -114,6 +117,8 @@ async def run_reaper(
                 agent_runtime=agent_runtime,
                 command_runtime=command_runtime,
             )
+            reaper_sweeps_total.labels(result="ok").inc()
         except Exception:
+            reaper_sweeps_total.labels(result="error").inc()
             logger.exception("run_reaper_pass_failed")
         await asyncio.sleep(settings.run_reaper_interval_seconds)

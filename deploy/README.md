@@ -40,7 +40,9 @@ validates it with kubeconform, then builds and Trivy-scans both images.
   `test_previews_are_cross_site_from_the_app` enforces this for the base hosts; keep it true
   when an overlay sets real ones.
 - Managed **Postgres** (+ optional PgBouncer, epic 05) and **Redis**, outside the cluster.
-- Prometheus in namespace `monitoring` if you scrape `/metrics` (bearer `METRICS_TOKEN`).
+- Prometheus in namespace `monitoring` if you scrape `/metrics` (bearer `METRICS_TOKEN`): the
+  API and proxy on their HTTP ports, workers on `METRICS_PORT` (9102). Optionally an
+  OpenTelemetry Collector there too (`OTEL_EXPORTER_OTLP_ENDPOINT`, port 4318); see Epic 09.
 
 ## Secrets
 
@@ -154,9 +156,10 @@ front (`DB_PGBOUNCER=true`).
   LLM, GitHub). Private, CGNAT and
   link-local ranges are excluded, so the cluster API server and cloud metadata are unreachable.
   A self-hosted Daytona or LLM on a private IP needs an overlay rule. The proxy has no Redis;
-  workers accept no ingress; `/metrics` is open only to `app.kubernetes.io/name: prometheus` pods
-  in `monitoring`. Every egress rule names its destinations. Narrow the Postgres/Redis `to:`
-  from "any private address" to your providers' CIDRs in the overlay.
+  `/metrics` is open only to `app.kubernetes.io/name: prometheus` pods in `monitoring`, and
+  that scrape (port 9102, bearer `METRICS_TOKEN`) is the only ingress workers accept. Every
+  egress rule names its destinations. Narrow the Postgres/Redis `to:` from "any private
+  address" to your providers' CIDRs in the overlay.
 - Edge: two Ingresses. `enigma` (app + API) caps uploads at 12m and retries 502/503 on another
   pod. `enigma-preview` streams requests and responses, allows 100m bodies, and never retries a
   503 (that is the proxy's self-retrying "Waking preview…" page).

@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
 from app.core.config import Settings, get_settings
+from app.core.middleware import websocket_context
 from app.core.security import verify_session_token
 from app.db.session import async_session_maker, get_db_session
 from app.models import AuditLog, Notification, User
@@ -111,6 +112,7 @@ async def list_audit_logs(
 
 
 @router.websocket("/notifications/stream")
+@websocket_context("notifications")
 async def stream_notifications(websocket: WebSocket) -> None:
     settings = get_settings()
     async with async_session_maker() as session:

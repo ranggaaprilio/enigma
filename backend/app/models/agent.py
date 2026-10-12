@@ -153,6 +153,10 @@ class AgentRun(Base):
     events_pruned_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Correlation (Epic 09): the request id and W3C traceparent of the request that created
+    # the run. The job payload carries only the run id, so the worker reads these off the row.
+    request_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    traceparent: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
     session: Mapped["AgentSession | None"] = relationship(back_populates="runs")
     events: Mapped[list["AgentEvent"]] = relationship(

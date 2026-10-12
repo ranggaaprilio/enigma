@@ -1,14 +1,75 @@
+import functools
+import re
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 
 import structlog
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.requests import Request
 from starlette.responses import Response
+from starlette.websockets import WebSocket
+
+from app.core.metrics import ws_connections
+from app.core.tracing import bind_trace_context
 
 REQUEST_ID_HEADER = "X-Request-ID"
+# What a caller-supplied id may look like. Anything else is replaced, never trimmed: the id
+# lands in every log line, on run rows and in stream frames, so it must be short and inert.
+_REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 
 logger = structlog.get_logger("app.request")
+
+
+def sanitize_request_id(raw: str | None) -> str:
+    """Return ``raw`` when it is a well-formed request id, otherwise a fresh one."""
+    candidate = raw.strip() if raw else ""
+    if candidate and _REQUEST_ID_RE.match(candidate):
+        return candidate
+    return uuid.uuid4().hex
+
+
+def current_request_id() -> str | None:
+    """The request id bound to this task's log context, if any.
+
+    Set by ``RequestContextMiddleware`` (HTTP), ``websocket_context`` (WebSockets) and the
+    worker (from the run row), so a service can stamp it on what it creates without every
+    route threading it through.
+    """
+    value = structlog.contextvars.get_contextvars().get("request_id")
+    return value if isinstance(value, str) else None
+
+
+WebSocketHandler = Callable[..., Awaitable[None]]
+
+
+def websocket_context(kind: str) -> Callable[[WebSocketHandler], WebSocketHandler]:
+    """Give a WebSocket handler a request id and count it while it is open.
+
+    ``BaseHTTPMiddleware`` never sees WebSocket connections, so this does for them what
+    ``RequestContextMiddleware`` does for requests: the id comes from the handshake's
+    ``X-Request-ID`` (sanitised) or is generated, and is bound into the log context for the
+    connection's lifetime, which is one asyncio task. The ``ws_connections`` gauge counts
+    handlers in flight from handshake to close. Apply it *inside* ``router.websocket``.
+    """
+
+    def decorate(handler: WebSocketHandler) -> WebSocketHandler:
+        @functools.wraps(handler)
+        async def wrapper(websocket: WebSocket, **kwargs) -> None:
+            request_id = sanitize_request_id(websocket.headers.get(REQUEST_ID_HEADER))
+            structlog.contextvars.clear_contextvars()
+            structlog.contextvars.bind_contextvars(request_id=request_id, ws_kind=kind)
+            bind_trace_context(request_id)
+            ws_connections.labels(kind=kind).inc()
+            try:
+                await handler(websocket=websocket, **kwargs)
+            finally:
+                ws_connections.labels(kind=kind).dec()
+                structlog.contextvars.clear_contextvars()
+
+        return wrapper
+
+    return decorate
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -22,12 +83,12 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
     """
 
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        incoming = request.headers.get(REQUEST_ID_HEADER)
-        request_id = incoming.strip() if incoming and incoming.strip() else uuid.uuid4().hex
+        request_id = sanitize_request_id(request.headers.get(REQUEST_ID_HEADER))
         request.state.request_id = request_id
 
         structlog.contextvars.clear_contextvars()
         structlog.contextvars.bind_contextvars(request_id=request_id)
+        bind_trace_context(request_id)
 
         start = time.perf_counter()
         logger.info("request.start", method=request.method, path=request.url.path)

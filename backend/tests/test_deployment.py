@@ -482,15 +482,27 @@ def test_network_policies_are_least_privilege(manifests):
     proxy = _get(manifests, "NetworkPolicy", "enigma-preview-proxy")
     frontend = _get(manifests, "NetworkPolicy", "enigma-frontend")
 
-    # Postgres (direct or PgBouncer), Redis, DNS and HTTPS to Daytona / the LLM / GitHub.
+    # Postgres (direct or PgBouncer), Redis, DNS, HTTPS to Daytona / the LLM / GitHub, and
+    # OTLP/HTTP traces to the collector.
     for policy in (api, worker):
-        assert _egress_ports(policy) == {53, 5432, 6432, 6379, 443}
+        assert _egress_ports(policy) == {53, 5432, 6432, 6379, 443, 4318}
     # The proxy never talks to Redis.
     assert _egress_ports(proxy) == {53, 5432, 6432, 443}
     assert _egress_ports(frontend) == set()
     assert "Egress" in frontend["spec"]["policyTypes"]
-    # Workers serve nothing: no ingress rule at all.
-    assert "Ingress" in worker["spec"]["policyTypes"] and not worker["spec"].get("ingress")
+    # Workers serve no traffic: their one ingress is the metrics scrape, from the Prometheus
+    # pods only (never the ingress controller), on the port the container exposes.
+    assert "Ingress" in worker["spec"]["policyTypes"]
+    (scrape,) = worker["spec"]["ingress"]
+    for peer in scrape["from"]:
+        assert peer["podSelector"]["matchLabels"] == {"app.kubernetes.io/name": "prometheus"}
+        assert peer["namespaceSelector"]["matchLabels"], "pinned to the monitoring namespace"
+    worker_container = _container(_get(manifests, "Deployment", "enigma-worker"))
+    (metrics_port,) = [p for p in worker_container["ports"] if p["name"] == "metrics"]
+    assert {p["port"] for p in scrape["ports"]} == {metrics_port["containerPort"]}
+    assert metrics_port["containerPort"] == _setting(
+        manifests, worker_container, "METRICS_PORT", Settings.model_fields["metrics_port"].default
+    )
     for policy in (api, proxy, frontend):
         (rule,) = policy["spec"]["ingress"]
         assert rule["from"][0]["namespaceSelector"]["matchLabels"], "ingress controller only"
@@ -514,6 +526,10 @@ def test_network_policies_are_least_privilege(manifests):
                 # DNS only to the cluster resolver: no tunnelling out through port 53.
                 (peer,) = rule["to"]
                 assert peer["podSelector"]["matchLabels"] == {"k8s-app": "kube-dns"}
+            if 4318 in ports:
+                # Traces go to specific collector pods, never to an address range.
+                (peer,) = rule["to"]
+                assert peer["podSelector"]["matchLabels"] and peer["namespaceSelector"]
             if 443 in ports:
                 # HTTPS is for the internet (Daytona, LLM, GitHub), not the cluster's own API
                 # server, private ranges or cloud metadata.
