@@ -489,8 +489,19 @@ def test_network_policies_are_least_privilege(manifests):
     assert _egress_ports(proxy) == {53, 5432, 6432, 443}
     assert _egress_ports(frontend) == set()
     assert "Egress" in frontend["spec"]["policyTypes"]
-    # Workers serve nothing: no ingress rule at all.
-    assert "Ingress" in worker["spec"]["policyTypes"] and not worker["spec"].get("ingress")
+    # Workers serve no traffic: their one ingress is the metrics scrape, from the Prometheus
+    # pods only (never the ingress controller), on the port the container exposes.
+    assert "Ingress" in worker["spec"]["policyTypes"]
+    (scrape,) = worker["spec"]["ingress"]
+    for peer in scrape["from"]:
+        assert peer["podSelector"]["matchLabels"] == {"app.kubernetes.io/name": "prometheus"}
+        assert peer["namespaceSelector"]["matchLabels"], "pinned to the monitoring namespace"
+    worker_container = _container(_get(manifests, "Deployment", "enigma-worker"))
+    (metrics_port,) = [p for p in worker_container["ports"] if p["name"] == "metrics"]
+    assert {p["port"] for p in scrape["ports"]} == {metrics_port["containerPort"]}
+    assert metrics_port["containerPort"] == _setting(
+        manifests, worker_container, "METRICS_PORT", Settings.model_fields["metrics_port"].default
+    )
     for policy in (api, proxy, frontend):
         (rule,) = policy["spec"]["ingress"]
         assert rule["from"][0]["namespaceSelector"]["matchLabels"], "ingress controller only"

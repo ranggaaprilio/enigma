@@ -49,6 +49,7 @@ from app.services.speckit import (
     PHASE_FINALIZE_TIMEOUT_SECONDS,
     SpecKitService,
 )
+from app.worker_metrics import WorkerMetricsServer, run_redis_probe
 
 logger = structlog.get_logger(__name__)
 
@@ -349,16 +350,21 @@ async def startup(ctx: dict[str, Any]) -> None:
     ctx["reaper"] = asyncio.create_task(run_reaper(async_session_maker, settings))
     # Epic 05: every worker prunes; SKIP LOCKED batches split the work between them.
     ctx["retention"] = start_retention(async_session_maker, settings)
+    # Epic 09: this worker's run/LLM/reaper metrics on METRICS_PORT, plus its Redis probe.
+    ctx["metrics_server"] = WorkerMetricsServer(settings).start()
+    ctx["redis_probe"] = asyncio.create_task(run_redis_probe(settings))
     logger.info("worker_started", worker_id=settings.worker_id, queue=settings.run_queue_name)
 
 
 async def shutdown(ctx: dict[str, Any]) -> None:
     settings: Settings = ctx.get("settings") or get_settings()
     lifecycle.begin_drain()
-    for name in ("reaper", "retention"):
+    for name in ("reaper", "retention", "redis_probe"):
         if (task := ctx.get(name)) is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+    if (metrics_server := ctx.get("metrics_server")) is not None:
+        metrics_server.stop()
     try:
         # arq has already waited `job_completion_wait` and cancelled what was still running;
         # cancelled runs were left active, so record them as interrupted now rather than when

@@ -9,7 +9,7 @@
 #     open only to private (RFC1918 + CGNAT) addresses, never the internet. That still includes
 #     other private hosts: the overlay should narrow `to:` to the providers' own CIDRs.
 # Ingress comes only from the ingress controller's namespace, plus the Prometheus pods for
-# /metrics (which still needs METRICS_TOKEN).
+# /metrics (which still needs METRICS_TOKEN). Workers admit only those Prometheus pods.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -86,8 +86,20 @@ spec:
     matchLabels:
       app.kubernetes.io/name: enigma
       app.kubernetes.io/component: worker
-  # Ingress listed with no rules: workers accept no connections at all.
   policyTypes: ["Ingress", "Egress"]
+  # Workers serve no traffic. The one ingress is the metrics scrape (Epic 09), and only from
+  # the Prometheus pods -- never the ingress controller.
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: prometheus
+      ports:
+        - port: 9102
+          protocol: TCP
   egress:
     - to:
         - namespaceSelector:
