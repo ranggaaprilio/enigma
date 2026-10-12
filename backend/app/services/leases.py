@@ -15,6 +15,8 @@ from datetime import timedelta
 import structlog
 from sqlalchemy import DateTime, func
 
+from app.core.metrics import run_lease_lost_total
+
 logger = structlog.get_logger(__name__)
 
 
@@ -46,6 +48,7 @@ async def heartbeat(
             logger.warning("run_lease_renew_failed", exc_info=True)
             continue
         if not renewed:
+            run_lease_lost_total.inc()
             logger.warning("run_lease_lost")
             if on_lost is not None:
                 on_lost()

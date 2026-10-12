@@ -9,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.core.lifecycle import lifecycle
+from app.core.metrics import observe_queue_wait, observe_run_finished, observe_run_start
 from app.core.middleware import current_request_id
 from app.models import CommandRun, CustomCommand, Workspace
 from app.services.agent_tools import DangerousCommandError
@@ -489,10 +490,12 @@ class CommandService:
                     heartbeat_at=db_now(),
                     lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
                 )
-                .returning(CommandRun.id)
+                .returning(CommandRun.id, CommandRun.enqueued_at, CommandRun.claimed_at)
             )
-            if claimed.scalar_one_or_none() is not None:
+            row = claimed.first()
+            if row is not None:
                 await session.commit()
+                observe_queue_wait("command", row.enqueued_at, row.claimed_at)
                 return "claimed"
             status = await session.scalar(
                 select(CommandRun.status).where(CommandRun.id == run_id)
@@ -555,6 +558,7 @@ class CommandService:
                 return False  # nothing written; closing the session ends the transaction
             await session.commit()
             run = await session.get(CommandRun, run_id)
+            observe_run_finished("command", "error", reason, run.started_at, run.completed_at)
             await self.runtime.publish(run_id, command_status_frame(run))
             return True
 
@@ -724,6 +728,8 @@ class CommandService:
         persisted = run.output[len(previous) :]
         if not persisted:
             return
+        if not previous:
+            observe_run_start("command", run.enqueued_at, datetime.now(UTC))
         session.add(run)
         await session.flush()
         await session.commit()
@@ -761,6 +767,7 @@ class CommandService:
         run.exit_code = exit_code
         run.completed_at = completed_at
         run.lease_expires_at = None
+        observe_run_finished("command", status, None, run.started_at, completed_at)
         session.add(run)
         await session.flush()
         await session.commit()

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from datetime import UTC, datetime
@@ -12,6 +13,14 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
 from app.core.lifecycle import lifecycle
+from app.core.metrics import (
+    llm_request_seconds,
+    llm_time_to_first_token_seconds,
+    observe_llm_usage,
+    observe_queue_wait,
+    observe_run_finished,
+    observe_run_start,
+)
 from app.core.middleware import current_request_id
 from app.core.pricing import estimate_cost
 from app.models import AgentEvent, AgentFileChange, AgentRun, AgentSession, Workspace
@@ -403,11 +412,12 @@ class AgentService:
                     heartbeat_at=db_now(),
                     lease_expires_at=lease_deadline(self.settings.run_lease_seconds),
                 )
-                .returning(AgentRun.working_dir)
+                .returning(AgentRun.working_dir, AgentRun.enqueued_at, AgentRun.claimed_at)
             )
             row = claimed.first()
             if row is not None:
                 await session.commit()
+                observe_queue_wait("agent", row.enqueued_at, row.claimed_at)
                 return RunClaim("claimed", row.working_dir)
             status = await session.scalar(select(AgentRun.status).where(AgentRun.id == run_id))
             if status is None:
@@ -1025,9 +1035,18 @@ class AgentService:
                 if context:
                     prompt_for_provider = f"{context}\n\n---\nCurrent request:\nUser: {run.prompt}"
 
+                llm_labels = {"provider": run.provider, "model": run.model or "unknown"}
+                llm_started = time.perf_counter()
+                first_event_at: datetime | None = None
                 async for provider_event in provider.stream_response(
                     prompt_for_provider, tools, stop_event
                 ):
+                    if first_event_at is None:
+                        first_event_at = datetime.now(UTC)
+                        llm_time_to_first_token_seconds.labels(**llm_labels).observe(
+                            time.perf_counter() - llm_started
+                        )
+                        observe_run_start("agent", run.enqueued_at, first_event_at)
                     if stop_event.is_set():
                         break
                     if provider_event.event_type == "status":
@@ -1056,6 +1075,10 @@ class AgentService:
                         provider_event.content,
                         provider_event.metadata,
                     )
+
+                llm_request_seconds.labels(**llm_labels).observe(
+                    time.perf_counter() - llm_started
+                )
 
                 await session.refresh(run)
                 if terminal_event_received:
@@ -1148,6 +1171,16 @@ class AgentService:
             )
         self._apply_estimated_cost(run)
         session.add(run)
+        observe_run_finished(
+            "agent", run.status, run.error_reason, run.started_at, run.completed_at
+        )
+        observe_llm_usage(
+            run.provider,
+            run.model,
+            input_tokens=run.input_tokens,
+            output_tokens=run.output_tokens,
+            cost_usd=float(run.estimated_cost) if run.estimated_cost is not None else None,
+        )
         notification_type = (
             "agent_run_completed" if run.status == "completed" else "agent_run_failed"
         )
