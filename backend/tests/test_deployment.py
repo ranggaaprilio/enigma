@@ -173,6 +173,39 @@ def test_compose_keeps_building_the_dev_targets():
         assert compose["services"][service]["build"].get("target") == "dev", service
 
 
+def _socket_mounts(service: dict) -> list[str]:
+    return [str(v) for v in service.get("volumes", []) if "docker.sock" in str(v)]
+
+
+def test_base_compose_never_mounts_the_container_daemon_socket():
+    """The socket is root-equivalent on the host: Daytona-only stacks must never get it."""
+    compose = yaml.safe_load((REPO / "docker-compose.yml").read_text())
+    for name, service in compose["services"].items():
+        assert _socket_mounts(service) == [], name
+
+
+def test_sandbox_override_gives_the_socket_only_to_the_daemon_clients():
+    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
+    # The preview proxy parses untrusted traffic and does not drive sandboxes until
+    # local-docker-runtime Epic 04, so it does not hold the socket yet.
+    clients = {"backend", "worker"}
+    assert set(override["services"]) == clients
+    for name in clients:
+        service = override["services"][name]
+        assert _socket_mounts(service) == [
+            "${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
+        ]
+        # Trusted services stay off the sandboxes' bridge, so a sandbox cannot reach them.
+        assert "networks" not in service, name
+    assert "networks" not in override
+
+
+def test_production_manifests_never_reference_the_container_daemon():
+    """The Kustomize production profile is Daytona-only (docs/local-docker-runtime)."""
+    for manifest in (REPO / "deploy" / "k8s").rglob("*.yaml"):
+        assert "docker.sock" not in manifest.read_text(), manifest
+
+
 # --- kustomize layout ---------------------------------------------------------------------
 
 

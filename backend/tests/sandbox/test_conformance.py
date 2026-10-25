@@ -22,7 +22,9 @@ from app.services.sandbox.daytona import DaytonaRuntime
 from tests.sandbox.fakes import (
     FakeDaytonaClient,
     FakeDaytonaSandbox,
+    FakeDockerClient,
     FakeSandboxRuntime,
+    docker_runtime_with,
     make_workspace,
 )
 
@@ -44,8 +46,29 @@ def echo(command: str) -> RuntimeCommandResult:
     return RuntimeCommandResult(exit_code=0, stdout=f"ran:{command}", stderr="")
 
 
-@pytest.fixture(params=["daytona", "fake"])
+# Contract parts a provider does not implement yet: strict xfail, so the marker has to be
+# removed (and the suite proves the contract) the moment the epic lands.
+PENDING = {
+    "docker": {
+        "test_fs_round_trip": "file access lands in local-docker-runtime Epic 03",
+        "test_pty_handle_contract": "the terminal lands in local-docker-runtime Epic 03",
+        "test_preview_link_shape": "app preview lands in local-docker-runtime Epic 04",
+    },
+}
+
+
+@pytest.fixture(params=["daytona", "docker", "fake"])
 def case(request):
+    reason = PENDING.get(request.param, {}).get(request.node.originalname)
+    if reason:
+        request.applymarker(
+            pytest.mark.xfail(strict=True, raises=SandboxRuntimeError, reason=reason)
+        )
+    if request.param == "docker":
+        client = FakeDockerClient(exec_handler=echo)
+        runtime = docker_runtime_with(client)
+        container = client.add_container("execute-conformance")
+        return runtime, make_workspace(container.id, runtime="docker")
     if request.param == "daytona":
         sandbox = FakeDaytonaSandbox("sandbox-1", exec_handler=echo)
         runtime = DaytonaRuntime(Settings(daytona_api_key="test"))

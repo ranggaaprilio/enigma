@@ -711,7 +711,8 @@ async def test_env_template_lists_keys_without_values_and_groups_by_scope(worksp
     assert "# Service: API Server" in body
 
 
-async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
+@pytest.mark.parametrize("default_runtime", ["daytona", "docker"])
+async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path, default_runtime):
     class EmptyResult:
         def scalar_one_or_none(self):
             return None
@@ -740,7 +741,8 @@ async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
             workspace.created_at = workspace.created_at or now
             workspace.updated_at = now
 
-    settings = Settings()
+    # New workspaces take the configured provider; pinned so a root `.env` cannot leak in.
+    settings = Settings(sandbox_runtime_default=default_runtime)
     session = FakeSession()
 
     class FakeRuntime:
@@ -764,6 +766,7 @@ async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
     )
 
     assert workspace.status == "ready"
+    assert workspace.runtime == default_runtime
     assert workspace.daytona_sandbox_id == f"sandbox-{workspace.id}"
     assert workspace.workspace_path == "workspace"
     assert session.commits == 2

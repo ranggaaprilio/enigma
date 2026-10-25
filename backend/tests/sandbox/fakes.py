@@ -435,3 +435,232 @@ class FakeDaytonaClient:
 
     async def close(self) -> None:
         return None
+
+
+# --- Docker SDK-level doubles ----------------------------------------------------------
+#
+# Mirror the slice of docker-py ``DockerRuntime`` uses: ``client.containers/images/
+# networks``, ``client.api.exec_create/exec_start/exec_inspect``. Commands arrive wrapped
+# (``/bin/sh -c <wrapper> <pidfile> <command>``); the fake runs ``exec_handler`` on the
+# user's command — the last argv element — and records the wrapper argv for assertions.
+
+
+@dataclass
+class DockerExecResult:
+    """What a fake exec produces: stdout/stderr chunks (streamed in order) and exit code."""
+
+    exit_code: int = 0
+    chunks: tuple[tuple[bytes | None, bytes | None], ...] = ()
+    block: Any = None  # a threading.Event the exec waits on (simulates a hung command)
+
+
+DockerExecHandler = Callable[[str], "RuntimeCommandResult | DockerExecResult"]
+
+
+class FakeDockerContainer:
+    def __init__(self, client: FakeDockerClient, spec: dict[str, Any]) -> None:
+        self.client = client
+        self.spec = spec
+        self.id = f"ctr-{uuid4().hex[:12]}"
+        self.name = spec["name"]
+        self.labels = dict(spec.get("labels") or {})
+        self.status = "running"
+        self.start_calls = 0
+        self.removed = False
+        self.exec_runs: list[list[str]] = []
+
+    def reload(self) -> None:
+        if self.removed:
+            raise _docker_not_found()
+
+    def start(self) -> None:
+        self.start_calls += 1
+        self.status = "running"
+
+    def unpause(self) -> None:
+        self.status = "running"
+
+    def stop(self, timeout: int = 10) -> None:
+        self.status = "exited"
+
+    def remove(self, force: bool = False) -> None:
+        self.removed = True
+        self.client.containers.by_id.pop(self.id, None)
+
+    def exec_run(self, cmd: list[str], workdir: str | None = None) -> Any:
+        self.exec_runs.append(list(cmd))
+        if len(cmd) == 4 and cmd[:2] == ["/bin/sh", "-c"] and "kill -s TERM" in cmd[2]:
+            self.client.killed_pidfiles.append(cmd[3])
+            event = self.client.blocked_by_pidfile.get(cmd[3])
+            if event is not None:
+                event.set()
+        if cmd[:2] == ["mkdir", "-p"] and self.client.fail_mkdir:
+            return SimpleNamespace(exit_code=1, output=b"read-only")
+        return SimpleNamespace(exit_code=0, output=b"")
+
+
+class _FakeContainers:
+    def __init__(self, client: FakeDockerClient) -> None:
+        self.client = client
+        self.by_id: dict[str, FakeDockerContainer] = {}
+        self.run_specs: list[dict[str, Any]] = []
+
+    def get(self, key: str) -> FakeDockerContainer:
+        for container in self.by_id.values():
+            if key in (container.id, container.name):
+                return container
+        raise _docker_not_found()
+
+    def run(self, **spec: Any) -> FakeDockerContainer:
+        self.run_specs.append(spec)
+        container = FakeDockerContainer(self.client, spec)
+        self.by_id[container.id] = container
+        return container
+
+    def list(self, all: bool = False, filters: dict | None = None) -> list[FakeDockerContainer]:
+        return list(self.by_id.values())
+
+
+class _FakeImages:
+    def __init__(self, names: set[str]) -> None:
+        self.names = names
+
+    def get(self, name: str) -> Any:
+        if name not in self.names:
+            from docker.errors import ImageNotFound
+
+            raise ImageNotFound(f"No such image: {name}")
+        return SimpleNamespace(tags=[name])
+
+
+class _FakeNetworks:
+    def __init__(self, names: set[str]) -> None:
+        self.names = names
+        self.created: list[str] = []
+
+    def list(self, names: list[str] | None = None) -> list[Any]:
+        # Docker's ``name`` filter is a substring match, not an exact one.
+        wanted = names or []
+        return [SimpleNamespace(name=n) for n in self.names if any(w in n for w in wanted)]
+
+    def create(self, name: str, driver: str = "bridge", labels: dict | None = None) -> Any:
+        self.created.append(name)
+        self.names.add(name)
+        return SimpleNamespace(name=name)
+
+
+class _FakeDockerAPI:
+    def __init__(self, client: FakeDockerClient) -> None:
+        self.client = client
+        self.execs: dict[str, dict[str, Any]] = {}
+        self.closed = False
+        self.api_version = "1.41"
+
+    def exec_create(self, container_id, cmd, environment=None, workdir=None, **_: Any):
+        exec_id = f"exec-{len(self.execs)}"
+        self.execs[exec_id] = {
+            "container": container_id,
+            "cmd": list(cmd),
+            "environment": environment,
+            "workdir": workdir,
+            "exit_code": None,
+            "running": False,
+            "finished": False,
+        }
+        return {"Id": exec_id}
+
+    def _result(self, exec_id: str) -> DockerExecResult:
+        record = self.execs[exec_id]
+        handler = self.client.exec_handler
+        outcome = handler(record["cmd"][-1]) if handler else RuntimeCommandResult(0, "", "")
+        if isinstance(outcome, RuntimeCommandResult):
+            outcome = DockerExecResult(
+                exit_code=outcome.exit_code,
+                chunks=(
+                    (outcome.stdout.encode() or None, None),
+                    (None, outcome.stderr.encode() or None),
+                ),
+            )
+        if outcome.block is not None:
+            self.client.blocked_by_pidfile[record["cmd"][3]] = outcome.block
+            self.client.blocked.append(outcome.block)
+            outcome.block.wait(10)
+        record["exit_code"] = outcome.exit_code
+        return outcome
+
+    def exec_start(self, exec_id, stream=False, demux=False, **_: Any):
+        record = self.execs[exec_id]
+        record["running"] = True
+        if not stream:
+            try:
+                outcome = self._result(exec_id)
+                return b"".join((out or b"") + (err or b"") for out, err in outcome.chunks)
+            finally:
+                record["running"], record["finished"] = False, True
+
+        def generate():
+            try:
+                outcome = self._result(exec_id)
+                for out, err in outcome.chunks:
+                    if out or err:
+                        yield (out, err)
+            finally:
+                record["running"], record["finished"] = False, True
+
+        return generate()
+
+    def exec_inspect(self, exec_id: str) -> dict[str, Any]:
+        record = self.execs[exec_id]
+        return {"ExitCode": record["exit_code"], "Running": record["running"]}
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeDockerClient:
+    def __init__(
+        self,
+        *,
+        images: set[str] | None = None,
+        networks: set[str] | None = None,
+        exec_handler: DockerExecHandler | None = None,
+    ) -> None:
+        self.containers = _FakeContainers(self)
+        self.images = _FakeImages(images if images is not None else {"enigma-sandbox:latest"})
+        self.networks = _FakeNetworks(networks if networks is not None else {"enigma-sandboxes"})
+        self.api = _FakeDockerAPI(self)
+        self.exec_handler = exec_handler
+        self.killed_pidfiles: list[str] = []
+        self.blocked: list[Any] = []
+        self.blocked_by_pidfile: dict[str, Any] = {}
+        self.fail_mkdir = False
+        self.closed = False
+
+    def ping(self) -> bool:
+        return True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def add_container(self, name: str, *, status: str = "running", labels: dict | None = None):
+        container = self.containers.run(name=name, labels=labels or {})
+        self.containers.run_specs.clear()
+        container.status = status
+        return container
+
+
+def _docker_not_found():
+    from docker.errors import NotFound
+
+    return NotFound("No such container")
+
+
+def docker_runtime_with(client: FakeDockerClient, **settings: Any):
+    """A real ``DockerRuntime`` wired to the fake client (both control and exec APIs)."""
+    from app.core.config import Settings
+    from app.services.sandbox.docker import DockerRuntime
+
+    runtime = DockerRuntime(Settings(docker_host="unix:///fake/docker.sock", **settings))
+    runtime._client = client
+    runtime._exec_api = client.api
+    return runtime
