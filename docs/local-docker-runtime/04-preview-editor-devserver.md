@@ -16,42 +16,61 @@ identical to the Daytona experience.
 
 ## Current State
 
-- **Preview chain (provider-friendly by design)**: `services/preview_capability.py`
-  mints an HMAC capability (`PAYLOAD_FORMAT = "!B16sHI"` over
-  `preview_session_id | port | expires_at`) encoded as a subdomain of
-  `DAYTONA_PREVIEW_PROXY_BASE_URL`. `preview_proxy.py` (`create_preview_proxy_app`,
-  port 8001) resolves it (`PreviewProxyResolver.resolve`, `:70`), loads
-  `PreviewSession` + `Workspace` from Postgres, then per request calls
-  `runtime.preview_link(workspace, port)` (`:247,263,317`) and forwards HTTP (streamed,
-  hop-by-hop headers stripped) or bridges WebSockets (`:198-210`), attaching
-  `X-Daytona-Preview-Token` / `X-Daytona-Skip-Preview-Warning`.
-- The resolver currently **requires `workspace.daytona_sandbox_id`** — after Epic 01
-  this is the neutral `sandbox_id`, satisfied by Docker container ids too.
-- **Editor**: `services/editor.py` launches code-server on port 13337 via exec
-  (`:56,73,126,147` — launch/pkill) and exposes it with `signed_preview_url`.
-  `editor_sessions` rows store `bind_host="daytona"`, `bind_port`, `url`,
-  `token_expires_at`.
-- **Dev server**: `services/dev_server.py` is exec-only (mise setup/run/status/logs/
-  pkill; `:128-536`) plus two `fs.get_file_info` calls (`:549,559`) covered by Epic 03.
-- **Port detection**: `services/preview.py:243` runs a python socket probe over
-  candidate ports (3000, 5173, 8000, 8080) via exec — provider-neutral already.
-- Docker workspaces after Epic 03: exec + fs + PTY all work, but `preview_link` /
-  `signed_preview_url` raise `NotImplementedError`.
+- **Preview chain (provider-friendly and, since horizontal-scale Epic 07, stateless)**:
+  `services/preview_capability.py` mints an HMAC capability (`PAYLOAD_FORMAT =
+  "!B16sHI"` over `preview_session_id | port | expires_at`) encoded as a subdomain of
+  `DAYTONA_PREVIEW_PROXY_BASE_URL`; `services/preview_alias.py` and
+  `services/editor_alias.py` add stable per-workspace preview/editor hosts gated by a
+  grant cookie (`WorkspacePreviewAlias`, migrations `0027`/`0029`). `preview_proxy.py`
+  (`create_preview_proxy_app`, port 8001) resolves all three host kinds
+  (`PreviewProxyResolver.resolve` 152, `resolve_alias` 183, `resolve_editor_alias` 241),
+  loads `PreviewSession`/`WorkspaceService`/`EditorSession` + `Workspace` from Postgres,
+  then per request calls `runtime.preview_link(workspace, port)` (1056, 1070, 1121) and
+  forwards HTTP (streamed, hop-by-hop headers stripped, client `X-Forwarded-Host`
+  dropped) or bridges WebSockets (`proxy_websocket` 615), attaching
+  `X-Daytona-Preview-Token` / `X-Daytona-Skip-Preview-Warning` (1095, 1123).
+- Guard rails already on the proxy: no module-level state (AST test,
+  `tests/test_preview_proxy_scaling.py:218`), its own `AppLifecycle`
+  (`app.state.lifecycle`), `/live`/`/ready`/`/health`/`/metrics` only on a non-preview
+  Host, `/health` calls `proxy_runtime.health()` (411) and the runtime is injectable
+  (`create_preview_proxy_app(runtime=...)`, 305) — the four `test_preview_proxy*.py`
+  files all pass a `FakeRuntime`.
+- Each resolver currently **requires `workspace.daytona_sandbox_id`** (173, 226, 269) —
+  after Epic 01 this is the neutral `sandbox_id`, satisfied by Docker container ids too.
+- **Editor**: `services/editor.py` launches code-server on `0.0.0.0:13337 --auth none`
+  via exec (install fallback 227, pkill 159) and exposes it on the proxy's stable
+  `editor-<alias>.<proxy-host>` origin authorised by the grant cookie — **not** a signed
+  Daytona URL any more (docstring at 46–55). `editor_sessions` rows store
+  `bind_host="daytona"` (124), `bind_port`, `url`, `token_expires_at`.
+  `signed_preview_url` has no callers and was dropped from the interface in Epic 01.
+- **Dev server / services**: the "Run App" path is `services/workspace_services.py`
+  (`WorkspaceServiceManager.start` 153, `_launch` 557; N tracked `workspace_services`
+  rows, each with its own log stream and preview session — improvement Epic 11).
+  `services/dev_server.py` is the single-service path that delegates to it when a
+  registry entry exists. Both are exec-only (mise setup/run/status/logs/pkill,
+  `env=` injected from workspace env vars) plus `fs.get_file_info` config probes
+  (`dev_server.py:462,470`, `workspace_services.py:1120,1129`) covered by Epic 03.
+- **Port detection**: `services/preview.py:316` / `services/sandbox_probe.py` run a
+  python socket probe over candidate ports (3000, 5173, 8000, 8080) via exec;
+  `services/run_detection.py` infers ports from manifests — provider-neutral already.
+- Docker workspaces after Epic 03: exec + fs + PTY all work, but `preview_link` raises
+  `NotImplementedError`.
 
 ## Scope
 
 **In scope**
 
-- `DockerRuntime.preview_link` / `signed_preview_url` backed by container-network
-  addressing.
+- `DockerRuntime.preview_link` backed by container-network addressing.
 - Preview proxy reachability to sandbox containers (compose network membership).
-- Editor (code-server) and dev-server flows validated end-to-end on Docker.
+- Editor (code-server) and dev-server / multi-service flows validated end-to-end on
+  Docker.
 - `editor_sessions.bind_host` values for the Docker provider.
 
 **Out of scope**
 
-- Any change to the capability format, TTLs, or subdomain scheme (shared with Daytona,
-  and with `horizontal-scale/07` which redesigns proxy statelessness — see Dependencies).
+- Any change to the capability/alias formats, TTLs, grant cookies or subdomain scheme
+  (shared with Daytona and owned by `horizontal-scale/07`, which has shipped).
+- Any module-level state in `preview_proxy.py` — the AST guard forbids it.
 - TLS/host exposure of the proxy itself (deployment concern, Epic 06 docs).
 - Idle lifecycle of preview sessions (Epic 05).
 
@@ -64,33 +83,38 @@ identical to the Daytona experience.
    - Empty token ⇒ the proxy's token header becomes a no-op; rename the header constant
      to a provider-neutral name (`X-Sandbox-Preview-Token`) while keeping the Daytona
      value on the Daytona path.
-2. **`DockerRuntime.signed_preview_url(workspace, port)`**: route through the existing
-   capability proxy — mint/reuse a `PreviewSession` and return the capability subdomain
-   URL (the same helper the preview API uses), so editor links look identical across
-   providers. Rename `daytona_preview_proxy_base_url` config to a neutral
-   `preview_proxy_base_url` with a back-compat env alias.
-3. **Network reachability**: `docker-compose.yml` — `preview-proxy` (and backend, for
-   health checks) joins `enigma-sandboxes` in addition to the default network. Document
-   the non-compose deployment requirement (the proxy must share a Docker network with
-   sandboxes).
-4. **Proxy resolver**: replace the `daytona_sandbox_id` requirement with the neutral
-   `sandbox_id`; no other resolver changes — capability decode, DB lookup, streaming,
-   and WS bridging are provider-blind.
+2. **Config naming**: rename `daytona_preview_proxy_base_url` / `_ttl_seconds` to neutral
+   `preview_proxy_base_url` / `preview_proxy_ttl_seconds` with back-compat env aliases
+   (`AliasChoices`); keep the https-unless-loopback validator (`core/config.py:~320`).
+   The editor needs nothing provider-specific: its URL is the alias host, minted by
+   `editor_alias.py` from this base URL.
+3. **Network reachability**: `docker-compose.yml` — `preview-proxy`, `backend` and
+   `worker` join `enigma-sandboxes` (declared in Epic 02) in addition to the default
+   network. Document the non-compose deployment requirement (the proxy must share a
+   Docker network with sandboxes).
+4. **Proxy resolver**: replace the three `daytona_sandbox_id` requirements (173, 226,
+   269) with the neutral `sandbox_id` (Epic 01 may already have done this); make the
+   proxy's `/health` runtime probe (411) factory-aware so a Docker-only install reports
+   the right provider; no other resolver changes — capability/alias decode, DB lookup,
+   streaming, and WS bridging are provider-blind.
 5. **Editor on Docker**: reuse `editor.py` exec launch verbatim (code-server is baked
    into the image at the same path); `editor_sessions.bind_host` gets `"docker"`; the
-   session URL is the `signed_preview_url` from task 2. Verify pkill/relaunch and
-   `token_expires_at` refresh behave the same.
-6. **Dev server on Docker**: run the existing mise setup/run/status/logs flows
-   end-to-end; fix only environment drift (PATH/home), not logic. Log streaming uses
-   `stream_command` from Epic 02.
+   session URL is the existing `editor-<alias>` origin. Verify pkill/relaunch, the
+   grant-cookie flow and `token_expires_at` refresh behave the same.
+6. **Dev server / services on Docker**: run `WorkspaceServiceManager` start/stop/
+   restart/logs and the single-service `dev_server.py` flows end-to-end, including
+   `env=` injection of workspace variables; fix only environment drift (PATH/home), not
+   logic. Log streaming uses `stream_command` from Epic 02; service log WebSockets must
+   keep obeying the "never hold a session across `accept()`" rule
+   (`tests/test_data_layer.py`).
 7. **WebSocket preview**: verify HMR (Vite :5173) works through the proxy → container
-   path (the WS bridge at `preview_proxy.py:198-210` should carry it; test it
-   explicitly).
+   path (the WS bridge at `preview_proxy.py:615` should carry it; test it explicitly).
 8. **Tests**: unit tests for `preview_link` (name-based URL, empty token) and resolver
-   neutrality; integration (`DOCKER_INTEGRATION_TESTS=1`): start a static server in a
+   neutrality, written the way the existing `test_preview_proxy*.py` files inject a
+   `FakeRuntime`; integration (`DOCKER_INTEGRATION_TESTS=1`): start a static server in a
    container, mint a capability, fetch through a locally-instantiated proxy app, assert
-   body + a WS echo; editor launch → URL 200s; dev-server start/logs/stop for a Vite
-   fixture.
+   body + a WS echo; editor launch → alias URL 200s with the grant cookie; service
+   start/logs/stop for a Vite fixture plus a two-service (api + web) fixture.
 
 ## Frontend Tasks
 
@@ -101,8 +125,8 @@ identical to the Daytona experience.
 ## Database Tasks
 
 - None required. `editor_sessions.bind_host` is a plain string column — `"docker"` needs
-  no migration. Optional cleanup (defer to Epic 06): rename the
-  `DAYTONA_PREVIEW_PROXY_*` settings/env names to neutral ones with aliases.
+  no migration. The `DAYTONA_PREVIEW_PROXY_*` env names stay accepted as aliases
+  (task 2) until Epic 06's cleanup.
 
 ## Security Requirements
 
@@ -119,11 +143,13 @@ identical to the Daytona experience.
 
 ## Acceptance Criteria
 
-- On a Docker workspace: "Run App" detects the port, creates a preview session, and the
-  capability URL serves the app — including Vite HMR over WebSocket.
-- The editor opens (code-server via capability URL), edits a file, and the change is
-  visible via the Files panel — on Docker.
-- Dev server start/status/logs/stop work; logs stream live over the existing WS.
+- On a Docker workspace: "Run App" detects the port, creates a `workspace_services`
+  row + preview session, and both the capability URL and the stable alias URL serve
+  the app — including Vite HMR over WebSocket. A two-service fixture (api + web)
+  previews both ports.
+- The editor opens (code-server via the `editor-<alias>` origin + grant cookie), edits
+  a file, and the change is visible via the Files panel — on Docker.
+- Service start/status/restart/logs/stop work; logs stream live over the existing WS.
 - The same flows on a Daytona workspace are unchanged (regression suite + one manual
   smoke: the preview URL still carries the real Daytona token).
 - No sandbox container has host-published ports (`docker inspect` assertion in the
@@ -132,11 +158,10 @@ identical to the Daytona experience.
 ## Dependencies
 
 - **Epic 03** (fs for dev-server config detection; exec parity) — hard dependency.
-- **Non-overlap with `horizontal-scale/07` (Stateless Preview Proxy)**: that epic
-  re-architects proxy *statefulness and routing*; this epic only changes *what
-  `preview_link` returns* for one provider. Both touch `preview_proxy.py` — if 07 lands
-  first, implement against its resolver; if this lands first, 07 inherits a
-  provider-neutral resolver. Flag it in both PRs.
+- **`horizontal-scale/07` (Stateless Preview Proxy) has shipped**: implement against
+  its resolver and keep its guarantees (no module-level state, per-app `AppLifecycle`,
+  host-gated ops endpoints, HMAC + Postgres as the only sources of truth). This epic
+  only changes *what `preview_link` returns* for one provider.
 
 ## Future Enhancements
 

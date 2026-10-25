@@ -18,22 +18,29 @@ can't eat the machine, and agent code can't scan your LAN or touch the Docker da
 ## Current State
 
 - Daytona-side lifecycle is declarative at provision time
-  (ex `daytona_runtime.py:118-133`): `auto_stop_interval` (=
+  (ex `daytona_runtime.py:125-140`): `auto_stop_interval` (=
   `daytona_auto_stop_minutes`, 30), `auto_archive_interval=0`, `auto_delete_interval=-1`,
   `ephemeral=False` — the platform enforces them. Docker has **no equivalent**; the
   provider must enforce them itself.
 - Egress policy on Daytona: `_desired_network_settings` / `_apply_network_settings`
-  (ex `daytona_runtime.py:314-352`) driven by `daytona_network_block_all` and
+  (ex `daytona_runtime.py:331-362`) driven by `daytona_network_block_all` and
   `daytona_network_allow_list`. Epic 02 put Docker sandboxes on one bridge network with
   no policy.
 - Epic 02 set security floors (non-root, no socket, no privileged, fixed cpu/mem) but no
   reaper, no pids/disk limits, no seccomp/cap profile, no startup reconciliation.
-- The backend has no background-maintenance scaffolding beyond lifespan hooks
-  (`main.py:13` only closes the runtime); `horizontal-scale/01` plans startup
-  reconciliation for *runs* — this epic's reconciliation is for *containers*, a
-  different object, coordinated below.
+- **Background-maintenance scaffolding now exists** (horizontal-scale): the API
+  lifespan (`main.py:57-104`) runs `reconcile_interrupted_runs` on startup and
+  `start_retention` as a periodic task; the worker (`app/worker.py`) additionally runs
+  `run_reaper` (`services/reaper.py`, lease expiry → `interrupted_worker_died`) and
+  reconciles only its own `worker_id`. Those are the patterns to copy: a periodic
+  asyncio task started from the lifespan, Postgres as the coordination point,
+  `FOR UPDATE SKIP LOCKED` / `pg_advisory_xact_lock` instead of in-process flags, and
+  bounded-label metrics in `core/metrics.py`. That reconciliation is for *runs*; this
+  epic's is for *containers* — a different object, coordinated below.
 - Activity signals that should reset an idle clock already flow through the runtime
-  layer: `exec`/`stream_command`/PTY traffic, preview proxy requests, editor sessions.
+  layer: `exec`/`stream_command`/PTY traffic, preview proxy requests, editor sessions —
+  but they originate in **three processes** (API, worker, preview proxy), so the clock
+  cannot live in memory.
 
 ## Scope
 
@@ -56,21 +63,28 @@ can't eat the machine, and agent code can't scan your LAN or touch the Docker da
 ## Backend Tasks
 
 1. **Idle tracking**: `DockerRuntime` records `last_activity_at` per sandbox on every
-   `exec` / `stream_command` / PTY byte / `preview_link` call. Store it as a container
-   label refresh or a lightweight table (`sandbox_activity(workspace_id,
-   last_activity_at)`) — decide by write frequency; label writes are cheap but racy, DB
-   is authoritative. Recommendation: DB row, debounced to at most one write per 30s.
-2. **Reaper task**: an asyncio background task started from the FastAPI lifespan (only
-   when the Docker provider is configured): every `docker_reaper_interval_seconds` (60),
-   stop `enigma.managed` containers idle beyond `sandbox_auto_stop_minutes` (a neutral
-   setting defaulting to the value of `daytona_auto_stop_minutes`, 30). Stopped
-   containers are *kept* (parity with Daytona auto-stop, not delete); the
-   ensure-started semantics from Epic 02 transparently restart on next use.
+   `exec` / `stream_command` / PTY byte / `preview_link` call, in a lightweight table
+   `sandbox_activity(workspace_id PK/FK, last_activity_at timestamptz)` — DB, not a
+   container label and not a module-level dict (`tests/test_run_runtime.py` style
+   guards apply; the proxy's AST guard forbids in-module caches outright). Debounce to
+   at most one write per 30s **per process** using instance state on the runtime
+   object, never module state; the proxy's debounce window lives on its
+   `app.state.runtime` instance.
+2. **Reaper task**: a periodic asyncio task modelled on `services/retention.py` /
+   `services/reaper.py`, started from the lifespan only when the Docker provider is
+   configured — in the API in `inline` mode, in each worker in `queue` mode (same split
+   retention uses). Every `docker_reaper_interval_seconds` (60), stop `enigma.managed`
+   containers idle beyond `sandbox_auto_stop_minutes` (a neutral setting defaulting to
+   the value of `daytona_auto_stop_minutes`, 30). Stopped containers are *kept* (parity
+   with Daytona auto-stop, not delete); the ensure-started semantics from Epic 02
+   transparently restart on next use.
 3. **Orphan reconciliation on startup**: list containers labelled `enigma.managed=1`,
    cross-check `workspaces.sandbox_id`; containers with no matching workspace row are
    removed (log + counter); workspaces whose container vanished get `status="error"`
-   surfaced by the existing status endpoint. Single-flight guard so two backend
-   processes (uvicorn reload) don't double-reap.
+   surfaced by the existing status endpoint. Serialise concurrent passes (uvicorn
+   `--reload`, API + worker starting together) with `pg_advisory_xact_lock` inside one
+   transaction — never a session-level advisory lock or an in-process flag (PgBouncer
+   rule, AGENTS.md gotcha 22).
 4. **Resource limits** (provision-time, from config): `nano_cpus`, `mem_limit` +
    `memswap_limit` (= mem, no swap abuse), `pids_limit` (default 512), `ulimits`
    (nofile), and `storage_opt={"size": ...}` guarded by a driver check (overlay2 +
@@ -96,8 +110,9 @@ can't eat the machine, and agent code can't scan your LAN or touch the Docker da
    - Default profile (`block_all=False`, empty allowlist) = unrestricted outbound,
      matching local-dev expectations; document the difference vs Daytona defaults.
 7. **Observability**: structlog events for reap/stop/remove/limit-hit (`State.OOMKilled`
-   surfaces as a distinct workspace status detail); health output includes
-   managed-container count and reaper liveness timestamp.
+   surfaces as a distinct workspace status detail); counters in `core/metrics.py` with
+   bounded labels (`provider`, `reason`) only — never a workspace id; health output
+   includes managed-container count and reaper liveness timestamp.
 8. **Config**: `sandbox_auto_stop_minutes`, `docker_reaper_interval_seconds`,
    `docker_sandbox_pids_limit`, `docker_sandbox_disk_gb`, `sandbox_network_block_all`,
    `sandbox_network_allow_list` — mirrored in `.env.example`; Daytona keeps consuming
@@ -116,8 +131,9 @@ can't eat the machine, and agent code can't scan your LAN or touch the Docker da
 
 ## Database Tasks
 
-- Migration for `sandbox_activity` **only if** the DB variant is chosen in task 1
-  (columns: `workspace_id` FK/PK, `last_activity_at timestamptz`). Otherwise none.
+- One expand-only migration adding `sandbox_activity` (`workspace_id` FK/PK,
+  `last_activity_at timestamptz`); numbered after the current head `0035` and clean
+  under `tests/test_migration_safety.py`.
 
 ## Security Requirements
 
@@ -150,9 +166,11 @@ can't eat the machine, and agent code can't scan your LAN or touch the Docker da
 
 - **Epic 02** (provision/lifecycle) hard; **Epics 03–04** should be landed so the
   activity-signal list is complete (PTY + preview traffic).
-- **Coordination, not overlap, with `horizontal-scale/01`** (startup orphan
-  reconciliation for *runs*) — different objects, same lifespan hook; structure the
-  lifespan so both reconcilers coexist, and note it in whichever PR lands second.
+- **Coordination, not overlap, with the shipped horizontal-scale reconcilers**
+  (`services/reconciliation.py` for runs, `services/reaper.py` for leases,
+  `services/retention.py` for data) — different objects, same lifespan hooks in
+  `main.py` and `worker.py`; add the container reaper beside them following the
+  inline/queue split retention already uses.
 - Ready to serve `hybrid-runtime-migration/05` later: its ephemeral-cleanup reaper can
   extend this one rather than duplicate it (shared label scheme).
 

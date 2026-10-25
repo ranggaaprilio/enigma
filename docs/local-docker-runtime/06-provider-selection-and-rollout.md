@@ -18,18 +18,26 @@ Enigma experience on your own machine. Operators get one documented self-host pr
 
 - Epics 01–05: both providers work behind `get_runtime(workspace)`, but
   `workspace.runtime` is still hardcoded `"daytona"` at creation
-  (`services/workspaces.py:131`) and defaulted in `schemas/workspaces.py:80,103`.
-- `GET /api/health` checks only Daytona (`api/health.py:41-45`, via the neutral factory
-  since Epic 01).
+  (`services/workspaces.py:180`) and defaulted by the `default_runtime` validators in
+  `schemas/workspaces.py:138-140,166-168` (`runtime: str` at 123, 157).
+- `GET /api/health` checks only Daytona (`api/health.py:49-54`, a throwaway
+  `DaytonaRuntime` per probe until Epic 01 routes it through `get_runtime_by_name`) and
+  reports it as the `daytona` field; `/live` and `/ready` are runtime-free and are what
+  the Kubernetes probes and `tests/test_deployment.py` depend on.
 - Frontend: workspace creation UI has no runtime field; no provider badge anywhere; all
   HTTP via `src/lib/api.ts`; no component library (Tailwind only), React Context state.
+  Hard-coded "Daytona" copy lives in `CreateWorkspaceWizard.tsx:111,475`,
+  `TeamRoute.tsx:323,420,441`, `DashboardOverviewRoute.tsx:25` (a filter key
+  `"daytona"`) and `DashboardRoute.tsx:519,593`.
 - Config still carries `daytona_*` names for genuinely neutral concepts
-  (`sandbox_home`, auto-stop minutes, preview proxy base URL) with aliases introduced
-  piecemeal in Epics 02–05.
-- The optional `daytona_sandbox_id` → `sandbox_id` column rename (deferred from
-  Epic 01) is still pending.
-- Compose mounts the Docker socket (Epic 02) unconditionally; docs for a Daytona-less
-  install don't exist.
+  (`sandbox_home`, auto-stop minutes, preview proxy base URL/TTL, network policy) with
+  aliases introduced piecemeal in Epics 02–05; `.env.example:76-100` documents the
+  `DAYTONA_*` set.
+- The `daytona_sandbox_id` → `sandbox_id` column rename (deferred from Epic 01) is
+  still pending and is a **contract** migration under `tests/test_migration_safety.py`.
+- Compose mounts the Docker socket into backend, worker and preview-proxy (Epic 02)
+  unconditionally; docs for a Daytona-less install don't exist. `deploy/k8s/` is
+  Daytona-only by design and stays that way.
 
 ## Scope
 
@@ -55,7 +63,9 @@ Enigma experience on your own machine. Operators get one documented self-host pr
    "docker"] | None`; `None` → `settings.sandbox_runtime_default`. Validate at creation:
    the requested provider must be `configured` (Daytona key present / Docker daemon
    reachable) — fail with a 422 carrying an actionable message, not at first use.
-   Remove the hardcode at `services/workspaces.py:131`.
+   Remove the hardcode at `services/workspaces.py:180`. For `runtime="docker"` also
+   refuse (422) when `RUN_EXECUTION_MODE=queue` unless `docker_single_host=true` is set
+   — the operator's explicit statement that API, workers and proxy share one daemon.
 2. **`sandbox_runtime_default`** config (default `"daytona"` for continuity). If the
    default provider is unconfigured but the other is, log a startup warning and fall
    back at creation-time validation (explicit, surfaced in the response) — never
@@ -64,23 +74,29 @@ Enigma experience on your own machine. Operators get one documented self-host pr
    `{"runtimes": {"daytona": {"configured": true, "status": "ok"},
    "docker": {"configured": true, "status": "ok", "managed_containers": 3}}}` — reusing
    `get_runtime_by_name`; unconfigured ⇒ `"status": "unconfigured"`, never an error.
-   Keep overall health semantics unchanged for existing monitors.
+   Keep the existing top-level `daytona` field and overall `ok|degraded` semantics for
+   existing monitors; leave `/live` and `/ready` untouched (the proxy's own `/health`
+   gets the same `runtimes` block).
 4. **Workspace read schemas** already expose `runtime` — verify serialization and add
    it to any list endpoints that trim fields.
 5. **Naming cleanup** (finish the aliases): neutral settings become canonical
    (`sandbox_home`, `sandbox_auto_stop_minutes`, `preview_proxy_base_url`,
    `sandbox_network_*`); `daytona_*` env names remain accepted aliases for one release
    (pydantic-settings `AliasChoices`), with a deprecation log line.
-6. **Column rename migration**: `workspaces.daytona_sandbox_id` → `sandbox_id`
-   (+ index rename `ix_workspaces_daytona_sandbox_id` → `ix_workspaces_sandbox_id`),
-   dropping the ORM alias property. `editor_sessions.bind_host` data values stay
-   (`"daytona"`/`"docker"` are already neutral enough). One reversible Alembic
-   migration.
+6. **Column rename, expand/contract**: migrations after `0034` must be expand-only
+   (`tests/test_migration_safety.py`), so the rename ships in two releases —
+   *expand*: add `workspaces.sandbox_id` + `ix_workspaces_sandbox_id`, backfill, make
+   the ORM write both columns; *contract* (next release): drop `daytona_sandbox_id` and
+   its index with a `# contract: <why safe>` marker, and drop the ORM alias property.
+   `editor_sessions.bind_host` data values stay (`"daytona"`/`"docker"` are already
+   neutral enough).
 7. **Docs (operator)**: `docs/self-host-docker.md` — prerequisites (Docker/Podman,
    socket path, compose overrides), building `enigma-sandbox:latest`, env profile with
    no Daytona key, egress policy options, resource-limit tuning, the single-host
-   limitation (explicit pointer to `docs/horizontal-scale/` for what this profile does
-   NOT cover), backup/reset guidance (`docker rm` + reprovision-from-git).
+   limitation (`docker_single_host`, explicit pointer to `docs/horizontal-scale/` and
+   `deploy/README.md` for what this profile does NOT cover — Kubernetes stays
+   Daytona-only), backup/reset guidance (`docker rm` + reprovision-from-git, plus
+   `scripts/backup_db.sh` / `restore_db.sh` for Postgres).
 8. **CI**: conformance suite (both fakes) on every PR; a separate scheduled/opt-in job
    runs `DOCKER_INTEGRATION_TESTS=1` against a real daemon with the built image
    (mirroring the `DAYTONA_INTEGRATION_TESTS=1` pattern).
@@ -95,14 +111,18 @@ Enigma experience on your own machine. Operators get one documented self-host pr
 2. **Provider badge**: small "Daytona" / "Local Docker" chip on the workspace card and
    workspace header (lucide-react icon), driven by the existing `runtime` field.
 3. **Status copy**: creating/starting/stopped/error states get provider-appropriate
-   copy (Docker error states can suggest "is the Docker daemon running?").
+   copy (Docker error states can suggest "is the Docker daemon running?"). Replace the
+   hard-coded "Daytona" strings listed under Current State (`CreateWorkspaceWizard`,
+   `TeamRoute`, `DashboardRoute`) with copy driven by `runtime`; make the
+   `DashboardOverviewRoute` filter list both providers.
 4. **Vitest**: picker availability logic (both available / one / neither), badge
    rendering, default selection.
 
 ## Database Tasks
 
-- The rename migration (task 6): `daytona_sandbox_id` → `sandbox_id` with its index.
-  Reversible; no data transform.
+- The expand half of task 6 (add `sandbox_id` + index, backfill from
+  `daytona_sandbox_id`), numbered after the current head `0035`. The contract half is a
+  separate later migration carrying the `# contract:` marker.
 
 ## Security Requirements
 
@@ -131,7 +151,12 @@ Enigma experience on your own machine. Operators get one documented self-host pr
   message; nothing half-provisioned.
 - CI: conformance suite green on both fakes; the Docker integration job green on the
   reference runner; the `grep`-guard from Epic 01 still enforced.
-- Alembic upgrade+downgrade of the rename migration round-trips on a seeded DB.
+- Alembic upgrade+downgrade of the expand migration round-trips on a seeded DB and
+  passes `tests/test_migration_safety.py`.
+- `runtime="docker"` with `RUN_EXECUTION_MODE=queue` and no `docker_single_host=true`
+  → 422; with the flag, a run enqueued by the API executes in the compose `worker`
+  against the same container.
+- `tests/test_deployment.py` stays green: nothing Docker-related enters `deploy/k8s/`.
 
 ## Dependencies
 
@@ -141,8 +166,9 @@ Enigma experience on your own machine. Operators get one documented self-host pr
   rollout are independent flags on independent axes; if both series are mid-flight,
   land their config keys with distinct prefixes (`hybrid_*` vs `sandbox_runtime_*`) —
   already the case as specced.
-- `horizontal-scale` untouched: the docs deliverable records that Docker-runtime
-  workspaces are node-pinned and out of that series' scope.
+- `horizontal-scale` (shipped) untouched: the docs deliverable records that
+  Docker-runtime workspaces are host-pinned, that queue mode needs the single-host
+  flag, and that the Kubernetes overlay does not carry the Docker provider.
 
 ## Future Enhancements
 
