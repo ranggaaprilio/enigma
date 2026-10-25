@@ -8,13 +8,17 @@ long-running streams would otherwise exhaust for the whole process:
 * ``exec`` pool — one thread per in-flight command for its whole life (bounded by
   ``DOCKER_MAX_CONCURRENT_EXECS``);
 * ``control`` pool — short calls (inspect, start, create, the kill exec), so stopping a
-  command can never queue behind the commands it is trying to stop.
+  command can never queue behind the commands it is trying to stop;
+* ``pty`` pool — one reader thread per open terminal, for the terminal's whole life.
 
 Commands run as ``timeout -k <grace> <secs> /bin/sh -c <command>`` (``0`` = no limit).
 GNU ``timeout`` makes itself a process-group leader and signals the whole group, so a
 timed-out command dies with its children inside the container. Its pid is written to a
 pidfile so a second exec can kill the same group when the caller is cancelled (shutdown
 drain) or the host-side guard fires — the equivalent of Daytona deleting the session.
+
+File access (``docker_fs.py``: argv execs + tar archives) and terminals
+(``docker_pty.py``: tmux sessions that survive a reconnect) live in sibling modules.
 """
 
 from __future__ import annotations
@@ -42,11 +46,21 @@ from app.models import Workspace
 from app.services.sandbox.base import (
     CommandTimeoutError,
     ProvisioningError,
+    PtySize,
     RuntimeCommandResult,
     RuntimePreviewLink,
     RuntimeUnavailableError,
     SandboxNotFoundError,
     SandboxRuntimeError,
+)
+from app.services.sandbox.docker_fs import DockerFileSystem
+from app.services.sandbox.docker_pty import (
+    TERM,
+    DockerPtyHandle,
+    attach_argv,
+    deliver_threadsafe,
+    new_pidfile,
+    tmux_session_name,
 )
 
 logger = structlog.get_logger(__name__)
@@ -180,6 +194,7 @@ class DockerRuntime:
         self._exec_api: Any = None  # docker.APIClient: exec streams, no read timeout
         self._exec_pool: ThreadPoolExecutor | None = None
         self._control_pool: ThreadPoolExecutor | None = None
+        self._pty_pool: ThreadPoolExecutor | None = None  # one reader per open terminal
         # Guards first connect; asyncio locks bind to one loop, so keep one per loop.
         self._locks: dict[int, asyncio.Lock] = {}
 
@@ -193,6 +208,13 @@ class DockerRuntime:
                     thread_name_prefix="docker-exec",
                 )
             return self._exec_pool
+        if kind == "pty":
+            if self._pty_pool is None:
+                self._pty_pool = ThreadPoolExecutor(
+                    max_workers=self.settings.docker_max_concurrent_execs,
+                    thread_name_prefix="docker-pty",
+                )
+            return self._pty_pool
         if self._control_pool is None:
             self._control_pool = ThreadPoolExecutor(
                 max_workers=CONTROL_POOL_SIZE, thread_name_prefix="docker-control"
@@ -259,10 +281,10 @@ class DockerRuntime:
         for closable in (exec_api, client):
             if closable is not None:
                 await asyncio.to_thread(closable.close)
-        for pool in (self._exec_pool, self._control_pool):
+        for pool in (self._exec_pool, self._control_pool, self._pty_pool):
             if pool is not None:
                 pool.shutdown(wait=False, cancel_futures=True)
-        self._exec_pool = self._control_pool = None
+        self._exec_pool = self._control_pool = self._pty_pool = None
         self._locks.clear()
 
     async def health(self) -> str:
@@ -544,21 +566,7 @@ class DockerRuntime:
         abandoned = threading.Event()
 
         def deliver(callback: Callable[[str], Awaitable[None]], text: str) -> bool:
-            """Hand a chunk to the consumer and wait for it (backpressure). False once the
-            caller has gone, so the pump stops instead of blocking on a dead consumer."""
-            if not text:
-                return True
-            if abandoned.is_set():
-                return False
-            future = asyncio.run_coroutine_threadsafe(callback(text), loop)
-            while True:
-                try:
-                    future.result(timeout=0.5)
-                    return True
-                except TimeoutError:
-                    if abandoned.is_set() or loop.is_closed():
-                        future.cancel()
-                        return False
+            return not text or deliver_threadsafe(loop, callback, text, abandoned)
 
         def pump() -> None:
             decoders = (
@@ -577,15 +585,10 @@ class DockerRuntime:
         await self._finish(self._run("exec", pump), container, exec_id, pidfile, timeout, abandoned)
         return await self._exit_code(exec_id, timeout, started)
 
-    # --- surfaces that land in later epics --------------------------------------------
+    # --- files & terminal -------------------------------------------------------------
 
-    def _require_sandbox(self, workspace: Workspace) -> None:
-        if not workspace.sandbox_id:
-            raise SandboxNotFoundError("Workspace has no Docker sandbox")
-
-    async def fs(self, workspace: Workspace) -> Any:
-        self._require_sandbox(workspace)
-        raise _not_yet("File access")  # Epic 03
+    async def fs(self, workspace: Workspace) -> DockerFileSystem:
+        return DockerFileSystem(self, await self._container(workspace))
 
     async def create_or_connect_pty(
         self,
@@ -597,12 +600,52 @@ class DockerRuntime:
         cols: int,
         rows: int,
         cwd: str | None = None,
-    ) -> Any:
-        self._require_sandbox(workspace)
-        raise _not_yet("The terminal")  # Epic 03
+    ) -> DockerPtyHandle:
+        pidfile = new_pidfile()
+        argv = attach_argv(
+            tmux_session_name(session_id),
+            pidfile,
+            cols=cols,
+            rows=rows,
+            cwd=self._resolve_cwd(workspace, cwd),
+            environment=_validate_env(env),
+        )
+        container = await self._container(workspace)
+        client, exec_api = await self._clients()
+        created = await self._call(
+            client.api.exec_create,
+            container.id,
+            argv,
+            stdin=True,
+            tty=True,
+            environment=[f"TERM={TERM}"],
+            workdir=self._home(),
+        )
+        sock = await self._call(exec_api.exec_start, created["Id"], tty=True, socket=True)
+        handle = DockerPtyHandle(self, container, created["Id"], pidfile, sock)
+        handle.start_reader(on_data)
+        try:
+            await handle.resize(PtySize(cols=cols, rows=rows))
+        except BaseException:
+            await handle.disconnect()
+            raise
+        return handle
 
     async def kill_pty(self, workspace: Workspace, session_id: str) -> None:
-        return None  # no PTY sessions exist yet; killing an unknown session is a no-op
+        container = await self._container(workspace, start=False)
+        await self._call(container.reload)
+        if container.status != "running":
+            return  # a stopped container has no tmux server, so no session to kill
+        # ``=name`` is an exact match; a missing session exits non-zero and is a no-op.
+        await self._call(
+            container.exec_run, ["tmux", "kill-session", "-t", f"={tmux_session_name(session_id)}"]
+        )
+
+    # --- surfaces that land in later epics --------------------------------------------
+
+    def _require_sandbox(self, workspace: Workspace) -> None:
+        if not workspace.sandbox_id:
+            raise SandboxNotFoundError("Workspace has no Docker sandbox")
 
     async def preview_link(self, workspace: Workspace, port: int) -> RuntimePreviewLink:
         self._require_sandbox(workspace)
