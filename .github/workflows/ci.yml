@@ -1,10 +1,13 @@
 name: CI
 
+# Disabled temporarily: no longer runs on pull requests or pushes. Restore the
+# pull_request/push triggers below to re-enable.
 "on":
-  pull_request:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
+  # pull_request:
+  # push:
+  #   branches:
+  #     - main
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
