@@ -50,8 +50,6 @@ def echo(command: str) -> RuntimeCommandResult:
 # removed (and the suite proves the contract) the moment the epic lands.
 PENDING = {
     "docker": {
-        "test_fs_round_trip": "file access lands in local-docker-runtime Epic 03",
-        "test_pty_handle_contract": "the terminal lands in local-docker-runtime Epic 03",
         "test_preview_link_shape": "app preview lands in local-docker-runtime Epic 04",
     },
 }
@@ -135,8 +133,12 @@ async def test_fs_round_trip(case) -> None:
     assert (await fs.get_file_info("/workspace/dir")).is_dir is True
     assert await fs.download_file("/workspace/dir/a.txt") == b"hello"
     assert [entry.name for entry in await fs.list_files("/workspace/dir")] == ["a.txt"]
-    matches = await fs.find_files("/workspace", "*.txt")
-    assert [match.file for match in matches] == ["/workspace/dir/a.txt"]
+    # A content search (grep), as Daytona's is — not a filename glob.
+    matches = await fs.find_files("/workspace", "ell")
+    assert [(match.file, match.line, match.content) for match in matches] == [
+        ("/workspace/dir/a.txt", 1, "hello")
+    ]
+    assert await fs.find_files("/workspace", "*.txt") == []
 
     await fs.set_file_permissions("/workspace/dir/a.txt", mode="600")
     await fs.move_files("/workspace/dir/a.txt", "/workspace/dir/b.txt")
@@ -145,6 +147,23 @@ async def test_fs_round_trip(case) -> None:
 
     await fs.delete_file("/workspace/dir", recursive=True)
     assert await _missing(fs, "/workspace/dir")
+
+
+@pytest.mark.parametrize(
+    "name", ["naïve résumé ✓.txt", "with space.txt", "-leading-dash", "semi; rm -rf x", "`tick`"]
+)
+async def test_fs_unusual_file_names_round_trip(case, name: str) -> None:
+    runtime, workspace = case
+    fs = await runtime.fs(workspace)
+    await fs.create_folder("/workspace/odd", "755")
+    path = f"/workspace/odd/{name}"
+    await fs.upload_file("ünïcode\n".encode(), path)
+
+    assert [entry.name for entry in await fs.list_files("/workspace/odd")] == [name]
+    assert (await fs.get_file_info(path)).name == name
+    assert await fs.download_file(path) == "ünïcode\n".encode()
+    await fs.delete_file("/workspace/odd", recursive=True)
+    assert await _missing(fs, path)
 
 
 async def test_workspace_without_sandbox_raises_not_found(case) -> None:

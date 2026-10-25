@@ -11,9 +11,10 @@ Two layers:
 
 from __future__ import annotations
 
+import queue
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
-from fnmatch import fnmatch
+from dataclasses import dataclass, field
+from posixpath import dirname
 from types import SimpleNamespace
 from typing import Any
 from uuid import uuid4
@@ -138,10 +139,13 @@ class FakeFileSystem:
             raise FileNotFoundError(path)
 
     async def find_files(self, path: str, pattern: str) -> list[Any]:
+        # Daytona's find_files is a content search (grep), not a filename glob.
         return [
-            SimpleNamespace(file=key)
+            SimpleNamespace(file=key, line=number, content=text)
             for key in sorted(self._children(path))
-            if key in self.files and fnmatch(key.rsplit("/", 1)[-1], pattern)
+            if key in self.files
+            for number, text in enumerate(self.files[key].decode(errors="replace").split("\n"), 1)
+            if pattern in text
         ]
 
     async def set_file_permissions(self, path: str, *, mode: str) -> None:
@@ -457,6 +461,175 @@ class DockerExecResult:
 DockerExecHandler = Callable[[str], "RuntimeCommandResult | DockerExecResult"]
 
 
+@dataclass
+class FakeContainerFs:
+    """The container's files, driven only by the argv shapes ``DockerFileSystem`` sends
+    (``find -printf``, ``mkdir -p -m``, ``mv -T``, ``rm -r|-d``, ``chmod`` and its read /
+    search scripts; writes arrive through ``write``). An argv it does not recognise fails
+    loudly, so a provider change cannot pass silently. ``readable=False`` paths model files
+    the sandbox user may not read."""
+
+    files: dict[str, bytes] = field(default_factory=dict)
+    dirs: set[str] = field(default_factory=lambda: {"/", "/home", "/home/daytona"})
+    links: dict[str, str] = field(default_factory=dict)
+    modes: dict[str, str] = field(default_factory=dict)
+    unreadable: set[str] = field(default_factory=set)
+
+    def exists(self, path: str) -> bool:
+        return path in self.files or path in self.dirs or path in self.links
+
+    def resolve(self, path: str) -> str:
+        return self.links.get(path, path)
+
+    def _children(self, path: str) -> list[str]:
+        prefix = path.rstrip("/") + "/"
+        return sorted(
+            key
+            for key in (*self.files, *self.dirs, *self.links)
+            if key.startswith(prefix) and "/" not in key[len(prefix) :] and key != "/"
+        )
+
+    def _record(self, path: str) -> bytes:
+        target = self.resolve(path)
+        kind = "l" if path in self.links else ("d" if path in self.dirs else "f")
+        target_kind = "d" if target in self.dirs else ("f" if target in self.files else "N")
+        size = len(self.files.get(target, b"")) if kind != "l" else len(self.links[path])
+        mode = self.modes.get(path, "755" if kind == "d" else "644")
+        fields = [kind, target_kind, str(size), "1700000000.5", mode, "-rw-r--r--"]
+        fields += ["daytona", "daytona", path]
+        return b"".join(value.encode("utf-8", "surrogateescape") + b"\0" for value in fields)
+
+    def _subtree(self, path: str) -> list[str]:
+        return [k for k in (*self.files, *self.dirs, *self.links) if k.startswith(path + "/")]
+
+    def run(self, argv: list[str]) -> tuple[int, bytes, bytes]:
+        missing = (1, b"", b"No such file or directory")
+        match argv:
+            case ["find", "-H", path, "-mindepth", "1", "-maxdepth", "1", "-printf", _]:
+                path = self.resolve(path)
+                if path not in self.dirs:
+                    return missing
+                return 0, b"".join(self._record(child) for child in self._children(path)), b""
+            case ["find", path, "-maxdepth", "0", "-printf", _]:
+                return (0, self._record(path), b"") if self.exists(path) else missing
+            case ["mkdir", "-p", "-m", mode, "--", path]:
+                if path in self.files:
+                    return 1, b"", b"File exists"
+                while path not in self.dirs:
+                    self.dirs.add(path)
+                    self.modes.setdefault(path, mode)
+                    path = dirname(path)
+                return 0, b"", b""
+            case ["mv", "-T", "--", source, destination]:
+                if not self.exists(source):
+                    return missing
+                for store in (self.files, self.links, self.modes):
+                    for key in [k for k in store if k == source or k.startswith(source + "/")]:
+                        store[destination + key[len(source) :]] = store.pop(key)
+                for key in [k for k in self.dirs if k == source or k.startswith(source + "/")]:
+                    self.dirs.remove(key)
+                    self.dirs.add(destination + key[len(source) :])
+                return 0, b"", b""
+            case ["rm", flag, "--", path] if flag in ("-r", "-d"):
+                if not self.exists(path):
+                    return missing
+                below = self._subtree(path)
+                if flag == "-d" and below:
+                    return 1, b"", b"Directory not empty"
+                for key in [path, *below]:
+                    for store in (self.files, self.links, self.modes):
+                        store.pop(key, None)
+                    self.dirs.discard(key)
+                return 0, b"", b""
+            case ["chmod", mode, "--", path]:
+                if not self.exists(path):
+                    return missing
+                self.modes[self.resolve(path)] = mode
+                return 0, b"", b""
+            case ["/bin/sh", "-c", script, "sh", path, cap] if (
+                "head -c" in script and "-f" in script
+            ):
+                target = self.resolve(path)
+                if target in self.unreadable:
+                    return 1, b"", b"head: cannot open: Permission denied"
+                if target in self.files:
+                    return 0, self.files[target][: int(cap)], b""
+                if self.exists(path):
+                    return 1, b"", b"not a regular file"
+                return missing
+            case ["/bin/sh", "-c", script, "sh", pattern, path, cap] if "grep" in script:
+                if not self.exists(path):
+                    return 2, b"", b"No such file or directory"
+                out = b""
+                for key in sorted(k for k in self.files if k == path or k.startswith(path + "/")):
+                    for number, line in enumerate(self.files[key].split(b"\n"), 1):
+                        if pattern.encode() in line:
+                            out += key.encode("utf-8", "surrogateescape") + b"\0"
+                            out += str(number).encode() + b":" + line + b"\n"
+                return 0, out[: int(cap)], b""
+        raise AssertionError(f"FakeContainerFs does not understand {argv!r}")
+
+    def write(self, path: str, parent: str, data: bytes) -> tuple[int, bytes]:
+        """``mkdir -p parent && head -c n > path`` as the sandbox user."""
+        target = self.resolve(path)
+        if path in self.dirs or target in self.dirs:
+            return 1, b"sh: cannot create: Is a directory"
+        if target in self.unreadable:
+            return 1, b"sh: cannot create: Permission denied"
+        self.run(["mkdir", "-p", "-m", "755", "--", parent])
+        self.modes.setdefault(target, "644")  # truncating keeps an existing mode
+        self.files[target] = data
+        return 0, b""
+
+
+class FakeStdinSocket:
+    """The socket of an upload exec: bytes sent are the file; reading runs the command and
+    returns its (multiplexed) stderr, then EOF."""
+
+    def __init__(self, on_complete: Callable[[bytes], bytes]) -> None:
+        self.received = bytearray()
+        self._on_complete = on_complete
+        self._pending: bytes | None = None
+
+    def settimeout(self, value: float) -> None:
+        return None
+
+    def sendall(self, data: bytes) -> None:
+        self.received.extend(data)
+
+    def recv(self, size: int) -> bytes:
+        if self._pending is None:
+            stderr = self._on_complete(bytes(self.received))
+            frame = b"\x02\0\0\0" + len(stderr).to_bytes(4, "big") + stderr
+            self._pending = frame if stderr else b""
+        chunk, self._pending = self._pending[:size], self._pending[size:]
+        return chunk
+
+    def shutdown(self, how: int) -> None:
+        return None
+
+
+class FakePtySocket:
+    """The raw socket ``exec_start(socket=True)`` returns: input echoes back as output."""
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.closed = False
+        self._out: queue.Queue[bytes] = queue.Queue()
+        self._out.put(b"$ ")
+
+    def recv(self, size: int) -> bytes:
+        return self._out.get(timeout=10)
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(data)
+        self._out.put(data)
+
+    def shutdown(self, how: int) -> None:
+        self.closed = True
+        self._out.put(b"")
+
+
 class FakeDockerContainer:
     def __init__(self, client: FakeDockerClient, spec: dict[str, Any]) -> None:
         self.client = client
@@ -468,6 +641,10 @@ class FakeDockerContainer:
         self.start_calls = 0
         self.removed = False
         self.exec_runs: list[list[str]] = []
+        self.fs = FakeContainerFs()
+        self.tmux_sessions: set[str] = set()
+        # pidfile -> socket of the attached tmux client it names
+        self.tmux_clients: dict[str, FakePtySocket] = {}
 
     def reload(self) -> None:
         if self.removed:
@@ -487,15 +664,30 @@ class FakeDockerContainer:
         self.removed = True
         self.client.containers.by_id.pop(self.id, None)
 
-    def exec_run(self, cmd: list[str], workdir: str | None = None) -> Any:
+    def exec_run(self, cmd: list[str], workdir: str | None = None, demux: bool = False) -> Any:
         self.exec_runs.append(list(cmd))
+        if demux:
+            code, stdout, stderr = self.fs.run(list(cmd))
+            return SimpleNamespace(exit_code=code, output=(stdout or None, stderr or None))
         if len(cmd) == 4 and cmd[:2] == ["/bin/sh", "-c"] and "kill -s TERM" in cmd[2]:
             self.client.killed_pidfiles.append(cmd[3])
             event = self.client.blocked_by_pidfile.get(cmd[3])
             if event is not None:
                 event.set()
+        if len(cmd) == 4 and cmd[:2] == ["/bin/sh", "-c"] and "kill -s HUP" in cmd[2]:
+            sock = self.tmux_clients.pop(cmd[3], None)
+            if sock is not None:
+                sock.shutdown(0)
+        if cmd[:3] == ["tmux", "kill-session", "-t"]:
+            name = cmd[3].removeprefix("=")
+            if name not in self.tmux_sessions:
+                return SimpleNamespace(exit_code=1, output=b"can't find session")
+            self.tmux_sessions.discard(name)
+            return SimpleNamespace(exit_code=0, output=b"")
         if cmd[:2] == ["mkdir", "-p"] and self.client.fail_mkdir:
             return SimpleNamespace(exit_code=1, output=b"read-only")
+        if cmd[:3] == ["mkdir", "-p", "--"]:
+            self.fs.run(["mkdir", "-p", "-m", "755", "--", cmd[3]])
         return SimpleNamespace(exit_code=0, output=b"")
 
 
@@ -553,21 +745,35 @@ class _FakeDockerAPI:
     def __init__(self, client: FakeDockerClient) -> None:
         self.client = client
         self.execs: dict[str, dict[str, Any]] = {}
+        self.resizes: list[tuple[str, int | None, int | None]] = []
         self.closed = False
         self.api_version = "1.41"
 
-    def exec_create(self, container_id, cmd, environment=None, workdir=None, **_: Any):
+    def exec_create(self, container_id, cmd, environment=None, workdir=None, tty=False, **_: Any):
         exec_id = f"exec-{len(self.execs)}"
         self.execs[exec_id] = {
             "container": container_id,
             "cmd": list(cmd),
             "environment": environment,
             "workdir": workdir,
+            "tty": tty,
             "exit_code": None,
             "running": False,
             "finished": False,
         }
         return {"Id": exec_id}
+
+    def _attach_tmux(self, exec_id: str) -> FakePtySocket:
+        record = self.execs[exec_id]
+        cmd = record["cmd"]
+        container = self.client.containers.get(record["container"])
+        container.tmux_sessions.add(cmd[cmd.index("-s") + 1])
+        sock = container.tmux_clients[cmd[3]] = FakePtySocket()
+        record["socket"] = sock
+        return sock
+
+    def exec_resize(self, exec_id: str, height: int | None = None, width: int | None = None):
+        self.resizes.append((exec_id, width, height))
 
     def _result(self, exec_id: str) -> DockerExecResult:
         record = self.execs[exec_id]
@@ -588,9 +794,32 @@ class _FakeDockerAPI:
         record["exit_code"] = outcome.exit_code
         return outcome
 
-    def exec_start(self, exec_id, stream=False, demux=False, **_: Any):
+    def _upload(self, exec_id: str) -> FakeStdinSocket:
+        record = self.execs[exec_id]
+        container = self.client.containers.get(record["container"])
+        _, _, _, _, path, parent, size = record["cmd"]
+        record["running"] = True
+
+        def complete(data: bytes) -> bytes:
+            code, stderr = container.fs.write(path, parent, data[: int(size)])
+            record["exit_code"], record["running"] = code, False
+            return stderr
+
+        return FakeStdinSocket(complete)
+
+    def exec_start(self, exec_id, stream=False, demux=False, socket=False, **_: Any):
+        if socket:
+            if "tmux" in self.execs[exec_id]["cmd"]:
+                return SimpleNamespace(_sock=self._attach_tmux(exec_id))
+            return SimpleNamespace(_sock=self._upload(exec_id))
         record = self.execs[exec_id]
         record["running"] = True
+        if stream and "[ -f" in record["cmd"][2]:  # DockerFileSystem.download_file
+            container = self.client.containers.get(record["container"])
+            container.exec_runs.append(list(record["cmd"]))
+            code, out, err = container.fs.run(list(record["cmd"]))
+            record["exit_code"], record["running"], record["finished"] = code, False, True
+            return iter([(out[:3] or None, None), (out[3:] or None, err or None)])
         if not stream:
             try:
                 outcome = self._result(exec_id)

@@ -475,20 +475,10 @@ async def test_kill_skips_a_command_that_already_finished() -> None:
 # --- not yet / errors --------------------------------------------------------------------
 
 
-async def test_later_epic_surfaces_fail_with_a_clear_unavailable_error() -> None:
+async def test_preview_fails_with_a_clear_unavailable_error_until_epic_04() -> None:
     runtime, workspace = await provisioned(FakeDockerClient())
-
-    async def on_data(data: bytes) -> None:
-        return None
-
-    for call in (
-        runtime.fs(workspace),
-        runtime.preview_link(workspace, 3000),
-        runtime.create_or_connect_pty(workspace, "t", on_data, env=None, cols=80, rows=24),
-    ):
-        with pytest.raises(RuntimeUnavailableError, match="not available on the Docker"):
-            await call
-    await runtime.kill_pty(workspace, "never-created")
+    with pytest.raises(RuntimeUnavailableError, match="not available on the Docker"):
+        await runtime.preview_link(workspace, 3000)
 
 
 def test_error_mapping_never_leaks_the_daemon_url() -> None:

@@ -4,10 +4,13 @@ Run with a daemon up and ``./sandbox/build-local-image.sh`` done:
 
     DOCKER_INTEGRATION_TESTS=1 uv run pytest tests/test_docker_integration.py
 
-Covers the local-docker-runtime Epic 02 acceptance criteria that need a real container:
-lifecycle, exec/stream parity, timeout and cancellation kill, auto-start, a command run
-through ``CommandService`` and an agent ``run_command`` on a docker workspace, and no
-leaked containers.
+Covers the local-docker-runtime acceptance criteria that need a real container.
+Epic 02: lifecycle, exec/stream parity, timeout and cancellation kill, auto-start, a
+command run through ``CommandService`` and an agent ``run_command``, no leaked
+containers. Epic 03: files (unusual names, modes, ownership, symlinks), the agent file
+tools, blank/template init, worktrees, ``specify init``, ``.env`` and SSH key ``0600``,
+the git token kept off every command line, and tmux terminals that survive a reconnect.
+The template and ``specify init`` tests need outbound network from the sandbox.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import os
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -24,8 +28,14 @@ from app.core.security import hash_password
 from app.models import User, Workspace
 from app.services.agent_tools import WorkspaceTools
 from app.services.commands import CommandRuntime, CommandService
-from app.services.sandbox import CommandTimeoutError
+from app.services.repositories import GitAuth, RepositoryService
+from app.services.sandbox import CommandTimeoutError, PtySize
 from app.services.sandbox.docker import MANAGED_LABEL, WORKSPACE_LABEL, DockerRuntime
+from app.services.speckit import SPECIFY_INIT_COMMAND
+from app.services.workspace_env import materialize_env_file
+from app.services.workspace_init import WorkspaceInitializer
+from app.services.workspaces import WorkspaceSecretCipher
+from app.services.worktrees import WorktreeService
 from tests.test_commands import real_db_session  # noqa: F401  (fixture)
 
 pytestmark = pytest.mark.skipif(
@@ -231,3 +241,249 @@ async def test_command_run_streams_and_completes_on_docker(runtime, real_db_sess
         assert str(workspace.id) in run.output
     finally:
         await runtime.delete(workspace)
+
+
+# --- Epic 03: files, git, terminal --------------------------------------------------------
+
+ROOT = "/home/daytona/workspace"
+
+
+async def _sh(runtime, workspace, command: str) -> str:
+    result = await runtime.exec(workspace, command, cwd="/home/daytona")
+    assert result.exit_code == 0, result.stdout
+    return result.stdout
+
+
+async def test_files_round_trip_with_modes_ownership_and_symlinks(runtime, sandbox) -> None:
+    fs = await runtime.fs(sandbox)
+    odd = f"{ROOT}/d ir/-x; rm `id` ✓\nz.txt"
+    await fs.upload_file(b"hello\nneedle here\n", odd)  # parent created on demand
+
+    assert [entry.name for entry in await fs.list_files(f"{ROOT}/d ir")] == [odd.rsplit("/")[-1]]
+    info = await fs.get_file_info(odd)
+    assert (info.is_dir, info.size, info.owner, info.permissions) == (
+        False,
+        len(b"hello\nneedle here\n"),
+        "daytona",
+        "0644",
+    )
+    assert await fs.download_file(odd) == b"hello\nneedle here\n"
+    assert [(m.file, m.line) for m in await fs.find_files(ROOT, "needle")] == [(odd, 2)]
+
+    script = f"{ROOT}/run.sh"
+    await fs.upload_file(b"#!/bin/sh\necho one\n", script)
+    await fs.set_file_permissions(script, mode="755")
+    await fs.upload_file(b"#!/bin/sh\necho two\n", script)
+    assert await _sh(runtime, sandbox, "stat -c '%a %U' workspace/run.sh; workspace/run.sh") == (
+        "755 daytona\ntwo\n"
+    )
+
+    await _sh(runtime, sandbox, "ln -s /etc/hostname workspace/escape")
+    assert (await fs.get_file_info(f"{ROOT}/escape")).is_symlink is True  # files.py refuses
+    with pytest.raises(IsADirectoryError):
+        await fs.download_file("/usr")  # refused up front, never streamed into memory
+
+    blob = os.urandom(5 * 1024 * 1024) + bytes(range(256))  # binary, larger than a frame
+    await fs.upload_file(blob, f"{ROOT}/blob.bin")
+    assert await fs.download_file(f"{ROOT}/blob.bin") == blob
+    await fs.upload_file(b"", f"{ROOT}/blob.bin")
+    assert await fs.download_file(f"{ROOT}/blob.bin") == b""
+
+    await fs.move_files(odd, f"{ROOT}/moved.txt")
+    with pytest.raises(FileNotFoundError):
+        await fs.get_file_info(odd)
+    await fs.delete_file(f"{ROOT}/d ir")  # now empty
+    await fs.delete_file(ROOT, recursive=True)
+    with pytest.raises(FileNotFoundError):
+        await fs.get_file_info(ROOT)
+
+
+async def test_symlinks_never_lend_the_daemon_root_privileges(runtime, sandbox) -> None:
+    """A repository can commit ``docs -> /etc``. Reads and writes run as the sandbox user,
+    so the kernel refuses what that user may not do — even through a parent symlink."""
+    fs = await runtime.fs(sandbox)
+    await _sh(runtime, sandbox, "mkdir -p workspace && ln -s /etc workspace/docs")
+    await _sh(runtime, sandbox, "ln -s /etc/shadow workspace/shadow")
+    before = await _sh(runtime, sandbox, "ls -la /etc | md5sum; stat -c %U /etc/hostname")
+
+    for target in (f"{ROOT}/docs/pwned", f"{ROOT}/docs/hostname"):
+        with pytest.raises(PermissionError):
+            await fs.upload_file(b"pwned", target)
+    for target in (f"{ROOT}/shadow", f"{ROOT}/docs/shadow"):
+        with pytest.raises(PermissionError):
+            await fs.download_file(target)
+
+    assert await _sh(runtime, sandbox, "ls -la /etc | md5sum; stat -c %U /etc/hostname") == before
+
+
+async def test_agent_file_and_git_tools_on_a_blank_workspace(runtime, sandbox) -> None:
+    await WorkspaceInitializer(runtime).initialize_blank(sandbox)
+    assert "Initial commit" in await _sh(runtime, sandbox, "git -C workspace log --oneline")
+
+    tools = WorkspaceTools(
+        sandbox, runtime=runtime, command_timeout_seconds=30, max_command_output_chars=20_000
+    )
+    await tools.write_file("src/app.py", "print('hello')\n")
+    patch = "<<<<<<< SEARCH\nprint('hello')\n=======\nprint('bye')\n>>>>>>> REPLACE\n"
+    assert (await tools.apply_patch("src/app.py", patch)).blocks_applied == 1
+    assert await tools.read_file("src/app.py") == "print('bye')\n"
+    assert sorted(await tools.list_files()) == ["README.md", "src/app.py"]
+    found = await tools.search_code("bye")
+    assert [(m.path, m.line_number) for m in found.matches] == [("src/app.py", 1)]
+    status = await tools.git_status()
+    assert status.is_clean is False and status.branch == "main"
+    await tools.write_file("README.md", "# changed\n")
+    assert "+# changed" in await tools.git_diff()
+
+
+async def test_template_init_and_specify_init(runtime, sandbox) -> None:
+    template = SimpleNamespace(
+        slug="react",
+        source_repo_url="https://github.com/github/codespaces-react.git",
+        source_ref=None,
+        mise_config='[tools]\nnode = "22"\n',
+    )
+    await WorkspaceInitializer(runtime).initialize_from_template(sandbox, template)
+    log = await _sh(runtime, sandbox, "git -C workspace log --oneline")
+    assert log.count("\n") == 1 and "from template react" in log
+    assert await _sh(runtime, sandbox, "cat workspace/mise.toml") == '[tools]\nnode = "22"\n'
+
+    result = await runtime.exec(sandbox, SPECIFY_INIT_COMMAND, timeout=180)
+    assert result.exit_code == 0, result.stdout[-2000:]
+    await _sh(runtime, sandbox, "test -d workspace/.specify")
+
+
+async def test_env_file_and_ssh_key_land_private(runtime, sandbox) -> None:
+    await WorkspaceInitializer(runtime).initialize_blank(sandbox)
+    sandbox.env_file_path = ".env"
+    written = await materialize_env_file(
+        runtime, sandbox, checkout="workspace", env={"API_KEY": "s3cr3t"}, timeout=30
+    )
+    stat = await _sh(runtime, sandbox, f"stat -c '%a %U' {written}; cat {written}")
+    assert stat.startswith("600 daytona\n") and "s3cr3t" in stat
+
+    service = RepositoryService(
+        session=None,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(get_settings().workspace_env_encryption_key),
+        runtime=runtime,
+    )
+    fs = await runtime.fs(sandbox)
+    async with service._ssh_identity(fs, "-----BEGIN KEY-----\nabc\n") as key_path:
+        modes = await _sh(runtime, sandbox, f"stat -c '%a' {key_path} $(dirname {key_path})")
+        assert modes == "600\n700\n"
+    with pytest.raises(FileNotFoundError):
+        await fs.get_file_info(key_path)
+
+
+async def test_git_token_never_reaches_a_command_line(runtime, sandbox) -> None:
+    await WorkspaceInitializer(runtime).initialize_blank(sandbox)
+    service = RepositoryService(
+        session=None,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(get_settings().workspace_env_encryption_key),
+        runtime=runtime,
+    )
+    auth = GitAuth(kind="token", username="x-access-token", token="tok-NEVER-IN-PS")
+    seen = await service._run_authenticated_git(
+        sandbox, ["config", "--get", "http.extraHeader"], auth, cwd="workspace"
+    )
+    assert seen.stdout.startswith("AUTHORIZATION: basic ")  # git does receive it
+    encoded = seen.stdout.split()[-1]
+
+    slow = asyncio.create_task(
+        service._run_authenticated_git(
+            sandbox, ["-c", "alias.slow=!sleep 3", "slow"], auth, cwd="workspace"
+        )
+    )
+    await asyncio.sleep(1.5)
+    snapshot = await _sh(
+        runtime, sandbox, "ps -eo args; for f in /proc/[0-9]*/cmdline; do tr '\\0' ' ' < $f; done"
+    )
+    assert (await slow).exit_code == 0
+    assert "sleep 3" in snapshot  # the sample really saw the running git
+    assert "tok-NEVER-IN-PS" not in snapshot and encoded not in snapshot
+
+
+async def test_worktrees_on_docker(runtime, real_db_session) -> None:  # noqa: F811
+    session, _ = real_db_session
+    user = User(
+        id=uuid4(),
+        email=f"docker-it-{uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("password"),
+        role="owner",
+        is_active=True,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    workspace = _workspace(user.id)
+    workspace.sandbox_id = await runtime.provision(workspace)
+    workspace.status = "ready"
+    session.add(user)
+    session.add(workspace)
+    await session.flush()
+    try:
+        await WorkspaceInitializer(runtime).initialize_blank(workspace)
+        service = WorktreeService(session, runtime, get_settings())
+        created = await service.create_worktree(workspace.id, user.id, "feature/it")
+        listed = await service.list_worktrees(workspace.id, user.id)
+        assert "feature/it" in [item.branch for item in listed]
+        fs = await runtime.fs(workspace)
+        path = await service.resolve_path(workspace, created.id)
+        assert (await fs.get_file_info(f"{path}/README.md")).is_dir is False
+        await service.remove_worktree(workspace.id, user.id, created.id)
+        assert "feature/it" not in [
+            i.branch for i in await service.list_worktrees(workspace.id, user.id)
+        ]
+    finally:
+        await runtime.delete(workspace)
+
+
+async def test_terminal_survives_a_reconnect_and_mirrors_tabs(runtime, sandbox) -> None:
+    first: list[bytes] = []
+    second: list[bytes] = []
+
+    def sink(store: list[bytes]):
+        async def on_data(data: bytes) -> None:
+            store.append(data)
+
+        return on_data
+
+    async def until(store: list[bytes], text: bytes) -> None:
+        for _ in range(100):
+            if text in b"".join(store):
+                return
+            await asyncio.sleep(0.05)
+        raise AssertionError(f"{text!r} never arrived: {b''.join(store)[-300:]!r}")
+
+    session_id = f"execute-{sandbox.id.hex}:{uuid4().hex}"  # a worktree terminal's id
+    tab = await runtime.create_or_connect_pty(
+        sandbox, session_id, sink(first), env={"GREETING": "hi there"}, cols=100, rows=30
+    )
+    await tab.send_input(b"echo marker-$GREETING; pwd; echo $TERM\n")
+    await until(first, b"marker-hi there")
+    await tab.resize(PtySize(cols=140, rows=40))
+    await tab.send_input("tput cols\n")
+    await until(first, b"140")
+
+    mirror = await runtime.create_or_connect_pty(
+        sandbox, session_id, sink(second), env=None, cols=140, rows=40
+    )
+    await tab.send_input(b"echo mirrored\n")
+    await until(second, b"mirrored")  # two tabs on one session see the same shell
+    await mirror.disconnect()
+
+    await tab.disconnect()
+    name = session_id.replace(":", "_")
+    assert await _sh(runtime, sandbox, "tmux list-clients") == ""  # detached, not killed
+    assert "marker-hi there" in await _sh(runtime, sandbox, f"tmux capture-pane -p -t ={name}:")
+
+    first.clear()
+    again = await runtime.create_or_connect_pty(
+        sandbox, session_id, sink(first), env=None, cols=100, rows=30
+    )
+    await until(first, b"marker-hi there")  # reattached: tmux redraws the old screen
+    await again.disconnect()
+
+    await runtime.kill_pty(sandbox, session_id)
+    await runtime.kill_pty(sandbox, session_id)
+    gone = await runtime.exec(sandbox, f"tmux has-session -t ={name}")
+    assert gone.exit_code != 0
