@@ -175,3 +175,99 @@ same semantics.
   interface hides the swap.
 - `inotify`-based file-change events for the editor/Files panel (neither provider
   streams changes today).
+
+## Implementation Notes (shipped)
+
+Built on the Epic 02 branch. Verified on Podman 5.8 with the real image: unit + conformance
+suites and `tests/test_docker_integration.py` (13 real-container tests). The code and
+security reviews' findings are fixed below; each has a regression test.
+
+- **Files** — `services/sandbox/docker_fs.py`, `DockerRuntime.fs()` returns a
+  `DockerFileSystem` over the (auto-started) container. **Every operation is a `docker exec`
+  as the sandbox user** — never the daemon's `get_archive`/`put_archive`, which the
+  security review showed run as root inside the container: through a committed symlink
+  such as `docs -> /etc` they wrote root-owned files (even replaced `/etc/passwd`) and read
+  `/etc/shadow`. With an exec the kernel checks every access; the integration suite pins
+  that writes and reads through final *and* parent symlinks to `/etc` fail with
+  `PermissionError` and leave `/etc` untouched.
+  - `list_files` / `get_file_info`: `find [-H] <path> -printf` with NUL-separated records
+    (any filename round-trips). Entries carry Daytona's `FileInfo` fields (`name`,
+    `is_dir`, `size`, `mod_time` ISO-8601 UTC, `mode`, `permissions` `0644`, `owner`,
+    `group`) plus `is_symlink`, which Daytona never sets — so the Files panel refuses to
+    open a symlink on Docker (stricter, deliberately).
+  - `download_file`: `[ -f "$1" ] && timeout 60 head -c <64 MiB + 1>` — a symlink is
+    followed (like Daytona), a directory or device is refused before anything is read
+    (the `timeout` covers a FIFO swapped in after the check), and backend memory is bounded
+    (`MAX_DOWNLOAD_BYTES`). The output is streamed and joined once: docker-py's
+    `exec_run(demux=True)` concatenates frame by frame, which the re-review measured at
+    5–30 s of GIL-holding CPU for 64 MiB.
+  - `upload_file`: the bytes stream over the exec's stdin into
+    `mkdir -p -- <parent> && head -c <n> > <path>`. `head -c n` needs no end-of-file
+    (portable across Docker and Podman), and truncating in place keeps an existing file's
+    mode and owner, so an agent edit of an executable script keeps it executable. A stream
+    cut off mid-way is an error, never a silently short file. Uploads are not atomic (a
+    failed one leaves the file partial) — Daytona's are not either, and a temp-file + rename
+    would replace symlinks and modes.
+  - `create_folder` = `mkdir -p -m` (an existing folder keeps its mode, like Daytona's
+    `MkdirAll`), `move_files` = `mv -T` (a rename, never "into"), `delete_file` = `rm -r` /
+    `rm -d`, `set_file_permissions` = `chmod` with modes validated as 3–4 octal digits.
+  - `find_files` is a **content** search, as Daytona's is (its SDK: "Search for text
+    pattern within files"): fixed-string `grep -rnHIF --null`, under `timeout 60`, output
+    capped at 8 MiB; a pattern with a newline matches nothing. The conformance test that
+    asserted a filename glob encoded the interface fake's behaviour, not Daytona's; it and
+    the fake now search contents.
+  - Paths are argv elements after `--` (or `$1` of a constant `sh -c` script) and always
+    absolute (`find` has no `--`, so `-delete` can never be built). Per-file failures raise
+    `OSError` subclasses (`FileNotFoundError`, `PermissionError`, `IsADirectoryError`), not
+    `SandboxRuntimeError`: consumers read the latter as "sandbox unavailable", and the
+    Daytona SDK's fs errors are not `SandboxRuntimeError` either. Daemon failures still are.
+  - File operations run on the provider's exec pool; the control pool stays free for kills.
+- **Terminal** — `services/sandbox/docker_pty.py`: each terminal is a tmux session in the
+  workspace container, `docker exec -it` of `tmux new-session -A -s <name>` (attach or
+  create), `bash -l` (the sandbox user's login shell is `/bin/sh`), `TERM=xterm-256color`,
+  cwd and env (`-e`) from the caller. Session ids map to tmux-safe names (`:` and `.` →
+  `_`; worktree terminals are `execute-<ws>:<wt>`). Podman does not end an exec when its
+  socket closes, so the attach runs under a constant wrapper that records the tmux client's
+  pid: `disconnect` SIGHUPs that client (detach) and the session, its shell and scrollback
+  live on; reconnecting reattaches and tmux redraws the screen. The wrapper starts the tmux
+  server separately (status bar off, no Escape delay, `exit-empty off`), so the long-lived
+  server's argv never carries a session's `-e` env. `resize` = exec resize (tmux reflows).
+  `kill_pty` = `tmux kill-session -t =<name>`, idempotent, and a stopped container is left
+  stopped. **Two tabs on one session mirror each other** — tmux's normal behaviour,
+  accepted. Each terminal's reader holds a thread of a dedicated `pty` pool for its whole
+  life, so open terminals can starve neither commands/file access nor their own input
+  (exec pool); the control pool stays reserved for kills. The hijacked exec socket and its
+  HTTP response are closed explicitly, in order (left to GC, docker-py's response finalizer
+  raises on the already-closed socket).
+- **Git** — no new code was needed: clone/pull/fetch/push, worktrees, blank and template
+  init, and `specify init` all pass on a real container. One fix, shared with Daytona and
+  approved at review: **token auth moved off git's command line**. The Basic header used to
+  be `git -c http.extraHeader=…` — readable from `ps` by any process in the sandbox,
+  including agent commands, while git ran. It is now `GIT_CONFIG_COUNT/KEY_0/VALUE_0`
+  environment (git ≥ 2.31; the image has 2.53). The integration test samples `ps` and every
+  `/proc/*/cmdline` during a running authenticated git and finds neither the token nor its
+  base64. The SSH deploy key lands `0600` in a `0700` dir and is removed afterwards; a
+  materialised `.env` is `0600`.
+- **Tests** — `tests/sandbox/fakes.py` gains `FakeContainerFs` (understands exactly the
+  argv shapes above and fails loudly on anything else), `FakeStdinSocket` and
+  `FakePtySocket`; the conformance suite's Docker case no longer xfails files or the PTY
+  and adds an unusual-filenames round trip for every provider; `tests/test_docker_fs_pty.py`
+  covers argv safety with hostile names, permission errors, bounds, pools and the tmux
+  lifecycle.
+
+### Known limitations
+
+- **Private-repo credentials were not exercised end to end** (no test repository): token and
+  SSH paths are covered up to the remote. Manual check: connect a private GitHub repo with a
+  PAT on a Docker workspace, clone, edit, commit, push; repeat with a generated deploy key.
+- **Files-panel search** passes a filename glob (`*query*`) to `find_files`, which is a
+  content search on both providers, so it finds next to nothing on either — a pre-existing
+  consumer bug, left for a follow-up.
+- **Capacity**: open terminals are bounded by the `pty` pool (`DOCKER_MAX_CONCURRENT_EXECS`,
+  default 64, platform-wide); past that a new terminal stays silent until one closes. There
+  is no per-workspace terminal cap yet (Epic 05). Directory listing has no timeout of its
+  own.
+- **A shell that exits** (`exit`) leaves the browser terminal silent until the tab is closed
+  or reconnected (which starts a fresh session); the bridge is not told.
+- `files.read` refuses only a final symlink; reads through a parent symlink succeed when the
+  sandbox user may read the target, the same as on Daytona.
