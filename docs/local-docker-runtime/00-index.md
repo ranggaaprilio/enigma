@@ -15,11 +15,16 @@ It complements the other planning folders and does **not** replace or overlap th
   series is the orthogonal **provider** dimension: *which engine* hosts a sandbox, not
   *when it lives or dies*. The two meet at one seam (see Dependency Notes) and can land in
   either order.
-- `docs/horizontal-scale/` — scales the **control plane** (FastAPI replicas, jobs, bus).
-  The Docker runtime is deliberately a **single-host** execution option (local dev,
-  self-host, small teams); multi-node container scheduling is explicitly out of scope
-  here (see Decision Log). Nothing in this series adds process-local state beyond what
-  `DaytonaRuntime` already has, so it does not block that series.
+- `docs/horizontal-scale/` — **shipped (Epics 01–09)**. It scaled the control plane
+  (API replicas, arq workers in `RUN_EXECUTION_MODE=queue`, Redis bus, leases, reaper,
+  retention, stateless preview proxy, Kustomize deploy). The Docker runtime is
+  deliberately a **single-host** execution option (local dev, self-host, small teams);
+  multi-node container scheduling is explicitly out of scope here (see Decision Log).
+  Three of its invariants now bind this series: (a) in queue mode **runs execute in the
+  worker process**, so whatever reaches the Docker daemon must be reachable from the
+  worker, not only the API; (b) process-local state is policed by tests
+  (`tests/test_run_runtime.py`, `tests/test_preview_proxy_scaling.py`); (c) migrations
+  after `0034` must be expand-only (`tests/test_migration_safety.py`).
 - `docs/copilot-workspace-parity/` — pure orchestration/UX above the runtime; it only
   requires that everything executes through the runtime layer, which this series preserves.
 
@@ -30,16 +35,18 @@ API key is absent or the subscription lapses, **nothing runs**: no agent tools, 
 no preview. Yet the codebase is one refactor away from provider-neutrality:
 
 - `Workspace.runtime` already exists as a discriminator column (default `"daytona"`,
-  `models/workspace.py:51`) — added by migration `0011_daytona_runtime.py` but currently
-  hardcoded at `services/workspaces.py:131`.
+  `models/workspace.py:68`) — added by migration `0011_daytona_runtime.py` but currently
+  hardcoded at `services/workspaces.py:180`.
 - `DaytonaRuntime` already exposes provider-neutral DTOs (`RuntimeCommandResult`,
   `RuntimePreviewLink`) and is injected everywhere through a single point
-  (`get_daytona_runtime()`, `daytona_runtime.py:354`).
+  (`get_daytona_runtime()`, `daytona_runtime.py:365`) — 31 modules import it, and the
+  worker keeps it in `ctx["daytona_runtime"]` (`worker.py:231,330`).
 - The sandbox image is already a Dockerfile (`daytona/Dockerfile`, base
   `daytonaio/sandbox:0.8.0` + mise + code-server + uv/specify) — directly reusable as a
   local image.
 - The test suite already contains hand-written fakes (`FakeSandbox`, `FakeFileSystem`,
-  `FakeProcess`, `FakeRuntime`) that are effectively a written-down spec of the interface.
+  `FakeProcess`, `FakeFs`, `FakeRuntime`, `FakeDaytona` — ~27 classes across 15 test
+  files) that are effectively a written-down spec of the interface.
 
 ## Target Architecture
 
@@ -47,7 +54,7 @@ no preview. Yet the codebase is one refactor away from provider-neutrality:
                  Workspace.runtime = "daytona" | "docker"
                                  │
                     ┌────────────▼─────────────┐
-                    │  get_runtime(workspace)   │   services/runtime/factory.py
+                    │  get_runtime(workspace)   │   services/sandbox/factory.py
                     │  (provider factory)       │
                     └─────┬──────────────┬─────┘
                           │              │
@@ -68,9 +75,16 @@ no preview. Yet the codebase is one refactor away from provider-neutrality:
 
 **Principle: one interface, two providers, zero behaviour change for Daytona.** Every
 consumer (`agent_tools`, `files`, `repositories`, `worktrees`, `terminal`, `editor`,
-`dev_server`, `preview`, `speckit`, `commands`, `preview_proxy`) talks to the
-`SandboxRuntime` interface only; nothing outside `services/runtime/` may import the
-`daytona` or `docker` packages.
+`dev_server`, `workspace_services`, `workspace_init`, `workspace_env`, `preview`,
+`run_detection`, `sandbox_probe`, `speckit`, `commands`, `agents`, `preview_proxy`,
+`worker`) talks to the `SandboxRuntime` interface only; nothing outside
+`services/sandbox/` may import the `daytona` or `docker` packages.
+
+> **Package name.** Earlier drafts called the package `services/runtime/`. That name is
+> taken: `services/runtime.py` is the horizontal-scale module holding `RunRegistry`,
+> `EventBus` and `RunLock` (AGENTS.md gotcha 16). The sandbox-provider package is
+> `services/sandbox/` throughout this series (`base.py`, `daytona.py`, `docker.py`,
+> `factory.py`).
 
 ## The Epics
 
@@ -111,11 +125,20 @@ consumer (`agent_tools`, `files`, `repositories`, `worktrees`, `terminal`, `edit
   Whichever series lands first must keep the two axes separate — do not merge tier and
   provider into one enum. Docker's ephemeral-tier equivalent is a `--rm` container; that
   mapping belongs to hybrid Epic 02, not here.
-- **Coordination with `horizontal-scale`.** When the control plane goes multi-replica, a
-  Docker-runtime workspace is pinned to the node whose daemon owns the container. This
-  series must not pretend otherwise: Epic 06 records the limitation (docs + a
-  `sandbox_node` note in Future Enhancements) and keeps the Docker provider valid for the
-  single-node/self-host profile that series does not target.
+- **Coordination with `horizontal-scale` (shipped).** A Docker-runtime workspace is
+  pinned to the host whose daemon owns the container. Consequences this series must
+  honour rather than paper over:
+  - In `RUN_EXECUTION_MODE=queue` any worker may claim any run, so the Docker provider
+    is supported only where API, worker(s) and preview proxy all share **one** daemon
+    (the compose stack / a single self-host box). Epic 06 validates that at creation
+    time and documents it; a multi-worker fleet on separate hosts is not a supported
+    Docker profile.
+  - The Kustomize production overlay (`deploy/k8s/`) stays Daytona-only: its workloads
+    run non-root with a read-only root FS and strict egress network policies
+    (`tests/test_deployment.py::test_workloads_are_locked_down`), so a Docker-socket
+    `hostPath` mount is out of the question there. Docker lives in `docker-compose.yml`
+    and the self-host docs, never in `deploy/k8s/`.
+  - Epic 06 records both limits (docs + a `sandbox_node` note in Future Enhancements).
 - No dependency on `copilot-workspace-parity` or `improvement-epics` in either direction.
 
 ## Shared Rules For Every Epic
@@ -123,8 +146,12 @@ consumer (`agent_tools`, `files`, `repositories`, `worktrees`, `terminal`, `edit
 - **Daytona behaviour must not change.** Every epic keeps the Daytona path
   byte-for-byte equivalent; the shared interface conformance tests run against both
   providers' fakes.
-- **Provider imports stay in `services/runtime/`.** No `import daytona` or `import docker`
-  anywhere else (enforce with a lint/CI grep).
+- **Provider imports stay in `services/sandbox/`.** No `import daytona` or `import docker`
+  anywhere else (enforce with a source-grep test, the same shape as
+  `tests/test_run_runtime.py::test_no_call_site_reaches_into_process_local_registries`).
+- **No new process-local state.** Idle clocks, container caches and the like live in
+  Postgres (transaction-scoped locks only — `pg_advisory_xact_lock`, never session
+  locks, per AGENTS.md gotcha 22) or in Redis, never in a module-level dict.
 - Land behind config: `sandbox_runtime_default` stays `"daytona"` until Epic 06 flips the
   self-host profile; per-workspace `runtime` is explicit opt-in before that.
 - A DB migration for every schema change (Alembic, async engine).
@@ -136,40 +163,71 @@ consumer (`agent_tools`, `files`, `repositories`, `worktrees`, `terminal`, `edit
 - Never log PATs/secrets; keep `sanitize_git_output` in every git path; git credentials go
   via askpass/env, never argv.
 
-## Grounding: Current State Snapshot (August 2026)
+## Grounding: Current State Snapshot (October 2026, verified against `main`)
 
-- **One runtime module**: `backend/app/services/daytona_runtime.py` (356 lines) — the only
-  module importing the `daytona` package (SDK pinned `daytona==0.185.0`). Singleton via
-  `@lru_cache get_daytona_runtime()` (line 354). Errors: `DaytonaRuntimeError`,
-  `DaytonaUnavailableError`, `DaytonaSandboxNotFoundError`, `DaytonaProvisioningError`,
-  `DaytonaCommandTimeoutError` (lines 26–44).
+- **One runtime module**: `backend/app/services/daytona_runtime.py` (366 lines) — the only
+  module importing the `daytona` package besides `terminal.py:6` (`PtySize`). SDK pinned
+  `daytona==0.185.0`. Singleton via `@lru_cache get_daytona_runtime()` (line 365).
+  Errors: `DaytonaRuntimeError`, `DaytonaUnavailableError`,
+  `DaytonaSandboxNotFoundError`, `DaytonaProvisioningError`,
+  `DaytonaCommandTimeoutError` (lines 27–45), caught by name in 15 modules.
 - **Method surface** (all async, keyed off a `Workspace` ORM object): `configured`,
-  `health`, `provision`, `get_sandbox`, `status`, `delete`, `exec`, `stream_command`,
-  `create_or_connect_pty`, `kill_pty`, `signed_preview_url`, `preview_link`, `close`, plus
-  internals `_ensure_started`, `_desired_network_settings`, `_apply_network_settings`.
-- **The leak**: `get_sandbox()` (line 147) returns the raw SDK `Sandbox`; consumers then
-  call SDK-native surfaces directly — `sandbox.fs.*` in `files.py`
-  (118,145,161,169,213–331), `agent_tools.py` (147–219), `repositories.py` (642–660),
-  `dev_server.py` (549,559); `sandbox.git.clone/status` in `repositories.py` (217,248);
-  `PtySize` imported from `daytona` in `terminal.py:224`.
-- **Preview proxy is already provider-friendly**: `preview_capability.py` mints an HMAC
-  subdomain capability; `preview_proxy.py:247–317` resolves it, calls
-  `runtime.preview_link(workspace, port)` per request, and forwards HTTP/WS with
-  `X-Daytona-Preview-Token`. A `RuntimePreviewLink(url=..., token="")` makes the token
-  header a harmless no-op.
+  `health`, `provision` (returns the raw SDK `Sandbox`; `workspaces.py:218` reads
+  `.id`), `get_sandbox` (154), `status` (165), `delete` (177), `exec` (188),
+  `stream_command` (215), `create_or_connect_pty` (270), `kill_pty` (296),
+  `signed_preview_url` (305 — **no callers left**; the editor moved to a stable alias
+  host), `preview_link` (316), `close`, plus internals `_ensure_started` (324),
+  `_desired_network_settings` (331), `_apply_network_settings` (345).
+- **The leak**: `get_sandbox()` returns the raw SDK `Sandbox`; consumers then call
+  SDK-native surfaces directly — `sandbox.fs.*` in `files.py` (118–337),
+  `agent_tools.py` (149–221), `repositories.py` (326–892), `dev_server.py` (254–470),
+  `workspace_services.py` (1103–1129), `workspace_init.py` (115–147),
+  `workspace_env.py` (181–190). Ops used: `list_files`, `get_file_info`,
+  `download_file`, `upload_file`, `create_folder`, `move_files`, `delete_file`,
+  `find_files`, **`set_file_permissions`** (SSH deploy keys `repositories.py:826`,
+  `.env` materialisation `workspace_env.py:190`). SDK git is down to one call,
+  `sandbox.git.status` (`repositories.py:368`); clone/pull/push/fetch already run
+  through the git CLI with per-command auth (token or SSH deploy key,
+  `_run_ssh_git`). `PtySize` is imported from `daytona` in `terminal.py:6` (used at
+  230). `workspace.daytona_sandbox_id` is read directly in 11 modules instead of the
+  `sandbox_id` alias.
+- **Preview proxy is already provider-friendly** and, since horizontal-scale Epic 07,
+  **stateless**: `preview_capability.py` mints an HMAC subdomain capability;
+  `preview_alias.py` / `editor_alias.py` add stable per-workspace preview and editor
+  hosts gated by grant cookies; `preview_proxy.py` resolves them (`resolve` 152,
+  `resolve_alias` 183, `resolve_editor_alias` 241 — each requires
+  `workspace.daytona_sandbox_id`), calls `runtime.preview_link(workspace, port)` per
+  request (1056, 1070, 1121) and forwards HTTP/WS (`proxy_websocket` 615) with
+  `X-Daytona-Preview-Token` / `X-Daytona-Skip-Preview-Warning` (1095, 1123). A
+  `RuntimePreviewLink(url=..., token="")` makes the token header a harmless no-op.
+  `tests/test_preview_proxy_scaling.py:218` fails the build if the module gains
+  module-level state; the proxy owns its own `AppLifecycle` and its `/health` calls
+  `proxy_runtime.health()` (411).
 - **DB**: `workspaces.runtime` (default `"daytona"`), `daytona_sandbox_id` (unique index)
-  with provider-neutral alias property `Workspace.sandbox_id` (`models/workspace.py:82`),
+  with provider-neutral alias property `Workspace.sandbox_id` (`models/workspace.py:115`),
   `snapshot`, `workspace_path`, `dev_autostart`. Sandbox-adjacent tables:
-  `terminal_sessions.pty_session_id`, `editor_sessions` (`bind_host="daytona"`),
-  `preview_sessions`, `workspace_worktrees`.
+  `terminal_sessions.pty_session_id`, `editor_sessions` (`bind_host="daytona"`,
+  `editor.py:124`), `preview_sessions`, `workspace_preview_aliases`,
+  `workspace_services` (multi-service preview, Epic 11), `workspace_worktrees`.
+  Migration head is `0035_run_correlation`; anything after `0034` is expand-only.
 - **No local execution exists.** No `docker` SDK dependency; `docker`/`docker-compose`
   appear only in the agent command denylist (`agent_tools.py:40-41`). Docker/Podman is
-  used only for the dev stack (`docker-compose.yml`: postgres, redis, backend :8000,
-  preview-proxy :8001, frontend :5173) and for building the Daytona snapshot
-  (`daytona/Dockerfile` + `build-snapshot.sh`).
-- **Agent engine**: OpenHands SDK 1.28.0 runs *in the API process*; its tools are bridged
-  to the sandbox via `openhands_tools.py`/`agent_tools.py` — Enigma does **not** use
-  OpenHands' own runtime container. This series gives Enigma its own equivalent.
+  used only for the dev stack (`docker-compose.yml`: postgres, redis, pgbouncer, backend
+  :8000, worker, preview-proxy :8001, frontend :5173 — **no `networks:` section yet**)
+  and for building the Daytona snapshot (`daytona/Dockerfile`, base
+  `daytonaio/sandbox:0.8.0` + mise + code-server + uv/specify; `build-snapshot.sh`).
+- **Execution topology**: `RUN_EXECUTION_MODE=inline` (default) runs agent/command runs
+  in the API process; `queue` mode enqueues them (arq) and `app/worker.py` executes them,
+  with leases, a reaper (`services/reaper.py`) and retention (`services/retention.py`) as
+  the established background-task patterns. Both `main.py:94` and `worker.py:395` close
+  the Daytona singleton on shutdown; `preview_proxy.py:341` closes its own instance.
+- **Agent engine**: OpenHands SDK 1.28.0 runs *in the API or worker process*; its tools
+  are bridged to the sandbox via `openhands_tools.py`/`agent_tools.py` — Enigma does
+  **not** use OpenHands' own runtime container. This series gives Enigma its own
+  equivalent.
+- **Frontend** still says "Daytona" in copy: `CreateWorkspaceWizard.tsx:111,475`,
+  `TeamRoute.tsx:323,420,441`, `DashboardOverviewRoute.tsx:25`,
+  `DashboardRoute.tsx:519,593`.
 
 ## Decision Log
 

@@ -18,24 +18,34 @@ subscription.
 ## Current State
 
 - Epic 01 defined `RuntimeFileSystem` (`list_files`, `get_file_info`, `download_file`,
-  `upload_file`, `create_folder`, `move_files`, `delete_file(recursive)`, `find_files`)
-  and `PtyHandle` (`send_input`, `resize`, `disconnect`) with the Daytona implementation
-  as a passthrough; the Docker implementation raises `NotImplementedError`.
+  `upload_file`, `create_folder`, `move_files`, `delete_file(recursive)`, `find_files`,
+  `set_file_permissions`) and `PtyHandle` (`send_input`, `resize`, `disconnect`) with
+  the Daytona implementation as a passthrough; the Docker implementation raises
+  `NotImplementedError`.
 - Consumers of `fs`: `services/files.py` (Files panel: list/read/write/mkdir/move/
   delete/search), `services/agent_tools.py` (list_files/read_file/write_file/
-  apply_patch/search_code), `services/repositories.py:642-660` (repo scaffolding),
-  `services/dev_server.py:549,559` (config detection).
-- Git is CLI-over-exec after Epic 01 (askpass/env credentials, `sanitize_git_output`);
-  `worktrees.py` was always CLI (`git worktree` via `exec`, lines 170–461);
-  `speckit.py` uses exec only (`:213,591,880-938`). So git parity is "exec works +
-  credentials work", not new surface.
+  apply_patch/search_code), `services/repositories.py` (workspace dir scaffolding
+  326–332 and 890–892, SSH deploy-key materialisation 824–826 with `chmod 600`,
+  `.git` probes 874), `services/workspace_init.py:115-147` (template/blank seeding),
+  `services/workspace_env.py:181-190` (`.env` materialisation, `chmod 600`),
+  `services/dev_server.py:462,470` and `services/workspace_services.py:1120,1129`
+  (mise config detection).
+- Git is CLI-over-exec already: clone/pull/fetch/push run through `exec` with
+  per-command auth — a token (`git_providers.py` basic-auth usernames) **or** a
+  server-generated SSH deploy key written into the sandbox (`ssh_keys.py`,
+  `repositories.py::_run_ssh_git`, needs `ssh` on PATH) — and `sanitize_git_output`;
+  `worktrees.py` was always CLI (`git worktree` via `exec`, from line 171);
+  `speckit.py` uses exec only (`specify init` at 237). So git parity is "exec works +
+  both credential flows work", not new surface.
 - Terminal: `services/terminal.py` calls `create_or_connect_pty(workspace, session_id,
-  on_data, env, cols, rows, cwd)` (`:193`) and `kill_pty` (`:128`);
-  `terminal_sessions.pty_session_id` persists session names so a browser reconnect
-  reattaches to the same shell. Daytona provides named, reconnectable PTY sessions
-  natively — Docker exec does not, which is the hard part of this epic.
-- Preview detection (`preview.py:243`) and dev server are exec-based — they come along
-  for free but are validated in Epic 04.
+  on_data, env, cols, rows, cwd)` (`:199`) and `kill_pty` (`:128`); session ids are
+  `execute-<workspace.id.hex>` (`:75`) and `terminal_sessions.pty_session_id` persists
+  them so a browser reconnect reattaches to the same shell. Worktree terminals get a
+  per-worktree PTY (`worktree_id` query param). Daytona provides named, reconnectable
+  PTY sessions natively — Docker exec does not, which is the hard part of this epic.
+- Preview port detection (`preview.py:316`, `sandbox_probe.py`), run detection
+  (`run_detection.py`) and dev server / services are exec-based — they come along for
+  free but are validated in Epic 04.
 
 ## Scope
 
@@ -70,15 +80,21 @@ subscription.
    - `upload_file` → build a single-member tar in memory, `container.put_archive(parent,
      tar)`; preserve the non-root user's uid/gid in tar headers so files stay editable.
    - `create_folder(path, mode)` → `mkdir -p` + `chmod`; `move_files` → `mv`;
-     `delete_file(recursive)` → `rm` / `rm -rf` with argv-array execution.
+     `delete_file(recursive)` → `rm` / `rm -rf`; `set_file_permissions(path, mode)` →
+     `chmod` — all with argv-array execution. The `chmod 600` on SSH keys and `.env`
+     files must be honoured, not best-effort: `ssh` refuses world-readable keys.
    - All paths normalized and confined exactly as today (`agent_tools` path confinement
      untouched; `files.py` keeps its own validation).
 3. **Git parity validation** (no new code expected beyond Epic 01's CLI collapse):
-   - Verify clone/pull/push of a private GitHub repo inside a container using the
-     askpass/env credential flow; token absent from `ps`, container logs, structlog.
+   - Verify clone/pull/push of a private repo inside a container with **both**
+     credential flows: token (`RepositoryService` per-command auth) and SSH deploy key
+     (`POST /repo/ssh-key` → key written via `fs` → `_run_ssh_git`); token absent from
+     `ps`, container logs, structlog; the key file lands `0600`.
    - Run the existing worktree suite (`worktrees.py`) and Spec Kit init
-     (`speckit.py:213`) against Docker — both are exec-only and should pass as-is; fix
+     (`speckit.py:237`) against Docker — both are exec-only and should pass as-is; fix
      any assumptions about `$HOME`/`PATH` that differ from the snapshot.
+   - Template/blank workspaces (`workspace_init.py`: clone template → `git init` →
+     initial commit) seed correctly on a fresh container.
 4. **PTY via tmux** (the image ships `tmux` — Epic 02 task 9):
    - `create_or_connect_pty(workspace, session_id, ...)` runs
      `exec_create(["tmux", "new-session", "-A", "-s", <session_id>, "-x", cols, "-y",
@@ -101,9 +117,10 @@ subscription.
      unicode filenames, large-file guard, recursive delete, find_files match shape.
    - PTY contract test against the Docker fake (send/echo/resize/disconnect/reconnect).
    - Integration (`DOCKER_INTEGRATION_TESTS=1`): agent tool sequence write_file →
-     apply_patch → read_file → search_code on a real container; clone a fixture repo;
-     tmux reconnect keeps scrollback (run `echo marker`, disconnect, reconnect, assert
-     the marker via `tmux capture-pane`).
+     apply_patch → read_file → search_code on a real container; clone a fixture repo
+     with a token and with an SSH deploy key; materialise a workspace `.env` and assert
+     `0600`; tmux reconnect keeps scrollback (run `echo marker`, disconnect, reconnect,
+     assert the marker via `tmux capture-pane`).
 
 ## Frontend Tasks
 
@@ -135,9 +152,11 @@ same semantics.
   with byte-identical tool-result shapes to Daytona (assert via the conformance suite).
 - Files panel: browse, open, edit/save, create folder, rename/move, delete, search — all
   functional on Docker.
-- Clone → edit → commit → push of a private repo works with the stored GitHub PAT; the
-  token never appears in logs or `ps` output.
-- Worktrees create/list/remove and Spec Kit `specify init` succeed on Docker.
+- Clone → edit → commit → push of a private repo works with the stored token **and**
+  with a server-generated SSH deploy key; the token never appears in logs or `ps`
+  output.
+- Worktrees create/list/remove, per-worktree terminals, workspace `.env`
+  materialisation and Spec Kit `specify init` succeed on Docker.
 - Terminal: open, run `top`, resize the pane (reflows), close the tab, reopen — same
   shell, history intact. Two browser tabs on the same session mirror each other (tmux
   gives this for free — accept or explicitly serialize, but document the choice).
