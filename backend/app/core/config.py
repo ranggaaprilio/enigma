@@ -103,6 +103,22 @@ class Settings(BaseSettings):
     daytona_preview_proxy_ttl_seconds: int = Field(default=60 * 60, gt=0)
     daytona_network_block_all: bool = False
     daytona_network_allow_list: str | list[str] = Field(default_factory=list)
+    # Provider for newly created workspaces ("daytona" | "docker"). Existing rows keep theirs.
+    sandbox_runtime_default: Literal["daytona", "docker"] = "daytona"
+    # Local Docker/Podman provider (docs/local-docker-runtime). Unset docker_host = the
+    # default unix socket; Podman: point it at `podman system service`'s socket.
+    docker_host: str | None = None
+    docker_sandbox_image: str = "enigma-sandbox:latest"
+    docker_sandbox_network: str = "enigma-sandboxes"
+    # Must exist in the image and must not be root (enforced at provision).
+    docker_sandbox_user: str = "daytona"
+    docker_sandbox_cpus: float = Field(default=2.0, gt=0)
+    docker_sandbox_memory_mb: int = Field(default=4096, gt=0)
+    docker_provision_timeout_seconds: int = Field(default=60, gt=0)
+    # Commands (exec/stream) in flight at once per process; each holds a thread meanwhile.
+    docker_max_concurrent_execs: int = Field(default=64, gt=0)
+    # Fork-bomb floor per sandbox (Epic 05 tunes the full resource profile).
+    docker_sandbox_pids_limit: int = Field(default=4096, gt=0)
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"

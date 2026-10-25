@@ -177,7 +177,7 @@ class SqlAlchemyWorkspaceService:
             source=source,
             template_id=template.id if template is not None else None,
             default_branch=default_branch,
-            runtime="daytona",
+            runtime=self.runtime.settings.sandbox_runtime_default,
             snapshot=snapshot,
             workspace_path=self.runtime.settings.daytona_workspace_path,
             status="creating",
