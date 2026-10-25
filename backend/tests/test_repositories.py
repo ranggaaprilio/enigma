@@ -11,7 +11,9 @@ from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
 from app.models import User, Workspace
+from app.services.agents import AgentService
 from app.services.repositories import (
+    GIT_STATUS_COMMAND,
     GitAuth,
     GitCommandError,
     GitCommit,
@@ -25,7 +27,9 @@ from app.services.repositories import (
     RepositoryNotClonedError,
     RepositoryPathError,
     RepositoryService,
+    branch_from_porcelain_header,
     parse_porcelain_status,
+    porcelain_status_word,
     sanitize_git_output,
     sanitize_repository_url,
     validate_commit_sha,
@@ -522,9 +526,8 @@ async def test_clone_uses_git_cli_with_pat_header_and_branch(tmp_path):
             created.append(path)
 
     class FakeRuntime:
-        async def get_sandbox(self, workspace):
-            # No ``git`` attribute: the SDK clone path is gone; only the CLI is used.
-            return SimpleNamespace(fs=FakeFs())
+        async def fs(self, workspace):
+            return FakeFs()
 
         async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
             commands.append((command, cwd))
@@ -597,10 +600,8 @@ async def test_push_uses_authenticated_git_cli_in_worktree(tmp_path):
             return SimpleNamespace(name=path)  # exists => treated as cloned
 
     class FakeRuntime:
-        async def get_sandbox(self, workspace):
-            # No ``git`` attribute: falling back to the SDK's go-git push would raise here,
-            # so a passing test proves the push runs through the git CLI instead.
-            return SimpleNamespace(fs=FakeFs())
+        async def fs(self, workspace):
+            return FakeFs()
 
         async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
             commands.append((command, cwd))
@@ -654,8 +655,8 @@ async def test_push_surfaces_sanitized_git_error(tmp_path):
             return SimpleNamespace(name=path)
 
     class FakeRuntime:
-        async def get_sandbox(self, workspace):
-            return SimpleNamespace(fs=FakeFs())
+        async def fs(self, workspace):
+            return FakeFs()
 
         async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
             return SimpleNamespace(
@@ -711,18 +712,17 @@ async def test_status_uses_git_cli_for_worktrees(tmp_path):
             return SimpleNamespace(name=path)  # exists => treated as cloned
 
     class FakeRuntime:
-        async def get_sandbox(self, workspace):
-            # No ``git`` attribute: if status() fell back to the SDK path it would raise.
-            return SimpleNamespace(fs=FakeFs())
+        async def fs(self, workspace):
+            return FakeFs()
 
         async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
             commands.append((command, cwd))
-            if command == "git status --porcelain":
+            if command == GIT_STATUS_COMMAND:
                 return SimpleNamespace(
-                    exit_code=0, stdout=" M README.md\n?? new.py\n", stderr=""
+                    exit_code=0,
+                    stdout="## feat-login...origin/feat-login [ahead 1]\n M README.md\n?? new.py\n",
+                    stderr="",
                 )
-            if command == "git branch --show-current":
-                return SimpleNamespace(exit_code=0, stdout="feat-login\n", stderr="")
             return SimpleNamespace(exit_code=1, stdout="", stderr="unexpected command")
 
     service = RepositoryService(
@@ -741,13 +741,49 @@ async def test_status_uses_git_cli_for_worktrees(tmp_path):
     assert result.cloned is True
     assert result.branch == "feat-login"
     assert result.is_clean is False
+    # Same vocabulary the SDK status returned, so the UI and the agent file-change badges
+    # (`created` for a new file, not `modified`) are unchanged.
     assert result.files == [
-        GitFileStatus(path="README.md", status="M"),
-        GitFileStatus(path="new.py", status="??"),
+        GitFileStatus(path="README.md", status="Modified"),
+        GitFileStatus(path="new.py", status="Untracked"),
     ]
-    # Both reads run via the git CLI against the worktree directory, not the SDK.
-    assert ("git status --porcelain", worktree_path) in commands
-    assert ("git branch --show-current", worktree_path) in commands
+    assert [AgentService._map_git_status_to_badge(f.status) for f in result.files] == [
+        "modified",
+        "created",
+    ]
+    # One git CLI read against the worktree directory, not the SDK, not two round-trips.
+    assert commands == [(GIT_STATUS_COMMAND, worktree_path)]
+
+
+@pytest.mark.parametrize(
+    ("code", "word"),
+    [
+        ("??", "Untracked"),
+        ("M", "Modified"),
+        ("A", "Added"),
+        ("AM", "Modified"),
+        ("D", "Deleted"),
+        ("R", "Renamed"),
+        ("MM", "Modified"),
+        ("X", "X"),
+    ],
+)
+def test_porcelain_status_word_matches_go_git_vocabulary(code: str, word: str) -> None:
+    assert porcelain_status_word(code) == word
+
+
+@pytest.mark.parametrize(
+    ("output", "branch"),
+    [
+        ("## main\n M a.py\n", "main"),
+        ("## main...origin/main [ahead 1, behind 2]\n", "main"),
+        ("## No commits yet on feature/x\n?? a.py\n", "feature/x"),
+        ("## HEAD (no branch)\n", None),
+        (" M a.py\n", None),
+    ],
+)
+def test_branch_from_porcelain_header(output: str, branch: str | None) -> None:
+    assert branch_from_porcelain_header(output) == branch
 
 
 # --------------------------------------------------------------------------------------
@@ -780,8 +816,8 @@ def _repo_service_with_exec(workspace: Workspace, exec_impl, *, token="raw-secre
             return SimpleNamespace(name=path)  # exists => treated as cloned
 
     class FakeRuntime:
-        async def get_sandbox(self, ws):
-            return SimpleNamespace(fs=FakeFs())
+        async def fs(self, ws):
+            return FakeFs()
 
         async def exec(self, ws, command, *, cwd=None, env=None, timeout=None):
             return await exec_impl(command, cwd)
@@ -1021,8 +1057,8 @@ def _ssh_service(workspace: Workspace, exec_impl, fs_log: list[tuple[str, ...]])
             fs_log.append(("delete", path, str(recursive)))
 
     class FakeRuntime:
-        async def get_sandbox(self, ws):
-            return SimpleNamespace(fs=FakeFs())
+        async def fs(self, ws):
+            return FakeFs()
 
         async def exec(self, ws, command, *, cwd=None, env=None, timeout=None):
             return await exec_impl(command, cwd, env)

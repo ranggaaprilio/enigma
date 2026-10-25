@@ -325,7 +325,7 @@ class _ListingRuntime:
         self.scripts: list[str] = []
 
     async def exec(self, workspace, script, *, cwd=None, env=None, timeout=None):
-        from app.services.daytona_runtime import RuntimeCommandResult
+        from app.services.sandbox import RuntimeCommandResult
 
         self.scripts.append(script)
         if script.startswith("ls -d"):
@@ -424,7 +424,7 @@ class _FakeWorkspace:
     def __init__(self, *, owner_id, sandbox_id="sandbox-1", app_root=None) -> None:
         self.id = "workspace-1"
         self.owner_id = owner_id
-        self.daytona_sandbox_id = sandbox_id
+        self.sandbox_id = sandbox_id
         self.app_root = app_root
         self.workspace_path = "workspace"
         self.default_branch = "main"
@@ -451,7 +451,7 @@ class _FakeProxyRuntime:
         import re
         import shlex
 
-        from app.services.daytona_runtime import RuntimeCommandResult
+        from app.services.sandbox import RuntimeCommandResult
 
         self.execs.append(script)
         quoted_paths = re.findall(r"\[ -f (\S+) \]", script)

@@ -431,7 +431,7 @@ async def _lifespan_retention(monkeypatch, mode: str) -> list[str]:
     monkeypatch.setattr(main_module, "reconcile_interrupted_runs", noop)
     monkeypatch.setattr(main_module, "drain_in_flight_runs", noop)
     monkeypatch.setattr(main_module, "close_run_dispatcher", noop)
-    monkeypatch.setattr(main_module, "get_daytona_runtime", lambda: Closable())
+    monkeypatch.setattr(main_module, "close_all", Closable().close)
     monkeypatch.setattr(main_module, "engine", Closable())
     monkeypatch.setattr(main_module, "install_sigterm_drain", lambda *a, **k: lambda: None)
     monkeypatch.setattr(lifecycle, "draining", False)

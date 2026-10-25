@@ -217,8 +217,8 @@ class FakeRuntime:
         self.commands: list[str] = []
         self.cwds: list[str | None] = []
 
-    async def get_sandbox(self, workspace, *, start: bool = True) -> FakeSandbox:
-        return self.sandbox
+    async def fs(self, workspace) -> FakeFs:
+        return self.sandbox.fs
 
     async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
         self.commands.append(command)

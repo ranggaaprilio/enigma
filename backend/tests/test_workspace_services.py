@@ -17,7 +17,7 @@ from app.models import (
     WorkspaceService,
     WorkspaceWorktree,
 )
-from app.services.daytona_runtime import DaytonaRuntimeError, RuntimeCommandResult
+from app.services.sandbox import RuntimeCommandResult, SandboxRuntimeError
 from app.services.workspace_services import (
     WorkspaceServiceLimitError,
     WorkspaceServiceManager,
@@ -73,8 +73,8 @@ class FakeRuntime:
         self.cwds: list[str | None] = []
         self.envs: list[dict | None] = []
 
-    async def get_sandbox(self, workspace, *, start: bool = True) -> FakeSandbox:
-        return self.sandbox
+    async def fs(self, workspace) -> FakeFs:
+        return self.sandbox.fs
 
     async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
         self.commands.append(command)
@@ -82,7 +82,7 @@ class FakeRuntime:
         self.envs.append(env)
         if "ENIGMA_PROBE_EOF" in command:
             if self.fail_probe:
-                raise DaytonaRuntimeError("sandbox unreachable")
+                raise SandboxRuntimeError("sandbox unreachable")
             lines = []
             for row_id, port_token in re.findall(
                 r"probe\('([^']*)', '[^']*', '[^']*', '[^']*', "

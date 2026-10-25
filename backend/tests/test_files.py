@@ -134,8 +134,8 @@ class FakeRuntime:
     def __init__(self, root: Path) -> None:
         self.sandbox = SimpleNamespace(fs=LocalFileSystem(root))
 
-    async def get_sandbox(self, workspace):
-        return self.sandbox
+    async def fs(self, workspace):
+        return self.sandbox.fs
 
 
 @pytest.fixture

@@ -17,11 +17,11 @@ from app.preview_proxy import (
     PreviewProxyTarget,
     create_preview_proxy_app,
 )
-from app.services.daytona_runtime import RuntimePreviewLink
 from app.services.preview_capability import (
     InvalidPreviewCapabilityError,
     create_preview_proxy_url,
 )
+from app.services.sandbox import RuntimePreviewLink
 
 
 def make_workspace() -> Workspace:

@@ -28,12 +28,12 @@ from app.preview_proxy import (
     PreviewProxyTarget,
     create_preview_proxy_app,
 )
-from app.services.daytona_runtime import DaytonaRuntimeError, RuntimePreviewLink
 from app.services.preview_alias import encode_alias_grant
 from app.services.preview_capability import (
     InvalidPreviewCapabilityError,
     create_preview_proxy_url,
 )
+from app.services.sandbox import RuntimePreviewLink, SandboxRuntimeError
 
 BASE_URL = "http://localhost:8001"
 PROBE_HOST = "localhost:8001"
@@ -536,7 +536,7 @@ def test_metrics_requires_the_bearer_token_when_one_is_configured():
 def test_http_requests_and_upstream_errors_are_counted():
     _workspace, preview, session = _fixture()
     app, http_client = _capability_app(
-        session, runtime=FakeRuntime(error=DaytonaRuntimeError("stopped"))
+        session, runtime=FakeRuntime(error=SandboxRuntimeError("stopped"))
     )
     requests_before = _sample("preview_proxy_requests_total", {"protocol": "http"})
     errors_before = _sample("preview_proxy_upstream_errors_total", {"protocol": "http"})
@@ -709,7 +709,7 @@ def _waking_case(kind: str):
     workspace, preview, session = _fixture()
     if kind == "capability-sandbox-asleep":
         app, http_client = _capability_app(
-            session, runtime=FakeRuntime(error=DaytonaRuntimeError("stopped"))
+            session, runtime=FakeRuntime(error=SandboxRuntimeError("stopped"))
         )
         return app, http_client, _capability_host(preview), {}
     if kind == "capability-upstream-unreachable":

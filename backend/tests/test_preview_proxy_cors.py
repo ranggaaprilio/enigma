@@ -15,8 +15,8 @@ from fastapi.testclient import TestClient
 from app.core.config import Settings
 from app.models import PreviewSession, Workspace
 from app.preview_proxy import PreviewProxyTarget, create_preview_proxy_app
-from app.services.daytona_runtime import RuntimePreviewLink
 from app.services.preview_capability import InvalidPreviewCapabilityError
+from app.services.sandbox import RuntimePreviewLink
 
 BASE_URL = "http://localhost:8001"
 CAP_HOST = "capability.localhost:8001"

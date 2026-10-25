@@ -25,9 +25,9 @@ from app.preview_proxy import (
     PreviewProxyTarget,
     create_preview_proxy_app,
 )
-from app.services.daytona_runtime import DaytonaRuntimeError, RuntimePreviewLink
 from app.services.preview_alias import encode_alias_grant
 from app.services.preview_capability import InvalidPreviewCapabilityError
+from app.services.sandbox import RuntimePreviewLink, SandboxRuntimeError
 
 BASE_URL = "http://localhost:8001"
 EDITOR_ALIAS = "editor-a1b2c3d4e5f6"
@@ -354,7 +354,7 @@ def test_an_unreachable_sandbox_is_a_503_that_also_sets_the_cookie():
 
     class FailingRuntime(FakeRuntime):
         async def preview_link(self, workspace, port):
-            raise DaytonaRuntimeError("sandbox is asleep")
+            raise SandboxRuntimeError("sandbox is asleep")
 
     resolver = FakeEditorResolver(_target(workspace, make_editor_session(workspace)))
     app = _app(resolver, FailingRuntime(), _http_client())

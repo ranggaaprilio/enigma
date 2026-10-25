@@ -1313,13 +1313,13 @@ class FakeCommandDaytonaRuntime:
 async def test_real_db_command_run_gets_enigma_exports_in_its_env(real_db_session):
     session, session_maker = real_db_session
     user, workspace = await _make_real_workspace(session)
-    daytona_runtime = FakeCommandDaytonaRuntime()
+    sandbox_runtime = FakeCommandDaytonaRuntime()
     service = CommandService(
         session=session,
         session_maker=session_maker,
         settings=get_settings_for_db(),
         runtime=CommandRuntime(),
-        daytona_runtime=daytona_runtime,
+        sandbox_runtime=sandbox_runtime,
     )
     custom_command = await service.create_command(
         workspace_id=workspace.id,
@@ -1337,8 +1337,8 @@ async def test_real_db_command_run_gets_enigma_exports_in_its_env(real_db_sessio
     assert task is not None
     await task
 
-    assert len(daytona_runtime.calls) == 1
-    env = daytona_runtime.calls[0]["env"]
+    assert len(sandbox_runtime.calls) == 1
+    env = sandbox_runtime.calls[0]["env"]
     assert env["ENIGMA_WORKSPACE_ID"] == str(workspace.id)
     assert env["ENIGMA_BRANCH"] == workspace.default_branch
 
@@ -1349,13 +1349,13 @@ async def test_real_db_command_run_gets_enigma_exports_in_its_env(real_db_sessio
 async def test_real_db_command_run_with_a_bad_template_fails_the_run_cleanly(real_db_session):
     session, session_maker = real_db_session
     user, workspace = await _make_real_workspace(session)
-    daytona_runtime = FakeCommandDaytonaRuntime()
+    sandbox_runtime = FakeCommandDaytonaRuntime()
     service = CommandService(
         session=session,
         session_maker=session_maker,
         settings=get_settings_for_db(),
         runtime=CommandRuntime(),
-        daytona_runtime=daytona_runtime,
+        sandbox_runtime=sandbox_runtime,
     )
     custom_command = await service.create_command(
         workspace_id=workspace.id,
@@ -1377,7 +1377,7 @@ async def test_real_db_command_run_with_a_bad_template_fails_the_run_cleanly(rea
     await task
 
     # The command process itself must never have been started.
-    assert daytona_runtime.calls == []
+    assert sandbox_runtime.calls == []
     await session.refresh(run)
     assert run.status == "error"
     assert "nonexistent" in run.output

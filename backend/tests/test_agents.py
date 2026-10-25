@@ -320,8 +320,8 @@ async def test_workspace_tools_allow_build_test_shell_and_block_sandbox_escape(t
             self.stdout = "build passed"
             self.stderr = ""
 
-        async def get_sandbox(self, workspace):
-            return type("Sandbox", (), {"fs": FakeFs()})()
+        async def fs(self, workspace):
+            return FakeFs()
 
         async def exec(self, workspace, command, *, cwd, timeout):
             self.exec_calls.append(
@@ -454,8 +454,8 @@ async def test_workspace_tools_list_files_is_bounded_and_skips_excluded_director
     fake_fs = FakeFs()
 
     class FakeRuntime:
-        async def get_sandbox(self, workspace):
-            return type("Sandbox", (), {"fs": fake_fs})()
+        async def fs(self, workspace):
+            return fake_fs
 
     tools = WorkspaceTools(
         workspace,
@@ -1264,15 +1264,12 @@ async def test_mock_agent_provider_emits_tool_call_id_in_metadata(tmp_path):
     (workspace_path / "README.md").write_text("hello", encoding="utf-8")
 
     class FakeRuntime:
-        async def get_sandbox(self, workspace):
+        async def fs(self, workspace):
             class FakeFs:
                 async def download_file(self, path):
                     return b"hello"
 
-            class Sandbox:
-                fs = FakeFs()
-
-            return Sandbox()
+            return FakeFs()
 
         async def exec(self, workspace, command, *, cwd, timeout):
             return type("Result", (), {"exit_code": 0, "stdout": "hello", "stderr": ""})()
@@ -1942,15 +1939,12 @@ class TestAgentRunLifecycle:
         (workspace_path / "README.md").write_text("hello", encoding="utf-8")
 
         class FakeRuntime:
-            async def get_sandbox(self, workspace):
+            async def fs(self, workspace):
                 class FakeFs:
                     async def download_file(self, path):
                         return b"hello"
 
-                class Sandbox:
-                    fs = FakeFs()
-
-                return Sandbox()
+                return FakeFs()
 
             async def exec(self, workspace, command, *, cwd, timeout):
                 return type("Result", (), {"exit_code": 0, "stdout": "hello", "stderr": ""})()

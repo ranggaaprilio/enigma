@@ -55,12 +55,12 @@ class FakeRuntime:
         fs: FakeFs | None = None,
         exec_handler: Callable[[str], FakeExecResult] | None = None,
     ) -> None:
-        self.fs = fs or FakeFs()
+        self.fake_fs = fs or FakeFs()
         self.exec_handler = exec_handler
         self.exec_calls: list[dict] = []
 
-    async def get_sandbox(self, workspace: Workspace):
-        return type("Sandbox", (), {"fs": self.fs})()
+    async def fs(self, workspace: Workspace) -> FakeFs:
+        return self.fake_fs
 
     async def exec(self, workspace, command, *, cwd=None, timeout=None) -> FakeExecResult:
         self.exec_calls.append({"command": command, "cwd": cwd, "timeout": timeout})

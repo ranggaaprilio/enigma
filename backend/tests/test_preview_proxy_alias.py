@@ -20,9 +20,9 @@ from app.preview_proxy import (
     PreviewProxyTarget,
     create_preview_proxy_app,
 )
-from app.services.daytona_runtime import RuntimePreviewLink
 from app.services.preview_alias import encode_alias_grant
 from app.services.preview_capability import InvalidPreviewCapabilityError
+from app.services.sandbox import RuntimePreviewLink
 
 BASE_URL = "http://localhost:8001"
 

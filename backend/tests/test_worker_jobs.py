@@ -280,7 +280,7 @@ async def seed_command_run(session, status: str = "running", **fields) -> Comman
 def command_ctx(session_maker, **kwargs) -> dict:
     ctx = make_ctx(session_maker, **kwargs)
     ctx["command_runtime"] = CommandRuntime(InMemoryRunRegistry(), InMemoryEventBus())
-    ctx["daytona_runtime"] = FakeDaytona()
+    ctx["sandbox_runtime"] = FakeDaytona()
     return ctx
 
 
@@ -310,7 +310,7 @@ async def test_queue_mode_command_run_is_enqueued_not_started(db_session, monkey
         session_maker,
         queue_settings(),
         runtime=runtime,
-        daytona_runtime=FakeDaytona(),
+        sandbox_runtime=FakeDaytona(),
         dispatcher=dispatcher,
     )
 
@@ -332,7 +332,7 @@ async def test_command_enqueue_failure_ends_the_run(db_session):
         session_maker,
         queue_settings(),
         runtime=CommandRuntime(InMemoryRunRegistry(), InMemoryEventBus()),
-        daytona_runtime=FakeDaytona(),
+        sandbox_runtime=FakeDaytona(),
         dispatcher=FakeDispatcher(fail=True),
     )
 
@@ -412,7 +412,7 @@ async def seed_running_phase(session, phase_name: str, run_status: str):
 
 def spec_ctx(session_maker, **kwargs) -> dict:
     ctx = make_ctx(session_maker, **kwargs)
-    ctx["daytona_runtime"] = FakeRuntime()
+    ctx["sandbox_runtime"] = FakeRuntime()
     ctx["dispatcher"] = FakeDispatcher()
     return ctx
 
@@ -754,7 +754,7 @@ async def test_worker_startup_and_shutdown_reconcile_only_its_own_runs(monkeypat
     monkeypatch.setattr(worker_module, "get_settings", lambda: queue_settings(worker_id="w-9"))
     monkeypatch.setattr(worker_module, "reconcile_interrupted_runs", reconcile)
     monkeypatch.setattr(worker_module, "run_reaper", reaper)
-    monkeypatch.setattr(worker_module, "get_daytona_runtime", lambda: FakeDaytona())
+    monkeypatch.setattr(worker_module, "close_all", FakeDaytona().close)
     monkeypatch.setattr(worker_module, "engine", FakeEngine())
     monkeypatch.setattr(lifecycle, "draining", False)
     ctx: dict = {"redis": object()}
@@ -792,7 +792,7 @@ async def test_worker_runs_retention_when_configured_and_cancels_it_on_shutdown(
     monkeypatch.setattr(worker_module, "reconcile_interrupted_runs", reconcile)
     monkeypatch.setattr(worker_module, "run_reaper", idle)
     monkeypatch.setattr("app.services.retention.run_retention", idle)
-    monkeypatch.setattr(worker_module, "get_daytona_runtime", lambda: FakeDaytona())
+    monkeypatch.setattr(worker_module, "close_all", FakeDaytona().close)
     monkeypatch.setattr(worker_module, "engine", FakeEngine())
     monkeypatch.setattr(lifecycle, "draining", False)  # shutdown() begins a drain
     ctx: dict = {"redis": object()}

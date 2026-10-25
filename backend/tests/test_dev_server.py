@@ -19,12 +19,12 @@ from app.models import (
     WorkspaceService,
     WorkspaceWorktree,
 )
-from app.services.daytona_runtime import RuntimeCommandResult
 from app.services.dev_server import (
     DevServerNotClonedError,
     DevServerService,
     DevServerState,
 )
+from app.services.sandbox import RuntimeCommandResult
 from app.services.users import DuplicateUserEmailError
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 from app.services.worktrees import WorktreeNotFoundError
@@ -94,8 +94,8 @@ class FakeRuntime:
         self.cwds: list[str | None] = []
         self.envs: list[dict | None] = []
 
-    async def get_sandbox(self, workspace, *, start: bool = True) -> FakeSandbox:
-        return self.sandbox
+    async def fs(self, workspace) -> FakeFs:
+        return self.sandbox.fs
 
     async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
         self.commands.append(command)

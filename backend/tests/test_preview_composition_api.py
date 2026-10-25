@@ -10,8 +10,8 @@ from app.api import auth as auth_module
 from app.api import preview as preview_module
 from app.core.security import hash_password
 from app.main import app
-from app.services.daytona_runtime import DaytonaRuntimeError
 from app.services.preview_composition import ComposedService, PreviewComposition
+from app.services.sandbox import SandboxRuntimeError
 from app.services.workspace_services import WorkspaceServiceWorkspacePathError
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -170,7 +170,7 @@ async def test_composition_endpoint_maps_sandbox_not_ready_to_409(composition_co
 
 async def test_composition_endpoint_maps_runtime_error_to_503(composition_context):
     _user, workspace_id, fake_service = composition_context
-    fake_service.error = DaytonaRuntimeError("sandbox unreachable")
+    fake_service.error = SandboxRuntimeError("sandbox unreachable")
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         await login(client)
