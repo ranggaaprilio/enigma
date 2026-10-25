@@ -11,10 +11,10 @@ from app.core.config import Settings
 from app.models import Workspace, WorkspaceWorktree
 from app.schemas.files import FileNode, FileReadResponse
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    get_daytona_runtime,
+from app.services.sandbox import (
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
 )
 from app.services.workspaces import WorkspaceNotFoundError
 from app.services.worktrees import WorktreeNotFoundError
@@ -84,11 +84,11 @@ class FileService:
         self,
         session: AsyncSession,
         settings: Settings,
-        runtime: DaytonaRuntime | None = None,
+        runtime: SandboxRuntime | None = None,
     ) -> None:
         self.session = session
         self.settings = settings
-        self.runtime = runtime or get_daytona_runtime()
+        self.runtime = runtime or get_sandbox_runtime()
 
     async def tree(
         self,
@@ -97,7 +97,7 @@ class FileService:
         path: str | None = None,
         worktree_id: UUID | None = None,
     ) -> FileNode:
-        workspace, sandbox, root = await self._workspace(workspace_id, owner_id, worktree_id)
+        workspace, fs, root = await self._workspace(workspace_id, owner_id, worktree_id)
         root_relative = self._normalize_relative(path or "", allow_empty=True)
         root_remote = self._remote_path(root, root_relative)
         semaphore = asyncio.Semaphore(max(1, self.settings.file_tree_concurrency))
@@ -115,7 +115,7 @@ class FileService:
             children: list[FileNode] = []
             if is_dir:
                 async with semaphore:
-                    entries = await sandbox.fs.list_files(
+                    entries = await fs.list_files(
                         self._remote_path(root, relative_path)
                     )
                 visible = [
@@ -142,7 +142,7 @@ class FileService:
             )
 
         try:
-            root_info = await sandbox.fs.get_file_info(root_remote)
+            root_info = await fs.get_file_info(root_remote)
         except Exception as error:
             raise FileNotFoundErrorInWorkspace from error
         return await build_node(root_info, root_relative)
@@ -154,11 +154,11 @@ class FileService:
         path: str,
         worktree_id: UUID | None = None,
     ) -> FileReadResponse:
-        workspace, sandbox, root = await self._workspace(workspace_id, owner_id, worktree_id)
+        workspace, fs, root = await self._workspace(workspace_id, owner_id, worktree_id)
         relative = self._normalize_relative(path)
         remote = self._remote_path(root, relative)
         try:
-            info = await sandbox.fs.get_file_info(remote)
+            info = await fs.get_file_info(remote)
             if self._is_symlink(info):
                 raise FilePathError
             if self._is_dir(info):
@@ -166,7 +166,7 @@ class FileService:
             size = self._size(info)
             if size > self.settings.file_max_read_bytes:
                 raise FileTooLargeError
-            content = await sandbox.fs.download_file(remote)
+            content = await fs.download_file(remote)
         except (FilePathError, FileTooLargeError):
             raise
         except Exception as error:
@@ -205,13 +205,13 @@ class FileService:
     ) -> str:
         if len(content) > self.settings.file_max_upload_bytes:
             raise FileTooLargeError
-        workspace, sandbox, root = await self._workspace(workspace_id, owner_id, worktree_id)
+        workspace, fs, root = await self._workspace(workspace_id, owner_id, worktree_id)
         upload_path = f"{path.rstrip('/')}/{filename.strip()}" if filename else path
         relative = self._normalize_relative(upload_path)
         parent = PurePosixPath(relative).parent.as_posix()
         if parent != ".":
-            await sandbox.fs.create_folder(self._remote_path(root, parent), "755")
-        await sandbox.fs.upload_file(content, self._remote_path(root, relative))
+            await fs.create_folder(self._remote_path(root, parent), "755")
+        await fs.upload_file(content, self._remote_path(root, relative))
         self._log("file_upload", workspace_id, owner_id, relative)
         await self._audit(owner_id, workspace_id, "file_upload", relative)
         return relative
@@ -223,12 +223,12 @@ class FileService:
         path: str,
         worktree_id: UUID | None = None,
     ) -> None:
-        workspace, sandbox, root = await self._workspace(workspace_id, owner_id, worktree_id)
+        workspace, fs, root = await self._workspace(workspace_id, owner_id, worktree_id)
         relative = self._normalize_relative(path)
         try:
-            await sandbox.fs.get_file_info(self._remote_path(root, relative))
+            await fs.get_file_info(self._remote_path(root, relative))
         except Exception:
-            await sandbox.fs.create_folder(self._remote_path(root, relative), "755")
+            await fs.create_folder(self._remote_path(root, relative), "755")
         else:
             raise FileConflictError
         await self._audit(owner_id, workspace_id, "file_folder_create", relative)
@@ -241,18 +241,18 @@ class FileService:
         new_path: str,
         worktree_id: UUID | None = None,
     ) -> str:
-        workspace, sandbox, root = await self._workspace(workspace_id, owner_id, worktree_id)
+        workspace, fs, root = await self._workspace(workspace_id, owner_id, worktree_id)
         source = self._normalize_relative(path)
         destination = self._normalize_relative(new_path)
         if destination == source or destination.startswith(f"{source}/"):
             raise FilePathError
         try:
-            await sandbox.fs.get_file_info(self._remote_path(root, destination))
+            await fs.get_file_info(self._remote_path(root, destination))
         except Exception:
             pass
         else:
             raise FileConflictError
-        await sandbox.fs.move_files(
+        await fs.move_files(
             self._remote_path(root, source),
             self._remote_path(root, destination),
         )
@@ -272,9 +272,9 @@ class FileService:
         path: str,
         worktree_id: UUID | None = None,
     ) -> None:
-        workspace, sandbox, root = await self._workspace(workspace_id, owner_id, worktree_id)
+        workspace, fs, root = await self._workspace(workspace_id, owner_id, worktree_id)
         relative = self._normalize_relative(path)
-        await sandbox.fs.delete_file(self._remote_path(root, relative), recursive=True)
+        await fs.delete_file(self._remote_path(root, relative), recursive=True)
         await self._audit(owner_id, workspace_id, "file_delete", relative)
 
     async def search(
@@ -284,11 +284,11 @@ class FileService:
         query: str,
         worktree_id: UUID | None = None,
     ) -> list[FileSearchResult]:
-        workspace, sandbox, root = await self._workspace(workspace_id, owner_id, worktree_id)
+        workspace, fs, root = await self._workspace(workspace_id, owner_id, worktree_id)
         normalized = query.strip()
         if not normalized:
             return []
-        matches = await sandbox.fs.find_files(root, f"*{normalized}*")
+        matches = await fs.find_files(root, f"*{normalized}*")
         results: list[FileSearchResult] = []
         for match in matches[: self.settings.file_tree_max_entries]:
             path = str(getattr(match, "file", getattr(match, "path", "")))
@@ -296,7 +296,7 @@ class FileService:
             if not relative or self._is_ignored(relative):
                 continue
             try:
-                info = await sandbox.fs.get_file_info(path)
+                info = await fs.get_file_info(path)
             except Exception:
                 continue
             is_dir = self._is_dir(info)
@@ -318,10 +318,10 @@ class FileService:
         path: str,
         worktree_id: UUID | None = None,
     ) -> tuple[str, bytes]:
-        workspace, sandbox, root = await self._workspace(workspace_id, owner_id, worktree_id)
+        workspace, fs, root = await self._workspace(workspace_id, owner_id, worktree_id)
         relative = self._normalize_relative(path)
         try:
-            content = await sandbox.fs.download_file(self._remote_path(root, relative))
+            content = await fs.download_file(self._remote_path(root, relative))
         except Exception as error:
             raise FileNotFoundErrorInWorkspace from error
         return PurePosixPath(relative).name, content or b""
@@ -334,10 +334,10 @@ class FileService:
             raise WorkspaceNotFoundError
         root = await self._resolve_root(workspace, worktree_id)
         try:
-            sandbox = await self.runtime.get_sandbox(workspace)
-        except DaytonaRuntimeError as error:
+            fs = await self.runtime.fs(workspace)
+        except SandboxRuntimeError as error:
             raise FileWorkspaceUnavailableError from error
-        return workspace, sandbox, root
+        return workspace, fs, root
 
     async def _resolve_root(self, workspace: Workspace, worktree_id: UUID | None) -> str:
         """Map a worktree id to its confined working directory; ``None`` => base clone.

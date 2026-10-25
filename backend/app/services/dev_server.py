@@ -23,14 +23,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.models import CustomCommand, Workspace, WorkspaceService, WorkspaceWorktree
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    get_daytona_runtime,
-)
 from app.services.git_providers import redact_secrets
 from app.services.preview import COMMON_PREVIEW_PORTS
 from app.services.run_paths import join_subpath, validate_relative_subpath
+from app.services.sandbox import (
+    RuntimeFileSystem,
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
+)
 from app.services.sandbox_probe import port_is_open
 from app.services.service_scripts import (
     build_mise_setup_script,
@@ -90,12 +91,12 @@ class DevServerService:
         self,
         session: AsyncSession,
         settings: Settings,
-        runtime: DaytonaRuntime | None = None,
+        runtime: SandboxRuntime | None = None,
         common_ports: tuple[int, ...] = COMMON_PREVIEW_PORTS,
     ) -> None:
         self.session = session
         self.settings = settings
-        self.runtime = runtime or get_daytona_runtime()
+        self.runtime = runtime or get_sandbox_runtime()
         self.common_ports = common_ports
         self._manager = WorkspaceServiceManager(session, settings, self.runtime, common_ports)
 
@@ -251,14 +252,14 @@ class DevServerService:
         *,
         require_mise: bool = True,
     ) -> DevServerState | None:
-        sandbox = await self.runtime.get_sandbox(workspace)
-        if not await self._is_cloned(sandbox, checkout):
+        fs = await self.runtime.fs(workspace)
+        if not await self._is_cloned(fs, checkout):
             raise DevServerNotClonedError
         if require_mise:
             candidates = [launch_cwd] if launch_cwd and launch_cwd != checkout else []
             candidates.append(checkout)
             for directory in candidates:
-                if await self._has_mise_config(sandbox, directory):
+                if await self._has_mise_config(fs, directory):
                     break
             else:
                 return DevServerState(
@@ -327,7 +328,7 @@ class DevServerService:
                 env=env or None,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             raise DevServerRuntimeError(str(error)) from error
 
         workspace.dev_worktree_id = worktree_id
@@ -413,7 +414,7 @@ class DevServerService:
                 cwd=workspace.workspace_path,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             raise DevServerRuntimeError(str(error)) from error
         return (result.stdout or "").strip() or "none"
 
@@ -432,7 +433,7 @@ class DevServerService:
                 cwd=workspace.workspace_path,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
-        except DaytonaRuntimeError:
+        except SandboxRuntimeError:
             return ""
         tail = (result.stdout or "").strip()[-2000:]
         # This tail reaches the browser via `DevServerState.message`, so it must be redacted
@@ -456,18 +457,18 @@ class DevServerService:
     async def _port_is_open(self, workspace: Workspace, port: int) -> bool:
         return await port_is_open(self.runtime, workspace, port)
 
-    async def _has_mise_config(self, sandbox, repo_path: str) -> bool:
+    async def _has_mise_config(self, fs: RuntimeFileSystem, repo_path: str) -> bool:
         for name in MISE_CONFIG_FILES:
             try:
-                await sandbox.fs.get_file_info(f"{repo_path}/{name}")
+                await fs.get_file_info(f"{repo_path}/{name}")
             except Exception:
                 continue
             return True
         return False
 
-    async def _is_cloned(self, sandbox, repo_path: str) -> bool:
+    async def _is_cloned(self, fs: RuntimeFileSystem, repo_path: str) -> bool:
         try:
-            await sandbox.fs.get_file_info(f"{repo_path}/.git")
+            await fs.get_file_info(f"{repo_path}/.git")
         except Exception:
             return False
         return True
@@ -476,6 +477,6 @@ class DevServerService:
         workspace = await self.session.get(Workspace, workspace_id)
         if workspace is None or workspace.owner_id != user_id:
             raise WorkspaceNotFoundError
-        if not workspace.daytona_sandbox_id:
+        if not workspace.sandbox_id:
             raise DevServerWorkspacePathError
         return workspace

@@ -22,12 +22,12 @@ from app.schemas.workspace_services import (
     WorkspaceServiceResponse,
     WorkspaceServicesResponse,
 )
-from app.services.daytona_runtime import (
-    DaytonaCommandTimeoutError,
-    DaytonaRuntimeError,
-    get_daytona_runtime,
-)
 from app.services.git_providers import redact_secrets
+from app.services.sandbox import (
+    CommandTimeoutError,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
+)
 from app.services.service_scripts import ServicePaths
 from app.services.workspace_env import load_all_values, redactable_env_values
 from app.services.workspace_services import (
@@ -96,7 +96,7 @@ async def get_workspace_service_manager(
     session: AsyncSession = DB_SESSION_DEP,
     settings: Settings = SETTINGS_DEP,
 ) -> WorkspaceServiceManagerProtocol:
-    return WorkspaceServiceManager(session, settings, get_daytona_runtime())
+    return WorkspaceServiceManager(session, settings, get_sandbox_runtime())
 
 
 WORKSPACE_SERVICE_MANAGER_DEP = Depends(get_workspace_service_manager)
@@ -162,7 +162,7 @@ async def list_workspace_services(
         raise workspace_not_found() from None
     except WorkspaceServiceWorkspacePathError:
         raise sandbox_not_ready() from None
-    except DaytonaRuntimeError as error:
+    except SandboxRuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return await _aggregate_response(manager, workspace_id, current_user.id, rows, primary)
 
@@ -183,7 +183,7 @@ async def ensure_workspace_services(
         raise workspace_not_found() from None
     except WorkspaceServiceWorkspacePathError:
         raise sandbox_not_ready() from None
-    except DaytonaRuntimeError as error:
+    except SandboxRuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return await _aggregate_response(manager, workspace_id, current_user.id, rows, primary)
 
@@ -217,7 +217,7 @@ async def start_workspace_service(
         raise HTTPException(status_code=409, detail=str(error)) from None
     except WorkspaceServicePortConflictError as error:
         raise HTTPException(status_code=409, detail=str(error)) from None
-    except (WorkspaceServiceRuntimeError, DaytonaRuntimeError) as error:
+    except (WorkspaceServiceRuntimeError, SandboxRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return await _service_response(manager, workspace_id, current_user.id, row, warning)
 
@@ -237,7 +237,7 @@ async def stop_workspace_service(
         raise service_not_found() from None
     except WorkspaceServiceWorkspacePathError:
         raise sandbox_not_ready() from None
-    except (WorkspaceServiceRuntimeError, DaytonaRuntimeError) as error:
+    except (WorkspaceServiceRuntimeError, SandboxRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return await _service_response(manager, workspace_id, current_user.id, row)
 
@@ -267,7 +267,7 @@ async def restart_workspace_service(
         raise sandbox_not_ready() from None
     except WorkspaceServiceNotClonedError:
         raise not_cloned() from None
-    except (WorkspaceServiceRuntimeError, DaytonaRuntimeError) as error:
+    except (WorkspaceServiceRuntimeError, SandboxRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return await _service_response(manager, workspace_id, current_user.id, row)
 
@@ -286,7 +286,7 @@ async def get_workspace_service_logs(
         raise workspace_not_found() from None
     except WorkspaceServiceNotFoundError:
         raise service_not_found() from None
-    except (WorkspaceServiceRuntimeError, DaytonaRuntimeError) as error:
+    except (WorkspaceServiceRuntimeError, SandboxRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return ServiceLogsResponse(content=content)
 
@@ -302,7 +302,7 @@ async def stream_workspace_service_logs(
         if user is None:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-        manager = WorkspaceServiceManager(session, settings, get_daytona_runtime())
+        manager = WorkspaceServiceManager(session, settings, get_sandbox_runtime())
         try:
             workspace = await manager.get_workspace_for(workspace_id, user.id)
             paths = await manager.log_paths(workspace_id, service_id, user.id)
@@ -317,7 +317,7 @@ async def stream_workspace_service_logs(
 
     await websocket.accept()
     secrets = redactable_env_values(env)
-    runtime = get_daytona_runtime()
+    runtime = get_sandbox_runtime()
 
     async def on_output(content: str) -> None:
         try:
@@ -353,7 +353,7 @@ async def stream_workspace_service_logs(
         if stream_task in done:
             try:
                 stream_task.result()
-            except (DaytonaCommandTimeoutError, DaytonaRuntimeError, WebSocketDisconnect):
+            except (CommandTimeoutError, SandboxRuntimeError, WebSocketDisconnect):
                 pass
     except WebSocketDisconnect:
         pass

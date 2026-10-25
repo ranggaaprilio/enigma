@@ -16,7 +16,6 @@ from app.models import CommandRun, CustomCommand, Workspace
 from app.services.agent_tools import DangerousCommandError
 from app.services.audit import AuditLogService
 from app.services.capacity import enforce_queue_depth
-from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
 from app.services.env_templates import enigma_exports, substitute
 from app.services.git_providers import redact_secrets
 from app.services.jobs import (
@@ -36,6 +35,7 @@ from app.services.runtime import (
     event_bus,
     run_registry,
 )
+from app.services.sandbox import SandboxRuntime, get_sandbox_runtime
 from app.services.workspace_env import build_template_context, redactable_env_values
 from app.services.workspace_env import resolve as _resolve_env
 from app.services.workspaces import WorkspaceNotFoundError
@@ -124,14 +124,14 @@ class CommandService:
         session_maker: async_sessionmaker[AsyncSession],
         settings: Settings,
         runtime: CommandRuntime = command_runtime,
-        daytona_runtime: DaytonaRuntime | None = None,
+        sandbox_runtime: SandboxRuntime | None = None,
         dispatcher: RunDispatcher | None = None,
     ) -> None:
         self.session = session
         self.session_maker = session_maker
         self.settings = settings
         self.runtime = runtime
-        self.daytona_runtime = daytona_runtime or get_daytona_runtime()
+        self.sandbox_runtime = sandbox_runtime or get_sandbox_runtime()
         self._dispatcher = dispatcher
 
     @property
@@ -401,7 +401,7 @@ class CommandService:
         custom_command = await self._get_command(workspace_id, command_id, user_id)
         if custom_command.requires_confirmation and not confirmed:
             raise CommandConfirmationRequiredError
-        if not workspace.daytona_sandbox_id:
+        if not workspace.sandbox_id:
             raise CommandWorkspacePathError
 
         # Resolve up front so an unusable worktree or working directory fails the request with a
@@ -622,7 +622,7 @@ class CommandService:
             workspace = await self._get_workspace(workspace_id, user_id)
         except WorkspaceNotFoundError:
             return
-        manager = WorkspaceServiceManager(self.session, self.settings, self.daytona_runtime)
+        manager = WorkspaceServiceManager(self.session, self.settings, self.sandbox_runtime)
         try:
             await manager.stop_for_command(workspace, command_id)
         except WorkspaceServiceRuntimeError:
@@ -694,7 +694,7 @@ class CommandService:
                 async def on_output(content: str) -> None:
                     await self._append_output(session, run, redact_secrets(content, *secrets))
 
-                exit_code = await self.daytona_runtime.stream_command(
+                exit_code = await self.sandbox_runtime.stream_command(
                     workspace,
                     session_id=f"command-{run.id.hex}",
                     command=command,

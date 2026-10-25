@@ -22,7 +22,6 @@ from app.core.middleware import REQUEST_ID_HEADER, RequestContextMiddleware
 from app.core.tracing import UNTRACED_URLS, configure_tracing, shutdown_tracing
 from app.db.session import async_session_maker, engine
 from app.services.capacity import RunCapacityExceededError, run_capacity_exceeded_handler
-from app.services.daytona_runtime import get_daytona_runtime
 from app.services.fleet_metrics import start_fleet_sampler
 from app.services.jobs import (
     RunQueueUnavailableError,
@@ -32,6 +31,7 @@ from app.services.jobs import (
 from app.services.reconciliation import reconcile_interrupted_runs
 from app.services.retention import start_retention
 from app.services.runtime import RedisEventBus, event_bus, run_registry
+from app.services.sandbox import close_all
 
 logger = structlog.get_logger(__name__)
 
@@ -91,7 +91,7 @@ async def lifespan(_app: FastAPI):
         # Whatever is left active is swept by the next startup; the pools must still close.
         logger.exception("shutdown_drain_failed")
     finally:
-        await get_daytona_runtime().close()
+        await close_all()
         # The queue-mode Redis clients (dispatcher pool, event bus); every other caller opens
         # and closes its own client.
         await close_run_dispatcher()

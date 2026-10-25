@@ -9,17 +9,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.models import EditorSession, Workspace
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    get_daytona_runtime,
-)
 from app.services.editor_alias import (
     editor_alias_url,
     editor_prime_url,
     ensure_editor_alias,
 )
 from app.services.preview_alias import encode_alias_grant
+from app.services.sandbox import (
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
+)
 from app.services.workspaces import WorkspaceNotFoundError
 from app.services.worktrees import WorktreeNotFoundError, WorktreeService
 
@@ -59,11 +59,11 @@ class EditorService:
         self,
         session: AsyncSession,
         settings: Settings,
-        runtime: DaytonaRuntime | None = None,
+        runtime: SandboxRuntime | None = None,
     ) -> None:
         self.session = session
         self.settings = settings
-        self.runtime = runtime or get_daytona_runtime()
+        self.runtime = runtime or get_sandbox_runtime()
 
     async def start_or_reuse(
         self,
@@ -72,7 +72,7 @@ class EditorService:
         worktree_id: UUID | None = None,
     ) -> EditorSession:
         workspace = await self._get_workspace(workspace_id, user_id)
-        if not workspace.daytona_sandbox_id:
+        if not workspace.sandbox_id:
             raise EditorWorkspacePathError
         folder = await self._resolve_folder(workspace, worktree_id)
         existing = await self._latest_for_workspace(workspace.id, user_id)
@@ -94,7 +94,7 @@ class EditorService:
                     "code-server could not be started in the sandbox. "
                     "Install it in the Daytona snapshot or enable editor auto-install."
                 )
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             raise EditorRuntimeError(str(error)) from error
 
         alias = await ensure_editor_alias(self.session, workspace)
@@ -162,7 +162,7 @@ class EditorService:
                 cwd=workspace.workspace_path,
                 timeout=10,
             )
-        except DaytonaRuntimeError:
+        except SandboxRuntimeError:
             pass
         editor_session.status = "stopped"
         editor_session.last_active_at = datetime.now(UTC)

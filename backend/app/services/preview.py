@@ -9,16 +9,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.models import PreviewSession, Workspace, WorkspaceWorktree
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    get_daytona_runtime,
-)
 from app.services.preview_capability import (
     InvalidPreviewCapabilityError,
     capability_from_host,
     create_preview_proxy_url,
     decode_preview_capability,
+)
+from app.services.sandbox import (
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
 )
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -42,12 +42,12 @@ class PreviewService:
         self,
         session: AsyncSession,
         settings: Settings,
-        runtime: DaytonaRuntime | None = None,
+        runtime: SandboxRuntime | None = None,
         common_ports: tuple[int, ...] = COMMON_PREVIEW_PORTS,
     ) -> None:
         self.session = session
         self.settings = settings
-        self.runtime = runtime or get_daytona_runtime()
+        self.runtime = runtime or get_sandbox_runtime()
         self.common_ports = common_ports
 
     async def list_for_workspace(self, workspace_id: UUID, user_id: UUID) -> list[PreviewSession]:
@@ -285,7 +285,7 @@ class PreviewService:
         workspace = await self.session.get(Workspace, workspace_id)
         if workspace is None or workspace.owner_id != user_id:
             raise WorkspaceNotFoundError
-        if not workspace.daytona_sandbox_id:
+        if not workspace.sandbox_id:
             raise PreviewWorkspacePathError
         return workspace
 
@@ -325,6 +325,6 @@ class PreviewService:
                 cwd=workspace.workspace_path,
                 timeout=3,
             )
-        except DaytonaRuntimeError:
+        except SandboxRuntimeError:
             return False
         return result.exit_code == 0

@@ -25,7 +25,6 @@ from app.db.session import async_session_maker, engine
 from app.models import AgentRun, CommandRun, SpecPhase, SpecWorkflow
 from app.services.agents import ACTIVE_RUN_STATUSES, AgentService, agent_runtime
 from app.services.commands import CommandService, command_runtime
-from app.services.daytona_runtime import get_daytona_runtime
 from app.services.jobs import (
     AGENT_RUN_JOB,
     COMMAND_RUN_JOB,
@@ -45,6 +44,7 @@ from app.services.reaper import run_reaper
 from app.services.reconciliation import reconcile_interrupted_runs
 from app.services.retention import start_retention
 from app.services.runtime import RedisEventBus, event_bus
+from app.services.sandbox import close_all
 from app.services.speckit import (
     _TERMINAL_RUN_STATUSES,
     PHASE_FINALIZE_TIMEOUT_SECONDS,
@@ -228,7 +228,7 @@ async def run_command_job(ctx: dict[str, Any], run_id: str) -> str:
             session_maker,
             settings,
             runtime=ctx["command_runtime"],
-            daytona_runtime=ctx.get("daytona_runtime"),
+            sandbox_runtime=ctx.get("sandbox_runtime"),
         )
         outcome = await _claim(
             lambda: service.claim_run(run_uuid, settings.worker_id, job_try),
@@ -327,7 +327,7 @@ async def finalize_spec_phase_job(ctx: dict[str, Any], phase_id: str, run_id: st
                 session,
                 session_maker,
                 settings,
-                runtime=ctx.get("daytona_runtime"),
+                runtime=ctx.get("sandbox_runtime"),
                 dispatcher=ctx.get("dispatcher"),
             )
             if run_status not in _TERMINAL_RUN_STATUSES:
@@ -392,7 +392,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
         logger.exception("worker_shutdown_reconcile_failed")
     finally:
         set_run_dispatcher(None)  # the pool is arq's; it closes it
-        await get_daytona_runtime().close()
+        await close_all()
         if isinstance(event_bus, RedisEventBus):
             await event_bus.aclose()
         await engine.dispose()

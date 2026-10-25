@@ -28,11 +28,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.models import Workspace
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    get_daytona_runtime,
-)
 from app.services.proxy_detection import (
     PROXY_CONFIG_FILES,
     ProxyConfig,
@@ -42,6 +37,11 @@ from app.services.proxy_detection import (
     angular_proxy_config_path as _angular_proxy_config_path,
 )
 from app.services.run_paths import join_subpath, resolve_worktree, validate_relative_subpath
+from app.services.sandbox import (
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
+)
 from app.services.workspaces import WorkspaceNotFoundError
 
 logger = structlog.get_logger(__name__)
@@ -588,11 +588,11 @@ class RunDetectionService:
         self,
         session: AsyncSession,
         settings: Settings,
-        runtime: DaytonaRuntime | None = None,
+        runtime: SandboxRuntime | None = None,
     ) -> None:
         self.session = session
         self.settings = settings
-        self.runtime = runtime or get_daytona_runtime()
+        self.runtime = runtime or get_sandbox_runtime()
 
     async def detect(
         self,
@@ -601,7 +601,7 @@ class RunDetectionService:
         worktree_id: UUID | None = None,
     ) -> list[DetectedCommand]:
         workspace = await self._get_workspace(workspace_id, user_id)
-        if not workspace.daytona_sandbox_id:
+        if not workspace.sandbox_id:
             raise RunDetectionUnavailableError("Workspace sandbox is not ready")
 
         checkout, _, _ = await resolve_worktree(self.session, workspace, worktree_id)
@@ -646,7 +646,7 @@ class RunDetectionService:
         service's `cwd` (relative to the resolved app root; `None` = the app root itself).
         """
         workspace = await self._get_workspace(workspace_id, user_id)
-        if not workspace.daytona_sandbox_id:
+        if not workspace.sandbox_id:
             raise RunDetectionUnavailableError("Workspace sandbox is not ready")
 
         checkout, _, _ = await resolve_worktree(self.session, workspace, worktree_id)
@@ -760,7 +760,7 @@ class RunDetectionService:
                 cwd=cwd,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             raise RunDetectionUnavailableError(str(error)) from error
         return result.stdout or ""
 

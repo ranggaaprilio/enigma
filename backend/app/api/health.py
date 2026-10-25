@@ -3,11 +3,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 
-from app.core.config import get_settings
 from app.core.lifecycle import lifecycle
 from app.db.session import async_session_maker
-from app.services.daytona_runtime import DaytonaRuntime
 from app.services.redis import get_redis_client
+from app.services.sandbox import get_runtime_by_name
 
 router = APIRouter(tags=["health"])
 
@@ -47,11 +46,7 @@ async def check_redis() -> str:
 
 
 async def check_daytona() -> str:
-    runtime = DaytonaRuntime(get_settings())
-    try:
-        return await runtime.health()
-    finally:
-        await runtime.close()
+    return await get_runtime_by_name("daytona").health()
 
 
 @router.get("/health", response_model=HealthResponse)

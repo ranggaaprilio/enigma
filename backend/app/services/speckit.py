@@ -8,7 +8,7 @@ sandbox (in a per-feature git worktree), then halts at ``awaiting_review`` until
 approves. The ``implement`` phase is hard-blocked until ``plan`` and ``tasks`` are approved.
 
 Scaffolding and git (``specify init``, ``git worktree``, commits) run directly through
-``DaytonaRuntime.exec`` because the agent tool sandbox blocks ``git``/``uv``/scripts. Artifact
+``SandboxRuntime.exec`` because the agent tool sandbox blocks ``git``/``uv``/scripts. Artifact
 *content* is produced by the agent (which can write into ``specs/`` and ``.specify/``).
 """
 
@@ -30,7 +30,6 @@ from app.core.lifecycle import ServiceDrainingError, lifecycle
 from app.models import AgentRun, SpecPhase, SpecWorkflow, User, Workspace
 from app.services.agents import AgentService
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import DaytonaRuntime, get_daytona_runtime
 from app.services.jobs import (
     ENQUEUE_FAILED,
     RunDispatcher,
@@ -45,6 +44,7 @@ from app.services.repositories import (
     RepositoryService,
 )
 from app.services.runtime import run_registry
+from app.services.sandbox import SandboxRuntime, get_sandbox_runtime
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 logger = structlog.get_logger(__name__)
@@ -214,13 +214,13 @@ class SpecKitService:
         session: AsyncSession,
         session_maker: async_sessionmaker[AsyncSession],
         settings: Settings,
-        runtime: DaytonaRuntime | None = None,
+        runtime: SandboxRuntime | None = None,
         dispatcher: RunDispatcher | None = None,
     ) -> None:
         self.session = session
         self.session_maker = session_maker
         self.settings = settings
-        self.runtime = runtime or get_daytona_runtime()
+        self.runtime = runtime or get_sandbox_runtime()
         self._dispatcher = dispatcher
         # Strong references to in-flight phase finalizers, so the event loop cannot
         # garbage-collect a running task out from under a workflow.

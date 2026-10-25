@@ -9,8 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import CustomCommand, Workspace, WorkspaceEnvVar, WorkspaceTemplate
 from app.models.project import TeamMember
-from app.services.daytona_runtime import DaytonaRuntime, DaytonaRuntimeError
 from app.services.git_providers import sanitize_repository_url
+from app.services.sandbox import SandboxRuntime, SandboxRuntimeError
 from app.services.templates import TemplateService
 from app.services.utils import slugify
 from app.services.workspace_init import WorkspaceInitializationError, WorkspaceInitializer
@@ -86,7 +86,7 @@ class SqlAlchemyWorkspaceService:
         self,
         session: AsyncSession,
         cipher: WorkspaceSecretCipher,
-        runtime: DaytonaRuntime,
+        runtime: SandboxRuntime,
         initializer: WorkspaceInitializer | None = None,
     ) -> None:
         self.session = session
@@ -203,7 +203,7 @@ class SqlAlchemyWorkspaceService:
     ) -> Workspace:
         """Bring an already-persisted workspace row up to a running sandbox.
 
-        Shared by `create` and `reprovision`. `DaytonaRuntime.provision` looks the sandbox up
+        Shared by `create` and `reprovision`. `SandboxRuntime.provision` looks the sandbox up
         by the name derived from the workspace id and reuses it when it exists, so calling
         this a second time repairs the row instead of leaking a second sandbox.
 
@@ -212,11 +212,8 @@ class SqlAlchemyWorkspaceService:
         writes over an existing working tree.
         """
         try:
-            sandbox = await self.runtime.provision(
-                workspace.id, workspace.owner_id, workspace.snapshot
-            )
-            workspace.daytona_sandbox_id = sandbox.id
-        except DaytonaRuntimeError as error:
+            workspace.sandbox_id = await self.runtime.provision(workspace)
+        except SandboxRuntimeError as error:
             await self._mark_error(workspace)
             raise WorkspaceRuntimeError(str(error)) from error
 
@@ -246,7 +243,7 @@ class SqlAlchemyWorkspaceService:
         sandbox to query. This is the repair path — typically after correcting the snapshot.
         """
         workspace = await self.get_for_owner(workspace_id, owner_id)
-        had_sandbox = workspace.daytona_sandbox_id is not None
+        had_sandbox = workspace.sandbox_id is not None
 
         template: WorkspaceTemplate | None = None
         if workspace.source == "template" and workspace.template_id is not None:
@@ -292,7 +289,7 @@ class SqlAlchemyWorkspaceService:
         workspace = await self.get_for_owner(workspace_id, owner_id)
         try:
             await self.runtime.delete(workspace)
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             raise WorkspaceRuntimeError(str(error)) from error
         await self.session.delete(workspace)
         await self.session.commit()

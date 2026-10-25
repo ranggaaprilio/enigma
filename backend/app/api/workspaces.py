@@ -55,7 +55,6 @@ from app.schemas.worktrees import (
     WorktreeSyncRequest,
 )
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import DaytonaRuntimeError, get_daytona_runtime
 from app.services.env_file import parse_env_text
 from app.services.git_providers import supports_pull_requests
 from app.services.github_client import GitHubApiError, PullRequestService
@@ -72,6 +71,7 @@ from app.services.repositories import (
     RepositoryService,
     RepositoryTokenError,
 )
+from app.services.sandbox import SandboxRuntimeError, get_sandbox_runtime
 from app.services.templates import TemplateNotFoundError
 from app.services.workspace_env import affected_running_services, egress_warnings
 from app.services.workspace_init import WorkspaceInitializationError
@@ -191,7 +191,7 @@ async def get_workspace_service(
     return SqlAlchemyWorkspaceService(
         session=session,
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
-        runtime=get_daytona_runtime(),
+        runtime=get_sandbox_runtime(),
     )
 
 
@@ -205,7 +205,7 @@ async def get_repository_service(
     return RepositoryService(
         session=session,
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
-        runtime=get_daytona_runtime(),
+        runtime=get_sandbox_runtime(),
         settings=settings,
     )
 
@@ -219,7 +219,7 @@ async def get_worktree_service(
 ) -> WorktreeService:
     return WorktreeService(
         session=session,
-        runtime=get_daytona_runtime(),
+        runtime=get_sandbox_runtime(),
         settings=settings,
     )
 
@@ -282,7 +282,7 @@ def workspace_create_error(error: Exception) -> HTTPException:
 
 
 def repository_error(error: Exception) -> HTTPException:
-    if isinstance(error, DaytonaRuntimeError):
+    if isinstance(error, SandboxRuntimeError):
         return HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=str(error),
@@ -440,7 +440,7 @@ async def connect_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -527,7 +527,7 @@ async def clone_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -571,7 +571,7 @@ async def get_repository_status(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
         WorktreeNotFoundError,
     ) as error:
         raise repository_error(error) from None
@@ -616,7 +616,7 @@ async def get_repository_diff(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
         WorktreeNotFoundError,
     ) as error:
         raise repository_error(error) from None
@@ -658,7 +658,7 @@ async def get_repository_log(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
         WorktreeNotFoundError,
     ) as error:
         raise repository_error(error) from None
@@ -709,7 +709,7 @@ async def get_repository_commit(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
         WorktreeNotFoundError,
     ) as error:
         raise repository_error(error) from None
@@ -745,7 +745,7 @@ async def pull_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -788,7 +788,7 @@ async def fetch_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
         WorktreeNotFoundError,
     ) as error:
         raise repository_error(error) from None
@@ -831,7 +831,7 @@ async def commit_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -880,7 +880,7 @@ async def discard_repository_changes(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
         WorktreeNotFoundError,
     ) as error:
         raise repository_error(error) from None
@@ -919,7 +919,7 @@ async def push_repository(
         RepositoryNotClonedError,
         NoChangesToCommitError,
         GitCommandError,
-        DaytonaRuntimeError,
+        SandboxRuntimeError,
     ) as error:
         raise repository_error(error) from None
     await record_audit_safely(
@@ -954,7 +954,7 @@ WORKTREE_ERRORS = (
     RepositoryNotClonedError,
     NoChangesToCommitError,
     GitCommandError,
-    DaytonaRuntimeError,
+    SandboxRuntimeError,
 )
 
 
@@ -1529,7 +1529,7 @@ async def get_workspace_status(
                 service.session.add(workspace)
                 await service.session.commit()
                 await service.session.refresh(workspace)
-            except DaytonaRuntimeError:
+            except SandboxRuntimeError:
                 workspace.status = "error"
         return workspace
     except WorkspaceNotFoundError:

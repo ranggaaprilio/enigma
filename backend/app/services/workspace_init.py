@@ -8,8 +8,8 @@ workspace's default branch plus one commit, so everything downstream that assume
 import shlex
 
 from app.models import Workspace, WorkspaceTemplate
-from app.services.daytona_runtime import DaytonaRuntime, DaytonaRuntimeError
 from app.services.git_providers import redact_secrets
+from app.services.sandbox import RuntimeFileSystem, SandboxRuntime, SandboxRuntimeError
 
 INIT_TIMEOUT_SECONDS = 180
 
@@ -35,27 +35,27 @@ class WorkspaceInitializationError(Exception):
 
 
 class WorkspaceInitializer:
-    def __init__(self, runtime: DaytonaRuntime) -> None:
+    def __init__(self, runtime: SandboxRuntime) -> None:
         self.runtime = runtime
 
     async def initialize_blank(self, workspace: Workspace) -> None:
-        sandbox = await self._sandbox(workspace)
+        fs = await self._fs(workspace)
         path = workspace.workspace_path
-        if await self._has_git(sandbox, path):
+        if await self._has_git(fs, path):
             return
-        await self._ensure_dir(sandbox, path)
+        await self._ensure_dir(fs, path)
         readme = f"# {workspace.name}\n\nCreated with Enigma.\n"
-        await self._upload(sandbox, readme, f"{path}/README.md")
+        await self._upload(fs, readme, f"{path}/README.md")
         await self._init_and_commit(workspace, "Initial commit")
 
     async def initialize_from_template(
         self, workspace: Workspace, template: WorkspaceTemplate
     ) -> None:
-        sandbox = await self._sandbox(workspace)
+        fs = await self._fs(workspace)
         path = workspace.workspace_path
-        if await self._has_git(sandbox, path):
+        if await self._has_git(fs, path):
             return
-        await self._ensure_dir(sandbox, path)
+        await self._ensure_dir(fs, path)
         clone_args = ["clone", "--depth", "1"]
         if template.source_ref:
             clone_args += ["--branch", template.source_ref]
@@ -63,8 +63,8 @@ class WorkspaceInitializer:
         await self._git(workspace, clone_args)
         # Fresh history: the template's commits and its remote are not the user's.
         await self._shell(workspace, "rm -rf .git")
-        if template.mise_config and not await self._has_mise_config(sandbox, path):
-            await self._upload(sandbox, template.mise_config, f"{path}/mise.toml")
+        if template.mise_config and not await self._has_mise_config(fs, path):
+            await self._upload(fs, template.mise_config, f"{path}/mise.toml")
         await self._init_and_commit(workspace, f"Initial commit from template {template.slug}")
 
     # ----- helpers ------------------------------------------------------------------
@@ -103,47 +103,47 @@ class WorkspaceInitializer:
                 env={"GIT_TERMINAL_PROMPT": "0"},
                 timeout=INIT_TIMEOUT_SECONDS,
             )
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             raise WorkspaceInitializationError(str(error)) from error
         if check and result.exit_code != 0:
             output = result.stderr or result.stdout or f"{command} failed"
             raise WorkspaceInitializationError(redact_secrets(output))
         return result
 
-    async def _sandbox(self, workspace: Workspace):
+    async def _fs(self, workspace: Workspace) -> RuntimeFileSystem:
         try:
-            return await self.runtime.get_sandbox(workspace)
-        except DaytonaRuntimeError as error:
+            return await self.runtime.fs(workspace)
+        except SandboxRuntimeError as error:
             raise WorkspaceInitializationError(str(error)) from error
 
     @staticmethod
-    async def _has_git(sandbox, path: str) -> bool:
+    async def _has_git(fs: RuntimeFileSystem, path: str) -> bool:
         try:
-            await sandbox.fs.get_file_info(f"{path}/.git")
+            await fs.get_file_info(f"{path}/.git")
         except Exception:
             return False
         return True
 
     @staticmethod
-    async def _has_mise_config(sandbox, path: str) -> bool:
+    async def _has_mise_config(fs: RuntimeFileSystem, path: str) -> bool:
         for name in MISE_CONFIG_FILES:
             try:
-                await sandbox.fs.get_file_info(f"{path}/{name}")
+                await fs.get_file_info(f"{path}/{name}")
             except Exception:
                 continue
             return True
         return False
 
     @staticmethod
-    async def _ensure_dir(sandbox, path: str) -> None:
+    async def _ensure_dir(fs: RuntimeFileSystem, path: str) -> None:
         try:
-            await sandbox.fs.get_file_info(path)
+            await fs.get_file_info(path)
         except Exception:
-            await sandbox.fs.create_folder(path, "755")
+            await fs.create_folder(path, "755")
 
     @staticmethod
-    async def _upload(sandbox, content: str, remote_path: str) -> None:
+    async def _upload(fs: RuntimeFileSystem, content: str, remote_path: str) -> None:
         try:
-            await sandbox.fs.upload_file(content.encode("utf-8"), remote_path)
+            await fs.upload_file(content.encode("utf-8"), remote_path)
         except Exception as error:
             raise WorkspaceInitializationError(f"Could not write {remote_path}: {error}") from error

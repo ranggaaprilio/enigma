@@ -33,12 +33,6 @@ from app.models import (
     WorkspacePreviewAlias,
     WorkspaceService,
 )
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    RuntimePreviewLink,
-    get_daytona_runtime,
-)
 from app.services.editor_alias import is_editor_alias_label
 from app.services.preview_alias import (
     InvalidPreviewAliasGrantError,
@@ -53,6 +47,12 @@ from app.services.preview_capability import (
     capability_from_host,
     decode_preview_capability,
     proxy_host_label,
+)
+from app.services.sandbox import (
+    RuntimePreviewLink,
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
 )
 from app.services.service_diagnostics import DiagnosticEvent, ServiceDiagnosticsRecorder
 
@@ -170,7 +170,7 @@ class PreviewProxyResolver:
             if (
                 workspace is None
                 or workspace.owner_id is None
-                or not workspace.daytona_sandbox_id
+                or not workspace.sandbox_id
             ):
                 raise InvalidPreviewCapabilityError("Preview workspace is unavailable")
             owner = await session.get(User, workspace.owner_id)
@@ -223,7 +223,7 @@ class PreviewProxyResolver:
             if (
                 workspace is None
                 or workspace.owner_id is None
-                or not workspace.daytona_sandbox_id
+                or not workspace.sandbox_id
             ):
                 raise InvalidPreviewCapabilityError("Preview workspace is unavailable")
             owner = await session.get(User, workspace.owner_id)
@@ -266,7 +266,7 @@ class PreviewProxyResolver:
             if (
                 workspace is None
                 or workspace.owner_id is None
-                or not workspace.daytona_sandbox_id
+                or not workspace.sandbox_id
             ):
                 raise InvalidPreviewCapabilityError("Editor workspace is unavailable")
             owner = await session.get(User, workspace.owner_id)
@@ -302,12 +302,12 @@ def create_preview_proxy_app(
     *,
     settings: Settings | None = None,
     resolver: PreviewProxyResolver | None = None,
-    runtime: DaytonaRuntime | None = None,
+    runtime: SandboxRuntime | None = None,
     http_client: httpx.AsyncClient | None = None,
     diagnostics: ServiceDiagnosticsRecorder | None = None,
 ) -> FastAPI:
     proxy_settings = settings or get_settings()
-    proxy_runtime = runtime or get_daytona_runtime()
+    proxy_runtime = runtime or get_sandbox_runtime()
     proxy_resolver = resolver or PreviewProxyResolver(proxy_settings)
     proxy_diagnostics = diagnostics or ServiceDiagnosticsRecorder(proxy_settings)
     owns_http_client = http_client is None
@@ -573,7 +573,7 @@ def create_preview_proxy_app(
                 query=query,
                 original_host=original_host,
             )
-        except (DaytonaRuntimeError, PreviewUpstreamUnavailableError):
+        except (SandboxRuntimeError, PreviewUpstreamUnavailableError):
             preview_proxy_upstream_errors_total.labels(protocol="http").inc()
             if is_editor:
                 return _editor_unavailable(request, proxy_settings, editor_grant_to_set)
@@ -1042,7 +1042,7 @@ async def _origin_belongs_to_workspace(
 async def _send_http_request(
     *,
     client: httpx.AsyncClient,
-    runtime: DaytonaRuntime,
+    runtime: SandboxRuntime,
     workspace: Workspace,
     port: int,
     request: Request,
@@ -1109,7 +1109,7 @@ async def _send_http_attempt(
 
 async def _connect_websocket(
     *,
-    runtime: DaytonaRuntime,
+    runtime: SandboxRuntime,
     workspace: Workspace,
     port: int,
     websocket: WebSocket,

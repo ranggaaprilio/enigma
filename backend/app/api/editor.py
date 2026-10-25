@@ -14,7 +14,6 @@ from app.schemas.editor import (
     EditorStartRequest,
     EditorStatusResponse,
 )
-from app.services.daytona_runtime import get_daytona_runtime
 from app.services.editor import (
     EditorRuntimeError,
     EditorService,
@@ -22,6 +21,7 @@ from app.services.editor import (
     EditorWorkspacePathError,
     EditorWorktreeError,
 )
+from app.services.sandbox import get_sandbox_runtime
 from app.services.workspaces import WorkspaceNotFoundError
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/editor", tags=["editor"])
@@ -46,7 +46,7 @@ async def get_editor_service(
     session: AsyncSession = DB_SESSION_DEP,
     settings: Settings = SETTINGS_DEP,
 ) -> EditorServiceProtocol:
-    return EditorService(session, settings, get_daytona_runtime())
+    return EditorService(session, settings, get_sandbox_runtime())
 
 
 EDITOR_SERVICE_DEP = Depends(get_editor_service)
