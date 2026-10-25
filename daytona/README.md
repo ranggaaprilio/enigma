@@ -36,4 +36,10 @@ succeeds and the runtime download is skipped.
 `mise install` (run during preview) still downloads language runtimes from the
 internet. If your sandboxes have no outbound access at all, also pre-install the
 project's tools at build time — see the commented `COPY` / `RUN mise install` block
-at the bottom of the `Dockerfile`.
+at the bottom of `sandbox/Dockerfile`.
+
+## Shared with the local Docker runtime
+
+The Dockerfile lives in `sandbox/` because the local Docker/Podman provider builds the same
+image (`./sandbox/build-local-image.sh` → `enigma-sandbox:latest`). Keep one definition so
+the two providers run an identical toolchain; `build-snapshot.sh` points at it.
