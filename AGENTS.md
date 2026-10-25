@@ -89,7 +89,9 @@ The backend manages ephemeral sandboxes through the provider-neutral `SandboxRun
 ```bash
 ./daytona/build-snapshot.sh
 ```
-Then set `DAYTONA_DEFAULT_SNAPSHOT=enigma-mise-code` in `.env`. The stock `daytonaio/sandbox` image will fail because runtime `curl | sh` installs are blocked by the sandbox network.
+Then set `DAYTONA_DEFAULT_SNAPSHOT=enigma-mise-code` in `.env`. The stock `daytonaio/sandbox` image will fail because runtime `curl | sh` installs are blocked by the sandbox network. The image definition is `sandbox/Dockerfile`, shared with the local Docker provider.
+
+**Local Docker provider** (`services/sandbox/docker.py`, `runtime="docker"`, new workspaces get `SANDBOX_RUNTIME_DEFAULT`): one long-lived container per workspace from `enigma-sandbox:latest` (`./sandbox/build-local-image.sh`), everything else via `docker exec` in `asyncio.to_thread`. Commands run under GNU `timeout` in their own process group with a pidfile, so a timeout or a cancelled caller kills the whole tree inside the container. SDK calls run on the provider's own thread pools (one exec thread per in-flight command, a separate control pool for kills) — never `asyncio.to_thread`, which long streams would exhaust. The provision-time `assert_safe_container_spec` refuses mounts, `privileged`, host namespaces or networks, any uid-0 user, added caps (it requires `cap_drop=["ALL"]` and a `pids_limit`), unconfined seccomp/AppArmor, or a missing `no-new-privileges` — the daemon socket is root-equivalent and never reaches a sandbox. The image is always `DOCKER_SANDBOX_IMAGE`; the user-settable `workspace.snapshot` is ignored on Docker. Compose access is opt-in via `docker-compose.sandbox.yml` (socket for backend + worker only, no trusted service on the sandbox network; `deploy/k8s` stays Daytona-only, guarded in `tests/test_deployment.py`). File access, PTY and preview raise `RuntimeUnavailableError` until local-docker-runtime Epics 03/04 (strict xfails in the conformance suite). Real-daemon tests: `DOCKER_INTEGRATION_TESTS=1 uv run pytest tests/test_docker_integration.py`.
 
 ### Global LLM Configuration
 
