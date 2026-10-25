@@ -115,6 +115,10 @@ class Workspace(Base):
     def sandbox_id(self) -> str | None:
         return self.daytona_sandbox_id
 
+    @sandbox_id.setter
+    def sandbox_id(self, value: str | None) -> None:
+        self.daytona_sandbox_id = value
+
 
 # "workspace" => applies to every service in the workspace; "service" => only the service
 # launched from ``custom_command_id``, overriding a workspace-wide value of the same key.
