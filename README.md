@@ -107,7 +107,7 @@ feature worktree), which you commit, push, and turn into a pull request.
 
 Every workspace owns one long-lived Daytona sandbox. The backend never runs user code locally — it
 proxies file, command, terminal, editor, and preview operations into the sandbox through
-`DaytonaRuntime` (`backend/app/services/daytona_runtime.py`).
+`DaytonaRuntime` (`backend/app/services/sandbox/daytona.py`, behind the provider-neutral `SandboxRuntime` interface in `backend/app/services/sandbox/`).
 
 ```mermaid
 flowchart LR

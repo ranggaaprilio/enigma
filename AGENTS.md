@@ -83,7 +83,7 @@ Some domains live in the service layer without their own top-level router — `r
 
 ### Daytona Sandbox Integration
 
-The backend manages ephemeral sandboxes via the Daytona API (`backend/app/services/daytona_runtime.py`). The `agent_tools.py` service maps agent tool calls to sandbox operations (write file, run command, etc.).
+The backend manages ephemeral sandboxes through the provider-neutral `SandboxRuntime` interface in `backend/app/services/sandbox/`: `base.py` (protocols, DTOs, errors), `daytona.py` (the Daytona provider and the **only** module that imports the `daytona` SDK), `factory.py` (`get_sandbox_runtime()` returns a dispatcher that routes each call by `Workspace.runtime`; `close_all()` runs in every lifespan). `tests/sandbox/test_boundary.py` fails the build if an SDK import or a raw sandbox object leaks outside the package; `tests/sandbox/test_conformance.py` is the provider contract. The `agent_tools.py` service maps agent tool calls to sandbox operations (write file, run command, etc.).
 
 **Custom snapshot required**: For the preview (dev-server) and editor (code-server) features, a custom Daytona snapshot with `mise` and `code-server` pre-installed is needed. Build it via:
 ```bash
@@ -110,7 +110,7 @@ OpenAI-compatible base URL, model, and a Fernet-encrypted API key. Owner-only, g
 
 - **Phases (in order)**: `constitution → specify → clarify → plan → analyze → tasks → implement`. Each phase is one agent run.
 - **Human-in-the-loop**: each phase halts at `awaiting_review` until a human approves. `implement` is **hard-blocked** until both `plan` and `tasks` are approved.
-- Each feature runs in its own **git worktree**. Scaffolding and git (`specify init`, `git worktree`, commits) run directly through `DaytonaRuntime.exec`, NOT the agent tool sandbox (which blocks `git`/`uv`/scripts). Artifact *content* (files under `specs/` and `.specify/`) is written by the agent.
+- Each feature runs in its own **git worktree**. Scaffolding and git (`specify init`, `git worktree`, commits) run directly through `SandboxRuntime.exec`, NOT the agent tool sandbox (which blocks `git`/`uv`/scripts). Artifact *content* (files under `specs/` and `.specify/`) is written by the agent.
 
 ### Git Worktrees & Pull Requests
 
@@ -138,7 +138,7 @@ OpenAI-compatible base URL, model, and a Fernet-encrypted API key. Owner-only, g
 8. **Docker Compose mounts source as volumes** (`./backend:/app`, `./frontend:/app`) for hot reload. The backend command also runs `git config safe.directory '*'` before starting.
 9. **`pnpm-workspace.yaml` exists in both root AND frontend/** — the frontend has its own workspace config. Modify the correct one.
 10. **No runtime type checking in Python** — mypy is not configured. Type hints are documentation only.
-11. **Git/uv/scripts run via `DaytonaRuntime.exec`, not the agent tool sandbox** — the agent tool sandbox blocks them. Spec Kit and worktree operations shell out through `DaytonaRuntime.exec` directly; only file *content* goes through agent tools.
+11. **Git/uv/scripts run via `SandboxRuntime.exec`, not the agent tool sandbox** — the agent tool sandbox blocks them. Spec Kit and worktree operations shell out through `SandboxRuntime.exec` directly; only file *content* goes through agent tools.
 12. **Spec Kit `implement` is hard-gated** — it cannot run until the `plan` and `tasks` phases are approved. Don't bypass the `awaiting_review` halts.
 13. **A stored LLM config always drives the OpenHands provider** — it is the only provider that accepts a `base_url`; `OpenAIResponsesProvider` hardcodes `api.openai.com/v1/responses`. With nothing configured, `create_run` raises `AgentConfigurationError` → **503**; tests that drive the run pipeline without an LLM must pass `Settings(agent_allow_mock_provider=True)`.
 14. **`Settings()` is order-dependent in tests** — importing `openhands.sdk` calls `load_dotenv()`, which injects the repo-root `.env` into `os.environ`. A test that means "nothing is configured" must pin the fields explicitly (see `bare_settings()` in `tests/test_platform_llm_settings.py`), never rely on a bare `Settings()`. This is also why `test_settings.py::test_command_deny_dangerous_defaults_to_true` fails locally in a full-suite run but passes alone.

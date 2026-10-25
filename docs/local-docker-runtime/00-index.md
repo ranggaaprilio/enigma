@@ -90,7 +90,7 @@ consumer (`agent_tools`, `files`, `repositories`, `worktrees`, `terminal`, `edit
 
 | # | Epic | Priority | Theme |
 |---|------|----------|-------|
-| 01 | [Runtime Provider Abstraction](./01-runtime-provider-abstraction.md) | **P1** | Foundation (pure refactor) |
+| 01 | [Runtime Provider Abstraction](./01-runtime-provider-abstraction.md) | **P1** — shipped | Foundation (pure refactor) |
 | 02 | [Docker Runtime Core (lifecycle + exec)](./02-docker-runtime-core.md) | **P1** | The new provider |
 | 03 | [Filesystem, Git & PTY Parity](./03-filesystem-git-pty-parity.md) | **P1** | Feature parity |
 | 04 | [Preview, Editor & Dev Server on Docker](./04-preview-editor-devserver.md) | **P1** | Human surfaces |

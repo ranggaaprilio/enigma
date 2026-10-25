@@ -208,3 +208,55 @@ deferred to Epic 06 as an expand/contract pair; this epic writes through the ORM
 - Remove the `Daytona*` error aliases entirely once callers are migrated.
 - Structured runtime capability flags (e.g. `supports_signed_preview`,
   `supports_snapshots`) if providers ever diverge in features rather than mechanics.
+
+## Implementation Notes (shipped)
+
+Landed as one pure refactor; the Daytona path is behaviour-for-behaviour the same and the
+full backend suite passes without expectation changes beyond import paths, error names and
+the fake shape change below. Where the code differs from the tasks above, this is why.
+
+- **Package** — `backend/app/services/sandbox/`: `base.py` (protocols `SandboxRuntime`,
+  `RuntimeFileSystem`, `PtyHandle`; `PtySize`; DTOs; neutral errors), `daytona.py`
+  (`DaytonaRuntime`, `DaytonaFileSystem`, `DaytonaPtyHandle` — the only `import daytona`),
+  `factory.py`. `services/daytona_runtime.py` is a re-export shim with the `Daytona*` error
+  names as plain aliases; nothing in the repo imports it any more, so delete it next release.
+- **Dispatcher, not per-call lookups.** Services are built before they know their workspace
+  (FastAPI dependencies, the worker `ctx`), so `get_sandbox_runtime()` returns one
+  `SandboxRuntimeDispatcher` that routes every call by `workspace.runtime` through
+  `get_runtime(workspace)`. `get_runtime_by_name(name)` serves `/health`; `close_all()` is
+  what the API, worker and preview-proxy lifespans call. A workspace with an unknown
+  `runtime` raises `RuntimeUnavailableError` (a `SandboxRuntimeError`), which the existing
+  route handlers already map to 4xx/503 — no 500. Epic 02 registers `"docker"` in
+  `factory._FACTORIES` and touches no consumer.
+- **`provision(workspace) -> str`** instead of `(workspace_id, owner_id, snapshot)`: the
+  row carries all three plus `runtime`, which the dispatcher needs to route the call.
+- **`fs(workspace)` is async** and resolves/starts the sandbox eagerly. Consumers wrap their
+  file calls in broad `except Exception` ("does not exist"), so a lazy handle would have
+  turned a provider outage into a 404; eager resolution keeps it a 503, exactly as the old
+  `get_sandbox()` call did. One lookup per service method, same as before.
+- **Git status is CLI-only** for the base clone too (the SDK `git.status` and its
+  `_file_status` mapper are gone). `RepositoryService._status_via_cli` runs one
+  `git status --porcelain -b --untracked-files=all` and translates the codes to go-git's
+  words (`porcelain_status_word`: `??` → `Untracked`, `AM` → `Modified`, …) so the status
+  API, the UI and `AgentService._map_git_status_to_badge` see exactly what the SDK returned.
+  Side effects on the worktree path, which already used the CLI: it now returns the same
+  words instead of raw codes (its `??` used to be badged `modified`), lists untracked files
+  individually, and makes one exec instead of two. The agent's `git_status` tool
+  (`agent_tools.py`) is untouched and still shows raw porcelain codes.
+- **`Workspace.sandbox_id` gained a setter** so the one write site
+  (`SqlAlchemyWorkspaceService._provision`) stays off the Daytona-named column; the column
+  rename itself is still Epic 06's expand/contract pair.
+- **Worker context key** is `ctx["sandbox_runtime"]`; `CommandService` takes
+  `sandbox_runtime=`. `signed_preview_url` was dropped (no callers).
+- **Tests** — `tests/sandbox/`: `fakes.py` (interface-level `FakeSandboxRuntime` /
+  `FakeFileSystem` / `FakePtyHandle`, plus the SDK-level `FakeDaytona*` graph),
+  `test_conformance.py` (parametrized over `daytona` — the real adapter on SDK fakes — and
+  `fake`, so the double can never drift from the contract), `test_factory.py`,
+  `test_boundary.py` (the two acceptance greps as tests). Task 11 was done only where the
+  `fs(workspace)` shape forced it (`test_files`, `test_agent_editing_tools`,
+  `test_workspace_init`, `test_workspace_env`, `test_workspace_services`,
+  `test_dev_server`, inline fakes in `test_repositories`/`test_agents`, provision fakes in
+  `test_workspaces`); the remaining ad-hoc fakes still work and can move to
+  `FakeSandboxRuntime` opportunistically.
+- No frontend, schema or config changes. `DAYTONA_INTEGRATION_TESTS=1` still drives the
+  same end-to-end flow (`test_daytona_integration.py` now calls `provision(workspace)`).
