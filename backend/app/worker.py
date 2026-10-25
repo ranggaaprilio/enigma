@@ -362,8 +362,11 @@ async def startup(ctx: dict[str, Any]) -> None:
     set_run_dispatcher(ArqDispatcher(settings, pool=ctx["redis"]))
     # Runs this worker identity claimed in a previous life (crash, OOM, kill -9) have no owner.
     await reconcile_interrupted_runs(async_session_maker, worker_id=settings.worker_id)
-    # Runs any *other* worker left behind are found by their expired leases (Epic 04).
-    ctx["reaper"] = asyncio.create_task(run_reaper(async_session_maker, settings))
+    # Runs any *other* worker left behind are found by their expired leases (Epic 04); runs
+    # whose job vanished from the queue before any claim, by asking arq's Redis.
+    ctx["reaper"] = asyncio.create_task(
+        run_reaper(async_session_maker, settings, redis=ctx["redis"])
+    )
     # Epic 05: every worker prunes; SKIP LOCKED batches split the work between them.
     ctx["retention"] = start_retention(async_session_maker, settings)
     # Epic 09: this worker's run/LLM/reaper metrics on METRICS_PORT, plus its Redis probe.

@@ -3,6 +3,7 @@
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import fakeredis
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import delete, func, select, text, update
@@ -13,8 +14,9 @@ from app.models import AgentEvent, AgentRun, CommandRun, Notification, User, Wor
 from app.services.agent_providers import AgentProvider, ProviderEvent
 from app.services.agents import AgentRunAlreadyActiveError, AgentRuntime, AgentService
 from app.services.commands import CommandRuntime, CommandService
+from app.services.jobs import JOB_LOST, agent_run_job_id, command_run_job_id
 from app.services.leases import heartbeat
-from app.services.reaper import INTERRUPTED_WORKER_DIED, reap_expired_leases
+from app.services.reaper import INTERRUPTED_WORKER_DIED, reap_expired_leases, reap_lost_jobs
 from app.services.runtime import InMemoryEventBus, InMemoryRunLock, InMemoryRunRegistry
 from app.worker import run_agent_job, run_command_job
 from tests.test_job_queue import (
@@ -516,6 +518,144 @@ async def test_concurrent_reapers_end_a_dead_run_exactly_once():
             await cleanup.commit()
         for engine in engines:
             await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Reaper: queued runs whose job was lost before any claim
+# ---------------------------------------------------------------------------
+
+
+def queue_redis(server=None) -> fakeredis.aioredis.FakeRedis:
+    return fakeredis.aioredis.FakeRedis(server=server or fakeredis.FakeServer())
+
+
+async def reap_lost(session_maker, redis, runtimes_pair=None):
+    agent_rt, command_rt = runtimes_pair or runtimes()
+    return await reap_lost_jobs(
+        session_maker, queue_settings(), redis, agent_runtime=agent_rt, command_runtime=command_rt
+    )
+
+
+async def test_reaper_ends_a_queued_run_whose_job_was_lost(db_session):
+    session, session_maker = db_session
+    run = await seed_run(session, status="thinking", enqueued_at=ago(600))
+    agent_rt, command_rt = runtimes()
+    frames = agent_rt.subscribe(run.id)
+
+    result = await reap_lost(session_maker, queue_redis(), (agent_rt, command_rt))
+
+    assert run.id in result.agent_run_ids
+    await session.refresh(run)
+    assert run.status == "error"
+    assert run.error_reason == JOB_LOST
+    assert run.completed_at is not None
+    frame = frames.get_nowait()
+    assert frame["event_type"] == "error"
+    assert frame["metadata"] == {"status": "error", "reason": JOB_LOST}
+    assert await notification_count(session, run.user_id) == 1
+
+    new_run = await agent_service(session, session_maker).create_run(
+        run.workspace_id, run.user_id, "again"
+    )
+    assert new_run.status == "thinking"
+
+
+async def test_reaper_ends_a_queued_command_run_whose_job_was_lost(db_session):
+    session, session_maker = db_session
+    run = await seed_command_run(session, enqueued_at=ago(600))
+    agent_rt, command_rt = runtimes()
+    frames = command_rt.subscribe(run.id)
+
+    result = await reap_lost(session_maker, queue_redis(), (agent_rt, command_rt))
+
+    assert run.id in result.command_run_ids
+    await session.refresh(run)
+    assert (run.status, run.error_reason) == ("error", JOB_LOST)
+    assert frames.get_nowait() == {
+        "type": "status",
+        "status": "error",
+        "exit_code": None,
+        "reason": JOB_LOST,
+    }
+
+
+@pytest.mark.parametrize("job_state", ["queued", "deferred", "in_progress"])
+async def test_reaper_leaves_a_run_whose_job_is_still_in_redis(db_session, job_state):
+    """However long a run has waited, a job arq still holds will be delivered."""
+    session, session_maker = db_session
+    run = await seed_run(session, status="thinking", enqueued_at=ago(3600))
+    command = await seed_command_run(session, enqueued_at=ago(3600))
+    redis = queue_redis()
+    queue = queue_settings().run_queue_name
+    for job_id in (agent_run_job_id(run.id), command_run_job_id(command.id)):
+        if job_state == "in_progress":
+            await redis.set(f"arq:in-progress:{job_id}", b"1")
+        else:
+            score = ahead(60) if job_state == "deferred" else ago(60)
+            await redis.zadd(queue, {job_id: score.timestamp() * 1000})
+
+    result = await reap_lost(session_maker, redis)
+
+    assert run.id not in result.agent_run_ids
+    assert command.id not in result.command_run_ids
+    await session.refresh(run)
+    await session.refresh(command)
+    assert (run.status, command.status) == ("thinking", "running")
+
+
+async def test_reaper_leaves_young_claimed_and_inline_runs_alone(db_session):
+    session, session_maker = db_session
+    young = await seed_run(session, status="thinking", enqueued_at=ago(5))
+    claimed = await seed_run(
+        session,
+        status="executing",
+        enqueued_at=ago(600),
+        claimed_at=ago(500),
+        worker_id="alive",
+        lease_expires_at=ahead(30),
+    )
+    inline = await seed_run(session, status="executing")  # never enqueued
+
+    result = await reap_lost(session_maker, queue_redis())
+
+    for row in (young, claimed, inline):
+        assert row.id not in result.agent_run_ids
+        await session.refresh(row)
+    assert (young.status, claimed.status, inline.status) == ("thinking", "executing", "executing")
+
+
+async def test_reaper_skips_lost_jobs_while_redis_is_down(db_session):
+    session, session_maker = db_session
+    run = await seed_run(session, status="thinking", enqueued_at=ago(600))
+    server = fakeredis.FakeServer()
+    server.connected = False
+
+    result = await reap_lost(session_maker, queue_redis(server))
+
+    assert run.id not in result.agent_run_ids
+    await session.refresh(run)
+    assert run.status == "thinking"
+
+
+async def test_a_claim_racing_the_lost_job_reaper_wins(db_session):
+    """``claimed_at IS NULL`` is re-checked in the UPDATE, after the reaper looked."""
+    session, session_maker = db_session
+    run = await seed_run(session, status="thinking", enqueued_at=ago(600))
+    command = await seed_command_run(session, enqueued_at=ago(600))
+    await agent_service(session, session_maker).claim_run(run.id, "worker-a", 1)
+    await command_service(session, session_maker).claim_run(command.id, "worker-a", 1)
+
+    agent_ended = await agent_service(session, session_maker).fail_active_run(
+        run.id, JOB_LOST, "gone", unclaimed=True
+    )
+    command_ended = await command_service(session, session_maker).fail_active_run(
+        command.id, JOB_LOST, "gone", unclaimed=True
+    )
+
+    assert (agent_ended, command_ended) == (False, False)
+    await session.refresh(run)
+    await session.refresh(command)
+    assert (run.status, command.status) == ("thinking", "running")
 
 
 # ---------------------------------------------------------------------------

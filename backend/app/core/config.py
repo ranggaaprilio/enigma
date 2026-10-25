@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     run_lease_seconds: float = Field(default=60.0, gt=0)
     run_heartbeat_seconds: float = Field(default=15.0, gt=0)
     run_reaper_interval_seconds: float = Field(default=30.0, gt=0)
+    # A queued run no worker has claimed is ended as `job_lost` once its arq job is gone from
+    # Redis (flushed, or dropped after max tries). Runs younger than this are skipped, so the
+    # gap between committing `enqueued_at` and the enqueue itself is never mistaken for a loss.
+    run_unclaimed_grace_seconds: float = Field(default=120.0, gt=0)
     # Epic 05 retention, in days; 0 keeps rows forever (the default). Agent events and command
     # output of finished runs are dropped (the run rows, with their token/cost totals, stay);
     # notifications are deleted once read for `read_…` days, or regardless after

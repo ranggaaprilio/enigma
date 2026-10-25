@@ -126,6 +126,16 @@ unregisters it in `finally`, so no change was needed. This epic added:
   reapers end a run exactly once. Each reaped run gets the usual flow: the error event is
   persisted, then published with `metadata.reason`, and the user gets a notification. Runs with
   no lease (inline mode) are never touched.
+- **Lost jobs** — the same pass (`reap_lost_jobs`, given arq's Redis by the worker) ends runs
+  that were enqueued but never claimed, once their arq job is gone (a Redis flush, or arq
+  dropping the job after its last try), as `error`/`job_lost`. Age cannot tell a lost job from
+  one waiting behind a busy pool, so Redis decides: `job_is_known` (`services/jobs.py`) asks arq
+  for the job's status, and only `not_found` counts. A run whose job is still queued, deferred
+  or in progress waits however long it takes. A Redis error skips the run, so an outage never
+  looks like a loss. `RUN_UNCLAIMED_GRACE_SECONDS` (120) skips young runs, which covers the gap
+  between committing `enqueued_at` and the enqueue itself. `fail_active_run(..., unclaimed=True)`
+  re-checks `claimed_at IS NULL`, so a claim racing the reaper wins. Counted in
+  `reaper_lost_jobs_total{kind}`, apart from worker deaths.
 - **State machine** — `AgentService._transition` is the single conditional status write
   (`… WHERE status IN ('thinking','executing')`). Active statuses move freely, terminal statuses
   are final, and ending a run clears its lease. `stop_run`, `_mark_stopped`, `_mark_error`,
@@ -169,7 +179,6 @@ unregisters it in `finally`, so no change was needed. This epic added:
 - **A cancelled command job does not kill its sandbox process.** The job stops streaming and
   writing, but the command itself runs on in the sandbox until its own timeout.
 - **Per-run event sequence numbers**, which epic 03 deferred to this epic, are not implemented.
-- **A run that is never claimed is never reaped.** If its arq job is lost before any worker
-  claims it, the row stays `thinking`/`running` with no lease and blocks the workspace, as it
-  did after epic 02. A queue-age cutoff would also reap runs that are legitimately waiting
-  behind a busy pool, so it needs a deliberate threshold. This is the remaining stuck-run case.
+- ~~**A run that is never claimed is never reaped.**~~ Fixed: lost jobs are reaped (see above).
+  What remains is a queue-mode run whose API died between inserting the row and stamping
+  `enqueued_at`. It has no `enqueued_at`, so the reaper cannot tell it from an inline run.

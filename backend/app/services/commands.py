@@ -528,12 +528,18 @@ class CommandService:
             return True
 
     async def fail_active_run(
-        self, run_id: UUID, reason: str, message: str, *, lease_expired: bool = False
+        self,
+        run_id: UUID,
+        reason: str,
+        message: str,
+        *,
+        lease_expired: bool = False,
+        unclaimed: bool = False,
     ) -> bool:
         """End a still-running run as ``error``/``reason``; a no-op if it already finished.
 
-        ``lease_expired`` also requires that no worker holds a live lease at write time (see
-        ``AgentService.fail_active_run``).
+        ``lease_expired`` also requires that no worker holds a live lease at write time, and
+        ``unclaimed`` that no worker has claimed it (see ``AgentService.fail_active_run``).
         """
         async with self.session_maker() as session:
             conditions = [CommandRun.id == run_id, CommandRun.status == "running"]
@@ -544,6 +550,8 @@ class CommandService:
                         CommandRun.lease_expires_at < db_now(),
                     )
                 )
+            if unclaimed:
+                conditions.append(CommandRun.claimed_at.is_(None))
             result = await session.execute(
                 update(CommandRun)
                 .where(*conditions)

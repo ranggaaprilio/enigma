@@ -250,5 +250,6 @@ cluster-wide anyway.
   connection (`conn_retries=5`, 1s apart) before the run ends as `enqueue_failed`.
 - **Dead-peer detection for an idle subscriber**: it relies on OS TCP keepalive (Linux default
   ~2h). Presence's commands fail fast, and the heartbeat surfaces an outage within one interval.
-- **Not-yet-claimed runs**: a run whose job is lost before any worker claims it still blocks
-  its workspace (the remaining epic 04 gap).
+- ~~**Not-yet-claimed runs**: a run whose job is lost before any worker claims it still blocks
+  its workspace (the remaining epic 04 gap).~~ Fixed: the reaper ends it as `job_lost` once
+  arq no longer holds the job (epic 04).
