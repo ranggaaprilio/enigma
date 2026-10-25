@@ -92,6 +92,12 @@ reaper_runs_ended_total = Counter(
     labelnames=("kind",),
 )
 
+reaper_lost_jobs_total = Counter(
+    "reaper_lost_jobs_total",
+    "Queued runs the reaper ended because their job vanished from Redis before any claim.",
+    labelnames=("kind",),
+)
+
 reaper_sweeps_total = Counter(
     "reaper_sweeps_total",
     "Reaper passes, by result.",

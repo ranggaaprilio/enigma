@@ -474,7 +474,13 @@ class AgentService:
         return status or "missing"
 
     async def fail_active_run(
-        self, run_id: UUID, reason: str, message: str, *, lease_expired: bool = False
+        self,
+        run_id: UUID,
+        reason: str,
+        message: str,
+        *,
+        lease_expired: bool = False,
+        unclaimed: bool = False,
     ) -> bool:
         """End a still-active run as ``error``/``reason``; a no-op if it already finished.
 
@@ -482,7 +488,8 @@ class AgentService:
         status written concurrently (e.g. a stop). ``lease_expired`` (the reaper, a redelivered
         job) additionally requires that no worker holds a live lease *at write time* -- it ran
         out, or was never stamped (claimed before leases existed) -- so a renewal that raced the
-        check wins. Returns whether this call ended the run.
+        check wins. ``unclaimed`` (the lost-job reaper) requires that no worker has claimed the
+        run, so a claim that raced the check wins. Returns whether this call ended the run.
         """
         async with self.session_maker() as session:
             conditions = [AgentRun.id == run_id, AgentRun.status.in_(ACTIVE_RUN_STATUSES)]
@@ -490,6 +497,8 @@ class AgentService:
                 conditions.append(
                     or_(AgentRun.lease_expires_at.is_(None), AgentRun.lease_expires_at < db_now())
                 )
+            if unclaimed:
+                conditions.append(AgentRun.claimed_at.is_(None))
             result = await session.execute(
                 update(AgentRun)
                 .where(*conditions)

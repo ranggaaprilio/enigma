@@ -15,6 +15,7 @@ from typing import Protocol
 from uuid import UUID
 
 from arq.connections import ArqRedis, RedisSettings, create_pool
+from arq.jobs import Job, JobStatus
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
@@ -31,6 +32,26 @@ WORKER_LOST = "worker_lost"
 DEAD_LETTER = "dead_letter"
 JOB_TIMEOUT = "job_timeout"
 WORKER_ERROR = "worker_error"
+JOB_LOST = "job_lost"
+
+
+def agent_run_job_id(run_id: UUID) -> str:
+    return f"agent_run:{run_id}"
+
+
+def command_run_job_id(run_id: UUID) -> str:
+    return f"command_run:{run_id}"
+
+
+async def job_is_known(redis: ArqRedis, queue_name: str, job_id: str) -> bool:
+    """Whether arq still holds the job: queued, deferred for a retry, or in progress.
+
+    False means it is gone -- Redis was flushed, or arq dropped it after its last try -- so no
+    worker will ever deliver it. Raises if Redis cannot be reached; callers must not read that
+    as a loss.
+    """
+    status = await Job(job_id, redis, _queue_name=queue_name).status()
+    return status != JobStatus.not_found
 
 
 def serialize_job_payload(data: dict) -> bytes:
@@ -84,10 +105,10 @@ class ArqDispatcher:
         await pool.enqueue_job(function, *args, _job_id=job_id)
 
     async def enqueue_agent_run(self, run_id: UUID) -> None:
-        await self._enqueue(AGENT_RUN_JOB, str(run_id), job_id=f"agent_run:{run_id}")
+        await self._enqueue(AGENT_RUN_JOB, str(run_id), job_id=agent_run_job_id(run_id))
 
     async def enqueue_command_run(self, run_id: UUID) -> None:
-        await self._enqueue(COMMAND_RUN_JOB, str(run_id), job_id=f"command_run:{run_id}")
+        await self._enqueue(COMMAND_RUN_JOB, str(run_id), job_id=command_run_job_id(run_id))
 
     async def enqueue_spec_finalize(self, phase_id: UUID, run_id: UUID) -> None:
         await self._enqueue(
