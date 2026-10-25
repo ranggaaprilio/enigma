@@ -1,3 +1,4 @@
+import base64
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from uuid import UUID, uuid4
@@ -511,11 +512,11 @@ def test_parse_porcelain_status_handles_modified_untracked_and_renamed_files():
 
 
 async def test_clone_uses_git_cli_with_pat_header_and_branch(tmp_path):
-    import base64
 
     user_id = uuid4()
     workspace = _demo_workspace(user_id)
     commands: list[tuple[str, str | None]] = []
+    envs: list[dict[str, str] | None] = []
     created: list[str] = []
 
     class FakeFs:
@@ -531,6 +532,7 @@ async def test_clone_uses_git_cli_with_pat_header_and_branch(tmp_path):
 
         async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
             commands.append((command, cwd))
+            envs.append(env)
             return SimpleNamespace(exit_code=0, stdout="", stderr="")
 
     service = RepositoryService(
@@ -557,9 +559,7 @@ async def test_clone_uses_git_cli_with_pat_header_and_branch(tmp_path):
     command, cwd = commands[-1]
     assert cwd == "/workspace"
     assert "clone --branch main -- https://github.com/example/demo.git ." in command
-    expected = base64.b64encode(b"x-access-token:raw-secret-token").decode()
-    assert f"http.extraHeader=AUTHORIZATION: basic {expected}" in command
-    assert "raw-secret-token" not in command
+    assert_token_header_in_env(envs[-1], command, b"x-access-token:raw-secret-token")
 
 
 async def test_clone_requires_a_connected_remote():
@@ -575,7 +575,6 @@ async def test_clone_requires_a_connected_remote():
 
 
 async def test_push_uses_authenticated_git_cli_in_worktree(tmp_path):
-    import base64
 
     user_id = uuid4()
     workspace = Workspace(
@@ -594,6 +593,7 @@ async def test_push_uses_authenticated_git_cli_in_worktree(tmp_path):
     )
     worktree_path = "/workspace/worktrees/feat-login"
     commands: list[tuple[str, str | None]] = []
+    envs: list[dict[str, str] | None] = []
 
     class FakeFs:
         async def get_file_info(self, path):
@@ -605,6 +605,7 @@ async def test_push_uses_authenticated_git_cli_in_worktree(tmp_path):
 
         async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
             commands.append((command, cwd))
+            envs.append(env)
             return SimpleNamespace(exit_code=0, stdout="", stderr="")
 
     service = RepositoryService(
@@ -628,10 +629,8 @@ async def test_push_uses_authenticated_git_cli_in_worktree(tmp_path):
     # Pushes the current branch, creating + tracking the remote branch — works in a worktree.
     assert "push --set-upstream origin HEAD" in command
     assert cwd == worktree_path
-    # Auth rides on an HTTP Basic header carrying the token; the raw token never appears verbatim.
-    expected = base64.b64encode(b"x-access-token:raw-secret-token").decode()
-    assert f"http.extraHeader=AUTHORIZATION: basic {expected}" in command
-    assert "raw-secret-token" not in command
+    # Auth rides on an HTTP Basic header carrying the token, in env — never on the argv.
+    assert_token_header_in_env(envs[-1], command, b"x-access-token:raw-secret-token")
 
 
 async def test_push_surfaces_sanitized_git_error(tmp_path):
@@ -808,6 +807,17 @@ def _demo_workspace(owner_id: UUID | None = None) -> Workspace:
     )
 
 
+def assert_token_header_in_env(env, command: str, credentials: bytes) -> None:
+    """The Basic header reaches git through ``GIT_CONFIG_*`` env, never the command line."""
+    expected = base64.b64encode(credentials).decode()
+    assert env is not None
+    assert env["GIT_CONFIG_COUNT"] == "1"
+    assert env["GIT_CONFIG_KEY_0"] == "http.extraHeader"
+    assert env["GIT_CONFIG_VALUE_0"] == f"AUTHORIZATION: basic {expected}"
+    assert expected not in command and "extraHeader" not in command
+    assert credentials.split(b":", 1)[1].decode() not in command
+
+
 def _repo_service_with_exec(workspace: Workspace, exec_impl, *, token="raw-secret-token"):
     """Build a RepositoryService whose sandbox reports "cloned" and routes exec to ``exec_impl``."""
 
@@ -819,7 +829,10 @@ def _repo_service_with_exec(workspace: Workspace, exec_impl, *, token="raw-secre
         async def fs(self, ws):
             return FakeFs()
 
+        envs: list[dict[str, str] | None] = []
+
         async def exec(self, ws, command, *, cwd=None, env=None, timeout=None):
+            self.envs.append(env)
             return await exec_impl(command, cwd)
 
     service = RepositoryService(
@@ -958,7 +971,6 @@ async def test_commit_detail_rejects_non_sha():
 
 
 async def test_fetch_uses_authenticated_git_in_worktree():
-    import base64
 
     workspace = _demo_workspace()
     worktree_path = "/workspace/worktrees/feat-login"
@@ -974,9 +986,9 @@ async def test_fetch_uses_authenticated_git_in_worktree():
     command, cwd = calls[-1]
     assert "fetch origin" in command
     assert cwd == worktree_path
-    expected = base64.b64encode(b"x-access-token:raw-secret-token").decode()
-    assert f"http.extraHeader=AUTHORIZATION: basic {expected}" in command
-    assert "raw-secret-token" not in command
+    assert_token_header_in_env(
+        service.runtime.envs[-1], command, b"x-access-token:raw-secret-token"
+    )
 
 
 async def test_discard_all_resets_hard_and_cleans():
@@ -1082,7 +1094,6 @@ def _ssh_service(workspace: Workspace, exec_impl, fs_log: list[tuple[str, ...]])
 
 
 async def test_push_uses_gitlab_oauth2_username_in_basic_header():
-    import base64
 
     workspace = _demo_workspace()
     workspace.repo_url = "https://gitlab.com/example/demo.git"
@@ -1100,8 +1111,7 @@ async def test_push_uses_gitlab_oauth2_username_in_basic_header():
     service._get_auth = fake_get_auth  # type: ignore[method-assign]
     await service.push(workspace.id, workspace.owner_id)
 
-    expected = base64.b64encode(b"oauth2:glpat-secret").decode()
-    assert f"http.extraHeader=AUTHORIZATION: basic {expected}" in calls[-1]
+    assert_token_header_in_env(service.runtime.envs[-1], calls[-1], b"oauth2:glpat-secret")
     # origin already matched the workspace URL, so no remote add/set-url ran.
     assert not any("remote add" in c or "remote set-url" in c for c in calls)
 

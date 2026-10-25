@@ -772,18 +772,24 @@ class RepositoryService:
         Token auth rides on a per-command HTTP Basic ``Authorization`` header
         (``http.extraHeader``) whose username half is provider-specific (``x-access-token`` for
         GitHub, ``oauth2`` for GitLab, ``x-token-auth`` or the account name for Bitbucket).
-        Passing it as a per-invocation ``-c`` value keeps it out of ``.git/config`` and the
-        remote URL. SSH auth materialises the deploy key inside the sandbox for the duration of
-        the command and points ``GIT_SSH_COMMAND`` at it. Nothing is persisted either way.
+        It is passed as ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` environment (git >= 2.31 reads
+        them like ``-c``; the sandbox image ships a newer git), which keeps it out of
+        ``.git/config``, the remote URL and the command string we hand the runtime. On the
+        Docker runtime that keeps it out of ``ps`` too; how a provider applies ``env`` is its
+        own business (Daytona's is a field of its exec API). SSH auth
+        materialises the deploy key inside the sandbox for the duration of the command and
+        points ``GIT_SSH_COMMAND`` at it. Nothing is persisted either way.
         """
         if auth.kind == "ssh":
             return await self._run_ssh_git(workspace, args, auth, cwd=cwd, timeout=timeout)
         basic = base64.b64encode(f"{auth.username}:{auth.token}".encode()).decode()
-        command = "git " + " ".join(
-            shlex.quote(part)
-            for part in ("-c", f"http.extraHeader=AUTHORIZATION: basic {basic}", *args)
-        )
-        return await self.runtime.exec(workspace, command, cwd=cwd, timeout=timeout)
+        command = "git " + " ".join(shlex.quote(part) for part in args)
+        env = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
+        }
+        return await self.runtime.exec(workspace, command, cwd=cwd, env=env, timeout=timeout)
 
     async def _run_ssh_git(
         self,
