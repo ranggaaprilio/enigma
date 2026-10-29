@@ -4,7 +4,7 @@ from typing import Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
-from pydantic import Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Insecure defaults that must never be used outside a local environment. The fail-fast
@@ -99,8 +99,19 @@ class Settings(BaseSettings):
     daytona_auto_stop_minutes: int = 30
     daytona_provision_timeout_seconds: int = 120
     daytona_preview_url_ttl_seconds: int = Field(default=60 * 60, gt=0)
-    daytona_preview_proxy_base_url: str = "http://localhost:8001"
-    daytona_preview_proxy_ttl_seconds: int = Field(default=60 * 60, gt=0)
+    # The capability proxy fronts every provider's previews and the editor. The
+    # DAYTONA_PREVIEW_PROXY_* names stay accepted until local-docker-runtime Epic 06.
+    preview_proxy_base_url: str = Field(
+        default="http://localhost:8001",
+        validation_alias=AliasChoices("preview_proxy_base_url", "daytona_preview_proxy_base_url"),
+    )
+    preview_proxy_ttl_seconds: int = Field(
+        default=60 * 60,
+        gt=0,
+        validation_alias=AliasChoices(
+            "preview_proxy_ttl_seconds", "daytona_preview_proxy_ttl_seconds"
+        ),
+    )
     daytona_network_block_all: bool = False
     daytona_network_allow_list: str | list[str] = Field(default_factory=list)
     # Provider for newly created workspaces ("daytona" | "docker"). Existing rows keep theirs.
@@ -110,6 +121,9 @@ class Settings(BaseSettings):
     docker_host: str | None = None
     docker_sandbox_image: str = "enigma-sandbox:latest"
     docker_sandbox_network: str = "enigma-sandboxes"
+    # The preview proxy's name on that network (compose: its service name). A sandbox's
+    # port relay admits connections from this name's addresses only (Epic 04).
+    docker_preview_proxy_host: str = "preview-proxy"
     # Must exist in the image and must not be root (enforced at provision).
     docker_sandbox_user: str = "daytona"
     docker_sandbox_cpus: float = Field(default=2.0, gt=0)
@@ -333,13 +347,13 @@ class Settings(BaseSettings):
         # `SameSite=None` without `Secure` is rejected by every current browser. `Secure`
         # requires HTTPS, except for the browser's own `localhost` exemption -- so a plain
         # `http://` proxy base URL on any other host makes every alias grant unsettable.
-        proxy_host = (urlsplit(self.daytona_preview_proxy_base_url).hostname or "").lower()
+        proxy_host = (urlsplit(self.preview_proxy_base_url).hostname or "").lower()
         proxy_is_loopback = proxy_host in {"localhost", "127.0.0.1", "::1"} or proxy_host.endswith(
             ".localhost"
         )
-        if self.daytona_preview_proxy_base_url.startswith("http://") and not proxy_is_loopback:
+        if self.preview_proxy_base_url.startswith("http://") and not proxy_is_loopback:
             raise ValueError(
-                "daytona_preview_proxy_base_url must be an https:// origin (or localhost) when "
+                "preview_proxy_base_url must be an https:// origin (or localhost) when "
                 f"environment={self.environment!r} -- preview-alias grant cookies require "
                 "SameSite=None; Secure, which cannot be set over plain HTTP on a non-loopback host."
             )

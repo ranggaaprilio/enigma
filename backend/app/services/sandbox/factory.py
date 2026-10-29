@@ -153,6 +153,9 @@ class SandboxRuntimeDispatcher:
     async def preview_link(self, workspace: Workspace, port: int) -> RuntimePreviewLink:
         return await get_runtime(workspace).preview_link(workspace, port)
 
+    async def expose_port(self, workspace: Workspace, port: int) -> None:
+        await get_runtime(workspace).expose_port(workspace, port)
+
     async def fs(self, workspace: Workspace) -> RuntimeFileSystem:
         return await get_runtime(workspace).fs(workspace)
 

@@ -348,6 +348,9 @@ class DaytonaRuntime:
         except Exception as error:
             raise map_daytona_error(error) from error
 
+    async def expose_port(self, workspace: Workspace, port: int) -> None:
+        """Nothing to do: Daytona's preview edge reaches the sandbox's loopback itself."""
+
     async def _ensure_started(self, sandbox: Any) -> Any:
         await sandbox.refresh_data()
         if str(sandbox.state or "").lower() != "started":

@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from urllib.parse import urlsplit
 from uuid import UUID
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +22,8 @@ from app.services.sandbox import (
     get_sandbox_runtime,
 )
 from app.services.workspaces import WorkspaceNotFoundError
+
+logger = structlog.get_logger(__name__)
 
 COMMON_PREVIEW_PORTS = (3000, 5173, 8000, 8080)
 
@@ -107,6 +110,7 @@ class PreviewService:
         self.session.add(preview)
         await self.session.commit()
         await self.session.refresh(preview)
+        await self._expose(workspace, port)
         return preview
 
     async def stop_for_service(self, workspace: Workspace, service_id: UUID) -> None:
@@ -182,6 +186,7 @@ class PreviewService:
         self.session.add(preview)
         await self.session.commit()
         await self.session.refresh(preview)
+        await self._expose(workspace, port)
         if is_new:
             await AuditLogService(self.session).record(
                 user_id=user_id,
@@ -220,7 +225,7 @@ class PreviewService:
 
     def _proxy_url(self, preview: PreviewSession) -> str:
         ttl_seconds = min(
-            self.settings.daytona_preview_proxy_ttl_seconds,
+            self.settings.preview_proxy_ttl_seconds,
             self.settings.daytona_preview_url_ttl_seconds,
         )
         renewal_window = timedelta(seconds=min(60, max(1, ttl_seconds // 10)))
@@ -228,7 +233,7 @@ class PreviewService:
             parsed = urlsplit(preview.public_url)
             capability_value = capability_from_host(
                 parsed.netloc,
-                base_url=self.settings.daytona_preview_proxy_base_url,
+                base_url=self.settings.preview_proxy_base_url,
             )
             capability = decode_preview_capability(
                 capability_value,
@@ -245,7 +250,7 @@ class PreviewService:
         return create_preview_proxy_url(
             preview.id,
             preview.port,
-            base_url=self.settings.daytona_preview_proxy_base_url,
+            base_url=self.settings.preview_proxy_base_url,
             secret_key=self.settings.auth_secret_key,
             ttl_seconds=ttl_seconds,
         )
@@ -304,6 +309,20 @@ class PreviewService:
         if row is None or row.workspace_id != workspace.id:
             return workspace.default_branch
         return row.branch
+
+    async def _expose(self, workspace: Workspace, port: int) -> None:
+        """Make the listening port reachable through the proxy (a Docker sandbox relays a
+        loopback-only dev server; Daytona needs nothing). Best effort: the session row is
+        already recorded, and a still-unreachable app surfaces as the proxy's usual 502."""
+        try:
+            await self.runtime.expose_port(workspace, port)
+        except SandboxRuntimeError as error:
+            logger.warning(
+                "preview_expose_port_failed",
+                workspace_id=str(workspace.id),
+                port=port,
+                error_type=type(error).__name__,
+            )
 
     async def _first_open_port(self, workspace: Workspace) -> int | None:
         for port in self.common_ports:

@@ -158,6 +158,15 @@ class SandboxRuntime(Protocol):
 
     async def preview_link(self, workspace: Workspace, port: int) -> RuntimePreviewLink: ...
 
+    async def expose_port(self, workspace: Workspace, port: int) -> None:
+        """Make a port that is listening in the sandbox reachable by ``preview_link``.
+
+        Called when a preview session is created or re-confirmed (the app is already
+        listening then), so it must be idempotent and cheap. Best effort: it logs and
+        never raises for a port it cannot expose, so the preview session still records.
+        """
+        ...
+
     async def fs(self, workspace: Workspace) -> RuntimeFileSystem:
         """Resolve (and start) the sandbox and return a file-system handle on it.
 

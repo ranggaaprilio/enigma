@@ -152,7 +152,7 @@ class PreviewProxyResolver:
     async def resolve(self, host: str) -> PreviewProxyTarget:
         capability_value = capability_from_host(
             host,
-            base_url=self.settings.daytona_preview_proxy_base_url,
+            base_url=self.settings.preview_proxy_base_url,
         )
         capability = decode_preview_capability(
             capability_value,
@@ -407,17 +407,23 @@ def create_preview_proxy_app(
         if not scrape_authorized(request):
             return unauthorized()
         database = await check_database()
-        try:
-            daytona = await proxy_runtime.health()
-        except Exception:
-            daytona = "error"
-        healthy = database == "ok" and daytona == "ok"
+        provider = proxy_settings.sandbox_runtime_default
+        if provider == "docker":
+            # The proxy holds no daemon socket: it dials Docker sandboxes by name on the
+            # sandbox network, so there is no provider control plane to probe from here.
+            sandbox = "skipped"
+        else:
+            try:
+                sandbox = await proxy_runtime.health()
+            except Exception:
+                sandbox = "error"
+        healthy = database == "ok" and sandbox in {"ok", "skipped"}
         return JSONResponse(
             status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
                 "status": "ok" if healthy else "degraded",
                 "database": database,
-                "daytona": daytona,
+                provider: sandbox,
             },
         )
 
@@ -432,7 +438,7 @@ def create_preview_proxy_app(
         original_host = request.headers.get("host", "")
         try:
             label = proxy_host_label(
-                original_host, base_url=proxy_settings.daytona_preview_proxy_base_url
+                original_host, base_url=proxy_settings.preview_proxy_base_url
             )
         except InvalidPreviewCapabilityError:
             probe = probes.get(path) if request.method in ("GET", "HEAD") else None
@@ -616,7 +622,7 @@ def create_preview_proxy_app(
         original_host = websocket.headers.get("host", "")
         try:
             label = proxy_host_label(
-                original_host, base_url=proxy_settings.daytona_preview_proxy_base_url
+                original_host, base_url=proxy_settings.preview_proxy_base_url
             )
         except InvalidPreviewCapabilityError:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -1023,7 +1029,7 @@ async def _origin_belongs_to_workspace(
     if not netloc:
         return False
     try:
-        proxy_host = classify_proxy_host(netloc, base_url=settings.daytona_preview_proxy_base_url)
+        proxy_host = classify_proxy_host(netloc, base_url=settings.preview_proxy_base_url)
     except InvalidPreviewCapabilityError:
         return False
     try:
@@ -1080,6 +1086,18 @@ async def _send_http_request(
     return preview_link, response
 
 
+def _sandbox_token_headers(preview_link: RuntimePreviewLink) -> dict[str, str]:
+    """The provider's preview-auth headers. Daytona's preview edge wants its token (and the
+    warning-page skip); a provider dialled directly on the sandbox network returns an empty
+    token, and the user's app then sees no provider header at all."""
+    if not preview_link.token:
+        return {}
+    return {
+        "X-Daytona-Preview-Token": preview_link.token,
+        "X-Daytona-Skip-Preview-Warning": "true",
+    }
+
+
 async def _send_http_attempt(
     client: httpx.AsyncClient,
     preview_link: RuntimePreviewLink,
@@ -1092,8 +1110,7 @@ async def _send_http_attempt(
 ) -> httpx.Response:
     headers = _forward_headers(request.headers, REQUEST_HEADERS_TO_STRIP)
     headers["Accept-Encoding"] = "identity"
-    headers["X-Daytona-Preview-Token"] = preview_link.token
-    headers["X-Daytona-Skip-Preview-Warning"] = "true"
+    headers.update(_sandbox_token_headers(preview_link))
     headers["X-Forwarded-Host"] = original_host
     upstream_request = client.build_request(
         request.method,
@@ -1120,8 +1137,7 @@ async def _connect_websocket(
     for _attempt in range(2):
         preview_link = await runtime.preview_link(workspace, port)
         headers = _forward_headers(websocket.headers, WEBSOCKET_HEADERS_TO_STRIP)
-        headers["X-Daytona-Preview-Token"] = preview_link.token
-        headers["X-Daytona-Skip-Preview-Warning"] = "true"
+        headers.update(_sandbox_token_headers(preview_link))
         headers["X-Forwarded-Host"] = original_host
         try:
             return await ws_connect(
@@ -1214,7 +1230,7 @@ async def _response_body(response: httpx.Response) -> AsyncIterator[bytes]:
 
 
 def _proxy_origin(settings: Settings, host: str) -> str:
-    return f"{urlsplit(settings.daytona_preview_proxy_base_url).scheme}://{host}"
+    return f"{urlsplit(settings.preview_proxy_base_url).scheme}://{host}"
 
 
 # Epic 13: CORS diagnosis. Pure read of request/response headers -- never injects, removes, or

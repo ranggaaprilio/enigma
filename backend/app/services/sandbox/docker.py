@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import ipaddress
 import os
 import re
+import socket
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -62,6 +64,7 @@ from app.services.sandbox.docker_pty import (
     new_pidfile,
     tmux_session_name,
 )
+from app.services.sandbox.port_relay import PORT_RELAY_TIMEOUT_SECONDS, port_relay_command
 
 logger = structlog.get_logger(__name__)
 
@@ -110,7 +113,6 @@ _KILLER = (
     'rm -f "$0" "$0.cancel"; exit 0'
 )
 
-_NOT_YET = "is not available on the Docker sandbox runtime yet"
 
 
 def map_docker_error(error: Exception) -> SandboxRuntimeError:
@@ -181,8 +183,24 @@ def assert_safe_container_spec(spec: dict[str, Any]) -> None:
         raise ProvisioningError(f"Refusing unsafe sandbox container spec: {sorted(problems)}")
 
 
-def _not_yet(what: str) -> RuntimeUnavailableError:
-    return RuntimeUnavailableError(f"{what} {_NOT_YET}")
+def _is_sandbox_address(value: str) -> bool:
+    """A private IPv4 a bridge network hands out (not loopback, link-local or unspecified)."""
+    try:
+        address = ipaddress.IPv4Address(value)
+    except ValueError:
+        return False
+    return address.is_private and not (
+        address.is_loopback
+        or address.is_link_local
+        or address.is_unspecified
+        or address.is_multicast
+        or address.is_reserved
+    )
+
+
+def container_name(workspace: Workspace) -> str:
+    """The sandbox's container name: also its DNS name on the sandbox network."""
+    return f"execute-{workspace.id.hex}"
 
 
 class DockerRuntime:
@@ -357,7 +375,7 @@ class DockerRuntime:
             raise ProvisioningError("Could not create the workspace directory")
 
     def _provision_sync(self, client: Any, workspace: Workspace) -> str:
-        name = f"execute-{workspace.id.hex}"
+        name = container_name(workspace)
         try:
             existing = client.containers.get(name)
         except NotFound:
@@ -641,15 +659,52 @@ class DockerRuntime:
             container.exec_run, ["tmux", "kill-session", "-t", f"={tmux_session_name(session_id)}"]
         )
 
-    # --- surfaces that land in later epics --------------------------------------------
-
-    def _require_sandbox(self, workspace: Workspace) -> None:
-        if not workspace.sandbox_id:
-            raise SandboxNotFoundError("Workspace has no Docker sandbox")
+    # --- preview ------------------------------------------------------------------------
 
     async def preview_link(self, workspace: Workspace, port: int) -> RuntimePreviewLink:
-        self._require_sandbox(workspace)
-        raise _not_yet("App preview")  # Epic 04
+        """The container's address on the sandbox network, from that network's DNS.
+
+        No daemon call: the preview proxy, which faces the internet, never holds the
+        root-equivalent daemon socket, and it is the one process on the sandbox network.
+        An address rather than the name because dev servers such as Vite 6+ refuse an
+        unknown ``Host`` (``server.allowedHosts``) but accept any IP. A stopped container
+        has no DNS entry, which surfaces as the proxy's self-retrying "Waking preview"
+        page. No token: the network is the boundary and the proxy's HMAC capability the
+        only gate.
+        """
+        if not workspace.sandbox_id:
+            raise SandboxNotFoundError("Workspace has no Docker sandbox")
+        # Absolute name, so a resolver search domain can never expand it to an outside host.
+        try:
+            addresses = await self._resolve_host(f"{container_name(workspace)}.")
+        except OSError as error:
+            raise RuntimeUnavailableError("The sandbox is not running") from error
+        address = next((a for a in addresses if _is_sandbox_address(a)), None)
+        if address is None:
+            # Never steer the proxy at a public host, its own loopback or a metadata endpoint.
+            raise RuntimeUnavailableError("The sandbox is not reachable on the sandbox network")
+        return RuntimePreviewLink(url=f"http://{address}:{int(port)}", token="")
+
+    async def _resolve_host(self, name: str) -> list[str]:
+        infos = await asyncio.get_running_loop().getaddrinfo(
+            name, None, family=socket.AF_INET, type=socket.SOCK_STREAM
+        )
+        return [str(info[4][0]) for info in infos]
+
+    async def expose_port(self, workspace: Workspace, port: int) -> None:
+        """Relay a loopback-only listener to the preview proxy alone (see ``port_relay``)."""
+        result = await self.exec(
+            workspace,
+            port_relay_command(port, self.settings.docker_preview_proxy_host),
+            timeout=PORT_RELAY_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            logger.warning(
+                "docker_port_relay_failed",
+                port=int(port),
+                exit_code=result.exit_code,
+                output=result.stdout[-300:],
+            )
 
 
 __all__ = ["DockerRuntime", "assert_safe_container_spec", "map_docker_error"]

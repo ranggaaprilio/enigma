@@ -255,7 +255,7 @@ async def build_template_context(
         )
         for alias_row in alias_result.scalars().all():
             alias_by_command[alias_row.custom_command_id] = alias_url(
-                alias_row.alias, base_url=settings.daytona_preview_proxy_base_url
+                alias_row.alias, base_url=settings.preview_proxy_base_url
             )
 
     refs: list[ServiceRef] = []

@@ -7,12 +7,23 @@
 #
 # SECURITY: the container daemon socket is root-equivalent on the host. Only the services
 # that drive sandboxes get it — the backend (provision, files, terminals) and the worker
-# (queue-mode runs) — and only through this file. The preview proxy joins in
-# local-docker-runtime Epic 04, when it starts dialling sandboxes. Sandbox containers never
-# get it (DockerRuntime refuses any sandbox spec with mounts), and the agent's command
-# denylist keeps `docker`/`docker-compose` blocked inside them. Never use this on a shared
-# host. Trusted services are deliberately NOT attached to the sandboxes' bridge network
-# (DockerRuntime creates `enigma-sandboxes` itself), so a sandbox cannot reach them.
+# (queue-mode runs) — and only through this file. Sandbox containers never get it
+# (DockerRuntime refuses any sandbox spec with mounts), and the agent's command denylist
+# keeps `docker`/`docker-compose` blocked inside them. Never use this on a shared host.
+#
+# NETWORK: only the preview proxy joins the sandboxes' bridge network (`enigma-sandboxes`),
+# because it dials app previews and the editor at `execute-<workspace>:<port>` directly
+# (local-docker-runtime Epic 04). It never gets the socket: it parses untrusted traffic,
+# and building a preview address needs no daemon call. The backend and worker reach
+# sandboxes through `docker exec` only, so they stay off that network and a sandbox cannot
+# reach the API or the worker. A sandbox CAN reach the proxy's port; every preview host
+# there needs a capability or grant, and /health and /metrics need METRICS_TOKEN.
+# Sandboxes can reach EACH OTHER on this network (per-workspace isolation is Epic 05): a
+# server a user binds to 0.0.0.0 is visible to other sandboxes. Enigma's own surfaces are
+# not: the editor and loopback-only dev servers are carried by a per-port relay that admits
+# only DOCKER_PREVIEW_PROXY_HOST's addresses (this service's name on the network).
+# The network is created by sandbox/build-local-image.sh (and by DockerRuntime on first
+# provision); compose only attaches to it, so run that script before the first `up`.
 #
 # DOCKER_SOCKET is the daemon socket path *where the containers run*:
 #   - Docker (Linux / Docker Desktop):  /var/run/docker.sock (default)
@@ -37,6 +48,7 @@ x-sandbox-env: &sandbox-env
   DOCKER_SANDBOX_MEMORY_MB: ${DOCKER_SANDBOX_MEMORY_MB:-4096}
   DOCKER_SANDBOX_PIDS_LIMIT: ${DOCKER_SANDBOX_PIDS_LIMIT:-4096}
   DOCKER_MAX_CONCURRENT_EXECS: ${DOCKER_MAX_CONCURRENT_EXECS:-64}
+  DOCKER_PREVIEW_PROXY_HOST: ${DOCKER_PREVIEW_PROXY_HOST:-preview-proxy}
 
 services:
   backend:
@@ -45,3 +57,15 @@ services:
   worker:
     <<: *sandbox-access
     environment: *sandbox-env
+  preview-proxy:
+    environment:
+      # Which provider the proxy's /health reports on.
+      SANDBOX_RUNTIME_DEFAULT: ${SANDBOX_RUNTIME_DEFAULT:-docker}
+    networks:
+      - default
+      - sandboxes
+
+networks:
+  sandboxes:
+    name: ${DOCKER_SANDBOX_NETWORK:-enigma-sandboxes}
+    external: true

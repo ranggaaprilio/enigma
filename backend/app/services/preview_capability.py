@@ -158,5 +158,5 @@ def parse_proxy_base_url(base_url: str) -> SplitResult:
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("DAYTONA_PREVIEW_PROXY_BASE_URL must be an HTTP origin")
+        raise ValueError("PREVIEW_PROXY_BASE_URL must be an HTTP origin")
     return parsed

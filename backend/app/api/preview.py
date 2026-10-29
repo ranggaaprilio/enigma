@@ -254,5 +254,5 @@ async def regenerate_preview_alias(
 
     return PreviewAliasRegenerateResponse(
         alias=row.alias,
-        alias_url=build_alias_url(row.alias, base_url=settings.daytona_preview_proxy_base_url),
+        alias_url=build_alias_url(row.alias, base_url=settings.preview_proxy_base_url),
     )
