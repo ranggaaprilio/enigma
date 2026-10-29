@@ -169,3 +169,65 @@ identical to the Daytona experience.
   collisions ever matter.
 - Local HTTPS (mkcert) profile for the proxy in self-host setups.
 - Port auto-detection beyond the fixed candidate list (parse dev-server stdout).
+
+## Implementation Notes (shipped)
+
+Built on the Epic 03 branch. Verified on Podman 5.8 with the real image: unit + conformance
+suites, `tests/test_docker_integration.py` (17 real-container tests, 3 new), and an
+end-to-end smoke through the compose `preview-proxy` (a default Vite app: 503 "Waking
+preview" before the relay, 200 after, HMR WebSocket `{"type":"connected"}`). Deviations
+from the plan above were made at plan review or after the security review, as noted.
+
+- **`preview_link` makes no daemon call** (deviation from "inspect the container"). The
+  proxy faces the internet, so it never holds the root-equivalent socket. It resolves
+  `execute-<workspace hex>.` on the sandbox network's DNS from inside the proxy process
+  (absolute name: no resolver search domain can expand it) and returns
+  `http://<ip>:<port>`, token `""`. An IP, not the name, because Vite 6+ answers an unknown
+  `Host` with 403 (`server.allowedHosts`); IPs are always allowed. Only a private IPv4 that
+  is not loopback, link-local, unspecified, multicast or reserved is accepted. A stopped
+  container has no DNS entry → `RuntimeUnavailableError` → the proxy's "Waking preview".
+- **Token headers** (deviation from renaming to `X-Sandbox-Preview-Token`): the proxy sends
+  `X-Daytona-Preview-Token` / `-Skip-Preview-Warning` only when the link carries a token, so
+  a Docker app sees no provider header and Daytona is byte-for-byte unchanged.
+- **Loopback-only dev servers** (not in the plan): Vite listens on `localhost` by default,
+  which the bridge cannot reach. New `SandboxRuntime.expose_port(workspace, port)` (Daytona
+  no-op) runs `services/sandbox/port_relay.py` in the container when a preview session is
+  created or re-confirmed (`PreviewService.detect` / `upsert_for_service`, i.e. every
+  service status poll, so a restarted dev server is re-relayed). If every listener on the
+  port is loopback, a detached, supervised asyncio relay listens on the container IP and
+  forwards to `127.0.0.1` or `::1`; it exits within a second of the app going away, so an
+  app relaunched on `0.0.0.0` finds the port free. One relay per port (atomic pidfile in
+  `/tmp`, verified via `/proc/<pid>/cmdline` so a pid reused after a container restart is
+  not mistaken for it); `expose_port` returns once the relay listens. Best effort: a
+  failure is logged and the preview row still records.
+- **Security review → proxy-only relay and loopback editor.** Every Docker sandbox shares
+  one flat bridge, so the first relay (socat, open to any peer) and code-server
+  (`--auth none` on `0.0.0.0`) were reachable by other tenants' sandboxes, bypassing the
+  proxy's HMAC. Now the relay admits only the current IPv4 addresses of
+  `DOCKER_PREVIEW_PROXY_HOST` (default `preview-proxy`, the compose service name),
+  re-resolved every second (fails closed while the proxy is down; scaled/restarted proxies
+  keep working). socat could take a single `range=`, so the relay is stdlib Python and
+  socat was dropped from the image. Spoofing a source needs `NET_RAW`, which `cap_drop=ALL`
+  removes. On Docker, code-server binds `127.0.0.1`, the launch waits for it to listen
+  (failing loudly otherwise) and `expose_port` carries it. **Accepted residual (Epic 05):**
+  a server a user binds to `0.0.0.0` is still visible to sibling sandboxes; per-workspace
+  network isolation is out of this epic's scope.
+- **Editor launch guard**: `pgrep -f 'code-server.*13337'` matched the very `sh -c` running
+  the launch script on Docker (its argv holds the launch line), so the editor never started.
+  The guard is now a listen check on `/proc/net/tcp{,6}`, for both providers.
+  `editor_sessions.bind_host` = `workspace.runtime`.
+- **Config**: `preview_proxy_base_url` / `preview_proxy_ttl_seconds` with `AliasChoices`;
+  `DAYTONA_PREVIEW_PROXY_*` env names and keyword arguments still work (new name wins)
+  until Epic 06. The https-unless-loopback validator is unchanged.
+- **Compose** (deviation: proxy only, not backend + worker): only `preview-proxy` joins
+  `enigma-sandboxes`, declared `external: true` (an existing network without compose's
+  labels is otherwise refused); `sandbox/build-local-image.sh` creates it idempotently.
+  Backend and worker reach sandboxes via `docker exec` and stay off it. The proxy's
+  `/health` reports `{"docker": "skipped"}` when `SANDBOX_RUNTIME_DEFAULT=docker` (no socket
+  to probe) and is unchanged for Daytona.
+- **Not done here**: the stable alias URL path and the grant cookie were not exercised
+  against a real container (the resolver is provider-blind and unit-tested); the Daytona
+  manual smoke (real token still sent) was not run — the unit test pins the header.
+  Open follow-ups: require `METRICS_TOKEN` when the Docker runtime is enabled (a sandbox can
+  reach the proxy); a code-server already running on `0.0.0.0` from before this change is
+  not restarted onto loopback; no per-relay connection cap.
