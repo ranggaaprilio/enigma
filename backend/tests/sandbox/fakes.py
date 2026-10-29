@@ -192,6 +192,7 @@ class FakeSandboxRuntime:
         self.exec_calls: list[dict[str, Any]] = []
         self.provisioned: list[Workspace] = []
         self.deleted: list[Workspace] = []
+        self.exposed_ports: list[int] = []
         self.started: list[Workspace] = []
         self.ptys: dict[str, FakePtyHandle] = {}
         self.closed = False
@@ -285,6 +286,10 @@ class FakeSandboxRuntime:
     async def preview_link(self, workspace: Workspace, port: int) -> RuntimePreviewLink:
         self._require(workspace)
         return RuntimePreviewLink(url=f"http://{workspace.sandbox_id}:{port}", token="")
+
+    async def expose_port(self, workspace: Workspace, port: int) -> None:
+        self._require(workspace)
+        self.exposed_ports.append(port)
 
     async def fs(self, workspace: Workspace) -> FakeFileSystem:
         self._require(workspace)
@@ -892,4 +897,9 @@ def docker_runtime_with(client: FakeDockerClient, **settings: Any):
     runtime = DockerRuntime(Settings(docker_host="unix:///fake/docker.sock", **settings))
     runtime._client = client
     runtime._exec_api = client.api
+
+    async def resolve(name: str) -> list[str]:  # the sandbox network's DNS, faked
+        return ["10.89.0.2"]
+
+    runtime._resolve_host = resolve  # type: ignore[method-assign]
     return runtime

@@ -472,13 +472,101 @@ async def test_kill_skips_a_command_that_already_finished() -> None:
     assert client.killed_pidfiles == []
 
 
-# --- not yet / errors --------------------------------------------------------------------
+# --- preview ----------------------------------------------------------------------------
 
 
-async def test_preview_fails_with_a_clear_unavailable_error_until_epic_04() -> None:
+async def test_preview_link_dials_the_containers_sandbox_network_address() -> None:
+    """By address, not name: dev servers such as Vite 6+ refuse an unknown Host header
+    (`server.allowedHosts`) but always accept an IP."""
     runtime, workspace = await provisioned(FakeDockerClient())
-    with pytest.raises(RuntimeUnavailableError, match="not available on the Docker"):
-        await runtime.preview_link(workspace, 3000)
+    asked: list[str] = []
+
+    async def resolve(name: str) -> list[str]:
+        asked.append(name)
+        return ["10.89.0.7"]
+
+    runtime._resolve_host = resolve  # type: ignore[method-assign]
+
+    link = await runtime.preview_link(workspace, 5173)
+
+    assert link.url == "http://10.89.0.7:5173"
+    assert link.token == ""
+    # Absolute name: a resolver search domain can never turn it into an outside host.
+    assert asked == [f"execute-{workspace.id.hex}."]
+
+
+async def test_preview_link_needs_no_daemon_at_all() -> None:
+    """The internet-facing preview proxy holds no daemon socket."""
+    runtime = docker_runtime_with(FakeDockerClient())
+    runtime._clients = None  # type: ignore[assignment]  # any daemon call would now crash
+    workspace = docker_workspace("container-id")
+
+    async def resolve(name: str) -> list[str]:
+        return ["172.18.0.3"]
+
+    runtime._resolve_host = resolve  # type: ignore[method-assign]
+
+    link = await runtime.preview_link(workspace, 3000)
+
+    assert link.url == "http://172.18.0.3:3000"
+
+
+async def test_an_unresolvable_sandbox_is_unavailable_so_the_proxy_shows_waking() -> None:
+    runtime = docker_runtime_with(FakeDockerClient())
+
+    async def resolve(name: str) -> list[str]:
+        raise OSError("Name or service not known")
+
+    runtime._resolve_host = resolve  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeUnavailableError):
+        await runtime.preview_link(docker_workspace("container-id"), 3000)
+
+
+@pytest.mark.parametrize("address", ["8.8.8.8", "127.0.0.1", "169.254.169.254", "0.0.0.0"])
+async def test_preview_link_refuses_an_address_off_a_private_network(address) -> None:
+    """Security: the proxy must never be steered at a public host, its own loopback or the
+    cloud metadata endpoint, whatever the resolver answers."""
+    runtime = docker_runtime_with(FakeDockerClient())
+
+    async def resolve(name: str) -> list[str]:
+        return [address]
+
+    runtime._resolve_host = resolve  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeUnavailableError):
+        await runtime.preview_link(docker_workspace("container-id"), 3000)
+
+
+async def test_preview_link_without_a_sandbox_is_not_found() -> None:
+    runtime = docker_runtime_with(FakeDockerClient())
+    with pytest.raises(SandboxNotFoundError):
+        await runtime.preview_link(docker_workspace(), 3000)
+
+
+async def test_expose_port_runs_the_relay_script_once_with_a_short_timeout() -> None:
+    """The relay only admits the preview proxy, named by DOCKER_PREVIEW_PROXY_HOST."""
+    from app.services.sandbox.port_relay import port_relay_command
+
+    client = FakeDockerClient()
+    runtime, workspace = await provisioned(client, docker_preview_proxy_host="proxy-a")
+
+    await runtime.expose_port(workspace, 5173)
+
+    [record] = client.api.execs.values()
+    assert record["cmd"][4] == port_relay_command(5173, "proxy-a")
+    assert "timeout -k 5 10 " in record["cmd"][2]
+
+
+async def test_expose_port_failure_is_logged_not_raised() -> None:
+    """A relay that cannot start must not fail the preview session around it."""
+    client = FakeDockerClient(exec_handler=lambda cmd: RuntimeCommandResult(1, "boom", ""))
+    runtime, workspace = await provisioned(client)
+
+    await runtime.expose_port(workspace, 5173)
+
+
+# --- errors ------------------------------------------------------------------------------
 
 
 def test_error_mapping_never_leaks_the_daemon_url() -> None:

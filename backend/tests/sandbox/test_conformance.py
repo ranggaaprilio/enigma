@@ -48,11 +48,7 @@ def echo(command: str) -> RuntimeCommandResult:
 
 # Contract parts a provider does not implement yet: strict xfail, so the marker has to be
 # removed (and the suite proves the contract) the moment the epic lands.
-PENDING = {
-    "docker": {
-        "test_preview_link_shape": "app preview lands in local-docker-runtime Epic 04",
-    },
-}
+PENDING: dict[str, dict[str, str]] = {}
 
 
 @pytest.fixture(params=["daytona", "docker", "fake"])
@@ -210,6 +206,12 @@ async def test_preview_link_shape(case) -> None:
     assert isinstance(link, RuntimePreviewLink)
     assert link.url.startswith("http")
     assert isinstance(link.token, str)
+
+
+async def test_expose_port_is_safe_to_call_repeatedly(case) -> None:
+    runtime, workspace = case
+    await runtime.expose_port(workspace, 5173)
+    await runtime.expose_port(workspace, 5173)
 
 
 async def test_close_is_idempotent(case) -> None:

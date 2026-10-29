@@ -10,7 +10,11 @@ command run through ``CommandService`` and an agent ``run_command``, no leaked
 containers. Epic 03: files (unusual names, modes, ownership, symlinks), the agent file
 tools, blank/template init, worktrees, ``specify init``, ``.env`` and SSH key ``0600``,
 the git token kept off every command line, and tmux terminals that survive a reconnect.
-The template and ``specify init`` tests need outbound network from the sandbox.
+Epic 04: previews over the sandbox network (a second sandbox stands in for the preview
+proxy and a third for a sibling tenant), the proxy-only loopback relay with a real Vite
+dev server and its HMR WebSocket, code-server on loopback, two registry services with
+their env, logs and previews, and no host-published ports.
+The template, ``specify init`` and Vite tests need outbound network from the sandbox.
 """
 
 from __future__ import annotations
@@ -487,3 +491,241 @@ async def test_terminal_survives_a_reconnect_and_mirrors_tabs(runtime, sandbox) 
     await runtime.kill_pty(sandbox, session_id)
     gone = await runtime.exec(sandbox, f"tmux has-session -t ={name}")
     assert gone.exit_code != 0
+
+
+# --- Epic 04: preview, editor and services over the sandbox network -----------------------
+
+APP = "/home/daytona/app"
+
+
+@pytest.fixture
+async def peer(runtime):
+    """A second sandbox on the same bridge, playing the preview proxy: the relay admits it."""
+    from app.services.sandbox.docker import container_name
+
+    workspace = _workspace()
+    workspace.sandbox_id = await runtime.provision(workspace)
+    runtime.settings.docker_preview_proxy_host = container_name(workspace)
+    yield workspace
+    await runtime.delete(workspace)
+
+
+@pytest.fixture
+async def stranger(runtime):
+    """A third sandbox: another tenant on the same bridge, which the relay must refuse."""
+    workspace = _workspace()
+    workspace.sandbox_id = await runtime.provision(workspace)
+    yield workspace
+    await runtime.delete(workspace)
+
+
+def _resolve_from(runtime, peer):
+    """The sandbox network's DNS, asked from inside it (the test host is not on it)."""
+
+    async def resolve(name: str) -> list[str]:
+        result = await runtime.exec(peer, f"getent ahostsv4 {name} || true")
+        return sorted({line.split()[0] for line in result.stdout.splitlines() if line.strip()})
+
+    return resolve
+
+
+async def _fetch(runtime, peer, url: str) -> tuple[str, str]:
+    result = await runtime.exec(
+        peer,
+        f"curl -s -m 5 -o /tmp/body -w '%{{http_code}}' {url} 2>/dev/null; echo; "
+        "cat /tmp/body 2>/dev/null",
+    )
+    code, _, body = result.stdout.partition("\n")
+    return code.strip(), body
+
+
+async def _wait_for(runtime, workspace, condition: str, seconds: int = 90) -> None:
+    result = await runtime.exec(
+        workspace,
+        f"for i in $(seq 1 {seconds * 2}); do ({condition}) && exit 0; sleep 0.5; done; exit 1",
+        timeout=seconds + 10,
+    )
+    assert result.exit_code == 0, f"timed out waiting for: {condition}"
+
+
+def _listening(port: int) -> str:
+    return f"grep -qi ':{port:04X} [0-9A-F:]* 0A' /proc/net/tcp /proc/net/tcp6"
+
+
+NO_RELAY = "! ls /tmp/enigma-port-relay-*.pid >/dev/null 2>&1"
+
+
+async def _relays(runtime, workspace) -> int:
+    result = await runtime.exec(workspace, "ls /tmp/enigma-port-relay-*.pid 2>/dev/null | wc -l")
+    return int(result.stdout.strip() or 0)
+
+
+async def test_sandbox_ports_are_never_published_to_the_host(runtime, sandbox) -> None:
+    client, _ = await runtime._clients()
+    container = await asyncio.to_thread(client.containers.get, sandbox.sandbox_id)
+    host_config = container.attrs["HostConfig"]
+    assert not host_config.get("PortBindings")
+    assert not host_config.get("PublishAllPorts")
+    assert not any((container.attrs["NetworkSettings"].get("Ports") or {}).values())
+
+
+async def test_vite_preview_and_hmr_through_the_loopback_relay(
+    runtime, sandbox, peer, stranger
+) -> None:
+    runtime._resolve_host = _resolve_from(runtime, peer)
+    await _sh(
+        runtime,
+        sandbox,
+        f"mkdir -p {APP} && cd {APP} && npm init -y >/dev/null && "
+        "npm install --no-audit --no-fund vite >/tmp/npm.log 2>&1 && "
+        "echo '<h1>enigma-vite</h1>' > index.html",
+    )
+    # Vite's default: loopback only, unreachable over the bridge until relayed.
+    await _sh(
+        runtime,
+        sandbox,
+        f"cd {APP} && (setsid nohup npx vite --port 5173 >/tmp/vite.log 2>&1 & "
+        "echo $! > /tmp/vite.pid)",
+    )
+    await _wait_for(runtime, sandbox, _listening(5173))
+    link = await runtime.preview_link(sandbox, 5173)
+    assert link.token == ""
+    assert (await _fetch(runtime, peer, link.url))[0] == "000"
+
+    await runtime.expose_port(sandbox, 5173)
+    await runtime.expose_port(sandbox, 5173)  # idempotent: still one relay
+    assert await _relays(runtime, sandbox) == 1
+    code, body = await _fetch(runtime, peer, link.url)
+    assert code == "200" and "enigma-vite" in body
+    # A sibling tenant on the same bridge gets nothing: the relay admits the proxy only.
+    assert (await _fetch(runtime, stranger, link.url))[0] == "000"
+    hmr = await runtime.exec(
+        peer,
+        "node -e \"const ws = new WebSocket(process.argv[1], 'vite-hmr'); "
+        "ws.onmessage = (e) => { console.log(e.data); process.exit(0) }; "
+        "setTimeout(() => process.exit(2), 8000)\" " + link.url.replace("http://", "ws://") + "/",
+        timeout=20,
+    )
+    assert hmr.exit_code == 0 and '"connected"' in hmr.stdout, hmr.stdout
+
+    # The relay leaves with the app, so a relaunch on 0.0.0.0 finds the port free.
+    await _sh(runtime, sandbox, "kill -- -$(cat /tmp/vite.pid) || kill $(cat /tmp/vite.pid)")
+    await _wait_for(runtime, sandbox, NO_RELAY, seconds=10)
+    await _sh(
+        runtime,
+        sandbox,
+        f"cd {APP} && (setsid nohup npx vite --host --port 5173 >/tmp/vite2.log 2>&1 &)",
+    )
+    await _wait_for(runtime, sandbox, _listening(5173))
+    await runtime.expose_port(sandbox, 5173)
+    assert await _relays(runtime, sandbox) == 0  # already reachable: nothing to relay
+    code, body = await _fetch(runtime, peer, (await runtime.preview_link(sandbox, 5173)).url)
+    assert code == "200" and "enigma-vite" in body
+
+
+async def test_code_server_reaches_the_proxy_and_never_a_sibling(
+    runtime, sandbox, peer, stranger
+) -> None:
+    """code-server runs `--auth none`; on the shared bridge it must stay off every address
+    but the proxy's, or another tenant could drive this workspace's editor and terminal."""
+    from app.services.editor import EditorService
+
+    runtime._resolve_host = _resolve_from(runtime, peer)
+    settings = get_settings()
+    editor = EditorService(None, settings, runtime)  # type: ignore[arg-type]  # launch only
+    launched = await runtime.exec(
+        sandbox,
+        editor._ensure_command(ROOT, loopback_only=True),
+        timeout=settings.editor_install_timeout_seconds,
+    )
+    assert launched.exit_code == 0, launched.stdout
+    await runtime.expose_port(sandbox, settings.editor_port)
+    assert await _relays(runtime, sandbox) == 1
+
+    link = await runtime.preview_link(sandbox, settings.editor_port)
+    assert (await _fetch(runtime, peer, f"{link.url}/healthz"))[0] == "200"
+    assert (await _fetch(runtime, stranger, f"{link.url}/healthz"))[0] == "000"
+
+
+async def test_two_services_start_preview_log_and_stop_on_docker(
+    runtime,
+    peer,
+    real_db_session,  # noqa: F811
+) -> None:
+    from sqlalchemy import select
+
+    from app.models import PreviewSession
+    from app.services.workspace_services import WorkspaceServiceManager
+    from tests.test_workspace_services import _row_for_command, make_service_command
+
+    runtime._resolve_host = _resolve_from(runtime, peer)
+    session, _ = real_db_session
+    user = User(
+        id=uuid4(),
+        email=f"docker-it-{uuid4().hex[:8]}@example.com",
+        password_hash=hash_password("password"),
+        role="owner",
+        is_active=True,
+        created_at=datetime.now(UTC),
+        updated_at=datetime.now(UTC),
+    )
+    workspace = _workspace(user.id)
+    workspace.sandbox_id = await runtime.provision(workspace)
+    workspace.status = "ready"
+    session.add_all([user, workspace])
+    await session.flush()
+    try:
+        await _sh(runtime, workspace, f"mkdir -p {ROOT} && cd {ROOT} && git init -q")
+        api = await make_service_command(
+            session,
+            workspace,
+            name="API",
+            command="python3 -m http.server 8000 --bind 127.0.0.1",
+            port=8000,
+        )
+        web = await make_service_command(
+            session,
+            workspace,
+            name="Web",
+            command="env | grep ^ENIGMA_ > env.txt && exec python3 -m http.server 5173",
+            port=5173,
+        )
+        manager = WorkspaceServiceManager(session, get_settings(), runtime)
+        await manager.list(workspace.id, user.id)
+        rows = [await _row_for_command(session, workspace.id, c.id) for c in (api, web)]
+        for row in rows:
+            await manager.start(workspace.id, row.id, user.id)
+
+        for _ in range(120):
+            listed, _primary = await manager.list(workspace.id, user.id)
+            if all(r.status == "running" for r in listed if r.id in {row.id for row in rows}):
+                break
+            await asyncio.sleep(0.5)
+        else:
+            raise AssertionError([(r.status, r.last_error) for r in listed])
+
+        previews = (
+            await session.execute(
+                select(PreviewSession).where(
+                    PreviewSession.workspace_id == workspace.id, PreviewSession.status == "active"
+                )
+            )
+        ).scalars().all()
+        assert sorted(p.port for p in previews) == [5173, 8000]
+        # The loopback-only API is relayed; the web service binds 0.0.0.0 on its own.
+        assert await _relays(runtime, workspace) == 1
+
+        api_code, _ = await _fetch(runtime, peer, (await runtime.preview_link(workspace, 8000)).url)
+        assert api_code == "200"
+        web_url = (await runtime.preview_link(workspace, 5173)).url
+        code, env_txt = await _fetch(runtime, peer, f"{web_url}/env.txt")
+        assert code == "200" and f"ENIGMA_WORKSPACE_ID={workspace.id}" in env_txt
+        logs = await manager.logs_tail(workspace.id, rows[1].id, user.id, 4000)
+        assert "GET /env.txt" in logs
+
+        for row in rows:
+            stopped = await manager.stop(workspace.id, row.id, user.id)
+            assert stopped.status == "stopped"
+        await _wait_for(runtime, workspace, NO_RELAY, seconds=10)
+    finally:
+        await runtime.delete(workspace)

@@ -186,18 +186,30 @@ def test_base_compose_never_mounts_the_container_daemon_socket():
 
 def test_sandbox_override_gives_the_socket_only_to_the_daemon_clients():
     override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
-    # The preview proxy parses untrusted traffic and does not drive sandboxes until
-    # local-docker-runtime Epic 04, so it does not hold the socket yet.
     clients = {"backend", "worker"}
-    assert set(override["services"]) == clients
+    assert set(override["services"]) == clients | {"preview-proxy"}
     for name in clients:
         service = override["services"][name]
         assert _socket_mounts(service) == [
             "${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
         ]
-        # Trusted services stay off the sandboxes' bridge, so a sandbox cannot reach them.
+        # They reach sandboxes through `docker exec`, never the network, so they stay off
+        # the sandboxes' bridge and a sandbox cannot reach the API or the worker.
         assert "networks" not in service, name
-    assert "networks" not in override
+
+
+def test_sandbox_override_puts_only_the_preview_proxy_on_the_sandbox_network():
+    """local-docker-runtime Epic 04: the proxy dials `execute-<id>:<port>` directly. It parses
+    untrusted traffic, so it gets the network but never the daemon socket."""
+    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
+    proxy = override["services"]["preview-proxy"]
+    assert _socket_mounts(proxy) == []
+    assert set(proxy["networks"]) == {"default", "sandboxes"}
+    network = override["networks"]["sandboxes"]
+    # DockerRuntime and sandbox/build-local-image.sh create it; compose must not try to own
+    # it (a network without compose's labels is refused) or remove it on `down`.
+    assert network["external"] is True
+    assert network["name"] == "${DOCKER_SANDBOX_NETWORK:-enigma-sandboxes}"
 
 
 def test_production_manifests_never_reference_the_container_daemon():

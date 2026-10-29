@@ -72,6 +72,13 @@ class FakeRuntime:
         self.commands: list[str] = []
         self.cwds: list[str | None] = []
         self.envs: list[dict | None] = []
+        self.exposed_ports: list[int] = []
+        self.fail_expose = False
+
+    async def expose_port(self, workspace, port) -> None:
+        if self.fail_expose:
+            raise SandboxRuntimeError("sandbox unreachable")
+        self.exposed_ports.append(port)
 
     async def fs(self, workspace) -> FakeFs:
         return self.sandbox.fs
@@ -345,6 +352,44 @@ async def test_stop_clears_desired_and_stops_its_preview_session(db_session):
     await db_session.refresh(preview)
     assert preview.status == "stopped"
     assert any("killtree" in c for c in runtime.commands)
+
+
+async def _running_service_with_preview(db_session, runtime: FakeRuntime):
+    user, workspace = await make_workspace(db_session)
+    cmd = await make_service_command(db_session, workspace, port=8000)
+    manager = WorkspaceServiceManager(db_session, get_settings(), runtime)
+    await manager.list(workspace.id, user.id)
+    row = await _row_for_command(db_session, workspace.id, cmd.id)
+    await manager.start(workspace.id, row.id, user.id)
+    runtime.statuses[str(row.id)] = "running"
+    runtime.pids_alive.add(str(row.id))
+    await manager.list(workspace.id, user.id)
+    preview = (
+        await db_session.execute(
+            select(PreviewSession).where(PreviewSession.service_id == row.id)
+        )
+    ).scalars().first()
+    return preview
+
+
+async def test_a_running_service_exposes_its_port_for_the_preview(db_session):
+    """local-docker-runtime Epic 04: the Docker provider relays a loopback-only dev server
+    onto the sandbox network when its preview session is (re)confirmed."""
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}), open_ports={8000})
+
+    preview = await _running_service_with_preview(db_session, runtime)
+
+    assert preview is not None and preview.status == "active"
+    assert 8000 in runtime.exposed_ports
+
+
+async def test_a_failed_expose_still_records_the_preview_session(db_session):
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}), open_ports={8000})
+    runtime.fail_expose = True
+
+    preview = await _running_service_with_preview(db_session, runtime)
+
+    assert preview is not None and preview.status == "active"
 
 
 async def test_restart_keeps_desired_and_targets_a_new_worktree(db_session):
