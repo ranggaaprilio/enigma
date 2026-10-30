@@ -225,9 +225,25 @@ from the plan above were made at plan review or after the security review, as no
   Backend and worker reach sandboxes via `docker exec` and stay off it. The proxy's
   `/health` reports `{"docker": "skipped"}` when `SANDBOX_RUNTIME_DEFAULT=docker` (no socket
   to probe) and is unchanged for Daytona.
-- **Not done here**: the stable alias URL path and the grant cookie were not exercised
-  against a real container (the resolver is provider-blind and unit-tested); the Daytona
-  manual smoke (real token still sent) was not run — the unit test pins the header.
-  Open follow-ups: require `METRICS_TOKEN` when the Docker runtime is enabled (a sandbox can
-  reach the proxy); a code-server already running on `0.0.0.0` from before this change is
-  not restarted onto loopback; no per-relay connection cap.
+- **Full-stack verification** (`tests/test_docker_stack_e2e.py`, opt-in with
+  `DOCKER_STACK_E2E=1` against `podman compose -f docker-compose.yml -f
+  docker-compose.sandbox.yml up -d postgres redis backend preview-proxy`; drives the real
+  HTTP API and dials the proxy by `Host`): the stable preview alias (404 without a cookie,
+  prime URL → 303 + `enigma_preview_alias` cookie → 200, tampered cookie → 404); the editor
+  (`prime_url` → workbench 200 with the grant cookie, 404 without; code-server WebSocket 101
+  with the cookie, refused without); service restart with live log frames over the logs
+  WebSocket before and after the restart; the single-service `/dev` run/status/stop path
+  with a minimal `mise.toml`. The editor/Files "same filesystem" check writes the file as
+  the sandbox user in the folder code-server opened — an edit driven through code-server's
+  own file protocol was not automated.
+- **Bug found by that suite (both providers)**: after a service restart the live log
+  stream dropped the new process's first lines. Launch scripts truncated the log in place
+  and `tail -F` kept its old offset once the new log outgrew it. `service_scripts.py` now
+  removes the log and writes a new file (`fresh_log_line`), which `tail -F` follows from
+  the top; regression test in `test_workspace_services.py`.
+- **Not done here**: the Daytona manual smoke (real token still sent) needs a Daytona
+  account — the unit test pins the header. Open follow-ups: require `METRICS_TOKEN` when
+  the Docker runtime is enabled (a sandbox can reach the proxy); a code-server already
+  running on `0.0.0.0` from before this change is not restarted onto loopback; no
+  per-relay connection cap. Sibling-sandbox isolation for servers a user binds to
+  `0.0.0.0` moves into Epic 05.
