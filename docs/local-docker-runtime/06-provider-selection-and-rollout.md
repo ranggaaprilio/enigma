@@ -307,7 +307,9 @@ already ran both fakes, the base compose never mounted the socket, and the migra
   rollout. The `Workspace.sandbox_id` hybrid now **reads `sandbox_id`** and still writes
   both columns, because the 0037 release reads `daytona_sandbox_id` while it overlaps this
   one. Tests build workspaces with `sandbox_id=`.
-- **Column contract, step 2** (migration `0039`, `# contract:`) drops `daytona_sandbox_id`
-  and its unique index, and makes `ix_workspaces_sandbox_id` unique. It must ship in the
-  **next** release, once no deployed replica reads the old column.
+- **Column contract, step 2** (migration `0039`, `# contract:`) backfills one last time,
+  makes `ix_workspaces_sandbox_id` unique (the old index was), and drops
+  `daytona_sandbox_id` with its index. `Workspace.sandbox_id` is a plain mapped column again.
+  It must ship in the **next** release, once no deployed replica reads the old column.
+  Upgrade, downgrade and upgrade round-trip on the dev database.
 

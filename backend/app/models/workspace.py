@@ -13,7 +13,6 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -67,11 +66,10 @@ class Workspace(Base):
     )
     default_branch: Mapped[str] = mapped_column(String(120), nullable=False, default="main")
     runtime: Mapped[str] = mapped_column(String(32), nullable=False, default="daytona")
-    daytona_sandbox_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
-    # Epic 06: read since migration 0038; ``daytona_sandbox_id`` is still written for the 0037
-    # release, which reads it, until 0039 drops it. Use ``sandbox_id``, never these two.
-    sandbox_id_column: Mapped[str | None] = mapped_column(
-        "sandbox_id", String(160), nullable=True, index=True
+    # The provider's sandbox id (a Daytona sandbox or a Docker container). Migration 0039
+    # dropped the old ``daytona_sandbox_id`` name.
+    sandbox_id: Mapped[str | None] = mapped_column(
+        String(160), nullable=True, unique=True, index=True
     )
     snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     workspace_path: Mapped[str] = mapped_column(Text, nullable=False, default="workspace")
@@ -116,16 +114,6 @@ class Workspace(Base):
         server_default=func.now(),
         onupdate=func.now(),
     )
-
-    # A hybrid, so the provider-neutral name also works in queries (`Workspace.sandbox_id`).
-    @hybrid_property
-    def sandbox_id(self) -> str | None:
-        return self.sandbox_id_column
-
-    @sandbox_id.inplace.setter
-    def _sandbox_id_setter(self, value: str | None) -> None:
-        self.daytona_sandbox_id = value
-        self.sandbox_id_column = value
 
 
 # "workspace" => applies to every service in the workspace; "service" => only the service
