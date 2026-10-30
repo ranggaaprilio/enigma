@@ -285,5 +285,5 @@ class EditorService:
         # sandbox home (e.g. "/home/daytona/workspace").
         if workspace_path.startswith("/"):
             return workspace_path
-        home = self.settings.daytona_sandbox_home.rstrip("/")
+        home = self.settings.sandbox_home.rstrip("/")
         return f"{home}/{workspace_path}"

@@ -33,6 +33,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 from functools import partial
 from posixpath import join as posix_join
 from typing import Any
@@ -334,6 +335,8 @@ class DockerRuntime:
         self.activity = SandboxActivityRecorder()
         self._installation: str | None = None  # this database's id, loaded on first use
         self._project: str | None = None  # the backend's own compose project, if any
+        # When this process last finished an upkeep pass (Epic 06 /health); None if it runs none.
+        self.last_upkeep_at: datetime | None = None
         self._project_known = False
 
     # --- threads & clients ------------------------------------------------------------
@@ -433,7 +436,7 @@ class DockerRuntime:
     # --- lifecycle --------------------------------------------------------------------
 
     def _home(self) -> str:
-        return self.settings.daytona_sandbox_home.rstrip("/") or "/"
+        return self.settings.sandbox_home.rstrip("/") or "/"
 
     def _resolve_cwd(self, workspace: Workspace, cwd: str | None) -> str:
         path = cwd or workspace.workspace_path or ""

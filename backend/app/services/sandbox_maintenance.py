@@ -19,7 +19,7 @@ lock -- never a session lock, which PgBouncer would break (AGENTS.md gotcha 22).
 from __future__ import annotations
 
 import asyncio
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import structlog
@@ -236,6 +236,7 @@ async def run_sandbox_maintenance(
             await runtime.reconcile_networks()
             await isolate_legacy_sandboxes(session_maker, runtime)
             await stop_idle_sandboxes(session_maker, settings, runtime)
+            runtime.last_upkeep_at = datetime.now(UTC)
         except asyncio.CancelledError:
             raise
         except Exception:

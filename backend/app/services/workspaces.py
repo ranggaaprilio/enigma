@@ -11,6 +11,7 @@ from app.models import CustomCommand, Workspace, WorkspaceEnvVar, WorkspaceTempl
 from app.models.project import TeamMember
 from app.services.git_providers import sanitize_repository_url
 from app.services.sandbox import SandboxRuntime, SandboxRuntimeError
+from app.services.sandbox.availability import Availability, choose_runtime
 from app.services.templates import TemplateService
 from app.services.utils import slugify
 from app.services.workspace_init import WorkspaceInitializationError, WorkspaceInitializer
@@ -88,11 +89,15 @@ class SqlAlchemyWorkspaceService:
         cipher: WorkspaceSecretCipher,
         runtime: SandboxRuntime,
         initializer: WorkspaceInitializer | None = None,
+        availability: Availability | None = None,
     ) -> None:
         self.session = session
         self.cipher = cipher
         self.runtime = runtime
         self.initializer = initializer or WorkspaceInitializer(runtime)
+        # Checks the chosen provider before the row is written (Epic 06). None (unit tests
+        # with a fake runtime) takes the requested provider or the default unchecked.
+        self.availability = availability
 
     async def _is_team_member(self, team_id: UUID, user_id: UUID) -> bool:
         result = await self.session.execute(
@@ -142,6 +147,7 @@ class SqlAlchemyWorkspaceService:
         *,
         source: str = "repository",
         template_id: UUID | None = None,
+        runtime: str | None = None,
     ) -> Workspace:
         template: WorkspaceTemplate | None = None
         if source == "repository":
@@ -168,6 +174,9 @@ class SqlAlchemyWorkspaceService:
             if result.scalar_one_or_none() is not None:
                 raise WorkspaceAlreadyExistsError
 
+        settings = self.runtime.settings
+        if self.availability is not None:
+            runtime = await choose_runtime(runtime, settings, self.availability)
         workspace = Workspace(
             owner_id=owner_id,
             team_id=team_id,
@@ -177,9 +186,9 @@ class SqlAlchemyWorkspaceService:
             source=source,
             template_id=template.id if template is not None else None,
             default_branch=default_branch,
-            runtime=self.runtime.settings.sandbox_runtime_default,
+            runtime=runtime or settings.sandbox_runtime_default,
             snapshot=snapshot,
-            workspace_path=self.runtime.settings.daytona_workspace_path,
+            workspace_path=self.runtime.settings.sandbox_workspace_path,
             status="creating",
         )
 

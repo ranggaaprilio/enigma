@@ -23,7 +23,7 @@ data:
   # A separate registrable domain from the app/API, never a subdomain of it: preview pages are
   # tenant code, and on the same site the SameSite=Lax session cookie would ride along on their
   # requests to the API (CSRF, cross-site WebSocket hijacking of the terminal/agent sockets).
-  DAYTONA_PREVIEW_PROXY_BASE_URL: https://enigma-preview.example.net
+  PREVIEW_PROXY_BASE_URL: https://enigma-preview.example.net
   AGENT_PROVIDER: auto
   OPENHANDS_SUPPRESS_BANNER: "1"
   # Long enough for ingress-nginx to observe /ready=503 and drop the endpoint before the

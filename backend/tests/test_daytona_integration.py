@@ -29,7 +29,7 @@ async def test_real_daytona_sandbox_lifecycle_and_command() -> None:
         default_branch="master",
         runtime="daytona",
         snapshot=settings.daytona_default_snapshot,
-        workspace_path=settings.daytona_workspace_path,
+        workspace_path=settings.sandbox_workspace_path,
         status="creating",
     )
     try:

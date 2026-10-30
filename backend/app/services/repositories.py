@@ -803,7 +803,7 @@ class RepositoryService:
         if not auth.private_key:
             raise RepositoryTokenError
         fs = await self.runtime.fs(workspace)
-        ssh_dir = f"{self.settings.daytona_sandbox_home.rstrip('/')}/.ssh"
+        ssh_dir = f"{self.settings.sandbox_home.rstrip('/')}/.ssh"
         async with self._ssh_identity(fs, auth.private_key) as key_path:
             ssh_command = " ".join(
                 (

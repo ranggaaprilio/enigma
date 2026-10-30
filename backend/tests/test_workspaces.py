@@ -60,6 +60,7 @@ class FakeWorkspaceService:
         # Registered by tests that need `custom_command_id` scoping to validate, since this
         # fake has no real `custom_commands` table to check against.
         self.custom_command_workspace: dict[UUID, UUID] = {}
+        self.unavailable_runtimes: set[str] = set()
         self.custom_command_names: dict[UUID, str] = {}
 
     def register_custom_command(
@@ -89,7 +90,14 @@ class FakeWorkspaceService:
         *,
         source: str = "repository",
         template_id: UUID | None = None,
+        runtime: str | None = None,
     ) -> Workspace:
+        if runtime is not None and runtime in self.unavailable_runtimes:
+            from app.services.sandbox.availability import RuntimeChoiceError
+
+            raise RuntimeChoiceError(
+                "Local Docker is not available: The Docker daemon is not reachable"
+            )
         if await self.list_for_owner(owner_id):
             raise WorkspaceAlreadyExistsError
         if source == "repository":
@@ -112,7 +120,7 @@ class FakeWorkspaceService:
             source=source,
             template_id=template_id,
             default_branch=default_branch,
-            runtime="daytona",
+            runtime=runtime or "daytona",
             daytona_sandbox_id=f"sandbox-{workspace_id}",
             snapshot=snapshot,
             workspace_path="/workspace",
@@ -906,6 +914,37 @@ async def test_create_workspace_source_validation(workspace_context, payload):
     assert response.status_code == 422
 
 
+async def test_create_workspace_passes_the_chosen_runtime(workspace_context):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post(
+            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "docker"}
+        )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["runtime"] == "docker"
+
+
+async def test_create_workspace_with_an_unavailable_runtime_is_422(workspace_context):
+    _, service, _ = workspace_context
+    service.unavailable_runtimes.add("docker")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post(
+            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "docker"}
+        )
+        unknown = await client.post(
+            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "k8s"}
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "Local Docker is not available: The Docker daemon is not reachable"
+    )
+    assert service.workspaces == {}
+    assert unknown.status_code == 422
+
+
 async def test_create_workspace_rejects_invalid_repo_url(workspace_context):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         await _login(client)
@@ -997,6 +1036,58 @@ async def test_sqlalchemy_create_marks_error_when_initializer_fails():
         )
 
     assert session.added[-1].status == "error"
+
+
+def _availability(**statuses: str):
+    from app.services.sandbox.availability import RuntimeAvailability
+
+    async def availability(provider: str) -> RuntimeAvailability:
+        status = statuses.get(provider, "unconfigured")
+        return RuntimeAvailability(
+            provider, status != "unconfigured", status, None if status == "ok" else "down"  # type: ignore[arg-type]
+        )
+
+    return availability
+
+
+async def test_sqlalchemy_create_uses_the_requested_runtime():
+    settings = Settings(sandbox_runtime_default="daytona", metrics_token="scrape-secret")
+    service = SqlAlchemyWorkspaceService(
+        session=_FakeCreateSession(),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=_RecordingInitializer(),  # type: ignore[arg-type]
+        availability=_availability(daytona="ok", docker="ok"),
+    )
+
+    workspace = await service.create(
+        owner_id=uuid4(), name="Local", repo_url=None, default_branch="main", source="blank",
+        runtime="docker",
+    )
+
+    assert workspace.runtime == "docker"
+
+
+async def test_sqlalchemy_create_refuses_an_unavailable_runtime_before_writing_a_row():
+    from app.services.sandbox.availability import RuntimeChoiceError
+
+    settings = Settings(sandbox_runtime_default="daytona")
+    session = _FakeCreateSession()
+    service = SqlAlchemyWorkspaceService(
+        session=session,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=_RecordingInitializer(),  # type: ignore[arg-type]
+        availability=_availability(daytona="ok", docker="error"),
+    )
+
+    with pytest.raises(RuntimeChoiceError):
+        await service.create(
+            owner_id=uuid4(), name="Local", repo_url=None, default_branch="main",
+            source="blank", runtime="docker",
+        )
+
+    assert session.added == [] and session.commits == 0  # nothing half-provisioned
 
 
 async def test_sqlalchemy_create_repository_sanitizes_url():

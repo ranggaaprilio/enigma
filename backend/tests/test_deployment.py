@@ -500,7 +500,7 @@ def test_previews_are_cross_site_from_the_app(manifests):
     # domain makes every such request cross-site, so the browser drops the cookie.
     app_sites = {_site(h) for h in _backends(_get(manifests, "Ingress", "enigma"))}
     preview_sites = {_site(h) for h in _backends(_get(manifests, "Ingress", "enigma-preview"))}
-    proxy_base = _config(manifests)["DAYTONA_PREVIEW_PROXY_BASE_URL"].split("://", 1)[1]
+    proxy_base = _config(manifests)["PREVIEW_PROXY_BASE_URL"].split("://", 1)[1]
     assert preview_sites == {_site(proxy_base)}
     assert not app_sites & preview_sites
     origins = _config(manifests)["BACKEND_CORS_ORIGINS"].split(",")

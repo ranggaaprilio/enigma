@@ -1,9 +1,12 @@
+import os
 import socket
+from collections.abc import Mapping
 from functools import lru_cache
 from typing import Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
+from dotenv import dotenv_values
 from pydantic import AliasChoices, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -94,8 +97,16 @@ class Settings(BaseSettings):
     daytona_target: str | None = None
     daytona_default_snapshot: str | None = None
     daytona_default_language: str = "python"
-    daytona_workspace_path: str = "workspace"
-    daytona_sandbox_home: str = "/home/daytona"
+    # Provider-neutral since Epic 06; DAYTONA_WORKSPACE_PATH / DAYTONA_SANDBOX_HOME still
+    # accepted for one release (logged as deprecated at startup).
+    sandbox_workspace_path: str = Field(
+        default="workspace",
+        validation_alias=AliasChoices("sandbox_workspace_path", "daytona_workspace_path"),
+    )
+    sandbox_home: str = Field(
+        default="/home/daytona",
+        validation_alias=AliasChoices("sandbox_home", "daytona_sandbox_home"),
+    )
     # Idle sandboxes stop after this long (0 = never). Daytona enforces it itself; the Docker
     # provider's reaper does (Epic 05). DAYTONA_AUTO_STOP_MINUTES is still accepted.
     sandbox_auto_stop_minutes: int = Field(
@@ -106,7 +117,7 @@ class Settings(BaseSettings):
     daytona_provision_timeout_seconds: int = 120
     daytona_preview_url_ttl_seconds: int = Field(default=60 * 60, gt=0)
     # The capability proxy fronts every provider's previews and the editor. The
-    # DAYTONA_PREVIEW_PROXY_* names stay accepted until local-docker-runtime Epic 06.
+    # DAYTONA_PREVIEW_PROXY_* names stay accepted for one release after Epic 06.
     preview_proxy_base_url: str = Field(
         default="http://localhost:8001",
         validation_alias=AliasChoices("preview_proxy_base_url", "daytona_preview_proxy_base_url"),
@@ -164,6 +175,10 @@ class Settings(BaseSettings):
     sandbox_busy_max_minutes: int = Field(default=240, gt=0)
     # How often the Docker upkeep pass runs (proxy re-attach, idle auto-stop).
     docker_reaper_interval_seconds: int = Field(default=60, gt=0)
+    # Docker sandboxes live on one daemon, so in queue mode the API, every worker and the
+    # proxy must share it. Setting this is the operator's statement that they do; without
+    # it, creating a Docker workspace in queue mode is refused (Epic 06).
+    docker_single_host: bool = False
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
@@ -394,3 +409,26 @@ class Settings(BaseSettings):
 @lru_cache
 def get_settings() -> Settings:
     return Settings()
+
+
+# Old DAYTONA_* names of provider-neutral settings: still accepted (AliasChoices above) for one
+# release after local-docker-runtime Epic 06, and logged at startup so operators can rename.
+DEPRECATED_SETTING_NAMES = {
+    "DAYTONA_WORKSPACE_PATH": "SANDBOX_WORKSPACE_PATH",
+    "DAYTONA_SANDBOX_HOME": "SANDBOX_HOME",
+    "DAYTONA_AUTO_STOP_MINUTES": "SANDBOX_AUTO_STOP_MINUTES",
+    "DAYTONA_PREVIEW_PROXY_BASE_URL": "PREVIEW_PROXY_BASE_URL",
+    "DAYTONA_PREVIEW_PROXY_TTL_SECONDS": "PREVIEW_PROXY_TTL_SECONDS",
+    "DAYTONA_NETWORK_BLOCK_ALL": "SANDBOX_NETWORK_BLOCK_ALL",
+    "DAYTONA_NETWORK_ALLOW_LIST": "SANDBOX_NETWORK_ALLOW_LIST",
+}
+
+
+def deprecated_setting_names(
+    environ: Mapping[str, str] | None = None, *, env_file: str | None = ".env"
+) -> dict[str, str]:
+    """The deprecated names set in the environment or ``env_file``, mapped to their new name."""
+    names = {key.upper() for key in (os.environ if environ is None else environ)}
+    if env_file and os.path.exists(env_file):
+        names |= {key.upper() for key in dotenv_values(env_file)}
+    return {old: new for old, new in DEPRECATED_SETTING_NAMES.items() if old in names}

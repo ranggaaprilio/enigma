@@ -8,10 +8,11 @@ imported from the app except a few setting defaults and the container labels. St
         up -d postgres redis backend preview-proxy
     DOCKER_STACK_E2E=1 uv run pytest tests/test_docker_stack_e2e.py
 
-``BACKEND_URL`` / ``PROXY_URL`` override the defaults below. The proxy picks a preview by its
-``Host``, and ``*.localhost`` does not always resolve on the test host, so every proxied request
-dials ``PROXY_URL`` and sets ``Host`` itself; cookies are handled by hand for the same reason
-(and because the grant cookie is ``Secure``, which an HTTP cookie jar would never send back).
+``BACKEND_URL`` / ``PROXY_URL`` / ``COMPOSE_PROJECT`` override the defaults below. The proxy
+picks a preview by its ``Host``, and ``*.localhost`` does not always resolve on the test host,
+so every proxied request dials ``PROXY_URL`` and sets ``Host`` itself; cookies are handled by
+hand for the same reason (and because the grant cookie is ``Secure``, which an HTTP cookie jar
+would never send back).
 
 Covers the local-docker-runtime Epic 04 criteria ``tests/test_docker_integration.py`` cannot
 reach without the proxy: the stable alias URL and its grant cookie, the editor's prime URL,
@@ -50,10 +51,16 @@ pytestmark = pytest.mark.skipif(
 
 BACKEND_URL = getenv("BACKEND_URL", "http://localhost:8000").rstrip("/")
 PROXY_URL = getenv("PROXY_URL", "http://127.0.0.1:8001").rstrip("/")
+# The compose project under test: the restart test kills and finds containers in it only.
+COMPOSE_PROJECT = getenv("COMPOSE_PROJECT", "enigma")
 SESSION_COOKIE = Settings.model_fields["auth_cookie_name"].default
 GRANT_COOKIE = Settings.model_fields["preview_alias_cookie_name"].default
 CAPABILITY_PARAM = Settings.model_fields["preview_alias_capability_query_param"].default
 NAVIGATE = {"sec-fetch-mode": "navigate", "accept": "text/html"}
+# Under uvicorn's 5 s keep-alive timeout (httpx's default expiry is also 5 s): through a
+# port forwarder (Podman's) the server's close is not seen at once, and a request sent on
+# that dead connection fails with "Server disconnected without sending a response".
+KEEPALIVE = httpx.Limits(keepalive_expiry=2)
 
 
 @dataclass
@@ -122,8 +129,8 @@ def _proxy_ws_kwargs(extra_headers: dict) -> dict:
 @pytest.fixture
 async def stack():
     async with (
-        httpx.AsyncClient(base_url=BACKEND_URL, timeout=180) as api,
-        httpx.AsyncClient(base_url=PROXY_URL, timeout=60) as proxy,
+        httpx.AsyncClient(base_url=BACKEND_URL, timeout=180, limits=KEEPALIVE) as api,
+        httpx.AsyncClient(base_url=PROXY_URL, timeout=60, limits=KEEPALIVE) as proxy,
     ):
         for client in (api, proxy):
             ready = await client.get("/ready")
@@ -514,35 +521,51 @@ async def test_a_terminal_wakes_a_stopped_sandbox(stack) -> None:
     assert await _status(stack) == "ready"
 
 
-async def _new_user_workspace() -> tuple[str, str]:
-    """A second user with its own blank workspace: (workspace id, session token)."""
-    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=180) as api:
+async def _create_as_new_user(payload: dict) -> httpx.Response:
+    """POST /workspaces as a freshly registered user (each user has one personal workspace)."""
+    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=180, limits=KEEPALIVE) as api:
         registered = await api.post(
             "/auth/register",
             json={"email": f"stack-e2e-{uuid4().hex[:10]}@example.com", "password": "password123"},
         )
         assert registered.status_code == 201, registered.text
-        token = _cookie_from(registered, SESSION_COOKIE)
-        api.headers["cookie"] = f"{SESSION_COOKIE}={token}"
-        created = await api.post("/workspaces", json={"name": "Orphan", "source": "blank"})
-        assert created.status_code == 201, created.text
-        return created.json()["id"], token
+        api.headers["cookie"] = f"{SESSION_COOKIE}={_cookie_from(registered, SESSION_COOKIE)}"
+        return await api.post("/workspaces", json=payload)
+
+
+async def _new_user_workspace() -> str:
+    """A second user's blank workspace id."""
+    created = await _create_as_new_user({"name": "Orphan", "source": "blank"})
+    assert created.status_code == 201, created.text
+    return created.json()["id"]
 
 
 async def _delete_workspace_row(workspace_id: str) -> None:
-    """Behind the backend's back, as a restored backup or a manual cleanup would."""
-    from sqlalchemy import text
-    from sqlalchemy.ext.asyncio import create_async_engine
-    from sqlalchemy.pool import NullPool
+    """Behind the backend's back, as a restored backup or a manual cleanup would -- in the
+    stack's own database, reached through its postgres container (it may publish no port)."""
+    from uuid import UUID
 
-    from app.core.config import get_settings
+    sql = f"DELETE FROM workspaces WHERE id = '{UUID(workspace_id)}'"
 
-    engine = create_async_engine(get_settings().database_url, poolclass=NullPool)
-    try:
-        async with engine.begin() as conn:
-            await conn.execute(text("DELETE FROM workspaces WHERE id = :id"), {"id": workspace_id})
-    finally:
-        await engine.dispose()
+    def delete(client) -> None:
+        postgres = _only(
+            client.containers.list(
+                filters={
+                    "label": [
+                        f"com.docker.compose.project={COMPOSE_PROJECT}",
+                        "com.docker.compose.service=postgres",
+                    ]
+                }
+            ),
+            "running compose postgres",
+        )
+        env = dict(item.split("=", 1) for item in postgres.attrs["Config"]["Env"])
+        result = postgres.exec_run(
+            ["psql", "-U", env["POSTGRES_USER"], "-d", env["POSTGRES_DB"], "-c", sql]
+        )
+        assert result.exit_code == 0 and b"DELETE 1" in result.output, result.output
+
+    await _docker(delete)
 
 
 def _only(found: list, what: str):
@@ -557,17 +580,22 @@ async def test_a_killed_backend_restarts_without_losing_live_sandboxes(stack) ->
         stack, "Web", "python3 -m http.server 5173 --bind 127.0.0.1", 5173
     )
     await _serves(stack, service["public_url"], marker)
-    orphan_id, _ = await _new_user_workspace()
+    orphan_id = await _new_user_workspace()
     assert len(await _containers_for(orphan_id)) == 1
 
+    project = f"com.docker.compose.project={COMPOSE_PROJECT}"
     backend = _only(
         await _docker(
-            lambda c: c.containers.list(filters={"label": "com.docker.compose.service=backend"})
+            lambda c: c.containers.list(
+                filters={"label": [project, "com.docker.compose.service=backend"]}
+            )
         ),
         "running compose backend",
     )
     proxy = _only(
-        await _docker(lambda c: c.containers.list(filters={"label": "enigma.preview-proxy=1"})),
+        await _docker(
+            lambda c: c.containers.list(filters={"label": [project, "enigma.preview-proxy=1"]})
+        ),
         "running preview proxy",
     )
     await asyncio.to_thread(backend.kill)  # SIGKILL: no shutdown hooks run
@@ -584,13 +612,15 @@ async def test_a_killed_backend_restarts_without_losing_live_sandboxes(stack) ->
         lambda: _ready(stack), lambda ok: ok, seconds=180, what="the restarted backend"
     )
 
-    # Startup: the orphan's container and network are removed ...
+    # Startup: the orphan's container and then its network are removed ...
+    async def orphan_left() -> list:
+        networks = await _docker(lambda c: c.networks.list(names=[_network_name(orphan_id)]))
+        return await _containers_for(orphan_id) + networks
+
     await _until(
-        lambda: _containers_for(orphan_id), lambda found: found == [], seconds=60,
-        what="the orphan sandbox to be removed",
+        orphan_left, lambda found: found == [], seconds=60,
+        what="the orphan sandbox and its network to be removed",
     )
-    networks = await _docker(lambda c: c.networks.list(names=[_network_name(orphan_id)]))
-    assert networks == []
     # ... the live sandbox is untouched, and the first upkeep pass re-attaches the proxy.
     assert [c.status for c in await _containers_for(stack.workspace_id)] == ["running"]
     assert await _status(stack) == "ready"
@@ -603,3 +633,95 @@ async def _ready(stack: Stack) -> bool:
         return (await stack.api.get("/ready")).status_code == 200
     except httpx.TransportError:
         return False
+
+
+# --- Epic 06: the no-subscription walkthrough -------------------------------------------------
+
+SELFHOST = pytest.mark.skipif(
+    getenv("DOCKER_SELFHOST_E2E") != "1",
+    reason=(
+        "Set DOCKER_SELFHOST_E2E=1 (and the stack's METRICS_TOKEN) against a fresh stack with "
+        "no Daytona key, AGENT_PROVIDER=mock and AGENT_ALLOW_MOCK_PROVIDER=true"
+    ),
+)
+
+
+@SELFHOST
+async def test_a_fresh_install_without_daytona_runs_everything_on_docker(stack) -> None:
+    """The fixture already created a workspace with no runtime given and got Docker. Here:
+    health and the create form's data, the refusal of an unconfigured provider, an agent run
+    whose tool call reaches the sandbox, an edit and a commit, and a terminal. The remaining
+    tests in this file cover the editor, previews and services on the same stack."""
+    health = await stack.api.get("/health")
+    assert health.status_code == 200, health.text  # no key is not "degraded"
+    body = health.json()
+    assert body["sandbox_runtime_default"] == "docker"
+    assert body["runtimes"]["daytona"] == {
+        "configured": False,
+        "status": "unconfigured",
+        "reason": "No Daytona API key is configured",
+        "managed_containers": None,
+        "upkeep_last_pass_at": None,
+    }
+    assert body["runtimes"]["docker"]["status"] == "ok"
+    # Operational detail is for a METRICS_TOKEN bearer only (required on a Docker default).
+    assert body["runtimes"]["docker"]["managed_containers"] is None
+    operator = await stack.api.get(
+        "/health", headers={"authorization": f"Bearer {getenv('METRICS_TOKEN', '')}"}
+    )
+    docker = operator.json()["runtimes"]["docker"]
+    assert isinstance(docker["managed_containers"], int)
+    assert docker["upkeep_last_pass_at"] is not None  # the upkeep loop runs in this API
+
+    refused = await _create_as_new_user({"name": "Cloud", "source": "blank", "runtime": "daytona"})
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == (
+        "Daytona is not available: No Daytona API key is configured"
+    )
+
+    run = await stack.api.post(f"{stack.ws}/agent/runs", json={"prompt": "Look around"})
+    assert run.status_code == 201, run.text
+
+    async def finished() -> dict:
+        got = await stack.api.get(f"{stack.ws}/agent/runs/{run.json()['id']}")
+        assert got.status_code == 200, got.text
+        return got.json()
+
+    detail = await _until(
+        finished,
+        lambda r: r["status"] in ("completed", "error", "stopped"),
+        seconds=60,
+        what="the agent run to finish",
+    )
+    assert detail["status"] == "completed", detail
+    results = [e for e in detail["events"] if e["event_type"] == "tool_result"]
+    assert results and results[0]["metadata"]["ok"] is True
+    assert "README.md" in results[0]["content"]  # list_files ran in the Docker sandbox
+
+    await _write_file(stack, "notes.md", "# Written on Docker\n")
+    committed = await stack.api.post(
+        f"{stack.ws}/repo/commit", json={"message": "Add notes on Docker"}
+    )
+    assert committed.status_code == 200, committed.text
+    log = await stack.api.get(f"{stack.ws}/repo/log")
+    assert log.status_code == 200, log.text
+    assert log.json()["commits"][0]["subject"] == "Add notes on Docker"
+
+    terminal = await stack.api.post(f"{stack.ws}/terminal/sessions", json={"name": "Shell"})
+    assert terminal.status_code == 201, terminal.text
+    url = BACKEND_URL.replace("http", "ws", 1) + (
+        f"{stack.ws}/terminal/sessions/{terminal.json()['id']}"
+    )
+    received = b""
+    async with websockets.connect(
+        url,
+        additional_headers={"cookie": f"{SESSION_COOKIE}={stack.session_token}"},
+        open_timeout=30,
+    ) as socket:
+        await socket.send(b"git log --format=%s -1\n")
+        deadline = time.monotonic() + 30
+        while b"Add notes on Docker" not in received.replace(b"\r", b""):
+            assert time.monotonic() < deadline, f"no git log in the terminal: {received[-300:]!r}"
+            frame = await asyncio.wait_for(socket.recv(), timeout=30)
+            if isinstance(frame, bytes):
+                received += frame

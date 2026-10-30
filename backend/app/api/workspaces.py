@@ -72,6 +72,7 @@ from app.services.repositories import (
     RepositoryTokenError,
 )
 from app.services.sandbox import SandboxRuntimeError, get_sandbox_runtime
+from app.services.sandbox.availability import RuntimeChoiceError, runtime_availability
 from app.services.templates import TemplateNotFoundError
 from app.services.workspace_env import affected_running_services, egress_warnings
 from app.services.workspace_init import WorkspaceInitializationError
@@ -192,6 +193,7 @@ async def get_workspace_service(
         session=session,
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
         runtime=get_sandbox_runtime(),
+        availability=runtime_availability,
     )
 
 
@@ -260,6 +262,7 @@ def not_found() -> HTTPException:
 
 
 WORKSPACE_CREATE_ERRORS = (
+    RuntimeChoiceError,
     WorkspaceRuntimeError,
     InvalidRepositoryUrlError,
     TemplateNotFoundError,
@@ -269,6 +272,10 @@ WORKSPACE_CREATE_ERRORS = (
 
 def workspace_create_error(error: Exception) -> HTTPException:
     """Map workspace-creation failures shared by the personal and team create routes."""
+    if isinstance(error, RuntimeChoiceError):
+        return HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=error.message
+        )
     if isinstance(error, InvalidRepositoryUrlError):
         return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=error.message)
     if isinstance(error, TemplateNotFoundError):
@@ -1360,6 +1367,8 @@ async def create_workspace(
         )
         if payload.snapshot is not None:
             create_values["snapshot"] = payload.snapshot
+        if payload.runtime is not None:
+            create_values["runtime"] = payload.runtime
         workspace = await service.create(**create_values)
     except WorkspaceAlreadyExistsError:
         raise HTTPException(

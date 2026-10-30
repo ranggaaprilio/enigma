@@ -212,6 +212,34 @@ async def test_upkeep_runs_only_on_a_docker_profile(monkeypatch) -> None:
     assert len(started) == 1
 
 
+async def test_each_upkeep_pass_records_when_it_finished(maker, monkeypatch) -> None:
+    """/health reports this (Epic 06): a stuck or crashed loop shows as a stale timestamp."""
+    import asyncio
+
+    from app.services import sandbox_maintenance
+
+    async def nothing(*args, **kwargs):
+        return {}
+
+    for name in ("reconcile_orphans", "isolate_legacy_sandboxes", "stop_idle_sandboxes"):
+        monkeypatch.setattr(sandbox_maintenance, name, nothing)
+    runtime = docker_runtime_with(FakeDockerClient())
+    assert runtime.last_upkeep_at is None
+
+    task = asyncio.create_task(
+        sandbox_maintenance.run_sandbox_maintenance(maker, runtime.settings, runtime)
+    )
+    try:
+        for _ in range(100):
+            if runtime.last_upkeep_at is not None:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert runtime.last_upkeep_at is not None
+
+
 # --- sandboxes from before installation labels -------------------------------------------
 
 
