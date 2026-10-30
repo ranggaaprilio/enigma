@@ -62,6 +62,37 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+function healthWith(
+  daytona: "ok" | "error" | "unconfigured",
+  docker: "ok" | "error" | "unconfigured",
+  sandboxDefault: "daytona" | "docker" = "daytona",
+) {
+  const entry = (status: "ok" | "error" | "unconfigured", reason: string) => ({
+    configured: status !== "unconfigured",
+    status,
+    reason: status === "ok" ? null : reason,
+    managed_containers: null,
+    upkeep_last_pass_at: null,
+  });
+  return {
+    status: "ok",
+    database: "ok",
+    redis: "ok",
+    daytona,
+    sandbox_runtime_default: sandboxDefault,
+    runtimes: {
+      daytona: entry(daytona, "No Daytona API key is configured"),
+      docker: entry(docker, "The Docker daemon is not reachable"),
+    },
+  };
+}
+
+async function toBlankDetails(name = "Scratch") {
+  await userEvent.click(screen.getByRole("radio", { name: /Blank workspace/ }));
+  await userEvent.click(screen.getByRole("button", { name: "Next" }));
+  await userEvent.type(screen.getByLabelText("Workspace name"), name);
+}
+
 describe("CreateWorkspaceWizard", () => {
   it("creates a blank workspace without sending repo_url", async () => {
     stubFetch(() => undefined);
@@ -268,5 +299,86 @@ describe("CreateWorkspaceWizard", () => {
     );
     await userEvent.keyboard("{Escape}");
     expect(onClose).toHaveBeenCalled();
+  });
+
+  describe("runtime picker", () => {
+    it("offers both runtimes and preselects the server default", async () => {
+      stubFetch((url) =>
+        url.endsWith("/health") ? jsonResponse(healthWith("ok", "ok", "docker")) : undefined,
+      );
+      const createFn = vi.fn().mockResolvedValue({ ...created, runtime: "docker" });
+      render(
+        <CreateWorkspaceWizard open onClose={vi.fn()} onCreated={vi.fn()} createFn={createFn} />,
+      );
+      await toBlankDetails();
+
+      const docker = await screen.findByRole("radio", { name: /Local Docker/ });
+      const daytona = screen.getByRole("radio", { name: /Daytona/ });
+      expect(docker).toBeChecked();
+      expect(daytona).toBeEnabled();
+      // A snapshot only means something on Daytona.
+      expect(screen.queryByLabelText(/snapshot/i)).not.toBeInTheDocument();
+
+      await userEvent.click(daytona);
+      expect(screen.getByLabelText(/Daytona snapshot/)).toBeInTheDocument();
+      await userEvent.click(docker);
+      await userEvent.click(screen.getByRole("button", { name: "Next" }));
+      expect(screen.getByText("Local Docker")).toBeInTheDocument(); // review row
+      await userEvent.click(screen.getByRole("button", { name: "Create workspace" }));
+
+      await waitFor(() => expect(createFn).toHaveBeenCalled());
+      expect(createFn.mock.calls[0][0]).toMatchObject({ source: "blank", runtime: "docker" });
+    });
+
+    it("disables an unavailable runtime, says why, and selects the other", async () => {
+      stubFetch((url) =>
+        url.endsWith("/health") ? jsonResponse(healthWith("unconfigured", "ok")) : undefined,
+      );
+      render(
+        <CreateWorkspaceWizard open onClose={vi.fn()} onCreated={vi.fn()} createFn={vi.fn()} />,
+      );
+      await toBlankDetails();
+
+      const daytona = await screen.findByRole("radio", { name: /Daytona/ });
+      expect(daytona).toBeDisabled();
+      expect(screen.getByText("No Daytona API key is configured")).toBeInTheDocument();
+      expect(screen.getByRole("radio", { name: /Local Docker/ })).toBeChecked();
+    });
+
+    it("blocks creation when neither runtime is available", async () => {
+      stubFetch((url) =>
+        url.endsWith("/health")
+          ? jsonResponse(healthWith("unconfigured", "error"), false, 503)
+          : undefined,
+      );
+      const createFn = vi.fn();
+      render(
+        <CreateWorkspaceWizard open onClose={vi.fn()} onCreated={vi.fn()} createFn={createFn} />,
+      );
+      await toBlankDetails();
+
+      await screen.findByText("The Docker daemon is not reachable");
+      await userEvent.click(screen.getByRole("button", { name: "Next" }));
+      expect(screen.getByText(/No sandbox runtime is available/)).toBeInTheDocument();
+      expect(createFn).not.toHaveBeenCalled();
+    });
+
+    it("checks again on request, picking up a daemon that came back", async () => {
+      let docker: "error" | "ok" = "error";
+      stubFetch((url) =>
+        url.endsWith("/health") ? jsonResponse(healthWith("unconfigured", docker)) : undefined,
+      );
+      render(
+        <CreateWorkspaceWizard open onClose={vi.fn()} onCreated={vi.fn()} createFn={vi.fn()} />,
+      );
+      await toBlankDetails();
+      await screen.findByText("The Docker daemon is not reachable");
+
+      docker = "ok";
+      await userEvent.click(screen.getByRole("button", { name: "Check again" }));
+
+      expect(await screen.findByRole("radio", { name: /Local Docker/ })).toBeChecked();
+      expect(screen.queryByRole("button", { name: "Check again" })).not.toBeInTheDocument();
+    });
   });
 });

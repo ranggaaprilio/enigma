@@ -28,6 +28,7 @@ import {
   resolveProvider,
 } from "../lib/gitProviders";
 import { useRepositoryCredential } from "../lib/useRepositoryCredential";
+import { RUNTIMES, runtimeLabel } from "../lib/runtime";
 import {
   ApiError,
   cloneRepository,
@@ -184,6 +185,21 @@ export function DashboardRoute() {
     workspaceState.status === "ready" ? workspaceState.workspace : null;
   const workspaceStatus =
     workspaceState.status === "loading" ? "loading" : workspace?.status ?? "none";
+
+  // The provider's actionable detail (e.g. a process killed for lack of memory). Read once per
+  // workspace, never polled: a poll would count as activity and keep a Docker sandbox awake.
+  // Not while provisioning: GET /status also stores the provider's status on the row.
+  const [statusDetail, setStatusDetail] = useState<string | null>(null);
+  const workspaceKey = workspace && workspace.status !== "creating" ? workspace.id : null;
+  useEffect(() => {
+    setStatusDetail(null);
+    if (!workspaceKey) return;
+    const controller = new AbortController();
+    getWorkspaceStatus(workspaceKey, controller.signal)
+      .then((checked) => setStatusDetail(checked.status_detail ?? null))
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [workspaceKey]);
   const previewStatusLabel =
     previewStatus.total === 0
       ? "inactive"
@@ -225,6 +241,7 @@ export function DashboardRoute() {
         healthTone={shellStatus.tone}
         workspace={workspace}
         workspaceStatus={workspaceStatus}
+        workspaceStatusDetail={statusDetail}
         previewStatusLabel={previewStatusLabel}
         user={user}
         onLogout={logout}
@@ -515,10 +532,19 @@ function FoundationChecks({
           <span>Redis</span>
           <span>{health.status === "ready" ? health.data.redis : "pending"}</span>
         </li>
-        <li className="flex items-center justify-between gap-3 border-b border-line pb-3">
-          <span>Daytona</span>
-          <span>{health.status === "ready" ? health.data.daytona : "pending"}</span>
-        </li>
+        {RUNTIMES.map((runtime) => (
+          <li
+            key={runtime}
+            className="flex items-center justify-between gap-3 border-b border-line pb-3"
+          >
+            <span>{runtimeLabel(runtime)}</span>
+            <span>
+              {health.status === "ready"
+                ? (health.data.runtimes?.[runtime]?.status ?? "unknown")
+                : "pending"}
+            </span>
+          </li>
+        ))}
         <li className="flex items-center justify-between gap-3">
           <span>Workspace</span>
           <span className="capitalize">{workspaceStatus}</span>
@@ -590,7 +616,7 @@ function WorkspaceOverview({ workspace }: { workspace: WorkspaceResponse }) {
       </div>
 
       <div className="rounded-md border border-line bg-white p-4">
-        <p className="text-sm text-ink/60">Daytona runtime</p>
+        <p className="text-sm text-ink/60">{runtimeLabel(workspace.runtime)} runtime</p>
         <p className="mt-2 break-all font-mono text-sm">
           {workspace.sandbox_id ?? "Provisioning"} at {workspace.workspace_path}
         </p>
@@ -1440,13 +1466,16 @@ function WorkspaceMetadataForm({
           hint="Connecting credentials from the Repository tab also sets this."
         />
       </div>
-      <div className="mt-4">
-        <TextInput
-          label="Daytona snapshot"
-          value={snapshot}
-          onChange={setSnapshot}
-        />
-      </div>
+      {/* Docker always runs DOCKER_SANDBOX_IMAGE; a snapshot only means something on Daytona. */}
+      {workspace.runtime !== "docker" && (
+        <div className="mt-4">
+          <TextInput
+            label="Daytona snapshot"
+            value={snapshot}
+            onChange={setSnapshot}
+          />
+        </div>
+      )}
 
       {message && (
         <div className="mt-4 rounded-md border border-signal/30 bg-[#f0faf5] px-3 py-2 text-sm text-signal">

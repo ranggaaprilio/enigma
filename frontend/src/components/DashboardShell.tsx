@@ -8,6 +8,7 @@ import { NavLink, useNavigate } from "react-router";
 
 import { AppSidebar } from "./AppSidebar";
 import { PresenceAvatars } from "./PresenceAvatars";
+import { ProviderBadge } from "./ProviderBadge";
 import {
   getNotificationStreamUrl,
   isServerReady,
@@ -19,6 +20,7 @@ import {
   type WorkspaceResponse,
   type WorkspaceStatus,
 } from "../lib/api";
+import { runtimeErrorHint } from "../lib/runtime";
 import { useOnlineStatus } from "../lib/useOnlineStatus";
 import {
   useReconnectingWebSocket,
@@ -30,6 +32,8 @@ type DashboardShellProps = {
   healthTone: "loading" | "ok" | "degraded" | "error";
   workspace: WorkspaceResponse | null;
   workspaceStatus: WorkspaceStatus | "none" | "loading";
+  /** The provider's detail for the workspace (e.g. an OOM kill), when there is one. */
+  workspaceStatusDetail?: string | null;
   previewStatusLabel: string;
   user: UserResponse | null;
   onLogout: () => Promise<void>;
@@ -51,6 +55,7 @@ export function DashboardShell({
   healthTone,
   workspace,
   workspaceStatus,
+  workspaceStatusDetail,
   previewStatusLabel,
   user,
   onLogout,
@@ -103,7 +108,12 @@ export function DashboardShell({
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <StatusPill label={healthLabel} tone={healthTone} />
-              <WorkspaceStatusPill status={workspaceStatus} runtime={workspace?.runtime} />
+              <ProviderBadge runtime={workspace?.runtime} />
+              <WorkspaceStatusPill
+                status={workspaceStatus}
+                runtime={workspace?.runtime}
+                detail={workspaceStatusDetail}
+              />
               {user && workspace && <PresenceAvatars workspaceId={workspace.id} />}
               {user && <NotificationBell onConnectionStateChange={setStreamState} />}
               {user && <UserMenu user={user} onLogout={handleLogout} />}
@@ -365,9 +375,12 @@ function StatusPill({
 export function WorkspaceStatusPill({
   status,
   runtime,
+  detail,
 }: {
   status: DashboardShellProps["workspaceStatus"];
   runtime?: string;
+  /** The provider's actionable detail (`GET /workspaces/{id}/status`), e.g. an OOM kill. */
+  detail?: string | null;
 }) {
   const toneClass = {
     loading: "bg-white text-muted ring-1 ring-line",
@@ -382,6 +395,7 @@ export function WorkspaceStatusPill({
   const label = status === "none" ? "No workspace" : `Workspace ${status}`;
   // Idle Docker sandboxes are stopped, not deleted; the next use starts them again.
   const wakesOnUse = status === "stopped" && runtime === "docker";
+  const errorHint = status === "error" ? runtimeErrorHint(runtime) : null;
   return (
     <span
       className={`rounded-full px-3 py-1 text-sm font-semibold ${toneClass}`}
@@ -390,6 +404,8 @@ export function WorkspaceStatusPill({
       {wakesOnUse && (
         <span className="ml-1 font-normal text-muted"> · wakes on next use</span>
       )}
+      {errorHint && <span className="ml-1 font-normal"> · {errorHint}</span>}
+      {detail && <span className="ml-1 font-normal text-warn"> · {detail}</span>}
     </span>
   );
 }

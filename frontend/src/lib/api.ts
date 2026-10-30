@@ -1,8 +1,24 @@
+export type RuntimeName = "daytona" | "docker";
+
+/** One sandbox provider on `/health`: never more than configured yes/no and a generic reason. */
+export type RuntimeHealth = {
+  configured: boolean;
+  status: "ok" | "error" | "unconfigured";
+  reason: string | null;
+  /** Docker only: this installation's sandboxes on the daemon. */
+  managed_containers: number | null;
+  /** Docker only: when the backend last ran its sandbox upkeep pass. */
+  upkeep_last_pass_at: string | null;
+};
+
 export type HealthResponse = {
   status: "ok" | "degraded";
   database: "ok" | "error";
   redis: "ok" | "error";
-  daytona: "ok" | "error";
+  /** Kept for existing monitors; the same as `runtimes.daytona.status`. */
+  daytona: "ok" | "error" | "unconfigured";
+  sandbox_runtime_default: RuntimeName;
+  runtimes: Record<RuntimeName, RuntimeHealth>;
 };
 
 export type UserRole = "owner" | "developer" | "viewer";
@@ -143,7 +159,10 @@ export type WorkspaceStatusResponse = Pick<
   | "workspace_path"
   | "created_at"
   | "updated_at"
->;
+> & {
+  /** An actionable detail from the provider, e.g. a process killed for lack of memory. */
+  status_detail?: string | null;
+};
 
 export type WorkspaceCreatePayload = {
   name: string;
@@ -153,6 +172,8 @@ export type WorkspaceCreatePayload = {
   template_id?: string;
   default_branch?: string;
   snapshot?: string | null;
+  /** Omit to let the server pick (`SANDBOX_RUNTIME_DEFAULT`, or the provider that is up). */
+  runtime?: RuntimeName;
 };
 
 export type WorkspaceUpdatePayload = Partial<

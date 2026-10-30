@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 
 import { AppShell } from "../components/AppShell";
+import { ProviderBadge } from "../components/ProviderBadge";
 import { BudgetConfig } from "../components/usage/BudgetConfig";
 import { UsagePanel } from "../components/usage/UsagePanel";
 import { CreateWorkspaceWizard } from "../components/workspace/CreateWorkspaceWizard";
@@ -33,6 +34,7 @@ import {
   type WorkspaceResponse,
   type WorkspaceStatus,
 } from "../lib/api";
+import { runtimeLabel } from "../lib/runtime";
 
 const STATUS_ORDER: WorkspaceStatus[] = [
   "ready",
@@ -320,7 +322,7 @@ export function TeamRoute() {
             </div>
             <p className="font-medium text-ink">No workspaces yet</p>
             <p className="mt-1 text-sm text-body">
-              Create a workspace to spin up a Daytona sandbox for this team.
+              Create a workspace to spin up a sandbox for this team.
             </p>
             <button
               onClick={() => setShowCreate(true)}
@@ -381,6 +383,7 @@ export function TeamRoute() {
                     <RepoIcon ws={ws} />
                     <span className="truncate">{repoLabel(ws)}</span>
                   </p>
+                  <ProviderBadge runtime={ws.runtime} />
                   <p className="flex items-center gap-1.5">
                     <GitBranch
                       className="h-3.5 w-3.5 shrink-0"
@@ -417,7 +420,7 @@ export function TeamRoute() {
         <CreateWorkspaceWizard
           open={showCreate}
           onClose={() => setShowCreate(false)}
-          subtitle="Provisions a Daytona sandbox for this team."
+          subtitle="Provisions a sandbox for this team."
           createFn={(payload) => createTeamWorkspace(projectId, teamId, payload)}
           onCreated={(ws) =>
             navigate(`/projects/${projectId}/teams/${teamId}/workspaces/${ws.id}`)
@@ -438,8 +441,8 @@ export function TeamRoute() {
               </div>
             </div>
             <p className="text-sm text-body">
-              This removes the workspace and its Daytona sandbox for the whole team. It
-              cannot be undone.
+              This removes the workspace and its {runtimeLabel(pendingDelete.runtime)} sandbox
+              for the whole team. It cannot be undone.
             </p>
             {deleteError && (
               <p className="mt-3 rounded-lg border border-danger/30 bg-[#fff5f2] px-3 py-2 text-sm text-danger">
