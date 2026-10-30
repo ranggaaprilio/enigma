@@ -32,6 +32,7 @@ from app.services.reconciliation import reconcile_interrupted_runs
 from app.services.retention import start_retention
 from app.services.runtime import RedisEventBus, event_bus, run_registry
 from app.services.sandbox import close_all
+from app.services.sandbox_maintenance import start_sandbox_maintenance
 
 logger = structlog.get_logger(__name__)
 
@@ -68,6 +69,12 @@ async def lifespan(_app: FastAPI):
         if settings.run_execution_mode == "inline"
         else None
     )
+    # Docker sandbox upkeep (local-docker-runtime Epic 05) follows the same split.
+    sandbox_upkeep = (
+        start_sandbox_maintenance(async_session_maker, settings)
+        if settings.run_execution_mode == "inline"
+        else None
+    )
     # Epic 09: fleet-wide gauges (queue depth, active runs and spend by team) on /metrics.
     fleet_sampler = start_fleet_sampler(async_session_maker, settings)
     restore_sigterm = install_sigterm_drain(
@@ -79,9 +86,10 @@ async def lifespan(_app: FastAPI):
     lifecycle.begin_drain()
     fleet_sampler.cancel()
     await asyncio.gather(fleet_sampler, return_exceptions=True)
-    if retention is not None:
-        retention.cancel()
-        await asyncio.gather(retention, return_exceptions=True)
+    for task in (retention, sandbox_upkeep):
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
     try:
         # Only the runs this process owns: an overlapping replica's live runs are not ours.
         owned_run_ids = run_registry.active_run_ids()

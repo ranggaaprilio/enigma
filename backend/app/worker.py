@@ -45,6 +45,7 @@ from app.services.reconciliation import reconcile_interrupted_runs
 from app.services.retention import start_retention
 from app.services.runtime import RedisEventBus, event_bus
 from app.services.sandbox import close_all
+from app.services.sandbox_maintenance import start_sandbox_maintenance
 from app.services.speckit import (
     _TERMINAL_RUN_STATUSES,
     PHASE_FINALIZE_TIMEOUT_SECONDS,
@@ -369,6 +370,7 @@ async def startup(ctx: dict[str, Any]) -> None:
     )
     # Epic 05: every worker prunes; SKIP LOCKED batches split the work between them.
     ctx["retention"] = start_retention(async_session_maker, settings)
+    ctx["sandbox_upkeep"] = start_sandbox_maintenance(async_session_maker, settings)
     # Epic 09: this worker's run/LLM/reaper metrics on METRICS_PORT, plus its Redis probe.
     ctx["metrics_server"] = start_if_possible(settings)
     ctx["redis_probe"] = asyncio.create_task(run_redis_probe(settings))
@@ -378,7 +380,7 @@ async def startup(ctx: dict[str, Any]) -> None:
 async def shutdown(ctx: dict[str, Any]) -> None:
     settings: Settings = ctx.get("settings") or get_settings()
     lifecycle.begin_drain()
-    for name in ("reaper", "retention", "redis_probe"):
+    for name in ("reaper", "retention", "sandbox_upkeep", "redis_probe"):
         if (task := ctx.get(name)) is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)

@@ -1520,9 +1520,10 @@ async def get_workspace_status(
     workspace_id: UUID,
     current_user: User = CURRENT_USER_DEP,
     service: WorkspaceService = WORKSPACE_SERVICE_DEP,
-) -> Workspace:
+) -> WorkspaceStatusResponse:
     try:
         workspace = await service.get_for_owner(workspace_id, current_user.id)
+        detail: str | None = None
         if isinstance(service, SqlAlchemyWorkspaceService):
             try:
                 workspace.status = await service.runtime.status(workspace)
@@ -1531,7 +1532,13 @@ async def get_workspace_status(
                 await service.session.refresh(workspace)
             except SandboxRuntimeError:
                 workspace.status = "error"
-        return workspace
+            else:
+                try:  # a note, never a reason to report a healthy sandbox as broken
+                    detail = await service.runtime.status_detail(workspace)
+                except SandboxRuntimeError:
+                    detail = None
+        response = WorkspaceStatusResponse.model_validate(workspace)
+        return response.model_copy(update={"status_detail": detail})
     except WorkspaceNotFoundError:
         raise not_found() from None
 

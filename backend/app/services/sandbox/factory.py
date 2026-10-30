@@ -90,6 +90,9 @@ class SandboxRuntimeDispatcher:
     async def status(self, workspace: Workspace) -> str:
         return await get_runtime(workspace).status(workspace)
 
+    async def status_detail(self, workspace: Workspace) -> str | None:
+        return await get_runtime(workspace).status_detail(workspace)
+
     async def start(self, workspace: Workspace) -> None:
         await get_runtime(workspace).start(workspace)
 

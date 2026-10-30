@@ -36,15 +36,17 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from posixpath import join as posix_join
 from typing import Any
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import docker
 import requests
 import structlog
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
+from docker.types import IPAMConfig, IPAMPool, Ulimit
 
 from app.core.config import Settings
 from app.models import Workspace
+from app.services.sandbox.activity import SandboxActivityRecorder
 from app.services.sandbox.base import (
     CommandTimeoutError,
     ProvisioningError,
@@ -70,6 +72,16 @@ logger = structlog.get_logger(__name__)
 
 DEFAULT_DOCKER_HOST = "unix:///var/run/docker.sock"
 MANAGED_LABEL = "enigma.managed"
+# This database's id (``sandbox_installation``): the upkeep loop only touches its own.
+INSTALLATION_LABEL = "enigma.installation"
+COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
+# Pure-sh (builtins only, nothing a tenant could shadow on PATH): "busy" while an exec or an
+# attached terminal client is alive in the sandbox.
+_BUSY_SCRIPT = (
+    "for f in /tmp/.enigma-exec/*.pid /tmp/.enigma-pty/*.pid; do "
+    '[ -f "$f" ] || continue; read pid < "$f" || continue; '
+    'kill -0 "$pid" 2>/dev/null && echo busy && exit 0; done; echo idle'
+)
 WORKSPACE_LABEL = "enigma.workspace-id"
 OWNER_LABEL = "enigma.owner-id"
 
@@ -183,6 +195,94 @@ def assert_safe_container_spec(spec: dict[str, Any]) -> None:
         raise ProvisioningError(f"Refusing unsafe sandbox container spec: {sorted(problems)}")
 
 
+def container_security_spec(settings: Settings) -> dict[str, Any]:
+    """The sandbox container's security and resource profile (Epic 05), in one place.
+
+    Every capability is dropped and none added: git, mise, code-server and dev servers all
+    run as the unprivileged sandbox user without one. Adding a capability needs a comment
+    and a test. ``no-new-privileges`` also defuses the base image's passwordless sudo.
+    ``init`` reaps the orphans that backgrounded dev servers leave. Swap is capped at the
+    memory limit, ``/tmp`` is a tmpfs, and the open-file limit is explicit.
+    """
+    memory = f"{settings.docker_sandbox_memory_mb}m"
+    return {
+        "user": settings.docker_sandbox_user,
+        "init": True,
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges:true"],
+        "pids_limit": settings.docker_sandbox_pids_limit,
+        "mem_limit": memory,
+        "memswap_limit": memory,
+        "nano_cpus": int(settings.docker_sandbox_cpus * 1_000_000_000),
+        "tmpfs": {"/tmp": f"rw,nosuid,nodev,size={settings.docker_sandbox_tmp_mb}m"},
+        "ulimits": [
+            Ulimit(
+                name="nofile",
+                soft=settings.docker_sandbox_nofile,
+                hard=settings.docker_sandbox_nofile,
+            )
+        ],
+    }
+
+
+def assert_safe_container(attrs: dict[str, Any]) -> None:
+    """The security floor, checked on an existing container's inspect output before it is
+    adopted: a hand-edited or drifted container under a sandbox's name is refused."""
+    host = attrs.get("HostConfig") or {}
+    problems = []
+    if host.get("Privileged"):
+        problems.append("privileged")
+    # Capabilities are checked on the live process (CapEff/CapBnd, see
+    # ``_assert_no_capabilities``): Docker and Podman report CapDrop differently.
+    if host.get("CapAdd"):
+        problems.append("cap_add")
+    if not host.get("CapDrop"):
+        problems.append("cap_drop")
+    options = [str(opt).replace(":", "=", 1) for opt in host.get("SecurityOpt") or []]
+    if not any(opt in {"no-new-privileges", "no-new-privileges=true"} for opt in options):
+        problems.append("no-new-privileges")
+    if any(opt.endswith("=unconfined") for opt in options):
+        problems.append("unconfined")
+    for opt in options:
+        key, _, value = opt.partition("=")
+        if key in {"seccomp", "apparmor"} and value not in {"", "default", "docker-default"}:
+            problems.append(f"custom {key} profile")
+        if key == "label" and value.startswith("disable"):
+            problems.append("label=disable")
+    for key in ("Devices", "DeviceRequests", "DeviceCgroupRules", "Sysctls", "PortBindings"):
+        if host.get(key):
+            problems.append(key)
+    if host.get("PublishAllPorts"):
+        problems.append("PublishAllPorts")
+    if not isinstance(host.get("PidsLimit"), int) or host["PidsLimit"] <= 0:
+        problems.append("pids_limit")
+    mode = str(host.get("NetworkMode") or "")
+    if mode == "host" or mode.startswith("container:"):
+        problems.append("network")
+    for key in ("PidMode", "IpcMode", "UTSMode", "UsernsMode", "CgroupnsMode"):
+        if str(host.get(key) or "").lower() == "host":
+            problems.append(key)
+    if attrs.get("Mounts"):
+        problems.append("mounts")
+    if _is_root_user(str((attrs.get("Config") or {}).get("User") or "")):
+        problems.append("user")
+    if problems:
+        raise ProvisioningError(
+            "Refusing a sandbox container that drifted from the security floor: "
+            f"{sorted(problems)}"
+        )
+
+
+def _parse_capability_mask(status: str, field: str) -> int | None:
+    for line in status.splitlines():
+        if line.startswith(f"{field}:"):
+            try:
+                return int(line.split(":", 1)[1].strip(), 16)
+            except ValueError:
+                return None
+    return None
+
+
 def _is_sandbox_address(value: str) -> bool:
     """A private IPv4 a bridge network hands out (not loopback, link-local or unspecified)."""
     try:
@@ -196,6 +296,21 @@ def _is_sandbox_address(value: str) -> bool:
         or address.is_multicast
         or address.is_reserved
     )
+
+
+def sandbox_network_name(workspace: Workspace) -> str:
+    return f"enigma-sbx-{workspace.id.hex}"
+
+
+def _network_subnets(network: Any) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
+    configs = ((network.attrs or {}).get("IPAM") or {}).get("Config") or []
+    subnets = []
+    for config in configs:
+        try:
+            subnets.append(ipaddress.ip_network(config.get("Subnet") or "", strict=False))
+        except ValueError:
+            continue
+    return subnets
 
 
 def container_name(workspace: Workspace) -> str:
@@ -215,6 +330,11 @@ class DockerRuntime:
         self._pty_pool: ThreadPoolExecutor | None = None  # one reader per open terminal
         # Guards first connect; asyncio locks bind to one loop, so keep one per loop.
         self._locks: dict[int, asyncio.Lock] = {}
+        # The shared idle clock (Epic 05): debounced per instance, stored in Postgres.
+        self.activity = SandboxActivityRecorder()
+        self._installation: str | None = None  # this database's id, loaded on first use
+        self._project: str | None = None  # the backend's own compose project, if any
+        self._project_known = False
 
     # --- threads & clients ------------------------------------------------------------
 
@@ -326,35 +446,214 @@ class DockerRuntime:
             "image": self.settings.docker_sandbox_image,
             "name": name,
             "detach": True,
-            # tini/catatonit as PID 1 reaps the orphans that backgrounded dev servers leave.
-            "init": True,
             "entrypoint": ["sleep", "infinity"],
             "command": [],
-            "user": self.settings.docker_sandbox_user,
             "working_dir": self._home(),
             "labels": {
                 MANAGED_LABEL: "1",
+                INSTALLATION_LABEL: self._require_installation(),
                 WORKSPACE_LABEL: str(workspace.id),
                 OWNER_LABEL: str(workspace.owner_id),
             },
-            "network": self.settings.docker_sandbox_network,
-            "mem_limit": f"{self.settings.docker_sandbox_memory_mb}m",
-            "nano_cpus": int(self.settings.docker_sandbox_cpus * 1_000_000_000),
-            "pids_limit": self.settings.docker_sandbox_pids_limit,
-            "cap_drop": ["ALL"],
-            "security_opt": ["no-new-privileges:true"],
+            "network": sandbox_network_name(workspace),
+            **container_security_spec(self.settings),
         }
 
-    def _ensure_network(self, client: Any) -> None:
-        name = self.settings.docker_sandbox_network
-        # The ``name`` filter is a substring match; only an exact name counts.
-        if any(network.name == name for network in client.networks.list(names=[name])):
-            return
+    # --- networks: one per sandbox (Epic 05) -------------------------------------------
+
+    def _subnet_candidates(self, workspace: Workspace) -> list[ipaddress.IPv4Network]:
+        pool = ipaddress.ip_network(self.settings.docker_sandbox_subnet_pool)
+        prefix = max(self.settings.docker_sandbox_subnet_prefix, pool.prefixlen)
+        subnets = list(pool.subnets(new_prefix=prefix))
+        # Start where this workspace hashes to, so concurrent provisions rarely collide.
+        start = workspace.id.int % len(subnets)
+        return subnets[start:] + subnets[:start]
+
+    # --- installation scoping ---------------------------------------------------------
+
+    async def _installation_id(self) -> str:
+        if self._installation is None:
+            from sqlalchemy import select
+            from sqlalchemy.ext.asyncio import create_async_engine
+            from sqlalchemy.pool import NullPool
+
+            from app.models import SandboxInstallation
+
+            # Read once per runtime, on a throwaway connection: a pooled one would be bound
+            # to whichever event loop happened to open it.
+            engine = create_async_engine(self.settings.database_url, poolclass=NullPool)
+            try:
+                async with engine.connect() as connection:
+                    value = await connection.scalar(select(SandboxInstallation.id))
+            finally:
+                await engine.dispose()
+            if value is None:
+                raise RuntimeUnavailableError(
+                    "This database has no sandbox installation id; run the migrations"
+                )
+            self._installation = str(value)
+        return self._installation
+
+    def _require_installation(self) -> str:
+        if self._installation is None:  # every entry point awaits _installation_id first
+            raise RuntimeUnavailableError("The sandbox installation id is not loaded")
+        return self._installation
+
+    def _ours(self) -> list[str]:
+        """Label filters for this installation's sandboxes and networks -- never another
+        stack's on the same daemon, never a container Enigma did not create."""
+        return [f"{MANAGED_LABEL}=1", f"{INSTALLATION_LABEL}={self._require_installation()}"]
+
+    def _compose_project(self, client: Any) -> str | None:
+        """The compose project of the container this process runs in (None outside one),
+        so only this stack's preview proxy is attached to its sandboxes."""
+        if not self._project_known:
+            try:
+                me = client.containers.get(socket.gethostname())
+                self._project = (me.labels or {}).get(COMPOSE_PROJECT_LABEL)
+            except (NotFound, APIError):
+                self._project = None
+            self._project_known = True
+        return self._project
+
+    def _proxies(self, client: Any) -> list[Any]:
+        filters = [self.settings.docker_preview_proxy_label]
+        project = self._compose_project(client)
+        if project:
+            filters.append(f"{COMPOSE_PROJECT_LABEL}={project}")
+        return client.containers.list(filters={"label": filters})
+
+    # --- networks: one per sandbox (Epic 05) -------------------------------------------
+
+    def _ensure_sandbox_network(self, client: Any, workspace: Workspace) -> Any:
+        name = sandbox_network_name(workspace)
+        internal = bool(self.settings.sandbox_network_block_all)
+        for network in client.networks.list(names=[name]):
+            if network.name != name:  # the name filter is a substring match
+                continue
+            network = client.networks.get(network.id)
+            if bool((network.attrs or {}).get("Internal")) == internal:
+                return network
+            # The egress policy changed since it was made: rebuild it (callers reconnect).
+            self._remove_sandbox_network(client, workspace)
+            break
+        used = [
+            subnet for network in client.networks.list() for subnet in _network_subnets(network)
+        ]
+        attempts = 0
+        for subnet in self._subnet_candidates(workspace):
+            if any(subnet.overlaps(other) for other in used):
+                continue
+            attempts += 1
+            if attempts > 64:
+                break
+            try:
+                return client.networks.create(
+                    name,
+                    driver="bridge",
+                    internal=internal,
+                    labels={
+                        MANAGED_LABEL: "1",
+                        INSTALLATION_LABEL: self._require_installation(),
+                        WORKSPACE_LABEL: str(workspace.id),
+                    },
+                    ipam=IPAMConfig(pool_configs=[IPAMPool(subnet=str(subnet))]),
+                )
+            except APIError as error:
+                if error.status_code == 409 and "already exists" in str(error).lower():
+                    return client.networks.get(name)  # another process created it first
+                text = str(getattr(error, "explanation", "") or error).lower()
+                if not any(hint in text for hint in ("overlap", "in use", "already used")):
+                    raise  # a real daemon error, not a taken subnet
+                used.append(subnet)  # taken meanwhile (a race or a hidden network): next one
+        raise ProvisioningError(
+            "No free sandbox subnet is left; widen DOCKER_SANDBOX_SUBNET_POOL"
+        )
+
+    def _attach_proxies(self, network: Any, proxies: list[Any]) -> None:
+        """Put this stack's preview-proxy containers on ``network`` under their alias."""
+        network.reload()
+        attached = set((network.attrs or {}).get("Containers") or {})
+        for proxy in proxies:
+            if proxy.id in attached:
+                continue
+            try:
+                network.connect(proxy, aliases=[self.settings.docker_preview_proxy_host])
+            except APIError as error:
+                if error.status_code != 409:  # 409: it joined meanwhile
+                    logger.warning(
+                        "docker_proxy_attach_failed", error_type=type(error).__name__
+                    )
+
+    def _isolate(
+        self, client: Any, container: Any, workspace: Workspace, proxies: list[Any]
+    ) -> None:
+        """Ensure ``container`` is on its own network only (moving it off the legacy shared
+        one) and that the preview proxy can reach it there."""
+        container.reload()  # first: a container deleted meanwhile must not get a new network
+        network = self._ensure_sandbox_network(client, workspace)
+        joined = set(((container.attrs or {}).get("NetworkSettings") or {}).get("Networks") or {})
+        legacy = self.settings.docker_sandbox_network
+        foreign = joined - {network.name, legacy}
+        if foreign:
+            raise ProvisioningError(
+                f"The sandbox is attached to networks it must not be on: {sorted(foreign)}"
+            )
+        if network.name not in joined:
+            network.connect(container)
+        if legacy in joined and legacy != network.name:
+            client.networks.get(legacy).disconnect(container, force=True)
+        self._attach_proxies(network, proxies)
+
+    def _remove_sandbox_network(self, client: Any, workspace: Workspace) -> None:
         try:
-            client.networks.create(name, driver="bridge", labels={MANAGED_LABEL: "1"})
-        except APIError as error:
-            if error.status_code != 409:  # another process created it first
-                raise
+            network = client.networks.get(sandbox_network_name(workspace))
+            network.reload()
+        except NotFound:
+            return
+        for container_id in list((network.attrs or {}).get("Containers") or {}):
+            try:
+                network.disconnect(container_id, force=True)
+            except NotFound:
+                continue
+        try:
+            network.remove()
+        except NotFound:
+            return
+
+    def _reconcile_networks_sync(self, client: Any) -> int:
+        """Every sandbox of this installation on its own network with this stack's proxy
+        attached; returns how many were checked. Idempotent, so safe to run concurrently."""
+        proxies = self._proxies(client)
+        checked = 0
+        for container in client.containers.list(all=True, filters={"label": self._ours()}):
+            workspace_id = (container.labels or {}).get(WORKSPACE_LABEL)
+            if not workspace_id:
+                continue
+            try:
+                self._isolate(client, container, Workspace(id=UUID(workspace_id)), proxies)
+                checked += 1
+            except (ValueError, APIError, NotFound, ProvisioningError) as error:
+                logger.warning("docker_network_reconcile_failed", error_type=type(error).__name__)
+        return checked
+
+    async def reconcile_networks(self) -> int:
+        await self._installation_id()
+        client, _ = await self._clients()
+        return await self._call(self._reconcile_networks_sync, client)
+
+    @staticmethod
+    def _assert_no_capabilities(container: Any) -> None:
+        """The live process holds no capability at all, whatever the inspect output says."""
+        result = container.exec_run(["/bin/cat", "/proc/1/status"])
+        status = (result.output or b"").decode(errors="replace")
+        effective = _parse_capability_mask(status, "CapEff")
+        bounding = _parse_capability_mask(status, "CapBnd")
+        if effective != 0 or bounding != 0:
+            raise ProvisioningError(
+                "Refusing a sandbox container that drifted from the security floor: "
+                "['capabilities']"
+            )
 
     @staticmethod
     def _ensure_running(container: Any) -> Any:
@@ -382,12 +681,21 @@ class DockerRuntime:
             existing = None
         if existing is not None:
             labels = existing.labels or {}
-            if labels.get(MANAGED_LABEL) != "1" or labels.get(WORKSPACE_LABEL) != str(workspace.id):
+            installation = labels.get(INSTALLATION_LABEL)
+            if (
+                labels.get(MANAGED_LABEL) != "1"
+                or labels.get(WORKSPACE_LABEL) != str(workspace.id)
+                or (installation is not None and installation != self._require_installation())
+            ):
                 raise ProvisioningError(
                     "A container with this workspace's sandbox name exists but was not "
                     "created by Enigma for it; remove it and retry"
                 )
+            existing.reload()
+            assert_safe_container(existing.attrs)
+            self._isolate(client, existing, workspace, self._proxies(client))
             container = self._ensure_running(existing)
+            self._assert_no_capabilities(container)
             self._ensure_workspace_dir(container, workspace)
             return container.id
         image = self.settings.docker_sandbox_image
@@ -397,11 +705,12 @@ class DockerRuntime:
             raise ProvisioningError(
                 "The sandbox image is not built; run sandbox/build-local-image.sh"
             ) from error
-        self._ensure_network(client)
+        network = self._ensure_sandbox_network(client, workspace)
         spec = self._container_spec(workspace, name)
         assert_safe_container_spec(spec)
         container = client.containers.run(**spec)
         try:
+            self._attach_proxies(network, self._proxies(client))
             self._ensure_workspace_dir(container, workspace)
         except Exception:
             container.remove(force=True)  # no half-made sandbox for the next retry to adopt
@@ -409,9 +718,12 @@ class DockerRuntime:
         return container.id
 
     async def provision(self, workspace: Workspace) -> str:
+        await self._installation_id()
         client, _ = await self._clients()
         try:
-            return await self._call(self._provision_sync, client, workspace)
+            sandbox_id = await self._call(self._provision_sync, client, workspace)
+            await self.activity.touch(workspace.id)
+            return sandbox_id
         except (RuntimeUnavailableError, ProvisioningError):
             raise
         except SandboxRuntimeError as error:
@@ -431,6 +743,38 @@ class DockerRuntime:
         await self._call(container.reload)
         return _STATUS.get(str(container.status or "").lower(), "error")
 
+    async def status_detail(self, workspace: Workspace) -> str | None:
+        """Out-of-memory kills, read straight from the container (no exec wrapper, so a
+        status poll neither wakes a stopped sandbox nor counts as activity)."""
+        container = await self._container(workspace, start=False)
+        limit = self.settings.docker_sandbox_memory_mb
+
+        def read() -> str | None:
+            container.reload()
+            if ((container.attrs or {}).get("State") or {}).get("OOMKilled"):
+                return (
+                    f"The sandbox was stopped for exceeding its {limit} MB memory limit. "
+                    "Raise DOCKER_SANDBOX_MEMORY_MB or use less memory."
+                )
+            if container.status != "running":
+                return None
+            # Absolute path: ~/.local/bin leads PATH and is the tenant's to write.
+            result = container.exec_run(["/bin/cat", "/sys/fs/cgroup/memory.events"])
+            killed = 0
+            for line in (result.output or b"").decode(errors="replace").splitlines():
+                key, _, value = line.partition(" ")
+                if key == "oom_kill" and value.strip().isdigit():
+                    killed = int(value)
+            if not killed:
+                return None
+            return (
+                f"{killed} process(es) in this sandbox were killed for exceeding its {limit} MB "
+                "memory limit since it started. Raise DOCKER_SANDBOX_MEMORY_MB or use less "
+                "memory."
+            )
+
+        return await self._call(read)
+
     async def start(self, workspace: Workspace) -> None:
         await self._container(workspace)
 
@@ -442,7 +786,65 @@ class DockerRuntime:
             container = await self._call(client.containers.get, workspace.sandbox_id)
             await self._call(container.remove, force=True)
         except SandboxNotFoundError:
-            return
+            pass
+        await self._call(self._remove_sandbox_network, client, workspace)
+
+    # --- upkeep (Epic 05): driven by services/sandbox_maintenance.py ------------------
+
+    async def stop_if_running(self, workspace: Workspace) -> bool:
+        """Stop (keep) the sandbox; the next use starts it again. False -- and left alone --
+        when it is not running, or when a command or an attached terminal is still alive
+        in it (a long, quiet build is not idle)."""
+        container = await self._container(workspace, start=False)
+
+        def stop() -> bool:
+            container.reload()
+            if container.status != "running":
+                return False
+            probe = container.exec_run(["/bin/sh", "-c", _BUSY_SCRIPT])
+            if b"busy" in (probe.output or b""):
+                return False
+            container.stop(timeout=10)
+            return True
+
+        return await self._call(stop)
+
+    async def managed_sandboxes(self) -> list[tuple[str, str]]:
+        """``(container id, workspace id label)`` of this installation's sandboxes -- and only
+        those: another stack's, or anything Enigma did not create, is never touched."""
+        await self._installation_id()
+        client, _ = await self._clients()
+
+        def listing() -> list[tuple[str, str]]:
+            containers = client.containers.list(all=True, filters={"label": self._ours()})
+            return [(c.id, (c.labels or {}).get(WORKSPACE_LABEL, "")) for c in containers]
+
+        return await self._call(listing)
+
+    async def managed_network_workspaces(self) -> list[str]:
+        await self._installation_id()
+        client, _ = await self._clients()
+
+        def listing() -> list[str]:
+            networks = client.networks.list(filters={"label": self._ours()})
+            labels = [((n.attrs or {}).get("Labels") or {}) for n in networks]
+            return [found for found in (lab.get(WORKSPACE_LABEL) for lab in labels) if found]
+
+        return await self._call(listing)
+
+    async def remove_sandbox(self, workspace_id: UUID, container_id: str | None) -> None:
+        """Remove an orphaned sandbox container (if any) and its network."""
+        client, _ = await self._clients()
+
+        def remove() -> None:
+            if container_id:
+                try:
+                    client.containers.get(container_id).remove(force=True)
+                except NotFound:
+                    pass
+            self._remove_sandbox_network(client, Workspace(id=workspace_id))
+
+        await self._call(remove)
 
     # --- commands ---------------------------------------------------------------------
 
@@ -547,6 +949,7 @@ class DockerRuntime:
         container, exec_id, pidfile = await self._create_exec(
             workspace, command, cwd=cwd, env=env, timeout=timeout
         )
+        await self.activity.touch(workspace.id)
         _, exec_api = await self._clients()
         started = time.monotonic()
         output = await self._finish(
@@ -579,6 +982,7 @@ class DockerRuntime:
         container, exec_id, pidfile = await self._create_exec(
             workspace, command, cwd=cwd, env=env, timeout=timeout
         )
+        await self.activity.touch(workspace.id)
         _, exec_api = await self._clients()
         loop = asyncio.get_running_loop()
         abandoned = threading.Event()
@@ -641,7 +1045,13 @@ class DockerRuntime:
         )
         sock = await self._call(exec_api.exec_start, created["Id"], tty=True, socket=True)
         handle = DockerPtyHandle(self, container, created["Id"], pidfile, sock)
-        handle.start_reader(on_data)
+
+        async def on_output(data: bytes) -> None:
+            # Terminal output (echoed keystrokes included) keeps the sandbox from idling.
+            await self.activity.touch(workspace.id)
+            await on_data(data)
+
+        handle.start_reader(on_output)
         try:
             await handle.resize(PtySize(cols=cols, rows=rows))
         except BaseException:
@@ -683,6 +1093,7 @@ class DockerRuntime:
         if address is None:
             # Never steer the proxy at a public host, its own loopback or a metadata endpoint.
             raise RuntimeUnavailableError("The sandbox is not reachable on the sandbox network")
+        await self.activity.touch(workspace.id)
         return RuntimePreviewLink(url=f"http://{address}:{int(port)}", token="")
 
     async def _resolve_host(self, name: str) -> list[str]:
@@ -707,4 +1118,10 @@ class DockerRuntime:
             )
 
 
-__all__ = ["DockerRuntime", "assert_safe_container_spec", "map_docker_error"]
+__all__ = [
+    "DockerRuntime",
+    "assert_safe_container",
+    "assert_safe_container_spec",
+    "container_security_spec",
+    "map_docker_error",
+]

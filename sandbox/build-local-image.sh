@@ -21,12 +21,5 @@ fi
 
 "${CONTAINER_CLI}" build -t "${IMAGE}" -f "${DIR}/Dockerfile" "${DIR}"
 
-# The sandboxes' bridge network. docker-compose.sandbox.yml attaches the preview proxy to it
-# as an external network, so it must exist before `compose up`; DockerRuntime adopts it.
-NETWORK="${DOCKER_SANDBOX_NETWORK:-enigma-sandboxes}"
-if ! "${CONTAINER_CLI}" network inspect "${NETWORK}" >/dev/null 2>&1; then
-  "${CONTAINER_CLI}" network create --driver bridge --label enigma.managed=1 "${NETWORK}"
-fi
-
 echo
-echo "Built ${IMAGE} and network ${NETWORK}. Set DOCKER_SANDBOX_IMAGE=${IMAGE} in .env (that is already the default)."
+echo "Built ${IMAGE}. Set DOCKER_SANDBOX_IMAGE=${IMAGE} in .env (that is already the default)."

@@ -154,6 +154,8 @@ class WorkspaceResponse(BaseModel):
 class WorkspaceStatusResponse(BaseModel):
     id: UUID
     status: WorkspaceStatus
+    # Live, never stored: an actionable note from the provider (e.g. out-of-memory kills).
+    status_detail: str | None = None
     runtime: str
     sandbox_id: str | None
     snapshot: str | None

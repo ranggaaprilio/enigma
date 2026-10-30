@@ -96,7 +96,13 @@ class Settings(BaseSettings):
     daytona_default_language: str = "python"
     daytona_workspace_path: str = "workspace"
     daytona_sandbox_home: str = "/home/daytona"
-    daytona_auto_stop_minutes: int = 30
+    # Idle sandboxes stop after this long (0 = never). Daytona enforces it itself; the Docker
+    # provider's reaper does (Epic 05). DAYTONA_AUTO_STOP_MINUTES is still accepted.
+    sandbox_auto_stop_minutes: int = Field(
+        default=30,
+        ge=0,
+        validation_alias=AliasChoices("sandbox_auto_stop_minutes", "daytona_auto_stop_minutes"),
+    )
     daytona_provision_timeout_seconds: int = 120
     daytona_preview_url_ttl_seconds: int = Field(default=60 * 60, gt=0)
     # The capability proxy fronts every provider's previews and the editor. The
@@ -112,18 +118,34 @@ class Settings(BaseSettings):
             "preview_proxy_ttl_seconds", "daytona_preview_proxy_ttl_seconds"
         ),
     )
-    daytona_network_block_all: bool = False
-    daytona_network_allow_list: str | list[str] = Field(default_factory=list)
+    # Sandbox egress policy for every provider (Daytona's network settings; on Docker,
+    # block_all makes each sandbox network internal). DAYTONA_NETWORK_* still accepted.
+    sandbox_network_block_all: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("sandbox_network_block_all", "daytona_network_block_all"),
+    )
+    sandbox_network_allow_list: str | list[str] = Field(
+        default_factory=list,
+        validation_alias=AliasChoices("sandbox_network_allow_list", "daytona_network_allow_list"),
+    )
     # Provider for newly created workspaces ("daytona" | "docker"). Existing rows keep theirs.
     sandbox_runtime_default: Literal["daytona", "docker"] = "daytona"
     # Local Docker/Podman provider (docs/local-docker-runtime). Unset docker_host = the
     # default unix socket; Podman: point it at `podman system service`'s socket.
     docker_host: str | None = None
     docker_sandbox_image: str = "enigma-sandbox:latest"
+    # Legacy shared network (Epics 02-04). Since Epic 05 every sandbox gets its own network
+    # (`enigma-sbx-<workspace>`); a sandbox still on this one is moved off it on provision.
     docker_sandbox_network: str = "enigma-sandboxes"
-    # The preview proxy's name on that network (compose: its service name). A sandbox's
-    # port relay admits connections from this name's addresses only (Epic 04).
+    # Per-sandbox networks are carved from this pool. Explicit subnets keep many sandboxes
+    # within reach of the daemon's default address pools (~31 networks on Docker).
+    docker_sandbox_subnet_pool: str = "10.213.0.0/16"
+    docker_sandbox_subnet_prefix: int = Field(default=28, ge=16, le=29)
+    # The preview proxy's name on every sandbox network; the backend attaches the proxy
+    # containers (found by this label) under it, and a sandbox's port relay admits
+    # connections from this name's addresses only (Epic 04).
     docker_preview_proxy_host: str = "preview-proxy"
+    docker_preview_proxy_label: str = "enigma.preview-proxy=1"
     # Must exist in the image and must not be root (enforced at provision).
     docker_sandbox_user: str = "daytona"
     docker_sandbox_cpus: float = Field(default=2.0, gt=0)
@@ -133,6 +155,12 @@ class Settings(BaseSettings):
     docker_max_concurrent_execs: int = Field(default=64, gt=0)
     # Fork-bomb floor per sandbox (Epic 05 tunes the full resource profile).
     docker_sandbox_pids_limit: int = Field(default=4096, gt=0)
+    # Epic 05: /tmp is a tmpfs (cleared on restart; counts against the memory limit) and the
+    # open-file limit is explicit rather than the daemon's default.
+    docker_sandbox_tmp_mb: int = Field(default=1024, gt=0)
+    docker_sandbox_nofile: int = Field(default=65536, gt=0)
+    # How often the Docker upkeep pass runs (proxy re-attach, idle auto-stop).
+    docker_reaper_interval_seconds: int = Field(default=60, gt=0)
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
@@ -278,7 +306,7 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
 
-    @field_validator("agent_command_allowlist", "daytona_network_allow_list", mode="before")
+    @field_validator("agent_command_allowlist", "sandbox_network_allow_list", mode="before")
     @classmethod
     def parse_command_allowlist(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):

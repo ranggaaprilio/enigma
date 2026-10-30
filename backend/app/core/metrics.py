@@ -104,6 +104,12 @@ reaper_sweeps_total = Counter(
     labelnames=("result",),
 )
 
+sandbox_maintenance_actions_total = Counter(
+    "sandbox_maintenance_actions_total",
+    "Docker sandbox upkeep actions (local-docker-runtime Epic 05), by action.",
+    labelnames=("provider", "action"),
+)
+
 llm_request_seconds = Histogram(
     "llm_request_seconds",
     "Wall time of a run's whole provider stream, first request to last event; it includes the "

@@ -161,7 +161,7 @@ class DaytonaRuntime:
                     "execute-owner-id": str(workspace.owner_id),
                 },
                 public=False,
-                auto_stop_interval=self.settings.daytona_auto_stop_minutes,
+                auto_stop_interval=self.settings.sandbox_auto_stop_minutes,
                 auto_archive_interval=0,
                 auto_delete_interval=-1,
                 ephemeral=False,
@@ -348,6 +348,9 @@ class DaytonaRuntime:
         except Exception as error:
             raise map_daytona_error(error) from error
 
+    async def status_detail(self, workspace: Workspace) -> str | None:
+        return None
+
     async def expose_port(self, workspace: Workspace, port: int) -> None:
         """Nothing to do: Daytona's preview edge reaches the sandbox's loopback itself."""
 
@@ -368,8 +371,8 @@ class DaytonaRuntime:
         to isolate or narrow.
         """
         return (
-            self.settings.daytona_network_block_all,
-            ",".join(self.settings.daytona_network_allow_list) or None,
+            self.settings.sandbox_network_block_all,
+            ",".join(self.settings.sandbox_network_allow_list) or None,
         )
 
     async def _apply_network_settings(self, sandbox: Any) -> None:

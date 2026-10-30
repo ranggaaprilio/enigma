@@ -427,7 +427,7 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _parsed_allow_networks(settings: Settings) -> list:
-    raw = settings.daytona_network_allow_list
+    raw = settings.sandbox_network_allow_list
     entries = (
         raw if isinstance(raw, list) else [item.strip() for item in raw.split(",") if item.strip()]
     )
@@ -444,7 +444,7 @@ def egress_warnings(env: dict[str, str], settings: Settings) -> list[str]:
     """Flag env values that point egress at a host outside `DAYTONA_NETWORK_ALLOW_LIST` while
     `DAYTONA_NETWORK_BLOCK_ALL` is on. Never includes the value itself, credentials, path, or
     query -- only the env key, the host, and the port."""
-    if not settings.daytona_network_block_all:
+    if not settings.sandbox_network_block_all:
         return []
 
     allow_networks = _parsed_allow_networks(settings)
