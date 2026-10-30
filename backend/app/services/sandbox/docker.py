@@ -791,19 +791,22 @@ class DockerRuntime:
 
     # --- upkeep (Epic 05): driven by services/sandbox_maintenance.py ------------------
 
-    async def stop_if_running(self, workspace: Workspace) -> bool:
+    async def stop_if_running(self, workspace: Workspace, *, force: bool = False) -> bool:
         """Stop (keep) the sandbox; the next use starts it again. False -- and left alone --
-        when it is not running, or when a command or an attached terminal is still alive
-        in it (a long, quiet build is not idle)."""
+        when it is not running, or (unless ``force``) when a command or an attached terminal
+        is still alive in it, so a long, quiet build is not idle. The busy probe reads the
+        sandbox's own /tmp, which its tenant controls: callers cap how long it may spare one.
+        """
         container = await self._container(workspace, start=False)
 
         def stop() -> bool:
             container.reload()
             if container.status != "running":
                 return False
-            probe = container.exec_run(["/bin/sh", "-c", _BUSY_SCRIPT])
-            if b"busy" in (probe.output or b""):
-                return False
+            if not force:
+                probe = container.exec_run(["/bin/sh", "-c", _BUSY_SCRIPT])
+                if b"busy" in (probe.output or b""):
+                    return False
             container.stop(timeout=10)
             return True
 
@@ -820,6 +823,34 @@ class DockerRuntime:
             return [(c.id, (c.labels or {}).get(WORKSPACE_LABEL, "")) for c in containers]
 
         return await self._call(listing)
+
+    async def legacy_sandboxes(self) -> list[tuple[str, str]]:
+        """``(container id, workspace id label)`` of managed containers created before the
+        installation label existed (labels are immutable, so they never gain it). Whose they
+        are is for the caller to establish -- they may be another stack's."""
+        client, _ = await self._clients()
+
+        def listing() -> list[tuple[str, str]]:
+            containers = client.containers.list(all=True, filters={"label": f"{MANAGED_LABEL}=1"})
+            return [
+                (c.id, (c.labels or {}).get(WORKSPACE_LABEL, ""))
+                for c in containers
+                if INSTALLATION_LABEL not in (c.labels or {})
+            ]
+
+        return await self._call(listing)
+
+    async def isolate_sandbox(self, workspace: Workspace) -> None:
+        """Move a sandbox the caller has established as this installation's onto its own
+        network, with this stack's proxy attached."""
+        await self._installation_id()
+        client, _ = await self._clients()
+
+        def isolate() -> None:
+            container = client.containers.get(workspace.sandbox_id)
+            self._isolate(client, container, workspace, self._proxies(client))
+
+        await self._call(isolate)
 
     async def managed_network_workspaces(self) -> list[str]:
         await self._installation_id()

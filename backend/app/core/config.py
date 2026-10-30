@@ -159,6 +159,9 @@ class Settings(BaseSettings):
     # open-file limit is explicit rather than the daemon's default.
     docker_sandbox_tmp_mb: int = Field(default=1024, gt=0)
     docker_sandbox_nofile: int = Field(default=65536, gt=0)
+    # A sandbox with a live exec or terminal is spared by the idle reaper, but only until it
+    # has been idle this long: "busy" is read from the sandbox, which its tenant controls.
+    sandbox_busy_max_minutes: int = Field(default=240, gt=0)
     # How often the Docker upkeep pass runs (proxy re-attach, idle auto-stop).
     docker_reaper_interval_seconds: int = Field(default=60, gt=0)
     agent_provider: str = "auto"

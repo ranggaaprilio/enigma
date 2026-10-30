@@ -84,10 +84,14 @@ async def stop_idle_sandboxes(
         async with session_maker() as session:
             recheck = _idle_workspaces(minutes).where(Workspace.id == workspace.id)
             still_idle = await session.scalar(select(func.count()).select_from(recheck.subquery()))
+            capped = _idle_workspaces(max(minutes, settings.sandbox_busy_max_minutes)).where(
+                Workspace.id == workspace.id
+            )
+            past_cap = await session.scalar(select(func.count()).select_from(capped.subquery()))
         if not still_idle:
             continue
         try:
-            if await runtime.stop_if_running(workspace):
+            if await runtime.stop_if_running(workspace, force=bool(past_cap)):
                 stopped += 1
                 logger.info("sandbox_idle_stopped", workspace_id=str(workspace.id))
         except SandboxNotFoundError:
@@ -169,6 +173,49 @@ async def reconcile_orphans(
     return report
 
 
+async def isolate_legacy_sandboxes(
+    session_maker: async_sessionmaker[AsyncSession],
+    runtime: DockerRuntime,
+    *,
+    only: set[UUID] | None = None,
+) -> int:
+    """Isolate sandboxes from before the installation label, but only those this database
+    names as a workspace's sandbox (same workspace id and container id): an unlabelled
+    container could be another stack's, which must not get this stack's proxy."""
+    legacy = await runtime.legacy_sandboxes()
+    by_workspace = {
+        workspace_id: container_id
+        for container_id, label in legacy
+        if (workspace_id := _workspace_uuid(label)) is not None
+        and (only is None or workspace_id in only)
+    }
+    if not by_workspace:
+        return 0
+    async with session_maker() as session:
+        rows = (
+            await session.scalars(
+                select(Workspace).where(
+                    Workspace.id.in_(set(by_workspace)), Workspace.runtime == PROVIDER
+                )
+            )
+        ).all()
+    isolated = 0
+    for workspace in rows:
+        if workspace.sandbox_id != by_workspace.get(workspace.id):
+            continue
+        try:
+            await runtime.isolate_sandbox(workspace)
+            isolated += 1
+        except SandboxRuntimeError as error:
+            logger.warning(
+                "sandbox_legacy_isolate_failed",
+                workspace_id=str(workspace.id),
+                error_type=type(error).__name__,
+            )
+    _count("legacy_isolated", isolated)
+    return isolated
+
+
 async def run_sandbox_maintenance(
     session_maker: async_sessionmaker[AsyncSession], settings: Settings, runtime: DockerRuntime
 ) -> None:
@@ -179,6 +226,7 @@ async def run_sandbox_maintenance(
     while True:
         try:
             await runtime.reconcile_networks()
+            await isolate_legacy_sandboxes(session_maker, runtime)
             await stop_idle_sandboxes(session_maker, settings, runtime)
         except asyncio.CancelledError:
             raise

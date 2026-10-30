@@ -10,7 +10,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import get_settings
 from app.models import User, Workspace
-from app.services.sandbox_maintenance import reconcile_orphans, stop_idle_sandboxes
+from app.services.sandbox_maintenance import (
+    isolate_legacy_sandboxes,
+    reconcile_orphans,
+    stop_idle_sandboxes,
+)
 from tests.sandbox.fakes import FakeDockerClient, docker_runtime_with
 
 
@@ -112,6 +116,23 @@ async def test_a_sandbox_running_a_long_quiet_command_is_not_stopped(maker) -> N
     assert client.containers.get(idle.sandbox_id).status == "running"
 
 
+async def test_busy_is_not_a_licence_to_run_forever(maker) -> None:
+    """The busy probe reads pidfiles in the tenant's own /tmp, so a tenant could claim
+    "busy" for ever; past SANDBOX_BUSY_MAX_MINUTES of idleness it is stopped anyway."""
+    client = FakeDockerClient()
+    runtime = docker_runtime_with(
+        client, sandbox_auto_stop_minutes=30, sandbox_busy_max_minutes=120
+    )
+    spared = await _sandboxed(maker, client, runtime, idle_minutes=60)
+    capped = await _sandboxed(maker, client, runtime, idle_minutes=180)
+    for workspace in (spared, capped):
+        client.containers.get(workspace.sandbox_id).busy = True
+
+    assert await stop_idle_sandboxes(maker, runtime.settings, runtime) == 1
+    assert client.containers.get(spared.sandbox_id).status == "running"
+    assert client.containers.get(capped.sandbox_id).status == "exited"
+
+
 async def test_daytona_workspaces_and_a_zero_window_are_left_alone(maker) -> None:
     client = FakeDockerClient()
     runtime = docker_runtime_with(client, sandbox_auto_stop_minutes=30)
@@ -178,3 +199,36 @@ async def test_upkeep_runs_only_on_a_docker_profile(monkeypatch) -> None:
     assert task is not None
     await asyncio.wait_for(task, 1)
     assert len(started) == 1
+
+
+# --- sandboxes from before installation labels -------------------------------------------
+
+
+async def test_a_legacy_sandbox_of_ours_is_moved_off_the_shared_network(maker) -> None:
+    """Container labels are immutable, so a pre-Epic-05 sandbox never gets the
+    installation label; it is still isolated when our database names it as a sandbox --
+    and one this database does not know is left alone (it may be another stack's)."""
+    client = FakeDockerClient(networks={"enigma-sandboxes"})
+    runtime = docker_runtime_with(client)
+    shared = client.networks.get("enigma-sandboxes")
+    ours = await _workspace(maker)
+    ours_ctr = client.add_container(
+        f"execute-{ours.id.hex}",
+        labels={"enigma.managed": "1", "enigma.workspace-id": str(ours.id)},
+    )
+    shared.connect(ours_ctr)
+    async with maker() as session:
+        row = await session.get(Workspace, ours.id)
+        row.daytona_sandbox_id = ours_ctr.id
+        await session.commit()
+    stranger_id = uuid4()
+    stranger_ctr = client.add_container(
+        f"execute-{stranger_id.hex}",
+        labels={"enigma.managed": "1", "enigma.workspace-id": str(stranger_id)},
+    )
+    shared.connect(stranger_ctr)
+
+    assert await isolate_legacy_sandboxes(maker, runtime, only={ours.id, stranger_id}) == 1
+
+    assert ours_ctr.networks == {f"enigma-sbx-{ours.id.hex}"}
+    assert stranger_ctr.networks == {"enigma-sandboxes"}

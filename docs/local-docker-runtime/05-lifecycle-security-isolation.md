@@ -208,7 +208,10 @@ sibling isolation pulled into this epic; egress allow-list and disk quota deferr
   `enigma.installation`, and the upkeep loop only lists, re-wires or removes its own — two
   stacks on one daemon (a second checkout, a test stack, a restored database) never treat
   each other's sandboxes as orphans. Containers created before this epic lack the label:
-  they keep working but upkeep ignores them; delete and re-create to bring them in.
+  they are never removed as orphans, but each upkeep pass still moves one onto its own
+  network when this database names it as a workspace's sandbox (same workspace id and
+  container id) — so no sandbox of ours stays on the old shared network (post-commit
+  security scan). One this database does not know is left alone: it may be another stack's.
 - **Security profile**: `container_security_spec()` is the single source (cap_drop ALL and
   nothing added, no-new-privileges, init, pids, CPU, memory with `memswap = memory`,
   `/tmp` tmpfs of `DOCKER_SANDBOX_TMP_MB`, `nofile` ulimit). Adopting an existing
@@ -225,9 +228,10 @@ sibling isolation pulled into this epic; egress allow-list and disk quota deferr
   (keeps) sandboxes idle past `SANDBOX_AUTO_STOP_MINUTES` (0 = never): the selection runs
   under `pg_try_advisory_xact_lock`, each stop happens outside the transaction after an
   idle re-check, and a sandbox with a live exec or attached terminal (pidfiles under `/tmp`,
-  checked with shell builtins only) is skipped, so a long quiet build is not stopped. Any
-  use wakes it again (Epic 02's ensure-started). An open dashboard's status polls count as
-  activity.
+  checked with shell builtins only) is skipped, so a long quiet build is not stopped — but
+  only until it has been idle `SANDBOX_BUSY_MAX_MINUTES` (240): the probe reads the
+  sandbox's own `/tmp`, which its tenant can fake (post-commit security scan). Any use wakes
+  it again (Epic 02's ensure-started). An open dashboard's status polls count as activity.
 - **Orphans (startup)**: under the lock, containers and networks of this installation
   whose workspace row is gone are removed; workspaces whose container vanished become
   `error`. Containers without the managed label are never touched (decoy test).
