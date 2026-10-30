@@ -93,6 +93,17 @@ async def test_an_idle_sandbox_is_stopped_and_a_busy_one_left_running(maker) -> 
     assert client.containers.get(idle.sandbox_id).status == "running"
 
 
+async def test_only_restricts_the_idle_pass_to_the_given_workspaces(maker) -> None:
+    client = FakeDockerClient()
+    runtime = docker_runtime_with(client, sandbox_auto_stop_minutes=30)
+    chosen = await _sandboxed(maker, client, runtime, idle_minutes=45)
+    other = await _sandboxed(maker, client, runtime, idle_minutes=45)
+
+    assert await stop_idle_sandboxes(maker, runtime.settings, runtime, only={chosen.id}) == 1
+    assert client.containers.get(chosen.sandbox_id).status == "exited"
+    assert client.containers.get(other.sandbox_id).status == "running"
+
+
 async def test_an_already_stopped_sandbox_is_not_stopped_again(maker) -> None:
     client = FakeDockerClient()
     runtime = docker_runtime_with(client, sandbox_auto_stop_minutes=30)

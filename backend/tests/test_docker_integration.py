@@ -14,6 +14,9 @@ Epic 04: previews over the sandbox network (a second sandbox stands in for the p
 proxy and a third for a sibling tenant), the proxy-only loopback relay with a real Vite
 dev server and its HMR WebSocket, code-server on loopback, two registry services with
 their env, logs and previews, and no host-published ports.
+Epic 05: sibling isolation, ``block_all`` egress (with the agent tools still working offline),
+pids/OOM limits, and the idle reaper against real rows: an attached terminal spares a sandbox
+until the busy cap, and a terminal wakes it again.
 The template, ``specify init`` and Vite tests need outbound network from the sandbox.
 """
 
@@ -35,12 +38,14 @@ from app.services.commands import CommandRuntime, CommandService
 from app.services.repositories import GitAuth, RepositoryService
 from app.services.sandbox import CommandTimeoutError, PtySize
 from app.services.sandbox.docker import MANAGED_LABEL, WORKSPACE_LABEL, DockerRuntime
+from app.services.sandbox_maintenance import stop_idle_sandboxes
 from app.services.speckit import SPECIFY_INIT_COMMAND
 from app.services.workspace_env import materialize_env_file
 from app.services.workspace_init import WorkspaceInitializer
 from app.services.workspaces import WorkspaceSecretCipher
 from app.services.worktrees import WorktreeService
 from tests.test_commands import real_db_session  # noqa: F401  (fixture)
+from tests.test_sandbox_maintenance import _sandboxed, maker  # noqa: F401  (fixture)
 
 pytestmark = pytest.mark.skipif(
     os.getenv("DOCKER_INTEGRATION_TESTS") != "1",
@@ -863,3 +868,109 @@ async def test_upkeep_only_ever_sees_containers_enigma_created(runtime, sandbox)
         assert decoy.id not in listed
     finally:
         await asyncio.to_thread(decoy.remove, force=True)
+
+
+async def test_agent_tools_work_offline_under_block_all() -> None:
+    """With egress blocked the agent still edits, searches, runs and diffs, and the terminal
+    works; a command that needs the network fails as an ordinary non-zero exit, never a hang
+    or a tool error."""
+    blocked = await _private_runtime(sandbox_network_block_all=True)
+    workspace = _workspace()
+    try:
+        workspace.sandbox_id = await blocked.provision(workspace)
+        await WorkspaceInitializer(blocked).initialize_blank(workspace)
+        tools = WorkspaceTools(
+            workspace, runtime=blocked, command_timeout_seconds=30, max_command_output_chars=20_000
+        )
+        await tools.write_file("src/app.py", "print('offline')\n")
+        assert await tools.read_file("src/app.py") == "print('offline')\n"
+        found = await tools.search_code("offline")
+        assert [m.path for m in found.matches] == ["src/app.py"]
+        ran = await tools.run_command("python3 src/app.py")
+        assert (ran.exit_code, ran.stdout) == (0, "offline\n")
+        await tools.write_file("README.md", "# offline\n")
+        assert "+# offline" in await tools.git_diff()
+        assert (await tools.git_status()).is_clean is False
+
+        fetch = "__import__('urllib.request').request.urlopen('https://example.com', timeout=5)"
+        online = await tools.run_command(f'python3 -c "{fetch}"')
+        assert online.exit_code != 0 and "URLError" in online.stdout + online.stderr
+
+        output: list[bytes] = []
+        tab = await blocked.create_or_connect_pty(
+            workspace, f"execute-{workspace.id.hex}", _collect(output), env=None, cols=80, rows=24
+        )
+        try:
+            await tab.send_input(b"echo offline-$((6*7))\n")
+            await _until_output(output, b"offline-42")  # the terminal needs no network
+        finally:
+            await tab.disconnect()
+    finally:
+        await blocked.delete(workspace)
+        await blocked.close()
+
+
+async def _until_output(store: list[bytes], text: bytes) -> None:
+    for _ in range(100):
+        if text in b"".join(store):
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"{text!r} never arrived: {b''.join(store)[-300:]!r}")
+
+
+def _collect(store: list[bytes]):
+    async def on_data(data: bytes) -> None:
+        store.append(data)
+
+    return on_data
+
+
+async def test_an_attached_terminal_spares_an_idle_sandbox_until_the_busy_cap(maker) -> None:  # noqa: F811
+    """The reaper against a real container and real rows: an attached tmux client keeps a
+    sandbox idle past the window running, a detached one does not, a terminal wakes it, and
+    past SANDBOX_BUSY_MAX_MINUTES even an attached client does not save it."""
+    from sqlalchemy import text
+
+    runtime = await _private_runtime(sandbox_auto_stop_minutes=30, sandbox_busy_max_minutes=120)
+    workspace = await _sandboxed(maker, None, runtime, idle_minutes=45)
+    only = {workspace.id}
+    session_id = f"execute-{workspace.id.hex}"
+    tab = None
+    try:
+        output: list[bytes] = []
+        tab = await runtime.create_or_connect_pty(
+            workspace, session_id, _collect(output), env=None, cols=80, rows=24
+        )
+        await tab.send_input(b"echo attached-$((6*7))\n")
+        await _until_output(output, b"attached-42")
+        assert await stop_idle_sandboxes(maker, runtime.settings, runtime, only=only) == 0
+        assert await runtime.status(workspace) == "ready"
+
+        await tab.disconnect()  # the tmux session lives on, detached: that is not "busy"
+        assert await stop_idle_sandboxes(maker, runtime.settings, runtime, only=only) == 1
+        assert await runtime.status(workspace) == "stopped"
+
+        output.clear()
+        tab = await runtime.create_or_connect_pty(
+            workspace, session_id, _collect(output), env=None, cols=80, rows=24
+        )
+        await tab.send_input(b"echo woke-$((6*7))\n")
+        await _until_output(output, b"woke-42")  # the terminal started the stopped sandbox
+        assert await runtime.status(workspace) == "ready"
+
+        async with maker() as session:
+            await session.execute(
+                text(
+                    "UPDATE sandbox_activity SET last_activity_at = "
+                    "clock_timestamp() - make_interval(mins => 180) WHERE workspace_id = :id"
+                ),
+                {"id": workspace.id},
+            )
+            await session.commit()
+        assert await stop_idle_sandboxes(maker, runtime.settings, runtime, only=only) == 1
+        assert await runtime.status(workspace) == "stopped"
+    finally:
+        if tab is not None:
+            await tab.disconnect()
+        await runtime.delete(workspace)
+        await runtime.close()

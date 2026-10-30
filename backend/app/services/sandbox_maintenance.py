@@ -65,20 +65,28 @@ def _idle_workspaces(minutes: int):
 
 
 async def stop_idle_sandboxes(
-    session_maker: async_sessionmaker[AsyncSession], settings: Settings, runtime: DockerRuntime
+    session_maker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    runtime: DockerRuntime,
+    *,
+    only: set[UUID] | None = None,
 ) -> int:
     """Stop (and keep) sandboxes idle past the window. The lock only guards the selection;
     each stop happens outside any transaction, after re-checking that the sandbox is still
     idle -- a stop takes seconds and must not hold a pooled connection or kill a command
     that started meanwhile. A sandbox with a live exec or terminal is skipped by the
-    provider."""
+    provider. ``only`` restricts the pass to those workspace ids (as in
+    ``reconcile_orphans``)."""
     minutes = settings.sandbox_auto_stop_minutes
     if minutes <= 0:
         return 0
     async with session_maker() as session, session.begin():
         if not await _try_lock(session, "sandbox_idle_reaper"):
             return 0
-        candidates = list((await session.scalars(_idle_workspaces(minutes))).all())
+        query = _idle_workspaces(minutes)
+        if only is not None:
+            query = query.where(Workspace.id.in_(only))
+        candidates = list((await session.scalars(query)).all())
     stopped = 0
     for workspace in candidates:
         async with session_maker() as session:

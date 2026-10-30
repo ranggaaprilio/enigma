@@ -17,6 +17,10 @@ Covers the local-docker-runtime Epic 04 criteria ``tests/test_docker_integration
 reach without the proxy: the stable alias URL and its grant cookie, the editor's prime URL,
 workbench and WebSocket on its own origin plus the filesystem it shares with the Files panel,
 service restart with live log streaming, and the single-service ``/dev`` path with mise.
+Epic 05: a terminal WebSocket wakes a stopped sandbox, and a backend killed and restarted
+keeps its live sandboxes (and their previews), re-attaches the proxy, and sweeps the sandbox
+of a workspace row that vanished while it was down. The restart test kills and restarts the
+compose backend container.
 Each test registers its own user (one blank workspace per user) and deletes the workspace,
 which removes its container; the fixture asserts nothing is left behind.
 """
@@ -148,20 +152,31 @@ async def stack():
             assert await _containers_for(stack.workspace_id) == []
 
 
-async def _containers_for(workspace_id: str) -> list:
+async def _docker(call: Callable):
+    """Run ``call(client)`` against the daemon the stack's sandboxes live on."""
     import docker
 
-    def list_them() -> list:
+    def run():
         client = docker.from_env()
         try:
-            return client.containers.list(
-                all=True,
-                filters={"label": [f"{MANAGED_LABEL}=1", f"{WORKSPACE_LABEL}={workspace_id}"]},
-            )
+            return call(client)
         finally:
             client.close()
 
-    return await asyncio.to_thread(list_them)
+    return await asyncio.to_thread(run)
+
+
+async def _containers_for(workspace_id: str) -> list:
+    return await _docker(
+        lambda client: client.containers.list(
+            all=True,
+            filters={"label": [f"{MANAGED_LABEL}=1", f"{WORKSPACE_LABEL}={workspace_id}"]},
+        )
+    )
+
+
+def _network_name(workspace_id: str) -> str:
+    return f"enigma-sbx-{workspace_id.replace('-', '')}"
 
 
 async def _write_file(stack: Stack, path: str, content: str) -> None:
@@ -459,3 +474,132 @@ async def test_single_service_dev_server_runs_with_mise(stack) -> None:
         status, lambda s: s["status"] != "running", seconds=30, what="dev server stopped"
     )
     assert final["status"] in ("stopped", "idle") and final["port"] is None
+
+
+# --- Epic 05: wake on use, and a backend that dies and comes back ---------------------------
+
+
+async def _status(stack: Stack) -> str:
+    got = await stack.api.get(f"{stack.ws}/status")
+    assert got.status_code == 200, got.text
+    return got.json()["status"]
+
+
+async def test_a_terminal_wakes_a_stopped_sandbox(stack) -> None:
+    created = await stack.api.post(f"{stack.ws}/terminal/sessions", json={"name": "Wake"})
+    assert created.status_code == 201, created.text
+    # What the idle reaper does: stop the container, keep it.
+    for container in await _containers_for(stack.workspace_id):
+        await asyncio.to_thread(container.stop, timeout=10)
+    assert await _status(stack) == "stopped"
+
+    url = BACKEND_URL.replace("http", "ws", 1) + (
+        f"{stack.ws}/terminal/sessions/{created.json()['id']}"
+    )
+    received = b""
+    async with websockets.connect(
+        url,
+        additional_headers={"cookie": f"{SESSION_COOKIE}={stack.session_token}"},
+        open_timeout=30,
+    ) as socket:
+        await socket.send(b"echo woke-$((6*7))\n")
+        deadline = time.monotonic() + 60
+        while b"woke-42" not in received:
+            assert time.monotonic() < deadline, f"no echo from the terminal: {received[-300:]!r}"
+            frame = await asyncio.wait_for(socket.recv(), timeout=60)
+            if isinstance(frame, str):
+                assert json.loads(frame).get("type") != "error", frame
+                continue
+            received += frame
+    assert await _status(stack) == "ready"
+
+
+async def _new_user_workspace() -> tuple[str, str]:
+    """A second user with its own blank workspace: (workspace id, session token)."""
+    async with httpx.AsyncClient(base_url=BACKEND_URL, timeout=180) as api:
+        registered = await api.post(
+            "/auth/register",
+            json={"email": f"stack-e2e-{uuid4().hex[:10]}@example.com", "password": "password123"},
+        )
+        assert registered.status_code == 201, registered.text
+        token = _cookie_from(registered, SESSION_COOKIE)
+        api.headers["cookie"] = f"{SESSION_COOKIE}={token}"
+        created = await api.post("/workspaces", json={"name": "Orphan", "source": "blank"})
+        assert created.status_code == 201, created.text
+        return created.json()["id"], token
+
+
+async def _delete_workspace_row(workspace_id: str) -> None:
+    """Behind the backend's back, as a restored backup or a manual cleanup would."""
+    from sqlalchemy import text
+    from sqlalchemy.ext.asyncio import create_async_engine
+    from sqlalchemy.pool import NullPool
+
+    from app.core.config import get_settings
+
+    engine = create_async_engine(get_settings().database_url, poolclass=NullPool)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(text("DELETE FROM workspaces WHERE id = :id"), {"id": workspace_id})
+    finally:
+        await engine.dispose()
+
+
+def _only(found: list, what: str):
+    assert len(found) == 1, f"expected one {what}, found {[c.name for c in found]}"
+    return found[0]
+
+
+async def test_a_killed_backend_restarts_without_losing_live_sandboxes(stack) -> None:
+    marker = f"restart-app-{uuid4().hex[:8]}"
+    await _write_file(stack, "index.html", f"<h1>{marker}</h1>\n")
+    service = await _start_service(
+        stack, "Web", "python3 -m http.server 5173 --bind 127.0.0.1", 5173
+    )
+    await _serves(stack, service["public_url"], marker)
+    orphan_id, _ = await _new_user_workspace()
+    assert len(await _containers_for(orphan_id)) == 1
+
+    backend = _only(
+        await _docker(
+            lambda c: c.containers.list(filters={"label": "com.docker.compose.service=backend"})
+        ),
+        "running compose backend",
+    )
+    proxy = _only(
+        await _docker(lambda c: c.containers.list(filters={"label": "enigma.preview-proxy=1"})),
+        "running preview proxy",
+    )
+    await asyncio.to_thread(backend.kill)  # SIGKILL: no shutdown hooks run
+
+    # While it is down: the orphan's row disappears, and the proxy loses the sandbox's
+    # network (what compose recreating the proxy does).
+    await _delete_workspace_row(orphan_id)
+    await _docker(lambda c: c.networks.get(_network_name(stack.workspace_id)).disconnect(proxy))
+    gone = await _proxied(stack, service["public_url"])
+    assert gone.status_code != 200 or marker not in gone.text
+
+    await asyncio.to_thread(backend.start)
+    await _until(
+        lambda: _ready(stack), lambda ok: ok, seconds=180, what="the restarted backend"
+    )
+
+    # Startup: the orphan's container and network are removed ...
+    await _until(
+        lambda: _containers_for(orphan_id), lambda found: found == [], seconds=60,
+        what="the orphan sandbox to be removed",
+    )
+    networks = await _docker(lambda c: c.networks.list(names=[_network_name(orphan_id)]))
+    assert networks == []
+    # ... the live sandbox is untouched, and the first upkeep pass re-attaches the proxy.
+    assert [c.status for c in await _containers_for(stack.workspace_id)] == ["running"]
+    assert await _status(stack) == "ready"
+    await _serves(stack, service["public_url"], marker)
+    assert marker in await _read_file(stack, "index.html")
+
+
+async def _ready(stack: Stack) -> bool:
+    try:
+        return (await stack.api.get("/ready")).status_code == 200
+    except httpx.TransportError:
+        return False
