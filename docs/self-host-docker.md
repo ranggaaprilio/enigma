@@ -11,6 +11,9 @@ container on your own Docker or Podman daemon. The full Enigma experience works 
 - Spec Kit
 
 You can also keep Daytona configured and offer both. The create form then lets users pick.
+A mixed install that keeps `SANDBOX_RUNTIME_DEFAULT=daytona` still needs the Docker upkeep
+loop. The compose override turns it on with `DOCKER_UPKEEP=true`; set it yourself outside
+compose. Without upkeep, Docker workspaces are refused.
 
 This profile is **one host**. Kubernetes (`deploy/k8s`, `deploy/README.md`) stays
 Daytona-only. Running Docker sandboxes on several nodes is not supported (see

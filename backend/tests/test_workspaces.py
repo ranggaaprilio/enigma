@@ -1051,7 +1051,9 @@ def _availability(**statuses: str):
 
 
 async def test_sqlalchemy_create_uses_the_requested_runtime():
-    settings = Settings(sandbox_runtime_default="daytona", metrics_token="scrape-secret")
+    settings = Settings(
+        sandbox_runtime_default="daytona", metrics_token="scrape-secret", docker_upkeep=True
+    )
     service = SqlAlchemyWorkspaceService(
         session=_FakeCreateSession(),  # type: ignore[arg-type]
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
@@ -1160,7 +1162,9 @@ async def test_reprovision_recovers_a_workspace_whose_sandbox_never_came_up():
 async def test_reprovision_leaves_an_existing_sandbox_uninitialized():
     settings = Settings()
     owner_id = uuid4()
-    workspace = _errored_workspace(owner_id, sandbox_id="sandbox-existing")
+    workspace = _errored_workspace(owner_id)
+    # The provider finds the same sandbox again (it looks it up by the workspace's name).
+    workspace.sandbox_id = f"sandbox-{workspace.id}"
     initializer = _RecordingInitializer()
     service = SqlAlchemyWorkspaceService(
         session=_FakeReprovisionSession(workspace),  # type: ignore[arg-type]
@@ -1174,6 +1178,28 @@ async def test_reprovision_leaves_an_existing_sandbox_uninitialized():
     assert recovered.status == "ready"
     # Re-seeding would write over the working tree the sandbox already has.
     assert initializer.calls == []
+
+
+async def test_reprovision_seeds_a_replacement_for_a_sandbox_that_is_gone():
+    """A Docker container removed (or a Daytona sandbox deleted) behind our back: the provider
+    makes a new, empty sandbox with a new id, so a blank or template workspace must be seeded
+    again or it comes back "ready" without a git repository."""
+    settings = Settings()
+    owner_id = uuid4()
+    workspace = _errored_workspace(owner_id, sandbox_id="container-that-was-removed")
+    initializer = _RecordingInitializer()
+    service = SqlAlchemyWorkspaceService(
+        session=_FakeReprovisionSession(workspace),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=initializer,  # type: ignore[arg-type]
+    )
+
+    recovered = await service.reprovision(workspace.id, owner_id)
+
+    assert recovered.status == "ready"
+    assert recovered.sandbox_id == f"sandbox-{workspace.id}"
+    assert initializer.calls == ["blank"]
 
 
 async def test_reprovision_marks_error_when_the_runtime_still_fails():

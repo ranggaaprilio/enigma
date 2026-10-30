@@ -211,6 +211,17 @@ async def test_upkeep_runs_only_on_a_docker_profile(monkeypatch) -> None:
     await asyncio.wait_for(task, 1)
     assert len(started) == 1
 
+    # A mixed install (Daytona default, Docker chosen per workspace) says so explicitly.
+    task = sandbox_maintenance.start_sandbox_maintenance(
+        None, Settings(sandbox_runtime_default="daytona", docker_upkeep=True)  # type: ignore[arg-type]
+    )
+    assert task is not None
+    await asyncio.wait_for(task, 1)
+    assert len(started) == 2
+    assert sandbox_maintenance.start_sandbox_maintenance(
+        None, Settings(sandbox_runtime_default="docker", docker_upkeep=False)  # type: ignore[arg-type]
+    ) is None
+
 
 async def test_each_upkeep_pass_records_when_it_finished(maker, monkeypatch) -> None:
     """/health reports this (Epic 06): a stuck or crashed loop shows as a stale timestamp."""

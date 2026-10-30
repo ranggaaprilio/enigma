@@ -196,7 +196,7 @@ class SqlAlchemyWorkspaceService:
         await self.session.flush()
         await self.session.commit()
 
-        return await self._provision(workspace, template, initialize=True)
+        return await self._provision(workspace, template)
 
     async def _mark_error(self, workspace: Workspace) -> None:
         workspace.status = "error"
@@ -207,8 +207,6 @@ class SqlAlchemyWorkspaceService:
         self,
         workspace: Workspace,
         template: WorkspaceTemplate | None,
-        *,
-        initialize: bool,
     ) -> Workspace:
         """Bring an already-persisted workspace row up to a running sandbox.
 
@@ -216,10 +214,12 @@ class SqlAlchemyWorkspaceService:
         by the name derived from the workspace id and reuses it when it exists, so calling
         this a second time repairs the row instead of leaking a second sandbox.
 
-        `initialize` is False when the workspace already had a sandbox: the template/blank
-        seed commit runs only for a workspace that never finished creating, so a repair never
-        writes over an existing working tree.
+        The template/blank seed commit runs only into a sandbox that is new -- the provider
+        returned a different id than the row had (none, for a workspace that never finished
+        creating; another, when the old sandbox was removed behind our back) -- so a repair
+        never writes over an existing working tree, and a replacement is never left empty.
         """
+        previous = workspace.sandbox_id
         try:
             workspace.sandbox_id = await self.runtime.provision(workspace)
         except SandboxRuntimeError as error:
@@ -228,6 +228,7 @@ class SqlAlchemyWorkspaceService:
 
         # Template/blank workspaces get their first commit now so the sandbox is usable (and
         # worktree-capable) before any remote is connected.
+        initialize = workspace.sandbox_id != previous
         try:
             if initialize and template is not None:
                 await self.initializer.initialize_from_template(workspace, template)
@@ -252,7 +253,6 @@ class SqlAlchemyWorkspaceService:
         sandbox to query. This is the repair path — typically after correcting the snapshot.
         """
         workspace = await self.get_for_owner(workspace_id, owner_id)
-        had_sandbox = workspace.sandbox_id is not None
 
         template: WorkspaceTemplate | None = None
         if workspace.source == "template" and workspace.template_id is not None:
@@ -262,7 +262,7 @@ class SqlAlchemyWorkspaceService:
         self.session.add(workspace)
         await self.session.commit()
 
-        return await self._provision(workspace, template, initialize=not had_sandbox)
+        return await self._provision(workspace, template)
 
     async def update(
         self,

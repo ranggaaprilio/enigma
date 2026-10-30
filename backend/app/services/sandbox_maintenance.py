@@ -249,13 +249,13 @@ def start_sandbox_maintenance(
 ) -> asyncio.Task | None:
     """Start the upkeep loop on a Docker profile whose daemon this process can reach.
 
-    Gated on ``SANDBOX_RUNTIME_DEFAULT=docker`` (what docker-compose.sandbox.yml sets): the
-    orphan sweep removes managed containers that have no workspace row, so a Daytona-default
-    process -- the test suite's app included -- must never run it.
+    Gated on ``DOCKER_UPKEEP`` (unset: ``SANDBOX_RUNTIME_DEFAULT=docker``; the compose
+    override sets it): the orphan sweep removes managed containers that have no workspace row,
+    so a process that never asked for it -- the test suite's app included -- must not run it.
     """
     from app.services.sandbox.factory import get_runtime_by_name
 
-    if settings.sandbox_runtime_default != PROVIDER:
+    if not settings.docker_upkeep_enabled:
         return None
     runtime = get_runtime_by_name(PROVIDER)
     if not isinstance(runtime, DockerRuntime) or not runtime.configured:

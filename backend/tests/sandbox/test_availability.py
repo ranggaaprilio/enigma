@@ -85,7 +85,12 @@ def _availability(**statuses: str):
 
 def _settings(**values) -> Settings:
     return Settings(
-        **{"sandbox_runtime_default": "daytona", "metrics_token": "scrape-secret", **values}
+        **{
+            "sandbox_runtime_default": "daytona",
+            "metrics_token": "scrape-secret",
+            "docker_upkeep": True,
+            **values,
+        }
     )
 
 
@@ -148,6 +153,22 @@ async def test_docker_is_refused_without_a_metrics_token_even_when_not_the_defau
         with pytest.raises(RuntimeChoiceError):
             await choose_runtime("docker", _settings(metrics_token=token), choose)
     assert await choose_runtime("daytona", _settings(metrics_token=None), choose) == "daytona"
+
+
+async def test_docker_is_refused_where_no_upkeep_would_look_after_it() -> None:
+    """Idle stop, the orphan sweep and the proxy re-attach run only where upkeep runs: a
+    Docker workspace elsewhere would never be stopped and its previews break on the next
+    proxy restart."""
+    choose = _availability(daytona="ok", docker="ok")
+    with pytest.raises(RuntimeChoiceError):
+        await choose_runtime("docker", _settings(docker_upkeep=None), choose)
+    with pytest.raises(RuntimeChoiceError):
+        await choose_runtime(
+            "docker", _settings(sandbox_runtime_default="docker", docker_upkeep=False), choose
+        )
+    # Unset follows the default: on a Docker default, upkeep runs.
+    docker_default = _settings(sandbox_runtime_default="docker", docker_upkeep=None)
+    assert await choose_runtime(None, docker_default, choose) == "docker"
 
 
 def test_docker_as_default_requires_a_metrics_token() -> None:

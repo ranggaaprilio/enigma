@@ -179,6 +179,10 @@ class Settings(BaseSettings):
     # proxy must share it. Setting this is the operator's statement that they do; without
     # it, creating a Docker workspace in queue mode is refused (Epic 06).
     docker_single_host: bool = False
+    # Run the Docker upkeep loop (idle stop, orphan sweep, proxy re-attach) in this process.
+    # Unset = only when Docker is the default. A mixed install (Daytona default, Docker picked
+    # per workspace) sets it true; Docker workspaces are refused wherever it is off.
+    docker_upkeep: bool | None = None
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
@@ -291,6 +295,12 @@ class Settings(BaseSettings):
     backend_cors_origins: str | list[str] = Field(
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )
+
+    @property
+    def docker_upkeep_enabled(self) -> bool:
+        if self.docker_upkeep is not None:
+            return self.docker_upkeep
+        return self.sandbox_runtime_default == "docker"
 
     model_config = SettingsConfigDict(
         env_file=".env",

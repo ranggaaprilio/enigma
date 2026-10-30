@@ -116,7 +116,11 @@ def _check_placement(provider: str, settings: Settings) -> None:
     goes to the log, so a non-admin never learns the deployment's topology."""
     if provider != "docker":
         return
-    if settings.run_execution_mode == "queue" and not settings.docker_single_host:
+    if not settings.docker_upkeep_enabled:
+        # Nothing would stop it when idle, sweep it when orphaned, or re-attach the preview
+        # proxy to its network after a proxy restart.
+        reason = "docker_upkeep_disabled"
+    elif settings.run_execution_mode == "queue" and not settings.docker_single_host:
         reason = "queue_mode_without_docker_single_host"
     elif not has_metrics_token(settings):
         # The preview proxy is attached to every Docker sandbox's network: without a token
