@@ -303,6 +303,11 @@ class AgentService:
     ) -> AgentRun:
         lifecycle.ensure_accepting_work()
         workspace = await self._get_workspace(workspace_id, user_id, require_drive=True)
+        # Block/warn before spending: an enforcing budget over its limit stops the run here.
+        # Kept outside the locks: a budget warning notifies, and a notification commits, which
+        # would release the advisory locks below before the run is inserted.
+        await BudgetService(self.session).assert_within_budget(workspace, user_id)
+
         # Check-then-insert under the per-workspace lock so two concurrent requests cannot both
         # pass the "no active run" guard: the in-process lock serialises this replica, and a
         # transaction-scoped Postgres advisory lock (released at the commit below) serialises
@@ -319,9 +324,6 @@ class AgentService:
             # Fair use (Epic 06): team/global concurrency caps, then queue backpressure.
             await enforce_run_caps(self.session, self.settings, workspace)
             await enforce_queue_depth(self.session, self.settings)
-
-            # Block/warn before spending: an enforcing budget over its limit stops the run here.
-            await BudgetService(self.session).assert_within_budget(workspace, user_id)
 
             provider = await provider_for_run(self.session, self.settings)
             run = AgentRun(
