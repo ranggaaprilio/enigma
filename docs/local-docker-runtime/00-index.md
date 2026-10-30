@@ -95,7 +95,7 @@ consumer (`agent_tools`, `files`, `repositories`, `worktrees`, `terminal`, `edit
 | 03 | [Filesystem, Git & PTY Parity](./03-filesystem-git-pty-parity.md) | **P1** — shipped | Feature parity |
 | 04 | [Preview, Editor & Dev Server on Docker](./04-preview-editor-devserver.md) | **P1** — shipped | Human surfaces |
 | 05 | [Lifecycle, Isolation & Security Hardening](./05-lifecycle-security-isolation.md) | P2 — shipped | Safety / cost |
-| 06 | [Provider Selection, Config & Rollout](./06-provider-selection-and-rollout.md) | P2 | Productization |
+| 06 | [Provider Selection, Config & Rollout](./06-provider-selection-and-rollout.md) | P2 — shipped (column contract pending) | Productization |
 
 ## Recommended Build Order
 
