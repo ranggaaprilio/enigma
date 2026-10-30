@@ -595,6 +595,9 @@ class DockerRuntime:
         one) and that the preview proxy can reach it there."""
         container.reload()  # first: a container deleted meanwhile must not get a new network
         network = self._ensure_sandbox_network(client, workspace)
+        # Again: rebuilding the network for a changed egress policy disconnected the container,
+        # and the inspect output read above still lists it as joined.
+        container.reload()
         joined = set(((container.attrs or {}).get("NetworkSettings") or {}).get("Networks") or {})
         legacy = self.settings.docker_sandbox_network
         foreign = joined - {network.name, legacy}
