@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.api.router import api_router
-from app.core.config import get_settings
+from app.core.config import deprecated_setting_names, get_settings
 from app.core.lifecycle import (
     ServiceDrainingError,
     drain_in_flight_runs,
@@ -32,6 +32,10 @@ from app.services.reconciliation import reconcile_interrupted_runs
 from app.services.retention import start_retention
 from app.services.runtime import RedisEventBus, event_bus, run_registry
 from app.services.sandbox import close_all
+from app.services.sandbox.availability import (
+    require_metrics_token_for_docker,
+    warn_if_default_runtime_unconfigured,
+)
 from app.services.sandbox_maintenance import start_sandbox_maintenance
 
 logger = structlog.get_logger(__name__)
@@ -57,6 +61,10 @@ async def unhandled_exception_handler(request: Request, _exc: Exception) -> JSON
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings = get_settings()
+    require_metrics_token_for_docker(settings)
+    warn_if_default_runtime_unconfigured(settings)
+    for old_name, new_name in deprecated_setting_names().items():
+        logger.warning("deprecated_setting_name", name=old_name, use=new_name)
     # Runs left active by a previous process (crash, deploy) have no owner any more; close
     # them out before serving so their workspaces are not blocked. Fails startup if Postgres
     # is unreachable, which /ready would report as not ready anyway. In queue mode the API owns

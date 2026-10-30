@@ -50,7 +50,7 @@ spec:
 # Previews are a tenant's own dev server, so they get their own edge settings: no API upload
 # cap, streamed (unbuffered) requests and responses for HMR/SSE, and no retry on 503 -- that is
 # the proxy's self-retrying "Waking preview..." page, which a retry would only delay. Every
-# preview host is `<capability-or-alias>.<DAYTONA_PREVIEW_PROXY_BASE_URL host>`; the bare proxy
+# preview host is `<capability-or-alias>.<PREVIEW_PROXY_BASE_URL host>`; the bare proxy
 # host is not exposed (probes answer on the pod IP, /metrics is scraped in-cluster). That host
 # must be its own registrable domain (enigma-preview.example.net, not *.enigma.example.com), so
 # tenant pages are cross-site to the API and its SameSite=Lax session cookie stays behind; hence

@@ -56,6 +56,37 @@ def test_egress_settings_accept_the_legacy_daytona_names(monkeypatch):
     assert legacy.sandbox_network_allow_list == ["10.0.0.0/8"]
 
 
+def test_sandbox_paths_have_neutral_names_and_accept_the_daytona_ones(monkeypatch):
+    """local-docker-runtime Epic 06: every provider-neutral setting has a neutral name."""
+    for name in ("SANDBOX_HOME", "SANDBOX_WORKSPACE_PATH"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("DAYTONA_SANDBOX_HOME", "/home/legacy")
+    monkeypatch.setenv("DAYTONA_WORKSPACE_PATH", "legacy-ws")
+
+    legacy = Settings()
+    assert (legacy.sandbox_home, legacy.sandbox_workspace_path) == ("/home/legacy", "legacy-ws")
+    neutral = Settings(sandbox_home="/home/me", sandbox_workspace_path="ws")
+    assert (neutral.sandbox_home, neutral.sandbox_workspace_path) == ("/home/me", "ws")
+
+
+def test_deprecated_daytona_names_in_use_are_reported(tmp_path):
+    from app.core.config import deprecated_setting_names
+
+    env_file = tmp_path / ".env"
+    env_file.write_text("DAYTONA_NETWORK_BLOCK_ALL=true\nDAYTONA_API_KEY=key\n")
+
+    found = deprecated_setting_names(
+        {"daytona_sandbox_home": "/home/x", "SANDBOX_HOME": "/home/y"}, env_file=str(env_file)
+    )
+
+    # Provider-specific names (DAYTONA_API_KEY) are not deprecated, only the neutral ones.
+    assert found == {
+        "DAYTONA_SANDBOX_HOME": "SANDBOX_HOME",
+        "DAYTONA_NETWORK_BLOCK_ALL": "SANDBOX_NETWORK_BLOCK_ALL",
+    }
+    assert deprecated_setting_names({}, env_file=str(tmp_path / "missing")) == {}
+
+
 def test_non_local_environment_requires_https_or_localhost_preview_proxy():
     """Epic 13: the preview-alias grant cookie needs SameSite=None; Secure, which cannot be set
     over plain HTTP except on the browser's localhost exemption."""

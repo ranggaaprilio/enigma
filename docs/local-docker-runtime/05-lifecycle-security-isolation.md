@@ -185,10 +185,32 @@ can't eat the machine, and agent code can't scan your LAN or touch the Docker da
 
 ## Implementation Notes (shipped)
 
-Built on the Epic 04 branch. Verified on Podman 5.8: unit suites (fakes), 23 real-daemon
-tests (`DOCKER_INTEGRATION_TESTS=1`, 6 new), and the full-stack e2e
-(`DOCKER_STACK_E2E=1`) through a compose backend and proxy. Plan decisions at Gate 1:
+Built on the Epic 04 branch. Verified on Podman 5.8: unit suites (fakes), 25 real-daemon
+tests (`DOCKER_INTEGRATION_TESTS=1`, 8 new), and 6 full-stack e2e tests
+(`DOCKER_STACK_E2E=1`, 2 new) through a compose backend and proxy. Plan decisions at Gate 1:
 sibling isolation pulled into this epic; egress allow-list and disk quota deferred.
+
+How each acceptance criterion is verified:
+
+- **Idle stop, wake, PTY keep-alive**: the reaper against a real container and real
+  `sandbox_activity` rows — an attached terminal spares a sandbox idle past the window, a
+  detached tmux session does not, past `SANDBOX_BUSY_MAX_MINUTES` even an attached one is
+  stopped (real-daemon); a terminal WebSocket on a stopped sandbox starts it and echoes
+  (full stack).
+- **Backend killed and restarted**: the compose backend is SIGKILLed with a loopback-only
+  service previewing; while it is down a second workspace's row is deleted and the proxy is
+  disconnected from the sandbox network. After restart the orphan's container and network
+  are gone, the live sandbox is untouched and `ready`, and its preview serves again through
+  the re-attached proxy and the existing relay (full stack). Agent runs interrupted by the
+  restart are the horizontal-scale reconciler's (`services/reconciliation.py`), covered by
+  its own tests.
+- **Fork bomb / OOM**: real-daemon; the OOM detail reaches `GET /workspaces/{id}/status`
+  but not yet the UI (below).
+- **`block_all`**: outbound HTTP and outside DNS fail; the agent tools (write, read,
+  search, run, git status/diff) and a terminal work; a network command fails as a plain
+  non-zero exit; the proxy still reaches the preview (real-daemon).
+- **Daytona untouched**: unit tests — the reaper skips `runtime="daytona"` workspaces, and
+  the upkeep loop never starts in a Daytona-default process.
 
 - **Isolation (added to scope)**: every sandbox gets its own bridge network
   `enigma-sbx-<workspace>` with an explicit /28 carved from `DOCKER_SANDBOX_SUBNET_POOL`

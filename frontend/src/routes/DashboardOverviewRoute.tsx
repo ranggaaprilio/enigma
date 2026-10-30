@@ -18,11 +18,18 @@ import {
   type HealthResponse,
   type WorkspaceStatus,
 } from "../lib/api";
+import { RUNTIMES, runtimeLabel } from "../lib/runtime";
 
-const SUBSYSTEMS: { key: keyof Omit<HealthResponse, "status">; label: string }[] = [
-  { key: "database", label: "Database" },
-  { key: "redis", label: "Redis" },
-  { key: "daytona", label: "Daytona" },
+type HealthValue = "ok" | "error" | "unconfigured" | "pending";
+
+// Both sandbox providers (local-docker-runtime Epic 06): "unconfigured" is not a fault.
+const SUBSYSTEMS: { label: string; read: (health: HealthResponse) => HealthValue }[] = [
+  { label: "Database", read: (health) => health.database },
+  { label: "Redis", read: (health) => health.redis },
+  ...RUNTIMES.map((runtime) => ({
+    label: runtimeLabel(runtime),
+    read: (health: HealthResponse): HealthValue => health.runtimes?.[runtime]?.status ?? "error",
+  })),
 ];
 
 const STATUS_ORDER: WorkspaceStatus[] = [
@@ -149,11 +156,11 @@ export function DashboardOverviewRoute() {
               label="Backend"
               value={healthFailed ? "error" : health ? "ok" : "pending"}
             />
-            {SUBSYSTEMS.map(({ key, label }) => (
+            {SUBSYSTEMS.map(({ label, read }) => (
               <HealthRow
-                key={key}
+                key={label}
                 label={label}
-                value={healthFailed ? "error" : health ? health[key] : "pending"}
+                value={healthFailed ? "error" : health ? read(health) : "pending"}
               />
             ))}
           </ul>
@@ -310,7 +317,7 @@ function HealthRow({
   value,
 }: {
   label: string;
-  value: "ok" | "error" | "pending";
+  value: HealthValue;
 }) {
   const tone =
     value === "ok"

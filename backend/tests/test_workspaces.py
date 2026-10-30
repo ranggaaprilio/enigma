@@ -22,6 +22,7 @@ from app.services.workspaces import (
     InvalidEnvScopeError,
     InvalidEnvVarKeyError,
     SqlAlchemyWorkspaceService,
+    WorkspaceAccessDeniedError,
     WorkspaceAlreadyExistsError,
     WorkspaceNotFoundError,
     WorkspaceRuntimeError,
@@ -60,6 +61,7 @@ class FakeWorkspaceService:
         # Registered by tests that need `custom_command_id` scoping to validate, since this
         # fake has no real `custom_commands` table to check against.
         self.custom_command_workspace: dict[UUID, UUID] = {}
+        self.unavailable_runtimes: set[str] = set()
         self.custom_command_names: dict[UUID, str] = {}
 
     def register_custom_command(
@@ -79,6 +81,9 @@ class FakeWorkspaceService:
             raise WorkspaceNotFoundError
         return workspace
 
+    async def get_for_manager(self, workspace_id: UUID, user_id: UUID) -> Workspace:
+        return await self.get_for_owner(workspace_id, user_id)
+
     async def create(
         self,
         owner_id: UUID,
@@ -89,7 +94,14 @@ class FakeWorkspaceService:
         *,
         source: str = "repository",
         template_id: UUID | None = None,
+        runtime: str | None = None,
     ) -> Workspace:
+        if runtime is not None and runtime in self.unavailable_runtimes:
+            from app.services.sandbox.availability import RuntimeChoiceError
+
+            raise RuntimeChoiceError(
+                "Local Docker is not available: The Docker daemon is not reachable"
+            )
         if await self.list_for_owner(owner_id):
             raise WorkspaceAlreadyExistsError
         if source == "repository":
@@ -112,7 +124,7 @@ class FakeWorkspaceService:
             source=source,
             template_id=template_id,
             default_branch=default_branch,
-            runtime="daytona",
+            runtime=runtime or "daytona",
             daytona_sandbox_id=f"sandbox-{workspace_id}",
             snapshot=snapshot,
             workspace_path="/workspace",
@@ -906,6 +918,37 @@ async def test_create_workspace_source_validation(workspace_context, payload):
     assert response.status_code == 422
 
 
+async def test_create_workspace_passes_the_chosen_runtime(workspace_context):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post(
+            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "docker"}
+        )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["runtime"] == "docker"
+
+
+async def test_create_workspace_with_an_unavailable_runtime_is_422(workspace_context):
+    _, service, _ = workspace_context
+    service.unavailable_runtimes.add("docker")
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await _login(client)
+        response = await client.post(
+            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "docker"}
+        )
+        unknown = await client.post(
+            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "k8s"}
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == (
+        "Local Docker is not available: The Docker daemon is not reachable"
+    )
+    assert service.workspaces == {}
+    assert unknown.status_code == 422
+
+
 async def test_create_workspace_rejects_invalid_repo_url(workspace_context):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         await _login(client)
@@ -999,6 +1042,60 @@ async def test_sqlalchemy_create_marks_error_when_initializer_fails():
     assert session.added[-1].status == "error"
 
 
+def _availability(**statuses: str):
+    from app.services.sandbox.availability import RuntimeAvailability
+
+    async def availability(provider: str) -> RuntimeAvailability:
+        status = statuses.get(provider, "unconfigured")
+        return RuntimeAvailability(
+            provider, status != "unconfigured", status, None if status == "ok" else "down"  # type: ignore[arg-type]
+        )
+
+    return availability
+
+
+async def test_sqlalchemy_create_uses_the_requested_runtime():
+    settings = Settings(
+        sandbox_runtime_default="daytona", metrics_token="scrape-secret", docker_upkeep=True
+    )
+    service = SqlAlchemyWorkspaceService(
+        session=_FakeCreateSession(),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=_RecordingInitializer(),  # type: ignore[arg-type]
+        availability=_availability(daytona="ok", docker="ok"),
+    )
+
+    workspace = await service.create(
+        owner_id=uuid4(), name="Local", repo_url=None, default_branch="main", source="blank",
+        runtime="docker",
+    )
+
+    assert workspace.runtime == "docker"
+
+
+async def test_sqlalchemy_create_refuses_an_unavailable_runtime_before_writing_a_row():
+    from app.services.sandbox.availability import RuntimeChoiceError
+
+    settings = Settings(sandbox_runtime_default="daytona")
+    session = _FakeCreateSession()
+    service = SqlAlchemyWorkspaceService(
+        session=session,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=_RecordingInitializer(),  # type: ignore[arg-type]
+        availability=_availability(daytona="ok", docker="error"),
+    )
+
+    with pytest.raises(RuntimeChoiceError):
+        await service.create(
+            owner_id=uuid4(), name="Local", repo_url=None, default_branch="main",
+            source="blank", runtime="docker",
+        )
+
+    assert session.added == [] and session.commits == 0  # nothing half-provisioned
+
+
 async def test_sqlalchemy_create_repository_sanitizes_url():
     settings = Settings()
     service = SqlAlchemyWorkspaceService(
@@ -1069,7 +1166,9 @@ async def test_reprovision_recovers_a_workspace_whose_sandbox_never_came_up():
 async def test_reprovision_leaves_an_existing_sandbox_uninitialized():
     settings = Settings()
     owner_id = uuid4()
-    workspace = _errored_workspace(owner_id, sandbox_id="sandbox-existing")
+    workspace = _errored_workspace(owner_id)
+    # The provider finds the same sandbox again (it looks it up by the workspace's name).
+    workspace.sandbox_id = f"sandbox-{workspace.id}"
     initializer = _RecordingInitializer()
     service = SqlAlchemyWorkspaceService(
         session=_FakeReprovisionSession(workspace),  # type: ignore[arg-type]
@@ -1083,6 +1182,28 @@ async def test_reprovision_leaves_an_existing_sandbox_uninitialized():
     assert recovered.status == "ready"
     # Re-seeding would write over the working tree the sandbox already has.
     assert initializer.calls == []
+
+
+async def test_reprovision_seeds_a_replacement_for_a_sandbox_that_is_gone():
+    """A Docker container removed (or a Daytona sandbox deleted) behind our back: the provider
+    makes a new, empty sandbox with a new id, so a blank or template workspace must be seeded
+    again or it comes back "ready" without a git repository."""
+    settings = Settings()
+    owner_id = uuid4()
+    workspace = _errored_workspace(owner_id, sandbox_id="container-that-was-removed")
+    initializer = _RecordingInitializer()
+    service = SqlAlchemyWorkspaceService(
+        session=_FakeReprovisionSession(workspace),  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
+        initializer=initializer,  # type: ignore[arg-type]
+    )
+
+    recovered = await service.reprovision(workspace.id, owner_id)
+
+    assert recovered.status == "ready"
+    assert recovered.sandbox_id == f"sandbox-{workspace.id}"
+    assert initializer.calls == ["blank"]
 
 
 async def test_reprovision_marks_error_when_the_runtime_still_fails():
@@ -1152,3 +1273,141 @@ async def test_patch_env_file_path_accepts_and_echoes_a_valid_value(workspace_co
 
     assert response.status_code == 200
     assert response.json()["env_file_path"] == "apps/api/.env"
+
+
+# --- team roles on a teammate's workspace -------------------------------------------------
+
+
+class _TeamRoleSession:
+    """`get` returns the workspace; `execute` answers the single `TeamMember.role` lookup."""
+
+    def __init__(self, workspace: Workspace, team_role: str | None) -> None:
+        self.workspace = workspace
+        self.team_role = team_role
+        self.committed = False
+
+    async def get(self, _model, _id):
+        return self.workspace
+
+    async def execute(self, _statement):
+        team_role = self.team_role
+
+        class _Result:
+            def scalar_one_or_none(self):
+                return team_role
+
+        return _Result()
+
+    def add(self, _row) -> None:
+        return None
+
+    async def commit(self) -> None:
+        self.committed = True
+
+    async def refresh(self, _row) -> None:
+        return None
+
+
+def _team_workspace() -> Workspace:
+    now = datetime.now(UTC)
+    return Workspace(
+        id=uuid4(),
+        owner_id=uuid4(),
+        team_id=uuid4(),
+        name="Team",
+        slug="team",
+        repo_url="https://github.com/example/team",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-team",
+        workspace_path="workspace",
+        status="ready",
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _team_service(workspace: Workspace, team_role: str | None):
+    settings = Settings()
+    session = _TeamRoleSession(workspace, team_role)
+    service = SqlAlchemyWorkspaceService(
+        session=session,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=None,  # type: ignore[arg-type]
+    )
+    return service, session
+
+
+@pytest.mark.parametrize("team_role", ["viewer", "member"])
+async def test_only_a_team_lead_or_the_owner_may_change_a_team_workspace(team_role):
+    workspace = _team_workspace()
+    service, session = _team_service(workspace, team_role)
+
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await service.update(workspace.id, uuid4(), name="Renamed")
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await service.delete(workspace.id, uuid4())
+
+    assert workspace.name == "Team"
+    assert session.committed is False
+
+
+async def test_team_lead_may_rename_but_not_repoint_the_owners_credential():
+    workspace = _team_workspace()
+    service, _session = _team_service(workspace, "lead")
+
+    renamed = await service.update(workspace.id, uuid4(), name="Renamed")
+    assert renamed.name == "Renamed"
+
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await service.update(workspace.id, uuid4(), repo_url="https://evil.example/x/y")
+    assert workspace.repo_url == "https://github.com/example/team"
+
+
+async def test_owner_may_repoint_their_own_workspace():
+    workspace = _team_workspace()
+    service, _session = _team_service(workspace, None)
+
+    updated = await service.update(
+        workspace.id, workspace.owner_id, repo_url="https://github.com/example/other"
+    )
+    assert updated.repo_url == sanitize_repository_url("https://github.com/example/other")
+
+
+async def test_team_viewer_cannot_drive_but_a_member_can():
+    workspace = _team_workspace()
+
+    viewer_service, _ = _team_service(workspace, "viewer")
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await viewer_service.get_for_driver(workspace.id, uuid4())
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await viewer_service.upsert_env_var(workspace.id, uuid4(), "API_KEY", "secret")
+
+    member_service, _ = _team_service(workspace, "member")
+    assert await member_service.get_for_driver(workspace.id, uuid4()) is workspace
+
+
+async def test_non_member_still_gets_not_found_for_a_change():
+    workspace = _team_workspace()
+    service, _session = _team_service(workspace, None)
+
+    with pytest.raises(WorkspaceNotFoundError):
+        await service.update(workspace.id, uuid4(), name="Renamed")
+
+
+async def test_update_route_maps_a_denied_team_role_to_403(workspace_context):
+    _user, service, _tmp_path = workspace_context
+
+    async def denied(**_kwargs):
+        raise WorkspaceAccessDeniedError
+
+    service.update = denied  # type: ignore[method-assign]
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post(
+            "/auth/login",
+            json={"email": "owner@example.com", "password": "password"},
+        )
+        response = await client.patch(f"/workspaces/{uuid4()}", json={"name": "Renamed"})
+
+    assert response.status_code == 403

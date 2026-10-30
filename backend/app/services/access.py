@@ -5,7 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import TeamMember, Workspace
-from app.services.workspaces import WorkspaceNotFoundError
+from app.services.workspaces import WorkspaceAccessDeniedError, WorkspaceNotFoundError
 
 _TEAM_ROLE_TO_WORKSPACE_ROLE = {
     "lead": "team_lead",
@@ -19,10 +19,6 @@ class WorkspaceRole(StrEnum):
     TEAM_LEAD = "team_lead"
     TEAM_MEMBER = "team_member"
     TEAM_VIEWER = "team_viewer"
-
-
-class WorkspaceAccessDeniedError(Exception):
-    """Raised when a user has some access to a workspace but not enough to drive it."""
 
 
 def can_drive(role: WorkspaceRole) -> bool:

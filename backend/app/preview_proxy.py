@@ -54,6 +54,11 @@ from app.services.sandbox import (
     SandboxRuntimeError,
     get_sandbox_runtime,
 )
+from app.services.sandbox.availability import (
+    PROVIDERS,
+    check_runtime,
+    require_metrics_token_for_docker,
+)
 from app.services.service_diagnostics import DiagnosticEvent, ServiceDiagnosticsRecorder
 
 HTTP_METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]
@@ -319,6 +324,7 @@ def create_preview_proxy_app(
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        require_metrics_token_for_docker(proxy_settings)
         app.state.http_client = http_client or httpx.AsyncClient(
             follow_redirects=False,
             timeout=None,
@@ -408,15 +414,18 @@ def create_preview_proxy_app(
             return unauthorized()
         database = await check_database()
         provider = proxy_settings.sandbox_runtime_default
-        if provider == "docker":
-            # The proxy holds no daemon socket: it dials Docker sandboxes by name on the
-            # sandbox network, so there is no provider control plane to probe from here.
-            sandbox = "skipped"
-        else:
-            try:
-                sandbox = await proxy_runtime.health()
-            except Exception:
-                sandbox = "error"
+        # Only the default provider is probed. The proxy holds no daemon socket (it dials
+        # Docker sandboxes by name on their network), so Docker is never probed from here.
+        skipped = {"configured": None, "status": "skipped", "reason": None}
+        runtimes = {name: dict(skipped) for name in PROVIDERS}
+        if provider != "docker":
+            found = await check_runtime(proxy_runtime, provider)
+            runtimes[provider] = {
+                "configured": found.configured,
+                "status": found.status,
+                "reason": found.reason,
+            }
+        sandbox = runtimes[provider]["status"]
         healthy = database == "ok" and sandbox in {"ok", "skipped"}
         return JSONResponse(
             status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -424,6 +433,7 @@ def create_preview_proxy_app(
                 "status": "ok" if healthy else "degraded",
                 "database": database,
                 provider: sandbox,
+                "runtimes": runtimes,
             },
         )
 
@@ -1069,7 +1079,10 @@ async def _send_http_request(
         query=query,
         original_host=original_host,
     )
-    if response.status_code not in {401, 403}:
+    # A retry only helps when there is a provider token to renew (Daytona's expires). Docker
+    # previews carry none, so a 401/403 is the app's own answer: replaying it would send the
+    # app's request (a POST /login, say) twice.
+    if response.status_code not in {401, 403} or not preview_link.token:
         return preview_link, response
 
     await response.aclose()

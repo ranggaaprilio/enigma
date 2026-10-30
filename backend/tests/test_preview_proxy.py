@@ -237,6 +237,37 @@ def test_http_proxy_injects_daytona_headers_retries_auth_and_rewrites_redirects(
     assert requests[1].headers["accept-encoding"] == "identity"
 
 
+def test_a_401_without_a_provider_token_is_returned_not_replayed():
+    """Docker previews carry no token (Epic 04): there is nothing to refresh, so retrying
+    would only send the app's request -- a POST /login, say -- a second time."""
+    workspace = make_workspace()
+    target = PreviewProxyTarget(preview_session=make_preview(workspace), workspace=workspace)
+    resolver = FakeResolver(target)
+    runtime = FakeRuntime([RuntimePreviewLink(url="http://10.213.0.2:5173", token="")])
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(401, content=b"bad password")
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    proxy_app = create_preview_proxy_app(
+        settings=Settings(preview_proxy_base_url="http://localhost:8001"),
+        resolver=resolver,  # type: ignore[arg-type]
+        runtime=runtime,  # type: ignore[arg-type]
+        http_client=http_client,
+    )
+
+    with TestClient(proxy_app, base_url="http://capability.localhost:8001") as client:
+        response = client.post("/login", content=b"user=a&pass=b")
+
+    asyncio.run(http_client.aclose())
+    assert response.status_code == 401
+    assert response.content == b"bad password"
+    assert len(requests) == 1
+    assert runtime.calls == 1
+
+
 class FakeUpstream:
     subprotocol = "vite"
 

@@ -68,6 +68,11 @@ class Workspace(Base):
     default_branch: Mapped[str] = mapped_column(String(120), nullable=False, default="main")
     runtime: Mapped[str] = mapped_column(String(32), nullable=False, default="daytona")
     daytona_sandbox_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    # Epic 06 expand: written alongside ``daytona_sandbox_id`` (migration 0037), which stays
+    # the one read until the contract release drops it. Use ``sandbox_id``, never these two.
+    sandbox_id_column: Mapped[str | None] = mapped_column(
+        "sandbox_id", String(160), nullable=True, index=True
+    )
     snapshot: Mapped[str | None] = mapped_column(String(255), nullable=True)
     workspace_path: Mapped[str] = mapped_column(Text, nullable=False, default="workspace")
     # Repo-relative subdirectory the workspace's commands and dev server run in (e.g.
@@ -120,6 +125,7 @@ class Workspace(Base):
     @sandbox_id.inplace.setter
     def _sandbox_id_setter(self, value: str | None) -> None:
         self.daytona_sandbox_id = value
+        self.sandbox_id_column = value
 
 
 # "workspace" => applies to every service in the workspace; "service" => only the service

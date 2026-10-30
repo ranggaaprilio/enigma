@@ -11,6 +11,7 @@ from app.models import CustomCommand, Workspace, WorkspaceEnvVar, WorkspaceTempl
 from app.models.project import TeamMember
 from app.services.git_providers import sanitize_repository_url
 from app.services.sandbox import SandboxRuntime, SandboxRuntimeError
+from app.services.sandbox.availability import Availability, choose_runtime
 from app.services.templates import TemplateService
 from app.services.utils import slugify
 from app.services.workspace_init import WorkspaceInitializationError, WorkspaceInitializer
@@ -23,12 +24,22 @@ APP_ROOT_UNSET = object()
 ENV_FILE_PATH_UNSET = object()
 
 
+# Team roles allowed to change a teammate's workspace (the owner always can). Everyone on the
+# team can read it through ``get_for_owner``.
+MANAGE_TEAM_ROLES = ("lead",)
+DRIVE_TEAM_ROLES = ("lead", "member")
+
+
 class WorkspaceAlreadyExistsError(Exception):
     pass
 
 
 class WorkspaceNotFoundError(Exception):
     pass
+
+
+class WorkspaceAccessDeniedError(Exception):
+    """Raised when a user has some access to a workspace but not enough to drive it."""
 
 
 class WorkspaceRuntimeError(Exception):
@@ -88,11 +99,15 @@ class SqlAlchemyWorkspaceService:
         cipher: WorkspaceSecretCipher,
         runtime: SandboxRuntime,
         initializer: WorkspaceInitializer | None = None,
+        availability: Availability | None = None,
     ) -> None:
         self.session = session
         self.cipher = cipher
         self.runtime = runtime
         self.initializer = initializer or WorkspaceInitializer(runtime)
+        # Checks the chosen provider before the row is written (Epic 06). None (unit tests
+        # with a fake runtime) takes the requested provider or the default unchecked.
+        self.availability = availability
 
     async def _is_team_member(self, team_id: UUID, user_id: UUID) -> bool:
         result = await self.session.execute(
@@ -102,6 +117,44 @@ class SqlAlchemyWorkspaceService:
             )
         )
         return result.scalar_one_or_none() is not None
+
+    async def _team_role(self, team_id: UUID, user_id: UUID) -> str | None:
+        result = await self.session.execute(
+            select(TeamMember.role).where(
+                TeamMember.team_id == team_id,
+                TeamMember.user_id == user_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _get_for_change(
+        self, workspace_id: UUID, user_id: UUID, team_roles: tuple[str, ...]
+    ) -> Workspace:
+        """The workspace, for a caller allowed to change it: its owner, or a teammate whose
+        team role is in ``team_roles``. Any other teammate can see it but not change it."""
+        workspace = await self.session.get(Workspace, workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError
+        if workspace.owner_id == user_id:
+            return workspace
+        role = (
+            await self._team_role(workspace.team_id, user_id)
+            if workspace.team_id is not None
+            else None
+        )
+        if role is None:
+            raise WorkspaceNotFoundError
+        if role not in team_roles:
+            raise WorkspaceAccessDeniedError
+        return workspace
+
+    async def get_for_manager(self, workspace_id: UUID, user_id: UUID) -> Workspace:
+        """Owner or team lead: settings, delete."""
+        return await self._get_for_change(workspace_id, user_id, MANAGE_TEAM_ROLES)
+
+    async def get_for_driver(self, workspace_id: UUID, user_id: UUID) -> Workspace:
+        """Owner, team lead or team member: env vars, reprovision. Never a viewer."""
+        return await self._get_for_change(workspace_id, user_id, DRIVE_TEAM_ROLES)
 
     async def list_for_owner(self, owner_id: UUID) -> list[Workspace]:
         result = await self.session.execute(
@@ -142,6 +195,7 @@ class SqlAlchemyWorkspaceService:
         *,
         source: str = "repository",
         template_id: UUID | None = None,
+        runtime: str | None = None,
     ) -> Workspace:
         template: WorkspaceTemplate | None = None
         if source == "repository":
@@ -168,6 +222,9 @@ class SqlAlchemyWorkspaceService:
             if result.scalar_one_or_none() is not None:
                 raise WorkspaceAlreadyExistsError
 
+        settings = self.runtime.settings
+        if self.availability is not None:
+            runtime = await choose_runtime(runtime, settings, self.availability)
         workspace = Workspace(
             owner_id=owner_id,
             team_id=team_id,
@@ -177,9 +234,9 @@ class SqlAlchemyWorkspaceService:
             source=source,
             template_id=template.id if template is not None else None,
             default_branch=default_branch,
-            runtime=self.runtime.settings.sandbox_runtime_default,
+            runtime=runtime or settings.sandbox_runtime_default,
             snapshot=snapshot,
-            workspace_path=self.runtime.settings.daytona_workspace_path,
+            workspace_path=self.runtime.settings.sandbox_workspace_path,
             status="creating",
         )
 
@@ -187,7 +244,7 @@ class SqlAlchemyWorkspaceService:
         await self.session.flush()
         await self.session.commit()
 
-        return await self._provision(workspace, template, initialize=True)
+        return await self._provision(workspace, template)
 
     async def _mark_error(self, workspace: Workspace) -> None:
         workspace.status = "error"
@@ -198,8 +255,6 @@ class SqlAlchemyWorkspaceService:
         self,
         workspace: Workspace,
         template: WorkspaceTemplate | None,
-        *,
-        initialize: bool,
     ) -> Workspace:
         """Bring an already-persisted workspace row up to a running sandbox.
 
@@ -207,10 +262,12 @@ class SqlAlchemyWorkspaceService:
         by the name derived from the workspace id and reuses it when it exists, so calling
         this a second time repairs the row instead of leaking a second sandbox.
 
-        `initialize` is False when the workspace already had a sandbox: the template/blank
-        seed commit runs only for a workspace that never finished creating, so a repair never
-        writes over an existing working tree.
+        The template/blank seed commit runs only into a sandbox that is new -- the provider
+        returned a different id than the row had (none, for a workspace that never finished
+        creating; another, when the old sandbox was removed behind our back) -- so a repair
+        never writes over an existing working tree, and a replacement is never left empty.
         """
+        previous = workspace.sandbox_id
         try:
             workspace.sandbox_id = await self.runtime.provision(workspace)
         except SandboxRuntimeError as error:
@@ -219,6 +276,7 @@ class SqlAlchemyWorkspaceService:
 
         # Template/blank workspaces get their first commit now so the sandbox is usable (and
         # worktree-capable) before any remote is connected.
+        initialize = workspace.sandbox_id != previous
         try:
             if initialize and template is not None:
                 await self.initializer.initialize_from_template(workspace, template)
@@ -242,8 +300,7 @@ class SqlAlchemyWorkspaceService:
         no sandbox id; nothing retries it, and `status` cannot recover it because there is no
         sandbox to query. This is the repair path — typically after correcting the snapshot.
         """
-        workspace = await self.get_for_owner(workspace_id, owner_id)
-        had_sandbox = workspace.sandbox_id is not None
+        workspace = await self.get_for_driver(workspace_id, owner_id)
 
         template: WorkspaceTemplate | None = None
         if workspace.source == "template" and workspace.template_id is not None:
@@ -253,7 +310,7 @@ class SqlAlchemyWorkspaceService:
         self.session.add(workspace)
         await self.session.commit()
 
-        return await self._provision(workspace, template, initialize=not had_sandbox)
+        return await self._provision(workspace, template)
 
     async def update(
         self,
@@ -266,7 +323,12 @@ class SqlAlchemyWorkspaceService:
         app_root: str | None | object = APP_ROOT_UNSET,
         env_file_path: str | None | object = ENV_FILE_PATH_UNSET,
     ) -> Workspace:
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_manager(workspace_id, owner_id)
+        # The stored git credential is the owner's and follows `repo_url`, so only the owner
+        # may point it somewhere else (a teammate could otherwise send it to their own host).
+        if repo_url is not None and workspace.owner_id != owner_id:
+            if sanitize_repository_url(repo_url) != workspace.repo_url:
+                raise WorkspaceAccessDeniedError
         if name is not None:
             workspace.name = name
             workspace.slug = slugify(name)
@@ -286,7 +348,7 @@ class SqlAlchemyWorkspaceService:
         return workspace
 
     async def delete(self, workspace_id: UUID, owner_id: UUID) -> None:
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_manager(workspace_id, owner_id)
         try:
             await self.runtime.delete(workspace)
         except SandboxRuntimeError as error:
@@ -322,7 +384,7 @@ class SqlAlchemyWorkspaceService:
         custom_command_id: UUID | None = None,
     ) -> tuple[WorkspaceEnvVar, EnvVarWriteStatus]:
         normalized_key = validate_env_key(key)
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_driver(workspace_id, owner_id)
         await self._validate_custom_command_id(workspace.id, custom_command_id)
         env_var, write_status = await self._upsert_one(
             workspace.id, normalized_key, value, custom_command_id=custom_command_id
@@ -383,7 +445,7 @@ class SqlAlchemyWorkspaceService:
         custom_command_id: UUID | None = None,
         dry_run: bool = False,
     ) -> list[BulkItem]:
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_driver(workspace_id, owner_id)
         await self._validate_custom_command_id(workspace.id, custom_command_id)
 
         valid_keys: dict[str, str] = {}
@@ -453,7 +515,7 @@ class SqlAlchemyWorkspaceService:
         custom_command_id: UUID | None = None,
     ) -> None:
         normalized_key = validate_env_key(key)
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_driver(workspace_id, owner_id)
         command_filter = (
             WorkspaceEnvVar.custom_command_id.is_(None)
             if custom_command_id is None
@@ -479,7 +541,7 @@ class SqlAlchemyWorkspaceService:
         *,
         custom_command_id: UUID | None = None,
     ) -> tuple[list[str], list[str]]:
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_driver(workspace_id, owner_id)
         await self._validate_custom_command_id(workspace.id, custom_command_id)
 
         deleted: list[str] = []

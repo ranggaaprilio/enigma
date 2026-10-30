@@ -173,9 +173,9 @@ class DaytonaRuntime:
                 timeout=self.settings.daytona_provision_timeout_seconds,
             )
             try:
-                await sandbox.fs.get_file_info(self.settings.daytona_workspace_path)
+                await sandbox.fs.get_file_info(self.settings.sandbox_workspace_path)
             except Exception:
-                await sandbox.fs.create_folder(self.settings.daytona_workspace_path, "755")
+                await sandbox.fs.create_folder(self.settings.sandbox_workspace_path, "755")
             return str(sandbox.id)
         except Exception as error:
             mapped = map_daytona_error(error)

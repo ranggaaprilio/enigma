@@ -30,7 +30,7 @@ const productFeatures = [
     icon: Server,
     label: "Isolated runtime",
     title: "One persistent workspace per project.",
-    body: "Keep the repository, environment variables, terminal, and running services together inside a Daytona sandbox.",
+    body: "Keep the repository, environment variables, terminal, and running services together inside an isolated sandbox: Daytona in the cloud, or Docker on your own machine.",
   },
   {
     icon: GitBranch,
@@ -282,7 +282,7 @@ export function LandingRoute() {
                 </h2>
                 <p className="mt-6 max-w-lg text-base leading-7 text-[#cfcdc4]">
                   Enigma runs alongside your existing stack. Project work happens inside
-                  an isolated Daytona workspace, while the control plane stays in your
+                  an isolated sandbox (Daytona or local Docker), while the control plane stays in your
                   hands.
                 </p>
                 <ul className="mt-8 space-y-4">
@@ -675,7 +675,7 @@ function RuntimeDiagram() {
             <Server className="h-4 w-4 text-[#9fbbe0]" aria-hidden="true" />
           </span>
           <div>
-            <p className="text-sm text-[#efeee8]">Daytona sandbox</p>
+            <p className="text-sm text-[#efeee8]">Daytona or Docker sandbox</p>
             <p className="mt-0.5 font-mono text-[10px] text-[#a09c92]">persistent project runtime</p>
           </div>
         </div>

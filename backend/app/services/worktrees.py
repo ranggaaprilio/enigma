@@ -372,7 +372,7 @@ class WorktreeService:
         )
         if result.exit_code != 0:
             return None
-        home = self.settings.daytona_sandbox_home.rstrip("/")
+        home = self.settings.sandbox_home.rstrip("/")
         entries: dict[str, str | None] = {}
         cur_path: str | None = None
         cur_branch: str | None = None

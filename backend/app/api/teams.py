@@ -28,6 +28,7 @@ from app.services.projects import (
     TeamPermissionError,
 )
 from app.services.sandbox import get_sandbox_runtime
+from app.services.sandbox.availability import runtime_availability
 from app.services.workspaces import (
     SqlAlchemyWorkspaceService,
     WorkspaceNotFoundError,
@@ -293,6 +294,7 @@ async def get_workspace_service(
         session=session,
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
         runtime=get_sandbox_runtime(),
+        availability=runtime_availability,
     )
 
 
@@ -347,6 +349,7 @@ async def create_team_workspace(
             team_id=team_id,
             source=payload.source,
             template_id=payload.template_id,
+            runtime=payload.runtime,
         )
     except WorkspaceRuntimeError as exc:
         raise HTTPException(

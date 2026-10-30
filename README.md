@@ -313,7 +313,7 @@ Copy `.env.example` to `.env`. Key variables:
 | `DAYTONA_API_URL` | No | Override for self-hosted Daytona (default: `https://app.daytona.io/api`) |
 | `DAYTONA_TARGET` | No | Daytona target region |
 | `DAYTONA_DEFAULT_SNAPSHOT` | Recommended | Custom snapshot name (e.g. `enigma-mise-code`) — needed for preview/editor/SDD (see below) |
-| `DAYTONA_AUTO_STOP_MINUTES` | No | Idle minutes before a sandbox auto-stops (default `30`) |
+| `SANDBOX_AUTO_STOP_MINUTES` | No | Idle minutes before a sandbox auto-stops (default `30`; `DAYTONA_AUTO_STOP_MINUTES` still accepted) |
 | `AUTH_SECRET_KEY` | Yes (prod) | Secret for signing session tokens — change from default in production |
 | `WORKSPACE_ENV_ENCRYPTION_KEY` | Yes (prod) | Fernet key for encrypting workspace env vars, repo tokens, and the global LLM API key. Rotating it invalidates all three |
 | `AGENT_PROVIDER` | No | Agent engine: `openhands`, `openai`, or `auto`. **Fallback only** — the global LLM settings stored from the UI take precedence |

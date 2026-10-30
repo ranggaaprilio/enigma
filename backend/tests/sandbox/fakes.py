@@ -661,6 +661,9 @@ class FakeDockerContainer:
         # pidfile -> socket of the attached tmux client it names
         self.tmux_clients: dict[str, FakePtySocket] = {}
         self.networks: set[str] = set()
+        # docker-py's ``attrs`` is the inspect output as of the last ``reload()``: network
+        # changes made since are not in it (a stale read is a real bug to catch).
+        self._inspected_networks: set[str] | None = None
 
     @property
     def attrs(self) -> dict[str, Any]:
@@ -680,13 +683,23 @@ class FakeDockerContainer:
                 "Sysctls": spec.get("sysctls"),
                 "PortBindings": spec.get("ports"),
             },
-            "NetworkSettings": {"Networks": {name: {} for name in sorted(self.networks)}},
+            "NetworkSettings": {
+                "Networks": {
+                    name: {}
+                    for name in sorted(
+                        self.networks
+                        if self._inspected_networks is None
+                        else self._inspected_networks
+                    )
+                }
+            },
             "State": {"OOMKilled": self.oom_killed},
         }
 
     def reload(self) -> None:
         if self.removed:
             raise _docker_not_found()
+        self._inspected_networks = set(self.networks)
 
     def start(self) -> None:
         self.start_calls += 1

@@ -5,12 +5,15 @@ import {
   ApiError,
   cloneRepository,
   connectRepository,
+  getHealth,
   getRepositoryCredential,
   listWorkspaceTemplates,
   setupDevServer,
   type GitProviderChoice,
+  type HealthResponse,
   type RepositoryAuthType,
   type RepositoryCredentialResponse,
+  type RuntimeName,
   type WorkspaceCreatePayload,
   type WorkspaceResponse,
   type WorkspaceSource,
@@ -24,6 +27,7 @@ import {
   providerLabel,
   resolveProvider,
 } from "../../lib/gitProviders";
+import { defaultRuntime, runtimeLabel, runtimeOptions } from "../../lib/runtime";
 import { TextInput } from "../ui/TextInput";
 import { ProviderAuthSelector } from "./ProviderAuthSelector";
 import { TemplateGallery } from "./TemplateGallery";
@@ -43,6 +47,8 @@ type WizardForm = {
   name: string;
   defaultBranch: string;
   snapshot: string;
+  /** Null until `/health` says what is available; null with no options = the server picks. */
+  runtime: RuntimeName | null;
   template: WorkspaceTemplateResponse | null;
   repoUrl: string;
   provider: GitProviderChoice;
@@ -60,6 +66,7 @@ function initialForm(): WizardForm {
     name: "",
     defaultBranch: "main",
     snapshot: "",
+    runtime: null,
     template: null,
     repoUrl: "",
     provider: "auto",
@@ -108,7 +115,7 @@ export function CreateWorkspaceWizard({
   onClose,
   onCreated,
   createFn,
-  subtitle = "Provisions a Daytona sandbox.",
+  subtitle = "Provisions a sandbox for the workspace.",
 }: {
   open: boolean;
   onClose: () => void;
@@ -125,6 +132,8 @@ export function CreateWorkspaceWizard({
   const [templatesError, setTemplatesError] = useState<string | null>(null);
   const [templatesAttempt, setTemplatesAttempt] = useState(0);
   const [copyLabel, setCopyLabel] = useState("Copy");
+  const [health, setHealth] = useState<HealthResponse | null>(null);
+  const [healthAttempt, setHealthAttempt] = useState(0);
 
   const patch = (values: Partial<WizardForm>) => setForm((prev) => ({ ...prev, ...values }));
 
@@ -135,6 +144,21 @@ export function CreateWorkspaceWizard({
     setSubmitting(false);
     setOutcome(null);
   }, [open]);
+
+  // Which runtimes can take a workspace (local-docker-runtime Epic 06). Unknown health leaves
+  // the choice to the server, which validates it anyway.
+  useEffect(() => {
+    if (!open) return;
+    const controller = new AbortController();
+    setHealth(null);
+    getHealth(controller.signal)
+      .then((data) => {
+        setHealth(data);
+        setForm((prev) => (prev.runtime ? prev : { ...prev, runtime: defaultRuntime(data) }));
+      })
+      .catch(() => undefined);
+    return () => controller.abort();
+  }, [open, healthAttempt]);
 
   useEffect(() => {
     if (!open || form.source !== "template") return;
@@ -184,6 +208,9 @@ export function CreateWorkspaceWizard({
   const resolvedProvider = resolveProvider(form.repoUrl, form.provider);
   const help = PROVIDER_HELP[resolvedProvider];
   const remote = parseGitRemote(form.repoUrl);
+  const runtimes = runtimeOptions(health);
+  // A snapshot names a Daytona image; Docker always runs DOCKER_SANDBOX_IMAGE.
+  const usesSnapshot = form.runtime !== "docker";
 
   function validate(step: Step): string | null {
     if (step === "source") return form.source ? null : "Choose how to start the workspace.";
@@ -195,6 +222,9 @@ export function CreateWorkspaceWizard({
       }
       if (form.source === "repository" && !remote) {
         return "Enter an HTTPS or SSH repository URL.";
+      }
+      if (runtimes.length > 0 && !form.runtime) {
+        return "No sandbox runtime is available. Ask an administrator to configure Daytona or Docker.";
       }
       return null;
     }
@@ -234,7 +264,8 @@ export function CreateWorkspaceWizard({
       name: form.name.trim(),
       default_branch: form.defaultBranch.trim() || "main",
     };
-    if (form.snapshot.trim()) base.snapshot = form.snapshot.trim();
+    if (usesSnapshot && form.snapshot.trim()) base.snapshot = form.snapshot.trim();
+    if (form.runtime) base.runtime = form.runtime;
     if (form.source === "blank") return { ...base, source: "blank" };
     if (form.source === "template" && form.template) {
       return {
@@ -471,12 +502,56 @@ export function CreateWorkspaceWizard({
                     onChange={(defaultBranch) => patch({ defaultBranch })}
                   />
                 )}
-                <TextInput
-                  label="Daytona snapshot (optional)"
-                  value={form.snapshot}
-                  onChange={(snapshot) => patch({ snapshot })}
-                />
+                {usesSnapshot && (
+                  <TextInput
+                    label="Daytona snapshot (optional)"
+                    value={form.snapshot}
+                    onChange={(snapshot) => patch({ snapshot })}
+                  />
+                )}
               </div>
+              {runtimes.length > 0 && (
+                <fieldset>
+                  <legend className="text-sm font-medium text-ink">Runtime</legend>
+                  <div className="mt-2 grid gap-2 md:grid-cols-2">
+                    {runtimes.map((option) => (
+                      <label
+                        key={option.value}
+                        className={`flex items-start gap-3 rounded-lg border px-3 py-2 text-sm ${
+                          form.runtime === option.value
+                            ? "border-primary bg-white"
+                            : "border-line bg-white"
+                        } ${option.available ? "cursor-pointer" : "cursor-not-allowed opacity-60"}`}
+                      >
+                        <input
+                          type="radio"
+                          name="runtime"
+                          value={option.value}
+                          checked={form.runtime === option.value}
+                          disabled={!option.available}
+                          onChange={() => patch({ runtime: option.value })}
+                          className="mt-1"
+                        />
+                        <span>
+                          <span className="block font-medium text-ink">{option.label}</span>
+                          <span className="block text-xs text-muted">
+                            {option.reason ?? option.description}
+                          </span>
+                        </span>
+                      </label>
+                    ))}
+                  </div>
+                  {runtimes.every((option) => !option.available) && (
+                    <button
+                      type="button"
+                      onClick={() => setHealthAttempt((value) => value + 1)}
+                      className="mt-2 text-xs font-medium text-primary hover:underline"
+                    >
+                      Check again
+                    </button>
+                  )}
+                </fieldset>
+              )}
             </div>
           ) : form.step === "access" ? (
             <div className="space-y-4">
@@ -520,7 +595,10 @@ export function CreateWorkspaceWizard({
                     />
                   </>
                 )}
-                {form.snapshot.trim() && <ReviewRow label="Snapshot" value={form.snapshot} mono />}
+                {form.runtime && <ReviewRow label="Runtime" value={runtimeLabel(form.runtime)} />}
+                {usesSnapshot && form.snapshot.trim() && (
+                  <ReviewRow label="Snapshot" value={form.snapshot} mono />
+                )}
               </dl>
               {form.source === "repository" &&
                 form.useCredentials &&

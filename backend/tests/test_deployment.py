@@ -212,6 +212,39 @@ def test_sandbox_override_marks_the_preview_proxy_for_the_backend_to_attach():
     assert "networks" not in override
 
 
+def _merged_env(service: str) -> dict[str, str]:
+    """A service's environment with the sandbox override applied (compose merges maps)."""
+    base = yaml.safe_load((REPO / "docker-compose.yml").read_text())["services"][service]
+    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())["services"]
+    return {**base.get("environment", {}), **override.get(service, {}).get("environment", {})}
+
+
+def test_the_sandbox_egress_policy_reaches_the_services_that_create_sandboxes():
+    """The egress policy is read from .env by compose and must reach the backend and worker
+    -- under its new name or the deprecated DAYTONA_* one -- with and without the Docker
+    override; a dropped setting would silently leave sandboxes with open egress."""
+    for service in ("backend", "worker"):
+        for env in (
+            yaml.safe_load((REPO / "docker-compose.yml").read_text())["services"][service][
+                "environment"
+            ],
+            _merged_env(service),
+        ):
+            assert env["SANDBOX_NETWORK_BLOCK_ALL"] == (
+                "${SANDBOX_NETWORK_BLOCK_ALL:-${DAYTONA_NETWORK_BLOCK_ALL:-false}}"
+            ), service
+            assert env["SANDBOX_NETWORK_ALLOW_LIST"] == (
+                "${SANDBOX_NETWORK_ALLOW_LIST:-${DAYTONA_NETWORK_ALLOW_LIST:-}}"
+            ), service
+
+
+def test_the_sandbox_override_runs_the_docker_upkeep():
+    """Docker workspaces are refused wherever upkeep is off; the override turns it on even
+    for a mixed install whose default stays Daytona."""
+    for service in ("backend", "worker"):
+        assert _merged_env(service)["DOCKER_UPKEEP"] == "${DOCKER_UPKEEP:-true}", service
+
+
 def test_production_manifests_never_reference_the_container_daemon():
     """The Kustomize production profile is Daytona-only (docs/local-docker-runtime)."""
     for manifest in (REPO / "deploy" / "k8s").rglob("*.yaml"):
@@ -500,7 +533,7 @@ def test_previews_are_cross_site_from_the_app(manifests):
     # domain makes every such request cross-site, so the browser drops the cookie.
     app_sites = {_site(h) for h in _backends(_get(manifests, "Ingress", "enigma"))}
     preview_sites = {_site(h) for h in _backends(_get(manifests, "Ingress", "enigma-preview"))}
-    proxy_base = _config(manifests)["DAYTONA_PREVIEW_PROXY_BASE_URL"].split("://", 1)[1]
+    proxy_base = _config(manifests)["PREVIEW_PROXY_BASE_URL"].split("://", 1)[1]
     assert preview_sites == {_site(proxy_base)}
     assert not app_sites & preview_sites
     origins = _config(manifests)["BACKEND_CORS_ORIGINS"].split(",")

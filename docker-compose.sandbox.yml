@@ -48,7 +48,13 @@ x-sandbox-env: &sandbox-env
   DOCKER_MAX_CONCURRENT_EXECS: ${DOCKER_MAX_CONCURRENT_EXECS:-64}
   DOCKER_PREVIEW_PROXY_HOST: ${DOCKER_PREVIEW_PROXY_HOST:-preview-proxy}
   DOCKER_SANDBOX_SUBNET_POOL: ${DOCKER_SANDBOX_SUBNET_POOL:-10.213.0.0/16}
-  SANDBOX_NETWORK_BLOCK_ALL: ${SANDBOX_NETWORK_BLOCK_ALL:-false}
+  # SANDBOX_NETWORK_BLOCK_ALL comes from the base file (with its DAYTONA_* fallback).
+  # Idle stop, orphan sweep and proxy re-attach; Docker workspaces are refused without it.
+  DOCKER_UPKEEP: ${DOCKER_UPKEEP:-true}
+  # Queue mode: the operator's statement that API, workers and proxy share this daemon.
+  DOCKER_SINGLE_HOST: ${DOCKER_SINGLE_HOST:-false}
+  # Required with Docker sandboxes: the proxy is reachable from every sandbox (Epic 06).
+  METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN in .env (required with Docker sandboxes)}
 
 services:
   backend:
@@ -61,6 +67,8 @@ services:
     environment:
       # Which provider the proxy's /health reports on.
       SANDBOX_RUNTIME_DEFAULT: ${SANDBOX_RUNTIME_DEFAULT:-docker}
+      # It sits on every sandbox network, so /health and /metrics must never be open.
+      METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN in .env (required with Docker sandboxes)}
     labels:
       enigma.preview-proxy: "1"
     # It sits on every sandbox network: it must never route between them.

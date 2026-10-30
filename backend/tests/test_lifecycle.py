@@ -53,7 +53,7 @@ async def test_live_is_a_dependency_free_liveness_probe(monkeypatch, draining):
 
     monkeypatch.setattr(health_module, "check_database", must_not_probe)
     monkeypatch.setattr(health_module, "check_redis", must_not_probe)
-    monkeypatch.setattr(health_module, "check_daytona", must_not_probe)
+    monkeypatch.setattr(health_module, "check_runtime", must_not_probe)
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         response = await client.get("/live")

@@ -367,3 +367,53 @@ async def test_team_cap_holds_across_two_replicas():
 async def test_global_cap_holds_across_two_replicas():
     results = await _race_two_creates(queue_settings(), team=False)
     assert results == ["admitted", "global"]
+
+
+# ---------------------------------------------------------------------------
+# Lock scope
+# ---------------------------------------------------------------------------
+
+
+async def test_budget_check_cannot_commit_away_the_cap_locks(db_session, monkeypatch):
+    """A budget warning notifies, and a notification commits. Any commit between taking the
+    advisory locks and inserting the run would release them and let two creates both pass
+    the caps, so the budget check has to run before the locks are taken."""
+    session, session_maker = db_session
+    user, workspace = await seed_workspace(session)
+    events: list[str] = []
+
+    async def budget_check_that_commits(self, _workspace, _user_id):
+        events.append("budget")
+        await self.session.commit()
+
+    monkeypatch.setattr(
+        "app.services.agents.BudgetService.assert_within_budget", budget_check_that_commits
+    )
+    real_execute, real_commit, real_begin_nested = (
+        session.execute,
+        session.commit,
+        session.begin_nested,
+    )
+
+    async def execute(statement, *args, **kwargs):
+        if "pg_advisory_xact_lock" in str(statement):
+            events.append("lock")
+        return await real_execute(statement, *args, **kwargs)
+
+    async def commit():
+        events.append("commit")
+        await real_commit()
+
+    def begin_nested():
+        events.append("insert")
+        return real_begin_nested()
+
+    monkeypatch.setattr(session, "execute", execute)
+    monkeypatch.setattr(session, "commit", commit)
+    monkeypatch.setattr(session, "begin_nested", begin_nested)
+
+    await agent_service(session, session_maker).create_run(workspace.id, user.id, "hello")
+
+    locked = events[events.index("lock") : events.index("insert")]
+    assert "budget" in events
+    assert "commit" not in locked, events

@@ -1,21 +1,54 @@
-from fastapi import APIRouter
+import asyncio
+import time
+from datetime import datetime
+
+from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import text
 
+from app.core.config import get_settings
 from app.core.lifecycle import lifecycle
+from app.core.metrics import metrics_token_authorized
 from app.db.session import async_session_maker
 from app.services.redis import get_redis_client
 from app.services.sandbox import get_runtime_by_name
+from app.services.sandbox.availability import (
+    HEALTH_TIMEOUT_SECONDS,
+    PROVIDERS,
+    runtime_availability,
+)
 
 router = APIRouter(tags=["health"])
+
+# /health is unauthenticated: provider probes (a Daytona API call, Docker daemon calls) are
+# shared by every caller for this long, one in flight at a time, so a flood of /health never
+# becomes a flood of upstream calls (Epic 06 security review).
+RUNTIME_HEALTH_TTL_SECONDS = 5.0
+
+
+class RuntimeHealth(BaseModel):
+    """One provider, at the exposure level of the rest of /health: configured yes/no, a
+    status and a generic reason -- never a socket path, URL or version (Epic 06)."""
+
+    configured: bool
+    status: str  # ok | error | unconfigured
+    reason: str | None = None
+    # Docker only: this installation's sandboxes on the daemon, and when this process last
+    # ran the upkeep pass (None where it does not run it, e.g. the API in queue mode). Shown
+    # only to a METRICS_TOKEN bearer when a token is set: operational detail, not status.
+    managed_containers: int | None = None
+    upkeep_last_pass_at: datetime | None = None
 
 
 class HealthResponse(BaseModel):
     status: str
     database: str
     redis: str
+    # Kept for existing monitors; the same value as runtimes["daytona"].status.
     daytona: str
+    sandbox_runtime_default: str
+    runtimes: dict[str, RuntimeHealth]
 
 
 class LiveResponse(BaseModel):
@@ -45,15 +78,50 @@ async def check_redis() -> str:
     return "ok"
 
 
-async def check_daytona() -> str:
-    return await get_runtime_by_name("daytona").health()
+async def count_managed_containers() -> int | None:
+    runtime = get_runtime_by_name("docker")
+    try:
+        found = await asyncio.wait_for(runtime.managed_sandboxes(), HEALTH_TIMEOUT_SECONDS)
+    except Exception:
+        return None
+    return len(found)
+
+
+def upkeep_last_pass_at() -> datetime | None:
+    return getattr(get_runtime_by_name("docker"), "last_upkeep_at", None)
+
+
+async def check_runtime(provider: str) -> RuntimeHealth:
+    found = await runtime_availability(provider)
+    entry = RuntimeHealth(configured=found.configured, status=found.status, reason=found.reason)
+    if provider == "docker" and found.available:
+        entry.managed_containers = await count_managed_containers()
+        entry.upkeep_last_pass_at = upkeep_last_pass_at()
+    return entry
+
+
+async def check_runtimes() -> dict[str, RuntimeHealth]:
+    checked = await asyncio.gather(*(check_runtime(provider) for provider in PROVIDERS))
+    return dict(zip(PROVIDERS, checked, strict=True))
+
+
+async def shared_runtimes(request: Request) -> dict[str, RuntimeHealth]:
+    """``check_runtimes``, shared through ``app.state`` for ``RUNTIME_HEALTH_TTL_SECONDS``."""
+    state = request.app.state
+    cached = getattr(state, "runtime_health", None)
+    now = time.monotonic()
+    if cached is None or (cached[1].done() and cached[0] <= now):
+        cached = (now + RUNTIME_HEALTH_TTL_SECONDS, asyncio.ensure_future(check_runtimes()))
+        state.runtime_health = cached
+    # Shielded: a caller that disconnects must not cancel the probe the others wait on.
+    return await asyncio.shield(cached[1])
 
 
 @router.get("/health", response_model=HealthResponse)
-async def health() -> HealthResponse | JSONResponse:
+async def health(request: Request) -> HealthResponse | JSONResponse:
+    settings = get_settings()
     database_status = "ok"
     redis_status = "ok"
-    daytona_status = "ok"
 
     try:
         database_status = await check_database()
@@ -65,27 +133,35 @@ async def health() -> HealthResponse | JSONResponse:
     except Exception:
         redis_status = "error"
 
-    try:
-        daytona_status = await check_daytona()
-    except Exception:
-        daytona_status = "error"
+    runtimes = await shared_runtimes(request)
+    if not metrics_token_authorized(
+        request.headers.get("authorization", ""), settings.metrics_token
+    ):
+        runtimes = {
+            name: entry.model_copy(update={"managed_containers": None, "upkeep_last_pass_at": None})
+            for name, entry in runtimes.items()
+        }
+    # An unconfigured provider is not a fault (a Docker-only install has no Daytona key),
+    # but a configured one that is down is, and so is having nowhere to put a workspace.
+    configured = [entry for entry in runtimes.values() if entry.configured]
+    runtimes_ok = bool(configured) and all(entry.status == "ok" for entry in configured)
 
     status = (
-        "ok"
-        if database_status == "ok" and redis_status == "ok" and daytona_status == "ok"
-        else "degraded"
+        "ok" if database_status == "ok" and redis_status == "ok" and runtimes_ok else "degraded"
     )
     payload = HealthResponse(
         status=status,
         database=database_status,
         redis=redis_status,
-        daytona=daytona_status,
+        daytona=runtimes["daytona"].status,
+        sandbox_runtime_default=settings.sandbox_runtime_default,
+        runtimes=runtimes,
     )
 
     if status == "ok":
         return payload
 
-    return JSONResponse(status_code=503, content=payload.model_dump())
+    return JSONResponse(status_code=503, content=payload.model_dump(mode="json"))
 
 
 @router.get("/live", response_model=LiveResponse)

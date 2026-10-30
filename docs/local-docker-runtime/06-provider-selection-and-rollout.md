@@ -179,3 +179,115 @@ Enigma experience on your own machine. Operators get one documented self-host pr
 - Auto-detect "Daytona quota exhausted / unreachable" and suggest Docker fallback at
   creation time.
 - A Kubernetes provider (`runtime="k8s"`) — the Epic 01 interface is the contract.
+
+## Implementation Notes (shipped)
+
+Built on the Epic 05 test branch. Gate 1 decisions:
+- Ship only the **expand** half of the column rename.
+- Automate the no-subscription walkthrough as a stack test with the mock agent provider.
+- Run the Docker integration job weekly and on demand, while the main CI triggers stay
+  disabled.
+- **`METRICS_TOKEN` is required with Docker.**
+
+The doc's "Current State" was stale. `sandbox_runtime_default` already existed, conformance
+already ran both fakes, the base compose never mounted the socket, and the migration head was
+`0036`.
+
+- **Creation** (`services/sandbox/availability.py`):
+  - `POST /workspaces` and the team route take an optional `runtime`.
+  - `choose_runtime` runs before the row is written:
+    - An explicit choice is honoured or refused, never swapped.
+    - No choice takes `SANDBOX_RUNTIME_DEFAULT`, or the other provider when only that one
+      is available, with a `sandbox_runtime_default_fallback` log line.
+  - A refusal is a 422 with a generic reason: configured yes/no, or not reachable. There
+    is no socket path or URL in it, and nothing is half-provisioned.
+  - Docker additionally needs `DOCKER_SINGLE_HOST=true` in queue mode and a non-blank
+    `METRICS_TOKEN` (security review M1). Otherwise it gets a generic "not available for
+    this deployment", and the reason goes to the log only (`sandbox_runtime_refused`).
+  - **Availability check.** An unconfigured provider is never probed. A configured one is
+    asked `health()` under a 3 s timeout, so a hung daemon reads as down.
+  - At startup the API logs `sandbox_runtime_default_unconfigured` when new workspaces
+    will fall back.
+- **Health:**
+  - `/health` gains `sandbox_runtime_default` and a `runtimes` block per provider
+    (`configured`, `status` ok/error/unconfigured, `reason`). Docker also gets
+    `managed_containers` and `upkeep_last_pass_at`, carried over from Epic 05.
+  - **Which statuses count as faults.** Unconfigured is not a fault. A configured provider
+    that is down, or having no provider at all, is a fault (`degraded`, 503).
+  - **Monitors.** The top-level `daytona` field stays. `/live` and `/ready` are unchanged.
+  - **Probe cost.** Probes are shared through `app.state` for 5 s with one in flight, so an
+    anonymous flood never becomes a flood of daemon or Daytona calls (security review M2).
+  - **Operational detail.** The count and the upkeep time are shown only to a
+    `METRICS_TOKEN` bearer when a token is set.
+  - **Proxy `/health`.** The proxy's token-gated `/health` carries the same block but
+    probes only its default provider. It holds no socket, so Docker is `skipped`.
+- **`METRICS_TOKEN`.** With `SANDBOX_RUNTIME_DEFAULT=docker`, the API and the preview proxy
+  refuse to start without one, because the proxy is reachable from every sandbox. The
+  compose override passes it to backend, worker and proxy with `:?`.
+- **Naming:**
+  - `SANDBOX_HOME` and `SANDBOX_WORKSPACE_PATH` join the earlier neutral names.
+  - Every `DAYTONA_*` alias of a neutral setting works for one release and is logged as
+    `deprecated_setting_name` (`core/config.py` `DEPRECATED_SETTING_NAMES`).
+  - Compose maps the old names onto the new ones, so under compose that log never fires.
+  - The k8s config, compose, README and `.env.example` use the new names.
+- **Column** (migration `0037`, expand):
+  - Adds `workspaces.sandbox_id` and `ix_workspaces_sandbox_id`, and backfills them.
+  - The `Workspace.sandbox_id` hybrid writes both columns and still reads
+    `daytona_sandbox_id`, which the previous release keeps writing during a rolling deploy.
+  - Upgrade, downgrade and upgrade round-trip on a seeded scratch database.
+  - **Contract (next release):** backfill again, switch reads, then drop the old column
+    and index with `# contract:`.
+- **Frontend:**
+  - Runtime picker in `CreateWorkspaceWizard`, fed by `/health`:
+    - It preselects the server default when that is available.
+    - It disables an unavailable option and shows its reason.
+    - It offers "Check again" when nothing is available.
+    - It hides the Daytona snapshot field on Docker.
+  - `ProviderBadge` on the workspace header and the team's workspace cards.
+  - `runtimeLabel` replaces the hard-coded "Daytona" copy (team, dashboard, settings,
+    landing).
+  - The overview and foundation checks list both providers.
+  - The status pill suggests "Is the Docker daemon running?" on a Docker `error`.
+  - `status_detail` is shown in the UI, carried over from Epic 05. It is read once per
+    workspace, never polled (a poll would keep a sandbox awake), and not while
+    `creating`.
+- **Docs and CI:**
+  - `docs/self-host-docker.md` is the operator guide. It covers the socket being
+    root-equivalent, install, tuning, egress, single-host limits, backup/reset and
+    troubleshooting.
+  - `.github/workflows/docker-integration.yml` builds the image and runs the real-daemon
+    suite, weekly and on demand (`permissions: contents: read`).
+
+**Verification:**
+- Unit tests: health in all four configured combinations, the cache and the token gating;
+  the choice, fallback, queue and token rules; the 422 route; settings aliases; the column
+  mapping.
+- Vitest: picker with both, one or no provider available, the default, Check again, and the
+  badge.
+- Real-daemon: 25 tests.
+- Stack e2e: 7 tests on a **fresh compose project with no Daytona key** and the mock
+  provider, run 4 times.
+  - `/health` shows only Docker, and an explicit `runtime=daytona` gets the 422.
+  - A create with no runtime lands on Docker.
+  - The agent run's tool call runs in the sandbox, followed by an edit, a commit and the
+    log.
+  - The terminal, editor, previews, services, wake on use and kill/restart all work.
+- **Keep-alive flake.** The stack tests' HTTP clients keep idle connections for 2 s, under
+  uvicorn's 5 s keep-alive. Through Podman's port forwarder a stale connection otherwise
+  failed with "Server disconnected without sending a response", which was the cause of the
+  earlier unexplained flake.
+
+**Not verified / deferred:**
+- **Push in the walkthrough.** It needs a real remote and credentials, and the SSRF guard
+  refuses `localhost` remotes. The git token path is covered by the real-daemon tests.
+- **Agent edits.** The mock provider only lists files. Agent file and git tools on Docker
+  are covered by `test_agent_file_and_git_tools_on_a_blank_workspace`.
+- **Queue mode with `DOCKER_SINGLE_HOST=true`.** That a run enqueued by the API executes in
+  the compose worker is not exercised; only the 422 rule is.
+- **Existing Daytona workspaces unchanged.** Not re-checked against a real Daytona account;
+  there is no key here.
+- **The integration workflow** has not run on GitHub yet.
+- **Deferred:**
+  - An operator allow-list of runtimes users may pick (security review, LOW).
+  - Pinning actions to SHAs (the main CI uses tags too).
+  - The contract migration.

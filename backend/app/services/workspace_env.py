@@ -441,8 +441,8 @@ def _parsed_allow_networks(settings: Settings) -> list:
 
 
 def egress_warnings(env: dict[str, str], settings: Settings) -> list[str]:
-    """Flag env values that point egress at a host outside `DAYTONA_NETWORK_ALLOW_LIST` while
-    `DAYTONA_NETWORK_BLOCK_ALL` is on. Never includes the value itself, credentials, path, or
+    """Flag env values that point egress at a host outside `SANDBOX_NETWORK_ALLOW_LIST` while
+    `SANDBOX_NETWORK_BLOCK_ALL` is on. Never includes the value itself, credentials, path, or
     query -- only the env key, the host, and the port."""
     if not settings.sandbox_network_block_all:
         return []
@@ -477,13 +477,13 @@ def egress_warnings(env: dict[str, str], settings: Settings) -> list[str]:
             except ValueError:
                 warnings.append(
                     f"{key} points at {host}:{port_display}; egress is blocked by default -- "
-                    "confirm its resolved address is in DAYTONA_NETWORK_ALLOW_LIST"
+                    "confirm its resolved address is in SANDBOX_NETWORK_ALLOW_LIST"
                 )
                 continue
             if not any(addr in network for network in allow_networks):
                 warnings.append(
                     f"{key} points at {host}:{port_display} which is not in "
-                    "DAYTONA_NETWORK_ALLOW_LIST while DAYTONA_NETWORK_BLOCK_ALL is on"
+                    "SANDBOX_NETWORK_ALLOW_LIST while SANDBOX_NETWORK_BLOCK_ALL is on"
                 )
 
     return warnings

@@ -93,6 +93,17 @@ async def test_an_idle_sandbox_is_stopped_and_a_busy_one_left_running(maker) -> 
     assert client.containers.get(idle.sandbox_id).status == "running"
 
 
+async def test_only_restricts_the_idle_pass_to_the_given_workspaces(maker) -> None:
+    client = FakeDockerClient()
+    runtime = docker_runtime_with(client, sandbox_auto_stop_minutes=30)
+    chosen = await _sandboxed(maker, client, runtime, idle_minutes=45)
+    other = await _sandboxed(maker, client, runtime, idle_minutes=45)
+
+    assert await stop_idle_sandboxes(maker, runtime.settings, runtime, only={chosen.id}) == 1
+    assert client.containers.get(chosen.sandbox_id).status == "exited"
+    assert client.containers.get(other.sandbox_id).status == "running"
+
+
 async def test_an_already_stopped_sandbox_is_not_stopped_again(maker) -> None:
     client = FakeDockerClient()
     runtime = docker_runtime_with(client, sandbox_auto_stop_minutes=30)
@@ -199,6 +210,45 @@ async def test_upkeep_runs_only_on_a_docker_profile(monkeypatch) -> None:
     assert task is not None
     await asyncio.wait_for(task, 1)
     assert len(started) == 1
+
+    # A mixed install (Daytona default, Docker chosen per workspace) says so explicitly.
+    task = sandbox_maintenance.start_sandbox_maintenance(
+        None, Settings(sandbox_runtime_default="daytona", docker_upkeep=True)  # type: ignore[arg-type]
+    )
+    assert task is not None
+    await asyncio.wait_for(task, 1)
+    assert len(started) == 2
+    assert sandbox_maintenance.start_sandbox_maintenance(
+        None, Settings(sandbox_runtime_default="docker", docker_upkeep=False)  # type: ignore[arg-type]
+    ) is None
+
+
+async def test_each_upkeep_pass_records_when_it_finished(maker, monkeypatch) -> None:
+    """/health reports this (Epic 06): a stuck or crashed loop shows as a stale timestamp."""
+    import asyncio
+
+    from app.services import sandbox_maintenance
+
+    async def nothing(*args, **kwargs):
+        return {}
+
+    for name in ("reconcile_orphans", "isolate_legacy_sandboxes", "stop_idle_sandboxes"):
+        monkeypatch.setattr(sandbox_maintenance, name, nothing)
+    runtime = docker_runtime_with(FakeDockerClient())
+    assert runtime.last_upkeep_at is None
+
+    task = asyncio.create_task(
+        sandbox_maintenance.run_sandbox_maintenance(maker, runtime.settings, runtime)
+    )
+    try:
+        for _ in range(100):
+            if runtime.last_upkeep_at is not None:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert runtime.last_upkeep_at is not None
 
 
 # --- sandboxes from before installation labels -------------------------------------------
