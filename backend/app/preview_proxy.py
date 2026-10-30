@@ -1079,7 +1079,10 @@ async def _send_http_request(
         query=query,
         original_host=original_host,
     )
-    if response.status_code not in {401, 403}:
+    # A retry only helps when there is a provider token to renew (Daytona's expires). Docker
+    # previews carry none, so a 401/403 is the app's own answer: replaying it would send the
+    # app's request (a POST /login, say) twice.
+    if response.status_code not in {401, 403} or not preview_link.token:
         return preview_link, response
 
     await response.aclose()
