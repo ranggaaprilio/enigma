@@ -20,7 +20,6 @@ from app.schemas.projects import (
 )
 from app.schemas.workspaces import WorkspaceCreateRequest, WorkspaceResponse
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import get_daytona_runtime
 from app.services.projects import (
     ProjectNotFoundError,
     SqlAlchemyProjectService,
@@ -28,6 +27,7 @@ from app.services.projects import (
     TeamNotFoundError,
     TeamPermissionError,
 )
+from app.services.sandbox import get_sandbox_runtime
 from app.services.workspaces import (
     SqlAlchemyWorkspaceService,
     WorkspaceNotFoundError,
@@ -292,7 +292,7 @@ async def get_workspace_service(
     return SqlAlchemyWorkspaceService(
         session=session,
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
-        runtime=get_daytona_runtime(),
+        runtime=get_sandbox_runtime(),
     )
 
 

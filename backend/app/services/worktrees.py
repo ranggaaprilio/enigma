@@ -3,7 +3,7 @@
 Worktrees let several branches live side-by-side in one Daytona sandbox: the base clone stays
 at ``workspace.workspace_path`` on the default branch, while feature branches are checked out
 into a managed sibling directory ``worktrees/<slug>`` (relative to the sandbox home). All git
-work runs through ``DaytonaRuntime.exec`` with raw ``git worktree`` because the Daytona git SDK
+work runs through ``SandboxRuntime.exec`` with raw ``git worktree`` because the Daytona git SDK
 only wraps high-level ops. This mirrors the pattern already used by ``speckit.py``.
 
 The only way a caller targets a worktree is by its database id, which this service resolves to a
@@ -22,8 +22,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.models import Workspace, WorkspaceWorktree
 from app.services.access import require_workspace_access
-from app.services.daytona_runtime import DaytonaRuntime
 from app.services.repositories import RepositoryNotClonedError, sanitize_git_output
+from app.services.sandbox import SandboxRuntime
 from app.services.workspaces import WorkspaceNotFoundError
 
 GIT_TIMEOUT_SECONDS = 120
@@ -106,7 +106,7 @@ class WorktreeService:
     def __init__(
         self,
         session: AsyncSession,
-        runtime: DaytonaRuntime,
+        runtime: SandboxRuntime,
         settings: Settings,
     ) -> None:
         self.session = session

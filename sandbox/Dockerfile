@@ -1,4 +1,8 @@
-# Custom Daytona sandbox snapshot for Enigma previews testing.
+# Enigma sandbox image — shared by both sandbox providers so they cannot drift:
+#   - Daytona:      ./daytona/build-snapshot.sh   (daytona snapshot create --dockerfile this)
+#   - local Docker: ./sandbox/build-local-image.sh (docker/podman build -t enigma-sandbox:latest)
+# Both run as the base image's non-root `daytona` user with home /home/daytona, which is
+# what the backend's DAYTONA_SANDBOX_HOME assumes for either provider.
 #
 # Why this exists:
 #   Two runtime features bootstrap their tooling with a `curl … | sh` install:
@@ -23,6 +27,18 @@
 # ~/.ssh/known_hosts for github.com / gitlab.com / bitbucket.org.
 ARG BASE_SNAPSHOT=daytonaio/sandbox:0.8.0
 FROM ${BASE_SNAPSHOT}
+
+# tmux backs the reconnectable terminal sessions on the local Docker runtime
+# (docs/local-docker-runtime/03); the base already ships git, openssh-client, GNU
+# coreutils `timeout` and `setsid`. Root only for the package install, then straight back
+# to the unprivileged user every later layer (and the running sandbox) uses.
+USER root
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends tmux; \
+    rm -rf /var/lib/apt/lists/*; \
+    tmux -V
+USER daytona
 
 # Pin for reproducible snapshots; bump deliberately. Empty = latest at build time.
 ARG MISE_VERSION=

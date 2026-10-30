@@ -31,15 +31,16 @@ from app.core.config import Settings
 from app.models import CustomCommand, PreviewSession, Workspace, WorkspaceService, WorkspaceWorktree
 from app.models.workspace_service import WORKSPACE_SERVICE_ACTIVE_STATUSES
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    get_daytona_runtime,
-)
 from app.services.git_providers import redact_secrets
 from app.services.preview import COMMON_PREVIEW_PORTS, PreviewService
 from app.services.run_detection import infer_port
 from app.services.run_paths import join_subpath, resolve_worktree, validate_relative_subpath
+from app.services.sandbox import (
+    RuntimeFileSystem,
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
+)
 from app.services.sandbox_probe import port_is_open, probe_ports
 from app.services.service_scripts import (
     ProbeResult,
@@ -104,12 +105,12 @@ class WorkspaceServiceManager:
         self,
         session: AsyncSession,
         settings: Settings,
-        runtime: DaytonaRuntime | None = None,
+        runtime: SandboxRuntime | None = None,
         common_ports: tuple[int, ...] = COMMON_PREVIEW_PORTS,
     ) -> None:
         self.session = session
         self.settings = settings
-        self.runtime = runtime or get_daytona_runtime()
+        self.runtime = runtime or get_sandbox_runtime()
         self.common_ports = common_ports
 
     # ------------------------------------------------------------------
@@ -241,7 +242,7 @@ class WorkspaceServiceManager:
                 cwd=workspace.workspace_path,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             raise WorkspaceServiceRuntimeError(str(error)) from error
         content = result.stdout or ""
         # A log's content is user-visible: redact the same way the log-stream WebSocket does,
@@ -527,7 +528,7 @@ class WorkspaceServiceManager:
                 cwd=workspace.workspace_path,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             raise WorkspaceServiceRuntimeError(str(error)) from error
         row.desired = False
         row.status = "stopped"
@@ -633,7 +634,7 @@ class WorkspaceServiceManager:
                 env=env or None,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             raise WorkspaceServiceRuntimeError(str(error)) from error
 
         now = datetime.now(UTC)
@@ -674,7 +675,7 @@ class WorkspaceServiceManager:
                 cwd=workspace.workspace_path,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
-        except DaytonaRuntimeError:
+        except SandboxRuntimeError:
             pass
 
     async def _refresh_single(
@@ -734,7 +735,7 @@ class WorkspaceServiceManager:
                 cwd=workspace.workspace_path,
                 timeout=self.settings.dev_server_command_timeout_seconds,
             )
-        except DaytonaRuntimeError:
+        except SandboxRuntimeError:
             return {}, target_ports
         return parse_probe_output(result.stdout or ""), target_ports
 
@@ -956,7 +957,7 @@ class WorkspaceServiceManager:
         workspace = await self.session.get(Workspace, workspace_id)
         if workspace is None or workspace.owner_id != user_id:
             raise WorkspaceNotFoundError
-        if not workspace.daytona_sandbox_id:
+        if not workspace.sandbox_id:
             raise WorkspaceServiceWorkspacePathError
         return workspace
 
@@ -1100,33 +1101,33 @@ class WorkspaceServiceManager:
     ) -> str | None:
         """Returns an error reason ('no-config') to surface, or None when runnable. Raises
         `WorkspaceServiceNotClonedError` when the checkout itself is missing."""
-        sandbox = await self.runtime.get_sandbox(workspace)
-        if not await _is_cloned(sandbox, checkout):
+        fs = await self.runtime.fs(workspace)
+        if not await _is_cloned(fs, checkout):
             raise WorkspaceServiceNotClonedError
         if require_mise:
             candidates = [launch_cwd] if launch_cwd and launch_cwd != checkout else []
             candidates.append(checkout)
             for directory in candidates:
-                if await _has_mise_config(sandbox, directory):
+                if await _has_mise_config(fs, directory):
                     break
             else:
                 return "no-config"
         return None
 
 
-async def _has_mise_config(sandbox: object, repo_path: str) -> bool:
+async def _has_mise_config(fs: RuntimeFileSystem, repo_path: str) -> bool:
     for name in MISE_CONFIG_FILES:
         try:
-            await sandbox.fs.get_file_info(f"{repo_path}/{name}")
+            await fs.get_file_info(f"{repo_path}/{name}")
         except Exception:
             continue
         return True
     return False
 
 
-async def _is_cloned(sandbox: object, repo_path: str) -> bool:
+async def _is_cloned(fs: RuntimeFileSystem, repo_path: str) -> bool:
     try:
-        await sandbox.fs.get_file_info(f"{repo_path}/.git")
+        await fs.get_file_info(f"{repo_path}/.git")
     except Exception:
         return False
     return True

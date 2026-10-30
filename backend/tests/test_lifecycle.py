@@ -256,7 +256,7 @@ async def test_lifespan_reconciles_on_startup_and_drains_in_order_on_shutdown(mo
 
     monkeypatch.setattr(main_module, "reconcile_interrupted_runs", reconcile)
     monkeypatch.setattr(main_module, "drain_in_flight_runs", drain)
-    monkeypatch.setattr(main_module, "get_daytona_runtime", lambda: FakeDaytona())
+    monkeypatch.setattr(main_module, "close_all", FakeDaytona().close)
     monkeypatch.setattr(main_module, "engine", FakeEngine())
     monkeypatch.setattr(main_module, "install_sigterm_drain", install)
     monkeypatch.setattr(main_module, "run_registry", FakeRegistry())
@@ -319,7 +319,7 @@ async def test_lifespan_still_closes_pools_when_the_drain_fails(monkeypatch):
 
     monkeypatch.setattr(main_module, "reconcile_interrupted_runs", reconcile)
     monkeypatch.setattr(main_module, "drain_in_flight_runs", broken_drain)
-    monkeypatch.setattr(main_module, "get_daytona_runtime", lambda: FakeDaytona())
+    monkeypatch.setattr(main_module, "close_all", FakeDaytona().close)
     monkeypatch.setattr(main_module, "engine", FakeEngine())
     monkeypatch.setattr(
         main_module,
@@ -360,7 +360,7 @@ async def test_queue_mode_api_does_not_sweep_runs_it_does_not_own(monkeypatch):
     monkeypatch.setattr(main_module, "get_settings", lambda: Settings(run_execution_mode="queue"))
     monkeypatch.setattr(main_module, "reconcile_interrupted_runs", reconcile)
     monkeypatch.setattr(main_module, "drain_in_flight_runs", drain)
-    monkeypatch.setattr(main_module, "get_daytona_runtime", lambda: FakeDaytona())
+    monkeypatch.setattr(main_module, "close_all", FakeDaytona().close)
     monkeypatch.setattr(main_module, "engine", FakeEngine())
     monkeypatch.setattr(main_module, "install_sigterm_drain", lambda *a, **k: lambda: None)
     monkeypatch.setattr(main_module, "run_registry", FakeRegistry())

@@ -3,19 +3,19 @@ from datetime import UTC, datetime
 from uuid import UUID
 
 import structlog
-from daytona import PtySize
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings
 from app.models import TerminalSession, Workspace
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    get_daytona_runtime,
-)
 from app.services.env_templates import TemplateProblem, enigma_exports, substitute
+from app.services.sandbox import (
+    PtySize,
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
+)
 from app.services.workspace_env import build_template_context
 from app.services.workspace_env import resolve as _resolve_env
 from app.services.workspaces import WorkspaceNotFoundError
@@ -40,11 +40,11 @@ class TerminalService:
         self,
         session: AsyncSession,
         settings: Settings,
-        runtime: DaytonaRuntime | None = None,
+        runtime: SandboxRuntime | None = None,
     ) -> None:
         self.session = session
         self.settings = settings
-        self.runtime = runtime or get_daytona_runtime()
+        self.runtime = runtime or get_sandbox_runtime()
 
     async def create_or_reuse(
         self,
@@ -53,7 +53,7 @@ class TerminalService:
         name: str,
     ) -> TerminalSession:
         workspace = await self._get_workspace(workspace_id, user_id)
-        if not workspace.daytona_sandbox_id:
+        if not workspace.sandbox_id:
             raise TerminalWorkspacePathError
         result = await self.session.execute(
             select(TerminalSession)
@@ -126,7 +126,7 @@ class TerminalService:
         )
         try:
             await self.runtime.kill_pty(workspace, terminal_session.pty_session_id)
-        except DaytonaRuntimeError:
+        except SandboxRuntimeError:
             pass
         terminal_session.status = "stopped"
         terminal_session.last_active_at = datetime.now(UTC)
@@ -174,7 +174,7 @@ class TerminalService:
 class TerminalPtyBridge:
     def __init__(
         self,
-        runtime: DaytonaRuntime,
+        runtime: SandboxRuntime,
         default_cols: int,
         default_rows: int,
     ) -> None:
@@ -205,7 +205,7 @@ class TerminalPtyBridge:
                 rows=self.default_rows,
                 cwd=cwd,
             )
-        except DaytonaRuntimeError as error:
+        except SandboxRuntimeError as error:
             await websocket.send_json({"type": "error", "message": str(error)})
             await websocket.close()
             return

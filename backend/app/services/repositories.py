@@ -13,7 +13,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import Settings, get_settings
 from app.models import RepositoryCredential, Workspace
-from app.services.daytona_runtime import DaytonaRuntime
 from app.services.git_providers import (
     AUTO_PROVIDER,
     InvalidRepositoryUrlError,
@@ -23,6 +22,7 @@ from app.services.git_providers import (
     redact_secrets,
 )
 from app.services.git_providers import sanitize_repository_url as _sanitize_repository_url
+from app.services.sandbox import RuntimeFileSystem, SandboxRuntime
 from app.services.ssh_keys import generate_ed25519_keypair
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
@@ -158,6 +158,9 @@ def sanitize_git_output(value: str, *secrets: str | None) -> str:
     return redact_secrets(value, *secrets)
 
 
+GIT_STATUS_COMMAND = "git status --porcelain -b --untracked-files=all"
+
+
 def parse_porcelain_status(output: str) -> list[GitFileStatus]:
     files: list[GitFileStatus] = []
     for line in output.splitlines():
@@ -171,6 +174,45 @@ def parse_porcelain_status(output: str) -> list[GitFileStatus]:
             path = path.rsplit(" -> ", 1)[1]
         files.append(GitFileStatus(path=path, status=status_code))
     return files
+
+
+# go-git's status words, which the SDK's ``git.status`` returned and the UI / the agent
+# file-change badge mapper (``AgentService._map_git_status_to_badge``) expect.
+_PORCELAIN_STATUS_WORDS = {
+    "?": "Untracked",
+    "!": "Ignored",
+    "M": "Modified",
+    "A": "Added",
+    "D": "Deleted",
+    "R": "Renamed",
+    "C": "Copied",
+    "U": "UpdatedButUnmerged",
+}
+
+
+def porcelain_status_word(code: str) -> str:
+    """Map a porcelain ``XY`` code (as ``parse_porcelain_status`` strips it) to go-git's word.
+
+    Like the SDK status did, the worktree column wins over staging when both are set
+    (``AM`` → ``Modified``); ``??`` → ``Untracked``.
+    """
+    selected = code[-1] if len(code) == 2 else code
+    return _PORCELAIN_STATUS_WORDS.get(selected, selected)
+
+
+def branch_from_porcelain_header(output: str) -> str | None:
+    """Current branch from a ``git status --porcelain -b`` header line, ``None`` when detached."""
+    for line in output.splitlines():
+        if not line.startswith("## "):
+            continue
+        header = line[3:]
+        for unborn in ("No commits yet on ", "Initial commit on "):
+            if header.startswith(unborn):
+                return header[len(unborn) :].strip() or None
+        if header.startswith("HEAD "):
+            return None
+        return header.split("...", 1)[0].split(" ", 1)[0] or None
+    return None
 
 
 def validate_diff_path(path: str) -> str:
@@ -195,7 +237,7 @@ class RepositoryService:
         self,
         session: AsyncSession,
         cipher: WorkspaceSecretCipher,
-        runtime: DaytonaRuntime,
+        runtime: SandboxRuntime,
         settings: Settings | None = None,
     ) -> None:
         self.session = session
@@ -323,13 +365,13 @@ class RepositoryService:
         if not workspace.repo_url:
             raise RepositoryCredentialNotFoundError
         auth = await self._get_auth(workspace.id)
-        sandbox = await self.runtime.get_sandbox(workspace)
-        if await self._is_cloned(sandbox, workspace.workspace_path):
+        fs = await self.runtime.fs(workspace)
+        if await self._is_cloned(fs, workspace.workspace_path):
             raise RepositoryAlreadyClonedError
         try:
-            await sandbox.fs.get_file_info(workspace.workspace_path)
+            await fs.get_file_info(workspace.workspace_path)
         except Exception:
-            await sandbox.fs.create_folder(workspace.workspace_path, "755")
+            await fs.create_folder(workspace.workspace_path, "755")
         # Clone with the git CLI (not the SDK's server-side go-git) so token and SSH auth share
         # one code path — the same reason push/pull already run through the CLI.
         result = await self._run_authenticated_git(
@@ -355,49 +397,26 @@ class RepositoryService:
     ) -> GitStatus:
         workspace = await self._get_workspace(workspace_id, owner_id)
         repo_path = worktree_path or workspace.workspace_path
-        sandbox = await self.runtime.get_sandbox(workspace)
-        if not await self._is_cloned(sandbox, repo_path):
+        fs = await self.runtime.fs(workspace)
+        if not await self._is_cloned(fs, repo_path):
             return GitStatus(cloned=False, branch=None, is_clean=True, files=[])
-        # A linked worktree's ``.git`` is a pointer file that Daytona's server-side git (go-git)
-        # cannot resolve references through ("reference not found"), so read its status with the
-        # git CLI — the same way diffs and worktree stats already do. The base clone keeps the
-        # richer SDK status.
-        if worktree_path is not None:
-            return await self._status_via_cli(workspace, repo_path)
-        try:
-            result = await sandbox.git.status(repo_path)
-        except Exception as error:
-            raise GitCommandError(str(error)) from error
+        # Always the git CLI: it is provider-neutral and, unlike a server-side git, resolves a
+        # linked worktree's ``.git`` pointer file — the same way diffs and worktree stats do.
+        return await self._status_via_cli(workspace, repo_path)
+
+    async def _status_via_cli(self, workspace: Workspace, repo_path: str) -> GitStatus:
+        # One exec: ``-b`` carries the branch in the header, ``-uall`` lists untracked files
+        # individually (go-git never collapsed a new directory to ``dir/``).
+        porcelain = await self.runtime.exec(workspace, GIT_STATUS_COMMAND, cwd=repo_path)
+        if porcelain.exit_code != 0:
+            raise GitCommandError(porcelain.stderr or porcelain.stdout or "Git status failed")
         files = [
-            GitFileStatus(
-                path=str(getattr(item, "path", getattr(item, "name", ""))),
-                status=self._file_status(item),
-            )
-            for item in (getattr(result, "file_status", None) or [])
+            GitFileStatus(path=item.path, status=porcelain_status_word(item.status))
+            for item in parse_porcelain_status(porcelain.stdout)
         ]
         return GitStatus(
             cloned=True,
-            branch=getattr(result, "current_branch", None),
-            is_clean=len(files) == 0,
-            files=files,
-        )
-
-    async def _status_via_cli(self, workspace: Workspace, repo_path: str) -> GitStatus:
-        porcelain = await self.runtime.exec(
-            workspace, "git status --porcelain", cwd=repo_path
-        )
-        if porcelain.exit_code != 0:
-            raise GitCommandError(
-                porcelain.stderr or porcelain.stdout or "Git status failed"
-            )
-        files = parse_porcelain_status(porcelain.stdout)
-        branch_result = await self.runtime.exec(
-            workspace, "git branch --show-current", cwd=repo_path
-        )
-        branch = branch_result.stdout.strip() if branch_result.exit_code == 0 else ""
-        return GitStatus(
-            cloned=True,
-            branch=branch or None,
+            branch=branch_from_porcelain_header(porcelain.stdout),
             is_clean=len(files) == 0,
             files=files,
         )
@@ -412,8 +431,8 @@ class RepositoryService:
     ) -> str:
         workspace = await self._get_workspace(workspace_id, owner_id)
         repo_path = worktree_path or workspace.workspace_path
-        sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, repo_path)
+        fs = await self.runtime.fs(workspace)
+        await self._ensure_cloned(fs, repo_path)
         args = ["diff", "--"]
         if path is not None:
             args.append(validate_diff_path(path))
@@ -437,8 +456,8 @@ class RepositoryService:
     ) -> list[GitCommit]:
         workspace = await self._get_workspace(workspace_id, owner_id)
         repo_path = worktree_path or workspace.workspace_path
-        sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, repo_path)
+        fs = await self.runtime.fs(workspace)
+        await self._ensure_cloned(fs, repo_path)
         capped = max(1, min(limit, 200))
         offset = max(0, skip)
         args = ["log", "-n", str(capped), f"--skip={offset}", f"--pretty=format:{LOG_FORMAT}"]
@@ -465,8 +484,8 @@ class RepositoryService:
     ) -> GitCommitDetail:
         workspace = await self._get_workspace(workspace_id, owner_id)
         repo_path = worktree_path or workspace.workspace_path
-        sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, repo_path)
+        fs = await self.runtime.fs(workspace)
+        await self._ensure_cloned(fs, repo_path)
         rev = validate_commit_sha(sha)
         # Metadata without the diff (``-s``); body (%b) is the final field so it can't shift others.
         meta = await self.runtime.exec(
@@ -535,12 +554,10 @@ class RepositoryService:
         workspace = await self._get_workspace(workspace_id, owner_id)
         auth = await self._get_auth(workspace.id)
         repo_path = worktree_path or workspace.workspace_path
-        sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, repo_path)
+        fs = await self.runtime.fs(workspace)
+        await self._ensure_cloned(fs, repo_path)
         await self._ensure_origin(workspace, repo_path)
-        result = await self._run_authenticated_git(
-            workspace, ["pull"], auth, cwd=repo_path
-        )
+        result = await self._run_authenticated_git(workspace, ["pull"], auth, cwd=repo_path)
         if result.exit_code != 0:
             raise GitCommandError(
                 sanitize_git_output(
@@ -558,8 +575,8 @@ class RepositoryService:
         workspace = await self._get_workspace(workspace_id, owner_id)
         auth = await self._get_auth(workspace.id)
         repo_path = worktree_path or workspace.workspace_path
-        sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, repo_path)
+        fs = await self.runtime.fs(workspace)
+        await self._ensure_cloned(fs, repo_path)
         await self._ensure_origin(workspace, repo_path)
         # A fetch updates the shared object store for every worktree in the clone, so ahead/behind
         # counts (WorktreeService._stats) become accurate afterward regardless of the cwd used.
@@ -585,8 +602,8 @@ class RepositoryService:
     ) -> None:
         workspace = await self._get_workspace(workspace_id, owner_id)
         repo_path = worktree_path or workspace.workspace_path
-        sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, repo_path)
+        fs = await self.runtime.fs(workspace)
+        await self._ensure_cloned(fs, repo_path)
         # Stop early when there is nothing staged or unstaged to commit.
         porcelain = await self.runtime.exec(
             workspace,
@@ -636,8 +653,8 @@ class RepositoryService:
         workspace = await self._get_workspace(workspace_id, owner_id)
         auth = await self._get_auth(workspace.id)
         repo_path = worktree_path or workspace.workspace_path
-        sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, repo_path)
+        fs = await self.runtime.fs(workspace)
+        await self._ensure_cloned(fs, repo_path)
         await self._ensure_origin(workspace, repo_path)
         # Push via the git CLI (not the Daytona SDK's server-side go-git). go-git cannot resolve
         # references through a linked worktree's ``.git`` pointer file — the same limitation that
@@ -672,8 +689,8 @@ class RepositoryService:
         """
         workspace = await self._get_workspace(workspace_id, owner_id)
         repo_path = worktree_path or workspace.workspace_path
-        sandbox = await self.runtime.get_sandbox(workspace)
-        await self._ensure_cloned(sandbox, repo_path)
+        fs = await self.runtime.fs(workspace)
+        await self._ensure_cloned(fs, repo_path)
         if path is None:
             # Everything: staged + unstaged tracked changes (reset --hard) and untracked files/dirs
             # (clean -fd).
@@ -693,8 +710,7 @@ class RepositoryService:
         # (clean), a tracked modification/deletion is restored from HEAD (checkout).
         status = await self.runtime.exec(
             workspace,
-            "git "
-            + " ".join(shlex.quote(arg) for arg in ["status", "--porcelain", "--", target]),
+            "git " + " ".join(shlex.quote(arg) for arg in ["status", "--porcelain", "--", target]),
             cwd=repo_path,
             timeout=GIT_TIMEOUT_SECONDS,
         )
@@ -756,18 +772,24 @@ class RepositoryService:
         Token auth rides on a per-command HTTP Basic ``Authorization`` header
         (``http.extraHeader``) whose username half is provider-specific (``x-access-token`` for
         GitHub, ``oauth2`` for GitLab, ``x-token-auth`` or the account name for Bitbucket).
-        Passing it as a per-invocation ``-c`` value keeps it out of ``.git/config`` and the
-        remote URL. SSH auth materialises the deploy key inside the sandbox for the duration of
-        the command and points ``GIT_SSH_COMMAND`` at it. Nothing is persisted either way.
+        It is passed as ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` environment (git >= 2.31 reads
+        them like ``-c``; the sandbox image ships a newer git), which keeps it out of
+        ``.git/config``, the remote URL and the command string we hand the runtime. On the
+        Docker runtime that keeps it out of ``ps`` too; how a provider applies ``env`` is its
+        own business (Daytona's is a field of its exec API). SSH auth
+        materialises the deploy key inside the sandbox for the duration of the command and
+        points ``GIT_SSH_COMMAND`` at it. Nothing is persisted either way.
         """
         if auth.kind == "ssh":
             return await self._run_ssh_git(workspace, args, auth, cwd=cwd, timeout=timeout)
         basic = base64.b64encode(f"{auth.username}:{auth.token}".encode()).decode()
-        command = "git " + " ".join(
-            shlex.quote(part)
-            for part in ("-c", f"http.extraHeader=AUTHORIZATION: basic {basic}", *args)
-        )
-        return await self.runtime.exec(workspace, command, cwd=cwd, timeout=timeout)
+        command = "git " + " ".join(shlex.quote(part) for part in args)
+        env = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": "http.extraHeader",
+            "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}",
+        }
+        return await self.runtime.exec(workspace, command, cwd=cwd, env=env, timeout=timeout)
 
     async def _run_ssh_git(
         self,
@@ -780,9 +802,9 @@ class RepositoryService:
     ):
         if not auth.private_key:
             raise RepositoryTokenError
-        sandbox = await self.runtime.get_sandbox(workspace)
+        fs = await self.runtime.fs(workspace)
         ssh_dir = f"{self.settings.daytona_sandbox_home.rstrip('/')}/.ssh"
-        async with self._ssh_identity(sandbox, auth.private_key) as key_path:
+        async with self._ssh_identity(fs, auth.private_key) as key_path:
             ssh_command = " ".join(
                 (
                     "ssh",
@@ -799,9 +821,8 @@ class RepositoryService:
                 )
             )
             # ``accept-new`` needs a writable known_hosts location; create ~/.ssh on first use.
-            command = (
-                f"mkdir -p {shlex.quote(ssh_dir)} && git "
-                + " ".join(shlex.quote(part) for part in args)
+            command = f"mkdir -p {shlex.quote(ssh_dir)} && git " + " ".join(
+                shlex.quote(part) for part in args
             )
             result = await self.runtime.exec(
                 workspace,
@@ -816,28 +837,28 @@ class RepositoryService:
         return result
 
     @asynccontextmanager
-    async def _ssh_identity(self, sandbox, private_key: str) -> AsyncIterator[str]:
+    async def _ssh_identity(self, fs: RuntimeFileSystem, private_key: str) -> AsyncIterator[str]:
         """Write the private key to a private temp dir in the sandbox; always remove it."""
         directory = f"{SSH_TMP_ROOT}/{uuid4().hex}"
         key_path = f"{directory}/id_ed25519"
         try:
-            await sandbox.fs.create_folder(directory, "700")
-            await sandbox.fs.upload_file(private_key.encode("utf-8"), key_path)
-            await sandbox.fs.set_file_permissions(key_path, mode="600")
+            await fs.create_folder(directory, "700")
+            await fs.upload_file(private_key.encode("utf-8"), key_path)
+            await fs.set_file_permissions(key_path, mode="600")
         except Exception as error:
-            await self._remove_quietly(sandbox, directory)
+            await self._remove_quietly(fs, directory)
             raise GitCommandError(
                 redact_secrets(f"Could not stage SSH key: {error}", private_key)
             ) from error
         try:
             yield key_path
         finally:
-            await self._remove_quietly(sandbox, directory)
+            await self._remove_quietly(fs, directory)
 
     @staticmethod
-    async def _remove_quietly(sandbox, path: str) -> None:
+    async def _remove_quietly(fs: RuntimeFileSystem, path: str) -> None:
         try:
-            await sandbox.fs.delete_file(path, recursive=True)
+            await fs.delete_file(path, recursive=True)
         except Exception:
             return
 
@@ -867,26 +888,20 @@ class RepositoryService:
             token=token,
         )
 
-    async def _is_cloned(self, sandbox, repo_path: str) -> bool:
+    async def _is_cloned(self, fs: RuntimeFileSystem, repo_path: str) -> bool:
         # In the base clone ``.git`` is a directory; inside a linked worktree it is a file that
         # points at the shared git dir. Either means the path is a usable git working tree.
         try:
-            await sandbox.fs.get_file_info(f"{repo_path}/.git")
+            await fs.get_file_info(f"{repo_path}/.git")
         except Exception:
             return False
         return True
 
-    def _file_status(self, item) -> str:
-        worktree = getattr(item, "worktree", None)
-        staging = getattr(item, "staging", None)
-        selected = worktree if getattr(worktree, "value", worktree) != "Unmodified" else staging
-        return str(getattr(selected, "value", selected) or "")
-
-    async def _ensure_cloned(self, sandbox, repo_path: str) -> None:
-        if not await self._is_cloned(sandbox, repo_path):
+    async def _ensure_cloned(self, fs: RuntimeFileSystem, repo_path: str) -> None:
+        if not await self._is_cloned(fs, repo_path):
             raise RepositoryNotClonedError
 
     async def delete_repo_directory(self, workspace: Workspace) -> None:
-        sandbox = await self.runtime.get_sandbox(workspace)
-        await sandbox.fs.delete_file(workspace.workspace_path, recursive=True)
-        await sandbox.fs.create_folder(workspace.workspace_path, "755")
+        fs = await self.runtime.fs(workspace)
+        await fs.delete_file(workspace.workspace_path, recursive=True)
+        await fs.create_folder(workspace.workspace_path, "755")

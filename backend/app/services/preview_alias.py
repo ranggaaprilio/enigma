@@ -441,7 +441,7 @@ class PreviewAliasService:
     ) -> WorkspacePreviewAlias:
         base_name = validate_alias(
             self._base_alias_name(workspace, name),
-            base_url=self.settings.daytona_preview_proxy_base_url,
+            base_url=self.settings.preview_proxy_base_url,
         )
         last_error: Exception | None = None
         for candidate in self._candidate_names(
@@ -506,4 +506,4 @@ async def alias_url_for_row(
     row = await service.alias_for_row(workspace.id, custom_command_id)
     if row is None or not row.enabled:
         return None
-    return alias_url(row.alias, base_url=settings.daytona_preview_proxy_base_url)
+    return alias_url(row.alias, base_url=settings.preview_proxy_base_url)

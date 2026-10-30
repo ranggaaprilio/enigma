@@ -267,7 +267,7 @@ async def test_command_runs_are_refused_under_queue_backpressure(db_session):
         session_maker,
         queue_settings(run_queue_max_depth=depth),
         runtime=CommandRuntime(InMemoryRunRegistry(), InMemoryEventBus()),
-        daytona_runtime=FakeDaytona(),
+        sandbox_runtime=FakeDaytona(),
         dispatcher=FakeDispatcher(),
     )
     with pytest.raises(RunCapacityExceededError) as exc:

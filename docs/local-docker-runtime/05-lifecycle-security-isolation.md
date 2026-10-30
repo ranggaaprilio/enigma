@@ -182,3 +182,84 @@ can't eat the machine, and agent code can't scan your LAN or touch the Docker da
   containers, with a grace notification.
 - Disk quotas via xfs project quotas on supported hosts; image GC for stale sandbox
   image versions.
+
+## Implementation Notes (shipped)
+
+Built on the Epic 04 branch. Verified on Podman 5.8: unit suites (fakes), 23 real-daemon
+tests (`DOCKER_INTEGRATION_TESTS=1`, 6 new), and the full-stack e2e
+(`DOCKER_STACK_E2E=1`) through a compose backend and proxy. Plan decisions at Gate 1:
+sibling isolation pulled into this epic; egress allow-list and disk quota deferred.
+
+- **Isolation (added to scope)**: every sandbox gets its own bridge network
+  `enigma-sbx-<workspace>` with an explicit /28 carved from `DOCKER_SANDBOX_SUBNET_POOL`
+  (default `10.213.0.0/16`, ~4096 sandboxes; Docker's default pools allow ~31 networks),
+  skipping subnets any other network uses; only a "taken subnet" error is retried, anything
+  else is raised. The backend (the socket holder) attaches this stack's preview proxy to
+  each network under `DOCKER_PREVIEW_PROXY_HOST`; proxies are found by
+  `DOCKER_PREVIEW_PROXY_LABEL` **and** the backend's own compose project (it inspects its
+  own container), so another stack's proxy is never attached. Each upkeep pass re-attaches
+  (compose drops those connections when it recreates the proxy). Sandboxes still on the
+  legacy shared network move on provision or the next pass; a sandbox on any other network
+  is refused. Sibling sandboxes can neither resolve nor reach each other (real-daemon
+  test); the proxy runs with `net.ipv4.ip_forward=0`. The shared `enigma-sandboxes`
+  network is retired from compose.
+- **Installation scoping (security/code review, HIGH/M1)**: migration `0036` also creates
+  `sandbox_installation`, one random id per database. Sandboxes and networks carry it as
+  `enigma.installation`, and the upkeep loop only lists, re-wires or removes its own — two
+  stacks on one daemon (a second checkout, a test stack, a restored database) never treat
+  each other's sandboxes as orphans. Containers created before this epic lack the label:
+  they are never removed as orphans, but each upkeep pass still moves one onto its own
+  network when this database names it as a workspace's sandbox (same workspace id and
+  container id) — so no sandbox of ours stays on the old shared network (post-commit
+  security scan). One this database does not know is left alone: it may be another stack's.
+- **Security profile**: `container_security_spec()` is the single source (cap_drop ALL and
+  nothing added, no-new-privileges, init, pids, CPU, memory with `memswap = memory`,
+  `/tmp` tmpfs of `DOCKER_SANDBOX_TMP_MB`, `nofile` ulimit). Adopting an existing
+  container runs `assert_safe_container` on its inspect output (privileged, cap_add,
+  no-new-privileges, unconfined or custom seccomp/AppArmor, `label=disable`, devices,
+  sysctls, published ports, mounts, root user, host namespaces) and then reads the live
+  process's `CapEff`/`CapBnd`, which must be zero — inspect formats differ (Docker reports
+  `ALL`, Podman lists each capability). Outdated resource limits on a legacy container are
+  not refused.
+- **Idle clock + reaper**: `sandbox_activity` (migration `0036`) is upserted with
+  `clock_timestamp()` by `SandboxActivityRecorder`, debounced 30 s per runtime instance,
+  from provision, exec, command streams, terminal output and `preview_link` (so the API,
+  worker and proxy all count). Every `DOCKER_REAPER_INTERVAL_SECONDS` the upkeep loop stops
+  (keeps) sandboxes idle past `SANDBOX_AUTO_STOP_MINUTES` (0 = never): the selection runs
+  under `pg_try_advisory_xact_lock`, each stop happens outside the transaction after an
+  idle re-check, and a sandbox with a live exec or attached terminal (pidfiles under `/tmp`,
+  checked with shell builtins only) is skipped, so a long quiet build is not stopped — but
+  only until it has been idle `SANDBOX_BUSY_MAX_MINUTES` (240): the probe reads the
+  sandbox's own `/tmp`, which its tenant can fake (post-commit security scan). Any use wakes
+  it again (Epic 02's ensure-started). An open dashboard's status polls count as activity.
+- **Orphans (startup)**: under the lock, containers and networks of this installation
+  whose workspace row is gone are removed; workspaces whose container vanished become
+  `error`. Containers without the managed label are never touched (decoy test).
+- **Where it runs**: `start_sandbox_maintenance` from the API lifespan (inline mode) or each
+  worker (queue mode), only when `SANDBOX_RUNTIME_DEFAULT=docker` (what the compose
+  override sets) and a daemon is reachable — never in a Daytona-default process, the test
+  suite's app included.
+- **OOM**: the kernel kills the biggest process, not PID 1, so the container keeps running
+  and `State.OOMKilled` stays false. `status_detail` (new on the runtime interface; Daytona
+  returns None) reads the cgroup's `oom_kill` counter with an absolute `/bin/cat` (the
+  tenant owns `~/.local/bin`, first on PATH) and `GET /workspaces/{id}/status` returns it as
+  `status_detail`; a failure to read it never turns a healthy status into `error`.
+- **Egress**: `SANDBOX_NETWORK_BLOCK_ALL=true` makes each sandbox network `internal`
+  (no outbound traffic or outside DNS; the proxy still reaches the sandbox — real-daemon
+  test); a changed policy rebuilds existing networks on the next pass.
+- **Config**: neutral names with the Daytona ones as aliases —
+  `SANDBOX_AUTO_STOP_MINUTES`, `SANDBOX_NETWORK_BLOCK_ALL`, `SANDBOX_NETWORK_ALLOW_LIST`;
+  new `DOCKER_SANDBOX_SUBNET_POOL`/`_SUBNET_PREFIX`, `DOCKER_PREVIEW_PROXY_LABEL`,
+  `DOCKER_SANDBOX_TMP_MB`, `DOCKER_SANDBOX_NOFILE`, `DOCKER_REAPER_INTERVAL_SECONDS`.
+  `Workspace.sandbox_id` is now a hybrid property, usable in queries.
+- **Frontend**: a stopped Docker workspace's pill reads "Workspace stopped · wakes on next
+  use".
+- **Deferred / not done**: egress allow-list on Docker (an egress proxy container; Daytona
+  still honours `SANDBOX_NETWORK_ALLOW_LIST`); per-sandbox disk quota; managed-container
+  count and reaper liveness in `/health` (Epic 06 owns health surfacing — the
+  `sandbox_maintenance_actions_total` counter exists); showing `status_detail` in the UI
+  (the dashboard reads the stored status, not the status endpoint). Residual exposure from
+  the security review, unchanged by this epic: a sandbox can reach its gateway (host
+  services bound to `0.0.0.0`) and, with egress open, the cloud metadata address; the
+  proxy holds `DATABASE_URL` and `AUTH_SECRET_KEY` while sitting on every sandbox network,
+  so it is the one pivot to harden (read-only DB role, `METRICS_TOKEN` required on Docker).

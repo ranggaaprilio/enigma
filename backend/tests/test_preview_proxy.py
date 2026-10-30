@@ -17,11 +17,11 @@ from app.preview_proxy import (
     PreviewProxyTarget,
     create_preview_proxy_app,
 )
-from app.services.daytona_runtime import RuntimePreviewLink
 from app.services.preview_capability import (
     InvalidPreviewCapabilityError,
     create_preview_proxy_url,
 )
+from app.services.sandbox import RuntimePreviewLink
 
 
 def make_workspace() -> Workspace:
@@ -133,7 +133,7 @@ async def test_resolver_rejects_inactive_sessions_and_port_mismatches(
     public_url = create_preview_proxy_url(
         preview.id,
         5173,
-        base_url=settings.daytona_preview_proxy_base_url,
+        base_url=settings.preview_proxy_base_url,
         secret_key=settings.auth_secret_key,
         ttl_seconds=3600,
     )
@@ -156,7 +156,7 @@ async def test_resolver_rejects_an_inactive_workspace_owner() -> None:
     public_url = create_preview_proxy_url(
         preview.id,
         preview.port,
-        base_url=settings.daytona_preview_proxy_base_url,
+        base_url=settings.preview_proxy_base_url,
         secret_key=settings.auth_secret_key,
         ttl_seconds=3600,
     )
@@ -311,6 +311,74 @@ def test_websocket_proxy_relays_messages_and_daytona_headers(monkeypatch) -> Non
     assert isinstance(headers, dict)
     assert headers["X-Daytona-Preview-Token"] == "ws-token"
     assert headers["X-Daytona-Skip-Preview-Warning"] == "true"
+    assert headers["X-Forwarded-Host"] == "capability.localhost:8001"
+
+
+def test_http_proxy_sends_no_daytona_headers_for_a_tokenless_sandbox() -> None:
+    """local-docker-runtime Epic 04: a Docker sandbox is dialled directly on the sandbox
+    network with an empty token, so no Daytona header may reach the user's app."""
+    workspace = make_workspace()
+    preview = make_preview(workspace)
+    runtime = FakeRuntime([RuntimePreviewLink(url="http://execute-abc:5173", token="")])
+    requests: list[httpx.Request] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, content=b"ok")
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handle))
+    proxy_app = create_preview_proxy_app(
+        settings=Settings(preview_proxy_base_url="http://localhost:8001"),
+        resolver=FakeResolver(  # type: ignore[arg-type]
+            PreviewProxyTarget(preview_session=preview, workspace=workspace)
+        ),
+        runtime=runtime,  # type: ignore[arg-type]
+        http_client=http_client,
+    )
+
+    with TestClient(proxy_app, base_url="http://capability.localhost:8001") as client:
+        response = client.get("/")
+
+    asyncio.run(http_client.aclose())
+    assert response.status_code == 200
+    assert str(requests[0].url) == "http://execute-abc:5173/"
+    assert not any(name.lower().startswith("x-daytona") for name in requests[0].headers)
+
+
+def test_websocket_proxy_sends_no_daytona_headers_for_a_tokenless_sandbox(monkeypatch) -> None:
+    workspace = make_workspace()
+    preview = make_preview(workspace)
+    upstream = FakeUpstream()
+    captured: dict[str, object] = {}
+
+    async def fake_connect(url: str, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return upstream
+
+    monkeypatch.setattr(preview_proxy_module, "ws_connect", fake_connect)
+    proxy_app = create_preview_proxy_app(
+        settings=Settings(preview_proxy_base_url="http://localhost:8001"),
+        resolver=FakeResolver(  # type: ignore[arg-type]
+            PreviewProxyTarget(preview_session=preview, workspace=workspace)
+        ),
+        runtime=FakeRuntime(  # type: ignore[arg-type]
+            [RuntimePreviewLink(url="http://execute-abc:5173", token="")]
+        ),
+        http_client=httpx.AsyncClient(transport=httpx.MockTransport(lambda _request: None)),
+    )
+
+    with TestClient(proxy_app, base_url="http://capability.localhost:8001") as client:
+        with client.websocket_connect(
+            "/@vite/client", headers={"host": "capability.localhost:8001"}
+        ) as socket:
+            socket.send_text("hmr")
+            assert socket.receive_text() == "echo:hmr"
+
+    assert captured["url"] == "ws://execute-abc:5173/@vite/client"
+    headers = captured["additional_headers"]
+    assert isinstance(headers, dict)
+    assert not any(name.lower().startswith("x-daytona") for name in headers)
     assert headers["X-Forwarded-Host"] == "capability.localhost:8001"
 
 

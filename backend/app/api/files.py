@@ -20,7 +20,6 @@ from app.schemas.files import (
     normalize_path,
 )
 from app.schemas.workspaces import DeleteResponse
-from app.services.daytona_runtime import get_daytona_runtime
 from app.services.files import (
     FileConflictError,
     FileIgnoredPathError,
@@ -32,6 +31,7 @@ from app.services.files import (
     FileTreeLimitExceededError,
     FileWorkspaceUnavailableError,
 )
+from app.services.sandbox import get_sandbox_runtime
 from app.services.workspaces import WorkspaceNotFoundError
 from app.services.worktrees import WorktreeNotFoundError
 
@@ -125,7 +125,7 @@ async def get_file_service(
     session: AsyncSession = DB_SESSION_DEP,
     settings: Settings = SETTINGS_DEP,
 ) -> FileServiceProtocol:
-    return FileService(session=session, settings=settings, runtime=get_daytona_runtime())
+    return FileService(session=session, settings=settings, runtime=get_sandbox_runtime())
 
 
 FILE_SERVICE_DEP = Depends(get_file_service)

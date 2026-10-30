@@ -9,17 +9,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.config import Settings
 from app.models import EditorSession, Workspace
 from app.services.audit import AuditLogService
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    get_daytona_runtime,
-)
 from app.services.editor_alias import (
     editor_alias_url,
     editor_prime_url,
     ensure_editor_alias,
 )
 from app.services.preview_alias import encode_alias_grant
+from app.services.sandbox import (
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
+)
 from app.services.workspaces import WorkspaceNotFoundError
 from app.services.worktrees import WorktreeNotFoundError, WorktreeService
 
@@ -48,6 +48,8 @@ class EditorService:
 
     The launch command is unchanged from the new-tab era -- code-server still binds
     ``0.0.0.0:13337`` with ``--auth none`` inside the sandbox, which is never reachable directly.
+    On the Docker provider every sandbox shares one bridge network, so there it binds
+    ``127.0.0.1`` and the proxy-only port relay (``sandbox/port_relay.py``) carries it.
     What changed is the URL handed to the browser: it used to be a Daytona signed preview URL
     (a bearer credential in the address bar, rotating hourly); it is now
     ``https://editor-<alias>.<proxy-host>/?folder=...``, a stable origin with no credential,
@@ -59,11 +61,11 @@ class EditorService:
         self,
         session: AsyncSession,
         settings: Settings,
-        runtime: DaytonaRuntime | None = None,
+        runtime: SandboxRuntime | None = None,
     ) -> None:
         self.session = session
         self.settings = settings
-        self.runtime = runtime or get_daytona_runtime()
+        self.runtime = runtime or get_sandbox_runtime()
 
     async def start_or_reuse(
         self,
@@ -72,14 +74,18 @@ class EditorService:
         worktree_id: UUID | None = None,
     ) -> EditorSession:
         workspace = await self._get_workspace(workspace_id, user_id)
-        if not workspace.daytona_sandbox_id:
+        if not workspace.sandbox_id:
             raise EditorWorkspacePathError
         folder = await self._resolve_folder(workspace, worktree_id)
         existing = await self._latest_for_workspace(workspace.id, user_id)
+        # Docker sandboxes share one bridge network, so code-server (`--auth none`) listens on
+        # loopback there and only the proxy-only port relay reaches it (Epic 04). Daytona's
+        # preview edge is per-sandbox: unchanged.
+        loopback_only = workspace.runtime == "docker"
         try:
             result = await self.runtime.exec(
                 workspace,
-                self._ensure_command(folder),
+                self._ensure_command(folder, loopback_only=loopback_only),
                 cwd=workspace.workspace_path,
                 timeout=self.settings.editor_install_timeout_seconds,
             )
@@ -92,15 +98,17 @@ class EditorService:
                 )
                 raise EditorRuntimeError(
                     "code-server could not be started in the sandbox. "
-                    "Install it in the Daytona snapshot or enable editor auto-install."
+                    "Install it in the sandbox image or enable editor auto-install."
                 )
-        except DaytonaRuntimeError as error:
+            if loopback_only:
+                await self.runtime.expose_port(workspace, self.settings.editor_port)
+        except SandboxRuntimeError as error:
             raise EditorRuntimeError(str(error)) from error
 
         alias = await ensure_editor_alias(self.session, workspace)
         editor_url = editor_alias_url(
             alias,
-            base_url=self.settings.daytona_preview_proxy_base_url,
+            base_url=self.settings.preview_proxy_base_url,
             folder=folder,
         )
         now = datetime.now(UTC)
@@ -121,7 +129,7 @@ class EditorService:
             url=editor_url,
             status="active",
             process_id=None,
-            bind_host="daytona",
+            bind_host=workspace.runtime,
             bind_port=self.settings.editor_port,
             worktree_id=worktree_id,
             folder=folder,
@@ -162,7 +170,7 @@ class EditorService:
                 cwd=workspace.workspace_path,
                 timeout=10,
             )
-        except DaytonaRuntimeError:
+        except SandboxRuntimeError:
             pass
         editor_session.status = "stopped"
         editor_session.last_active_at = datetime.now(UTC)
@@ -198,7 +206,7 @@ class EditorService:
         )
         return editor_prime_url(
             workspace.editor_alias,
-            base_url=self.settings.daytona_preview_proxy_base_url,
+            base_url=self.settings.preview_proxy_base_url,
             grant=grant,
             capability_query_param=self.settings.preview_alias_capability_query_param,
             folder=editor_session.folder,
@@ -213,11 +221,13 @@ class EditorService:
             raise EditorWorktreeError("Worktree not found") from error
         return self._absolute_workspace_path(path)
 
-    def _ensure_command(self, folder: str) -> str:
+    def _ensure_command(self, folder: str, *, loopback_only: bool = False) -> str:
         binary = self.settings.editor_code_server_binary
         port = self.settings.editor_port
         quoted_folder = quote(folder, safe="/")
         run_log = "/tmp/execute-code-server.log"
+        bind = "127.0.0.1" if loopback_only else "0.0.0.0"
+        listening = f"grep -qi ':{port:04X} [0-9A-F:]* 0A' /proc/net/tcp /proc/net/tcp6 2>/dev/null"
         install_log = "/tmp/execute-code-server-install.log"
         # Make a user-local install discoverable without needing sudo/PATH reloads.
         lines = ['export PATH="$HOME/.local/bin:$PATH"']
@@ -233,13 +243,21 @@ class EditorService:
                 # Fail loudly if the binary still isn't there so the API never hands back
                 # a URL that points at a port nothing is listening on.
                 f"command -v {binary} >/dev/null 2>&1 || exit 127",
+                # Already serving? Ask the kernel's listen table, not `pgrep -f`: a process
+                # pattern also matches the shell running this script, whose argv holds the
+                # launch line below (local-docker-runtime Epic 04).
                 (
-                    f"pgrep -f '{binary}.*{port}' >/dev/null 2>&1 || "
-                    f"nohup {binary} --auth none --bind-addr 0.0.0.0:{port} "
+                    f"{listening} || "
+                    f"nohup {binary} --auth none --bind-addr {bind}:{port} "
                     f"{quoted_folder} >{run_log} 2>&1 &"
                 ),
             ]
         )
+        if loopback_only:
+            # The relay can only take over a port that is already listening.
+            lines.append(
+                f"for i in $(seq 1 60); do {listening} && exit 0; sleep 0.5; done; exit 1"
+            )
         return "\n".join(lines)
 
     async def _get_workspace(self, workspace_id: UUID, user_id: UUID) -> Workspace:

@@ -28,12 +28,12 @@ from app.preview_proxy import (
     PreviewProxyTarget,
     create_preview_proxy_app,
 )
-from app.services.daytona_runtime import DaytonaRuntimeError, RuntimePreviewLink
 from app.services.preview_alias import encode_alias_grant
 from app.services.preview_capability import (
     InvalidPreviewCapabilityError,
     create_preview_proxy_url,
 )
+from app.services.sandbox import RuntimePreviewLink, SandboxRuntimeError
 
 BASE_URL = "http://localhost:8001"
 PROBE_HOST = "localhost:8001"
@@ -46,7 +46,7 @@ NAVIGATION_HEADERS = {"accept": "text/html,application/xhtml+xml", "sec-fetch-mo
 def _settings(**overrides) -> Settings:
     return Settings(
         **{
-            "daytona_preview_proxy_base_url": BASE_URL,
+            "preview_proxy_base_url": BASE_URL,
             "auth_secret_key": SECRET,
             "metrics_token": None,
             **overrides,
@@ -371,7 +371,9 @@ def test_ready_answers_503_while_draining_without_probing():
 def test_health_on_the_probe_host_checks_postgres_and_daytona():
     _workspace, _preview, session = _fixture()
     runtime = FakeRuntime()
-    app, http_client = _capability_app(session, runtime=runtime)
+    app, http_client = _capability_app(
+        session, runtime=runtime, settings=_settings(sandbox_runtime_default="daytona")
+    )
 
     with TestClient(app, base_url=f"http://{PROBE_HOST}") as client:
         response = client.get("/health")
@@ -380,6 +382,25 @@ def test_health_on_the_probe_host_checks_postgres_and_daytona():
     assert response.status_code == 200
     assert response.json() == {"status": "ok", "database": "ok", "daytona": "ok"}
     assert runtime.health_calls == 1
+
+
+def test_health_on_a_docker_install_reports_docker_without_a_daemon_call():
+    """local-docker-runtime Epic 04: the proxy holds no daemon socket (it dials sandboxes by
+    name on the sandbox network), so it reports the Docker provider without probing it,
+    and a Docker-only install is not "degraded" for lacking a Daytona key."""
+    _workspace, _preview, session = _fixture()
+    runtime = FakeRuntime()
+    app, http_client = _capability_app(
+        session, runtime=runtime, settings=_settings(sandbox_runtime_default="docker")
+    )
+
+    with TestClient(app, base_url=f"http://{PROBE_HOST}") as client:
+        response = client.get("/health")
+
+    asyncio.run(http_client.aclose())
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok", "database": "ok", "docker": "skipped"}
+    assert runtime.health_calls == 0
 
 
 @pytest.mark.parametrize("path", ["/live", "/ready", "/health", "/metrics"])
@@ -536,7 +557,7 @@ def test_metrics_requires_the_bearer_token_when_one_is_configured():
 def test_http_requests_and_upstream_errors_are_counted():
     _workspace, preview, session = _fixture()
     app, http_client = _capability_app(
-        session, runtime=FakeRuntime(error=DaytonaRuntimeError("stopped"))
+        session, runtime=FakeRuntime(error=SandboxRuntimeError("stopped"))
     )
     requests_before = _sample("preview_proxy_requests_total", {"protocol": "http"})
     errors_before = _sample("preview_proxy_upstream_errors_total", {"protocol": "http"})
@@ -709,7 +730,7 @@ def _waking_case(kind: str):
     workspace, preview, session = _fixture()
     if kind == "capability-sandbox-asleep":
         app, http_client = _capability_app(
-            session, runtime=FakeRuntime(error=DaytonaRuntimeError("stopped"))
+            session, runtime=FakeRuntime(error=SandboxRuntimeError("stopped"))
         )
         return app, http_client, _capability_host(preview), {}
     if kind == "capability-upstream-unreachable":

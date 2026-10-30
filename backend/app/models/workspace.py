@@ -13,6 +13,7 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.base import Base
@@ -111,9 +112,14 @@ class Workspace(Base):
         onupdate=func.now(),
     )
 
-    @property
+    # A hybrid, so the provider-neutral name also works in queries (`Workspace.sandbox_id`).
+    @hybrid_property
     def sandbox_id(self) -> str | None:
         return self.daytona_sandbox_id
+
+    @sandbox_id.inplace.setter
+    def _sandbox_id_setter(self, value: str | None) -> None:
+        self.daytona_sandbox_id = value
 
 
 # "workspace" => applies to every service in the workspace; "service" => only the service

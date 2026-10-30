@@ -9,6 +9,7 @@ from app.models.platform_llm import PlatformLlmSettings
 from app.models.preview import PreviewSession
 from app.models.project import Project, ProjectMember, Team, TeamMember
 from app.models.repository import RepositoryCredential
+from app.models.sandbox_activity import SandboxActivity, SandboxInstallation
 from app.models.service_diagnostic import ServiceDiagnostic
 from app.models.speckit import SpecPhase, SpecWorkflow
 from app.models.template import WorkspaceTemplate
@@ -36,6 +37,8 @@ __all__ = [
     "ProjectMember",
     "PullRequest",
     "RepositoryCredential",
+    "SandboxActivity",
+    "SandboxInstallation",
     "ServiceDiagnostic",
     "SpecPhase",
     "SpecWorkflow",

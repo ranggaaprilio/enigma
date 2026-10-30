@@ -33,12 +33,6 @@ from app.models import (
     WorkspacePreviewAlias,
     WorkspaceService,
 )
-from app.services.daytona_runtime import (
-    DaytonaRuntime,
-    DaytonaRuntimeError,
-    RuntimePreviewLink,
-    get_daytona_runtime,
-)
 from app.services.editor_alias import is_editor_alias_label
 from app.services.preview_alias import (
     InvalidPreviewAliasGrantError,
@@ -53,6 +47,12 @@ from app.services.preview_capability import (
     capability_from_host,
     decode_preview_capability,
     proxy_host_label,
+)
+from app.services.sandbox import (
+    RuntimePreviewLink,
+    SandboxRuntime,
+    SandboxRuntimeError,
+    get_sandbox_runtime,
 )
 from app.services.service_diagnostics import DiagnosticEvent, ServiceDiagnosticsRecorder
 
@@ -152,7 +152,7 @@ class PreviewProxyResolver:
     async def resolve(self, host: str) -> PreviewProxyTarget:
         capability_value = capability_from_host(
             host,
-            base_url=self.settings.daytona_preview_proxy_base_url,
+            base_url=self.settings.preview_proxy_base_url,
         )
         capability = decode_preview_capability(
             capability_value,
@@ -170,7 +170,7 @@ class PreviewProxyResolver:
             if (
                 workspace is None
                 or workspace.owner_id is None
-                or not workspace.daytona_sandbox_id
+                or not workspace.sandbox_id
             ):
                 raise InvalidPreviewCapabilityError("Preview workspace is unavailable")
             owner = await session.get(User, workspace.owner_id)
@@ -223,7 +223,7 @@ class PreviewProxyResolver:
             if (
                 workspace is None
                 or workspace.owner_id is None
-                or not workspace.daytona_sandbox_id
+                or not workspace.sandbox_id
             ):
                 raise InvalidPreviewCapabilityError("Preview workspace is unavailable")
             owner = await session.get(User, workspace.owner_id)
@@ -266,7 +266,7 @@ class PreviewProxyResolver:
             if (
                 workspace is None
                 or workspace.owner_id is None
-                or not workspace.daytona_sandbox_id
+                or not workspace.sandbox_id
             ):
                 raise InvalidPreviewCapabilityError("Editor workspace is unavailable")
             owner = await session.get(User, workspace.owner_id)
@@ -302,12 +302,12 @@ def create_preview_proxy_app(
     *,
     settings: Settings | None = None,
     resolver: PreviewProxyResolver | None = None,
-    runtime: DaytonaRuntime | None = None,
+    runtime: SandboxRuntime | None = None,
     http_client: httpx.AsyncClient | None = None,
     diagnostics: ServiceDiagnosticsRecorder | None = None,
 ) -> FastAPI:
     proxy_settings = settings or get_settings()
-    proxy_runtime = runtime or get_daytona_runtime()
+    proxy_runtime = runtime or get_sandbox_runtime()
     proxy_resolver = resolver or PreviewProxyResolver(proxy_settings)
     proxy_diagnostics = diagnostics or ServiceDiagnosticsRecorder(proxy_settings)
     owns_http_client = http_client is None
@@ -407,17 +407,23 @@ def create_preview_proxy_app(
         if not scrape_authorized(request):
             return unauthorized()
         database = await check_database()
-        try:
-            daytona = await proxy_runtime.health()
-        except Exception:
-            daytona = "error"
-        healthy = database == "ok" and daytona == "ok"
+        provider = proxy_settings.sandbox_runtime_default
+        if provider == "docker":
+            # The proxy holds no daemon socket: it dials Docker sandboxes by name on the
+            # sandbox network, so there is no provider control plane to probe from here.
+            sandbox = "skipped"
+        else:
+            try:
+                sandbox = await proxy_runtime.health()
+            except Exception:
+                sandbox = "error"
+        healthy = database == "ok" and sandbox in {"ok", "skipped"}
         return JSONResponse(
             status_code=status.HTTP_200_OK if healthy else status.HTTP_503_SERVICE_UNAVAILABLE,
             content={
                 "status": "ok" if healthy else "degraded",
                 "database": database,
-                "daytona": daytona,
+                provider: sandbox,
             },
         )
 
@@ -432,7 +438,7 @@ def create_preview_proxy_app(
         original_host = request.headers.get("host", "")
         try:
             label = proxy_host_label(
-                original_host, base_url=proxy_settings.daytona_preview_proxy_base_url
+                original_host, base_url=proxy_settings.preview_proxy_base_url
             )
         except InvalidPreviewCapabilityError:
             probe = probes.get(path) if request.method in ("GET", "HEAD") else None
@@ -573,7 +579,7 @@ def create_preview_proxy_app(
                 query=query,
                 original_host=original_host,
             )
-        except (DaytonaRuntimeError, PreviewUpstreamUnavailableError):
+        except (SandboxRuntimeError, PreviewUpstreamUnavailableError):
             preview_proxy_upstream_errors_total.labels(protocol="http").inc()
             if is_editor:
                 return _editor_unavailable(request, proxy_settings, editor_grant_to_set)
@@ -616,7 +622,7 @@ def create_preview_proxy_app(
         original_host = websocket.headers.get("host", "")
         try:
             label = proxy_host_label(
-                original_host, base_url=proxy_settings.daytona_preview_proxy_base_url
+                original_host, base_url=proxy_settings.preview_proxy_base_url
             )
         except InvalidPreviewCapabilityError:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
@@ -1023,7 +1029,7 @@ async def _origin_belongs_to_workspace(
     if not netloc:
         return False
     try:
-        proxy_host = classify_proxy_host(netloc, base_url=settings.daytona_preview_proxy_base_url)
+        proxy_host = classify_proxy_host(netloc, base_url=settings.preview_proxy_base_url)
     except InvalidPreviewCapabilityError:
         return False
     try:
@@ -1042,7 +1048,7 @@ async def _origin_belongs_to_workspace(
 async def _send_http_request(
     *,
     client: httpx.AsyncClient,
-    runtime: DaytonaRuntime,
+    runtime: SandboxRuntime,
     workspace: Workspace,
     port: int,
     request: Request,
@@ -1080,6 +1086,18 @@ async def _send_http_request(
     return preview_link, response
 
 
+def _sandbox_token_headers(preview_link: RuntimePreviewLink) -> dict[str, str]:
+    """The provider's preview-auth headers. Daytona's preview edge wants its token (and the
+    warning-page skip); a provider dialled directly on the sandbox network returns an empty
+    token, and the user's app then sees no provider header at all."""
+    if not preview_link.token:
+        return {}
+    return {
+        "X-Daytona-Preview-Token": preview_link.token,
+        "X-Daytona-Skip-Preview-Warning": "true",
+    }
+
+
 async def _send_http_attempt(
     client: httpx.AsyncClient,
     preview_link: RuntimePreviewLink,
@@ -1092,8 +1110,7 @@ async def _send_http_attempt(
 ) -> httpx.Response:
     headers = _forward_headers(request.headers, REQUEST_HEADERS_TO_STRIP)
     headers["Accept-Encoding"] = "identity"
-    headers["X-Daytona-Preview-Token"] = preview_link.token
-    headers["X-Daytona-Skip-Preview-Warning"] = "true"
+    headers.update(_sandbox_token_headers(preview_link))
     headers["X-Forwarded-Host"] = original_host
     upstream_request = client.build_request(
         request.method,
@@ -1109,7 +1126,7 @@ async def _send_http_attempt(
 
 async def _connect_websocket(
     *,
-    runtime: DaytonaRuntime,
+    runtime: SandboxRuntime,
     workspace: Workspace,
     port: int,
     websocket: WebSocket,
@@ -1120,8 +1137,7 @@ async def _connect_websocket(
     for _attempt in range(2):
         preview_link = await runtime.preview_link(workspace, port)
         headers = _forward_headers(websocket.headers, WEBSOCKET_HEADERS_TO_STRIP)
-        headers["X-Daytona-Preview-Token"] = preview_link.token
-        headers["X-Daytona-Skip-Preview-Warning"] = "true"
+        headers.update(_sandbox_token_headers(preview_link))
         headers["X-Forwarded-Host"] = original_host
         try:
             return await ws_connect(
@@ -1214,7 +1230,7 @@ async def _response_body(response: httpx.Response) -> AsyncIterator[bytes]:
 
 
 def _proxy_origin(settings: Settings, host: str) -> str:
-    return f"{urlsplit(settings.daytona_preview_proxy_base_url).scheme}://{host}"
+    return f"{urlsplit(settings.preview_proxy_base_url).scheme}://{host}"
 
 
 # Epic 13: CORS diagnosis. Pure read of request/response headers -- never injects, removes, or

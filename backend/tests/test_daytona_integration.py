@@ -5,7 +5,7 @@ import pytest
 
 from app.core.config import get_settings
 from app.models import Workspace
-from app.services.daytona_runtime import DaytonaRuntime
+from app.services.sandbox.daytona import DaytonaRuntime
 
 pytestmark = pytest.mark.skipif(
     os.getenv("DAYTONA_INTEGRATION_TESTS") != "1",
@@ -33,8 +33,7 @@ async def test_real_daytona_sandbox_lifecycle_and_command() -> None:
         status="creating",
     )
     try:
-        sandbox = await runtime.provision(workspace_id, owner_id, workspace.snapshot)
-        workspace.daytona_sandbox_id = sandbox.id
+        workspace.sandbox_id = await runtime.provision(workspace)
         result = await runtime.exec(
             workspace,
             "printf daytona-ready",

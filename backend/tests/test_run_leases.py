@@ -55,7 +55,7 @@ def command_service(session, session_maker) -> CommandService:
         session_maker,
         queue_settings(),
         runtime=CommandRuntime(InMemoryRunRegistry(), InMemoryEventBus()),
-        daytona_runtime=FakeDaytona(),
+        sandbox_runtime=FakeDaytona(),
     )
 
 

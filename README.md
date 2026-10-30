@@ -107,7 +107,7 @@ feature worktree), which you commit, push, and turn into a pull request.
 
 Every workspace owns one long-lived Daytona sandbox. The backend never runs user code locally — it
 proxies file, command, terminal, editor, and preview operations into the sandbox through
-`DaytonaRuntime` (`backend/app/services/daytona_runtime.py`).
+`DaytonaRuntime` (`backend/app/services/sandbox/daytona.py`, behind the provider-neutral `SandboxRuntime` interface in `backend/app/services/sandbox/`).
 
 ```mermaid
 flowchart LR
@@ -156,7 +156,7 @@ Key points:
   existing sandbox of the same name).
 - **Custom snapshot required.** The sandbox network blocks runtime `curl | sh` installs, so `mise`,
   `code-server`, the `specify` CLI (Spec Kit), and `uv` are **baked into the image at build time**
-  (`daytona/Dockerfile`). See [Sandbox snapshot](#sandbox-snapshot).
+  (`sandbox/Dockerfile`, shared with the local Docker runtime). See [Sandbox snapshot](#sandbox-snapshot).
 - **Confined agent tools.** The agent can only `list_files`, `read_file`, `write_file`, and
   `run_command` (`backend/app/services/agent_tools.py`). Commands are denylisted (no `git`, `rm`,
   `curl`, `sudo`, shell operators, …) and every path is confined to the workspace (or worktree) root.
@@ -346,4 +346,4 @@ Build and publish the custom snapshot (build host needs network access; tools ar
 ./daytona/build-snapshot.sh        # builds snapshot "enigma-mise-code"
 ```
 Then set `DAYTONA_DEFAULT_SNAPSHOT=enigma-mise-code` in `.env` and recreate existing workspaces so
-they pick up the new image. See `daytona/Dockerfile` and `daytona/README.md` for details.
+they pick up the new image. See `sandbox/Dockerfile` and `daytona/README.md` for details. The same Dockerfile builds the image for local Docker/Podman sandboxes (`./sandbox/build-local-image.sh`, opt in with `docker-compose.sandbox.yml`).

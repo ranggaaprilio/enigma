@@ -75,6 +75,17 @@ def shell_quote(value: str) -> str:
     return "'" + value.replace("'", "'\\''") + "'"
 
 
+def fresh_log_line(log_path: str) -> str:
+    """Redirect the script into a *new* log file rather than truncating the old one in place.
+
+    The live log stream follows the file with `tail -F`, which notices an in-place truncation
+    only if it looks before the file has grown back past its old size; otherwise it carries on
+    from the old offset and silently drops the start of the restarted service's output. A new
+    inode is always noticed ("has been replaced; following new file") and read from the top.
+    """
+    return f"rm -f {log_path}\nexec >{log_path} 2>&1\n"
+
+
 def build_mise_setup_script(
     paths: ServicePaths,
     gen: str,
@@ -93,7 +104,7 @@ def build_mise_setup_script(
         )
     pid_path = paths.setup_pid or paths.pid
     script = (
-        f"exec >{paths.log} 2>&1\n"
+        f"{fresh_log_line(paths.log)}"
         "set -x\n"
         'export PATH="$HOME/.local/bin:$PATH"\n'
         'export MISE_INSTALL_PATH="$HOME/.local/bin/mise"\n'
@@ -133,7 +144,7 @@ def build_mise_run_script(paths: ServicePaths, gen: str, *, install_deps: bool) 
             "fi\n"
         )
     script = (
-        f"exec >{paths.log} 2>&1\n"
+        f"{fresh_log_line(paths.log)}"
         "set -x\n"
         'export PATH="$HOME/.local/bin:$PATH"\n'
         'export MISE_INSTALL_PATH="$HOME/.local/bin/mise"\n'
@@ -198,7 +209,7 @@ def build_registry_script(
         tail = "echo '[setup] environment ready'; setst ready\n"
     pid_path = paths.pid if serve else (paths.setup_pid or paths.pid)
     script = (
-        f"exec >{paths.log} 2>&1\n"
+        f"{fresh_log_line(paths.log)}"
         "set -x\n"
         'export PATH="$HOME/.local/bin:$HOME/.local/share/mise/shims:$PATH"\n'
         'export MISE_INSTALL_PATH="$HOME/.local/bin/mise"\n'

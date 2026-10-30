@@ -338,12 +338,12 @@ def test_preview_service_re_mints_a_proxy_url_inside_the_renewal_window(preview_
         settings=settings,
         runtime=object(),  # type: ignore[arg-type]
     )
-    ttl = min(settings.daytona_preview_proxy_ttl_seconds, settings.daytona_preview_url_ttl_seconds)
+    ttl = min(settings.preview_proxy_ttl_seconds, settings.daytona_preview_url_ttl_seconds)
     # Minted long enough ago that only 30 seconds of its life remain.
     preview.public_url = create_preview_proxy_url(
         preview.id,
         preview.port,
-        base_url=settings.daytona_preview_proxy_base_url,
+        base_url=settings.preview_proxy_base_url,
         secret_key=settings.auth_secret_key,
         ttl_seconds=ttl,
         now=datetime.now(UTC) - timedelta(seconds=ttl - 30),
@@ -354,8 +354,65 @@ def test_preview_service_re_mints_a_proxy_url_inside_the_renewal_window(preview_
     assert renewed != preview.public_url
     capability = decode_preview_capability(
         capability_from_host(
-            urlsplit(renewed).netloc, base_url=settings.daytona_preview_proxy_base_url
+            urlsplit(renewed).netloc, base_url=settings.preview_proxy_base_url
         ),
         secret_key=settings.auth_secret_key,
     )
     assert capability.expires_at - datetime.now(UTC) > timedelta(seconds=ttl - 60)
+
+
+# --- detect exposes the port (local-docker-runtime Epic 04) ------------------------------
+
+
+@pytest.fixture
+async def preview_db_session():
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    from app.core.config import get_settings
+
+    engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
+    async with engine.connect() as conn:
+        await conn.begin()
+        maker = async_sessionmaker(bind=conn, expire_on_commit=False)
+        async with maker() as session:
+            await session.begin_nested()
+            yield session
+            await session.rollback()
+    await engine.dispose()
+
+
+async def test_detect_exposes_the_detected_port(preview_db_session):
+    from app.core.config import get_settings
+    from tests.sandbox.fakes import FakeSandboxRuntime
+
+    session = preview_db_session
+    user = User(
+        id=uuid4(),
+        email=f"{uuid4().hex}@example.com",
+        password_hash="x",
+        role="owner",
+        is_active=True,
+    )
+    session.add(user)
+    await session.flush()
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=user.id,
+        name="Demo",
+        slug=f"demo-{uuid4().hex[:8]}",
+        repo_url="https://github.com/example/demo",
+        default_branch="main",
+        runtime="docker",
+        daytona_sandbox_id=f"sandbox-{uuid4().hex[:8]}",
+        workspace_path="workspace",
+        status="ready",
+    )
+    session.add(workspace)
+    await session.flush()
+    runtime = FakeSandboxRuntime()  # every probe exits 0: the first candidate port is open
+
+    service = PreviewService(session, get_settings(), runtime, common_ports=(5173,))  # type: ignore[arg-type]
+    preview = await service.detect(workspace.id, user.id)
+
+    assert preview.port == 5173
+    assert runtime.exposed_ports == [5173]

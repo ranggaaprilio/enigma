@@ -13,8 +13,8 @@ from app.db.session import async_session_maker, get_db_session
 from app.models import TerminalSession, User
 from app.schemas.terminal import TerminalSessionCreateRequest, TerminalSessionResponse
 from app.schemas.workspaces import DeleteResponse
-from app.services.daytona_runtime import get_daytona_runtime
 from app.services.run_paths import join_subpath, validate_relative_subpath
+from app.services.sandbox import get_sandbox_runtime
 from app.services.terminal import (
     TerminalPtyBridge,
     TerminalRuntimeError,
@@ -52,7 +52,7 @@ async def get_terminal_service(
     return TerminalService(
         session=session,
         settings=settings,
-        runtime=get_daytona_runtime(),
+        runtime=get_sandbox_runtime(),
     )
 
 
@@ -146,7 +146,7 @@ async def connect_terminal_session(
         service = TerminalService(
             session=session,
             settings=settings,
-            runtime=get_daytona_runtime(),
+            runtime=get_sandbox_runtime(),
         )
         try:
             workspace, terminal_session = await service.get_for_workspace(
@@ -175,7 +175,7 @@ async def connect_terminal_session(
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                 return
             worktree_service = WorktreeService(
-                session=session, runtime=get_daytona_runtime(), settings=settings
+                session=session, runtime=get_sandbox_runtime(), settings=settings
             )
             try:
                 resolved = await worktree_service.resolve_path(workspace, worktree_uuid)
@@ -201,7 +201,7 @@ async def connect_terminal_session(
         except RuntimeError:
             break
     bridge = TerminalPtyBridge(
-        runtime=get_daytona_runtime(),
+        runtime=get_sandbox_runtime(),
         default_cols=settings.terminal_default_cols,
         default_rows=settings.terminal_default_rows,
     )

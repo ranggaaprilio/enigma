@@ -10,7 +10,6 @@ from app.core.config import Settings, get_settings
 from app.db.session import get_db_session
 from app.models import User
 from app.schemas.dev_server import DevServerActionResponse, DevServerStatusResponse
-from app.services.daytona_runtime import DaytonaRuntimeError, get_daytona_runtime
 from app.services.dev_server import (
     DevServerNotClonedError,
     DevServerRuntimeError,
@@ -18,6 +17,7 @@ from app.services.dev_server import (
     DevServerState,
     DevServerWorkspacePathError,
 )
+from app.services.sandbox import SandboxRuntimeError, get_sandbox_runtime
 from app.services.workspaces import WorkspaceNotFoundError
 from app.services.worktrees import WorktreeNotFoundError
 
@@ -47,7 +47,7 @@ async def get_dev_server_service(
     session: AsyncSession = DB_SESSION_DEP,
     settings: Settings = SETTINGS_DEP,
 ) -> DevServerServiceProtocol:
-    return DevServerService(session, settings, get_daytona_runtime())
+    return DevServerService(session, settings, get_sandbox_runtime())
 
 
 DEV_SERVER_SERVICE_DEP = Depends(get_dev_server_service)
@@ -80,7 +80,7 @@ async def setup_dev_server(
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
     except DevServerNotClonedError:
         raise HTTPException(status_code=409, detail="Repository is not cloned yet") from None
-    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+    except (DevServerRuntimeError, SandboxRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return DevServerActionResponse(ok=True, status=state.status, message=state.message)
 
@@ -104,7 +104,7 @@ async def run_dev_server(
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
     except DevServerNotClonedError:
         raise HTTPException(status_code=409, detail="Repository is not cloned yet") from None
-    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+    except (DevServerRuntimeError, SandboxRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return DevServerActionResponse(ok=True, status=state.status, message=state.message)
 
@@ -121,7 +121,7 @@ async def get_dev_server_status(
         raise not_found() from None
     except DevServerWorkspacePathError:
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
-    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+    except (DevServerRuntimeError, SandboxRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return DevServerStatusResponse(
         status=state.status,
@@ -150,7 +150,7 @@ async def ensure_dev_server(
         raise not_found() from None
     except DevServerWorkspacePathError:
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
-    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+    except (DevServerRuntimeError, SandboxRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return DevServerStatusResponse(
         status=state.status,
@@ -173,6 +173,6 @@ async def stop_dev_server(
         raise not_found() from None
     except DevServerWorkspacePathError:
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
-    except (DevServerRuntimeError, DaytonaRuntimeError) as error:
+    except (DevServerRuntimeError, SandboxRuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return DevServerActionResponse(ok=True, status=state.status, message=state.message)

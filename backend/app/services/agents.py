@@ -31,7 +31,6 @@ from app.services.agent_tools import WorkspaceTools
 from app.services.audit import AuditLogService
 from app.services.budgets import BudgetService
 from app.services.capacity import ACTIVE_RUN_STATUSES, enforce_queue_depth, enforce_run_caps
-from app.services.daytona_runtime import get_daytona_runtime
 from app.services.jobs import (
     ENQUEUE_FAILED,
     JOB_TIMEOUT,
@@ -52,6 +51,7 @@ from app.services.runtime import (
     run_registry,
 )
 from app.services.runtime import run_lock as default_run_lock
+from app.services.sandbox import get_sandbox_runtime
 from app.services.workspaces import WorkspaceSecretCipher
 
 TERMINAL_RUN_STATUSES = ("completed", "error", "stopped")
@@ -874,7 +874,7 @@ class AgentService:
         swallowed — leaving the run with no recorded file changes at all.
         """
         cipher = WorkspaceSecretCipher(self.settings.workspace_env_encryption_key)
-        runtime = get_daytona_runtime()
+        runtime = get_sandbox_runtime()
         repo_service = RepositoryService(session, cipher, runtime)
         try:
             return await repo_service.status(
@@ -1025,7 +1025,7 @@ class AgentService:
                 terminal_event_received = False
                 tools = WorkspaceTools(
                     workspace=workspace,
-                    runtime=get_daytona_runtime(),
+                    runtime=get_sandbox_runtime(),
                     command_timeout_seconds=self.settings.agent_command_timeout_seconds,
                     max_command_output_chars=self.settings.agent_max_command_output_chars,
                     working_dir=working_dir,

@@ -28,6 +28,7 @@ dependencies = [
   "opentelemetry-instrumentation-aiohttp-client==0.60b1",
   "opentelemetry-sdk==1.39.1",
   "opentelemetry-exporter-otlp-proto-http==1.39.1",
+  "docker>=7.1",
 ]
 
 [dependency-groups]

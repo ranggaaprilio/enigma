@@ -103,7 +103,7 @@ export function DashboardShell({
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <StatusPill label={healthLabel} tone={healthTone} />
-              <WorkspaceStatusPill status={workspaceStatus} />
+              <WorkspaceStatusPill status={workspaceStatus} runtime={workspace?.runtime} />
               {user && workspace && <PresenceAvatars workspaceId={workspace.id} />}
               {user && <NotificationBell onConnectionStateChange={setStreamState} />}
               {user && <UserMenu user={user} onLogout={handleLogout} />}
@@ -362,10 +362,12 @@ function StatusPill({
   );
 }
 
-function WorkspaceStatusPill({
+export function WorkspaceStatusPill({
   status,
+  runtime,
 }: {
   status: DashboardShellProps["workspaceStatus"];
+  runtime?: string;
 }) {
   const toneClass = {
     loading: "bg-white text-muted ring-1 ring-line",
@@ -378,11 +380,16 @@ function WorkspaceStatusPill({
   }[status];
 
   const label = status === "none" ? "No workspace" : `Workspace ${status}`;
+  // Idle Docker sandboxes are stopped, not deleted; the next use starts them again.
+  const wakesOnUse = status === "stopped" && runtime === "docker";
   return (
     <span
       className={`rounded-full px-3 py-1 text-sm font-semibold ${toneClass}`}
     >
       {label}
+      {wakesOnUse && (
+        <span className="ml-1 font-normal text-muted"> · wakes on next use</span>
+      )}
     </span>
   );
 }

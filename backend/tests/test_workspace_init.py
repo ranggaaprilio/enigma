@@ -65,12 +65,12 @@ class FakeFs:
 
 class FakeRuntime:
     def __init__(self, fs: FakeFs, fail_on: str | None = None) -> None:
-        self.fs = fs
+        self.fake_fs = fs
         self.commands: list[tuple[str, str | None, dict | None]] = []
         self.fail_on = fail_on
 
-    async def get_sandbox(self, workspace):
-        return SimpleNamespace(fs=self.fs)
+    async def fs(self, workspace) -> FakeFs:
+        return self.fake_fs
 
     async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
         self.commands.append((command, cwd, env))

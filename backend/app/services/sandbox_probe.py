@@ -9,7 +9,7 @@ so a multi-port scan costs one sandbox round-trip instead of one per port.
 from collections.abc import Sequence
 
 from app.models import Workspace
-from app.services.daytona_runtime import DaytonaRuntime, DaytonaRuntimeError
+from app.services.sandbox import SandboxRuntime, SandboxRuntimeError
 
 _PORT_SCAN_TIMEOUT_SECONDS = 5
 
@@ -33,7 +33,7 @@ def _build_port_scan_script(ports: Sequence[int]) -> str:
 
 
 async def probe_ports(
-    runtime: DaytonaRuntime, workspace: Workspace, ports: Sequence[int]
+    runtime: SandboxRuntime, workspace: Workspace, ports: Sequence[int]
 ) -> set[int]:
     """Return the subset of ``ports`` that are open (bound) inside the sandbox.
 
@@ -49,7 +49,7 @@ async def probe_ports(
             cwd=workspace.workspace_path,
             timeout=_PORT_SCAN_TIMEOUT_SECONDS,
         )
-    except DaytonaRuntimeError:
+    except SandboxRuntimeError:
         return set()
     tokens = (result.stdout or "").split()
     open_ports: set[int] = set()
@@ -61,5 +61,5 @@ async def probe_ports(
     return open_ports
 
 
-async def port_is_open(runtime: DaytonaRuntime, workspace: Workspace, port: int) -> bool:
+async def port_is_open(runtime: SandboxRuntime, workspace: Workspace, port: int) -> bool:
     return port in await probe_ports(runtime, workspace, [port])

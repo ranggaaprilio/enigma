@@ -28,7 +28,6 @@ from app.models import (
     WorkspaceService,
 )
 from app.models.workspace_service import WORKSPACE_SERVICE_ACTIVE_STATUSES
-from app.services.daytona_runtime import DaytonaRuntime
 from app.services.env_file import serialize_env
 from app.services.env_templates import (
     EnvPrepareError,
@@ -41,6 +40,7 @@ from app.services.env_templates import (
 from app.services.preview_alias import alias_url
 from app.services.run_detection import infer_port
 from app.services.run_paths import join_subpath
+from app.services.sandbox import SandboxRuntime
 from app.services.workspaces import WorkspaceSecretCipher
 
 logger = structlog.get_logger(__name__)
@@ -157,7 +157,7 @@ def redactable_env_values(
 
 
 async def materialize_env_file(
-    runtime: DaytonaRuntime,
+    runtime: SandboxRuntime,
     workspace: Workspace,
     *,
     checkout: str,
@@ -169,7 +169,7 @@ async def materialize_env_file(
 
     Returns the sandbox-relative path written, or `None`. Raises `EnvFileError` when the parent
     directory does not already exist in the checkout -- this never creates directories inside
-    the user's repository. Content is written exclusively through `sandbox.fs`, never through
+    the user's repository. Content is written exclusively through `runtime.fs()`, never through
     `runtime.exec`, so a secret value never appears in a command string or log.
     """
     if not workspace.env_file_path:
@@ -178,23 +178,23 @@ async def materialize_env_file(
     path = join_subpath(checkout, workspace.app_root, workspace.env_file_path)
     parent = path.rsplit("/", 1)[0] if "/" in path else checkout
 
-    sandbox = await runtime.get_sandbox(workspace)
+    fs = await runtime.fs(workspace)
     try:
-        await sandbox.fs.get_file_info(parent)
+        await fs.get_file_info(parent)
     except Exception as error:
         raise EnvFileError(
             f"env_file_path parent directory '{parent}' does not exist in the checkout"
         ) from error
 
-    await sandbox.fs.upload_file(serialize_env(env).encode("utf-8"), path)
-    await sandbox.fs.set_file_permissions(path, mode="600")
+    await fs.upload_file(serialize_env(env).encode("utf-8"), path)
+    await fs.set_file_permissions(path, mode="600")
 
     await _append_git_exclude(runtime, workspace, checkout=checkout, timeout=timeout)
     return path
 
 
 async def _append_git_exclude(
-    runtime: DaytonaRuntime,
+    runtime: SandboxRuntime,
     workspace: Workspace,
     *,
     checkout: str,
@@ -255,7 +255,7 @@ async def build_template_context(
         )
         for alias_row in alias_result.scalars().all():
             alias_by_command[alias_row.custom_command_id] = alias_url(
-                alias_row.alias, base_url=settings.daytona_preview_proxy_base_url
+                alias_row.alias, base_url=settings.preview_proxy_base_url
             )
 
     refs: list[ServiceRef] = []
@@ -295,7 +295,7 @@ async def build_template_context(
 async def prepare_launch_env(
     session: AsyncSession,
     settings: Settings,
-    runtime: DaytonaRuntime,
+    runtime: SandboxRuntime,
     workspace: Workspace,
     *,
     checkout: str,
@@ -427,7 +427,7 @@ def _is_loopback_host(host: str) -> bool:
 
 
 def _parsed_allow_networks(settings: Settings) -> list:
-    raw = settings.daytona_network_allow_list
+    raw = settings.sandbox_network_allow_list
     entries = (
         raw if isinstance(raw, list) else [item.strip() for item in raw.split(",") if item.strip()]
     )
@@ -444,7 +444,7 @@ def egress_warnings(env: dict[str, str], settings: Settings) -> list[str]:
     """Flag env values that point egress at a host outside `DAYTONA_NETWORK_ALLOW_LIST` while
     `DAYTONA_NETWORK_BLOCK_ALL` is on. Never includes the value itself, credentials, path, or
     query -- only the env key, the host, and the port."""
-    if not settings.daytona_network_block_all:
+    if not settings.sandbox_network_block_all:
         return []
 
     allow_networks = _parsed_allow_networks(settings)

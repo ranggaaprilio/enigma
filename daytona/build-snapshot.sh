@@ -15,7 +15,8 @@
 set -euo pipefail
 
 SNAPSHOT_NAME="${SNAPSHOT_NAME:-enigma-base}"
-DOCKERFILE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The image definition is shared with the local Docker runtime (sandbox/build-local-image.sh).
+DOCKERFILE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../sandbox" && pwd)"
 
 # Daytona snapshots must be linux/amd64. The CLI builds the image and parses the
 # Dockerfile's COPY/ADD into the build context automatically.

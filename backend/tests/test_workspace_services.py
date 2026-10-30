@@ -17,7 +17,14 @@ from app.models import (
     WorkspaceService,
     WorkspaceWorktree,
 )
-from app.services.daytona_runtime import DaytonaRuntimeError, RuntimeCommandResult
+from app.services.sandbox import RuntimeCommandResult, SandboxRuntimeError
+from app.services.service_scripts import (
+    build_mise_run_script,
+    build_mise_setup_script,
+    build_registry_script,
+    fresh_log_line,
+    service_paths,
+)
 from app.services.workspace_services import (
     WorkspaceServiceLimitError,
     WorkspaceServiceManager,
@@ -72,9 +79,16 @@ class FakeRuntime:
         self.commands: list[str] = []
         self.cwds: list[str | None] = []
         self.envs: list[dict | None] = []
+        self.exposed_ports: list[int] = []
+        self.fail_expose = False
 
-    async def get_sandbox(self, workspace, *, start: bool = True) -> FakeSandbox:
-        return self.sandbox
+    async def expose_port(self, workspace, port) -> None:
+        if self.fail_expose:
+            raise SandboxRuntimeError("sandbox unreachable")
+        self.exposed_ports.append(port)
+
+    async def fs(self, workspace) -> FakeFs:
+        return self.sandbox.fs
 
     async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
         self.commands.append(command)
@@ -82,7 +96,7 @@ class FakeRuntime:
         self.envs.append(env)
         if "ENIGMA_PROBE_EOF" in command:
             if self.fail_probe:
-                raise DaytonaRuntimeError("sandbox unreachable")
+                raise SandboxRuntimeError("sandbox unreachable")
             lines = []
             for row_id, port_token in re.findall(
                 r"probe\('([^']*)', '[^']*', '[^']*', '[^']*', "
@@ -345,6 +359,44 @@ async def test_stop_clears_desired_and_stops_its_preview_session(db_session):
     await db_session.refresh(preview)
     assert preview.status == "stopped"
     assert any("killtree" in c for c in runtime.commands)
+
+
+async def _running_service_with_preview(db_session, runtime: FakeRuntime):
+    user, workspace = await make_workspace(db_session)
+    cmd = await make_service_command(db_session, workspace, port=8000)
+    manager = WorkspaceServiceManager(db_session, get_settings(), runtime)
+    await manager.list(workspace.id, user.id)
+    row = await _row_for_command(db_session, workspace.id, cmd.id)
+    await manager.start(workspace.id, row.id, user.id)
+    runtime.statuses[str(row.id)] = "running"
+    runtime.pids_alive.add(str(row.id))
+    await manager.list(workspace.id, user.id)
+    preview = (
+        await db_session.execute(
+            select(PreviewSession).where(PreviewSession.service_id == row.id)
+        )
+    ).scalars().first()
+    return preview
+
+
+async def test_a_running_service_exposes_its_port_for_the_preview(db_session):
+    """local-docker-runtime Epic 04: the Docker provider relays a loopback-only dev server
+    onto the sandbox network when its preview session is (re)confirmed."""
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}), open_ports={8000})
+
+    preview = await _running_service_with_preview(db_session, runtime)
+
+    assert preview is not None and preview.status == "active"
+    assert 8000 in runtime.exposed_ports
+
+
+async def test_a_failed_expose_still_records_the_preview_session(db_session):
+    runtime = FakeRuntime(FakeSandbox({"workspace/.git"}), open_ports={8000})
+    runtime.fail_expose = True
+
+    preview = await _running_service_with_preview(db_session, runtime)
+
+    assert preview is not None and preview.status == "active"
 
 
 async def test_restart_keeps_desired_and_targets_a_new_worktree(db_session):
@@ -630,3 +682,34 @@ async def test_ensure_running_does_not_relaunch_on_a_transient_probe_failure(db_
     # The row's last-known status is left alone rather than guessed at.
     relaunched = next(r for r in rows if r.id == row.id)
     assert relaunched.status == "installing"
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda paths: build_registry_script(
+            paths, "gen", command="serve", install_command=None, serve=True
+        ),
+        lambda paths: build_mise_run_script(paths, "gen", install_deps=False),
+        lambda paths: build_mise_setup_script(
+            paths, "gen", mise_auto_install=False, mise_install_url="https://mise.run"
+        ),
+    ],
+)
+def test_every_launch_writes_a_new_log_file_so_the_live_stream_reads_it_from_the_top(
+    build, tmp_path
+) -> None:
+    # Regression: a launch used to truncate the log in place, and the live stream's `tail -F`
+    # kept its old offset whenever the new log had already grown past the old size -- the
+    # restarted service's first lines (often all of them) never reached the socket.
+    import subprocess
+
+    paths = service_paths(uuid4())
+    assert fresh_log_line(paths.log) in build(paths)
+
+    log = tmp_path / "service.log"
+    log.write_text("old output from the previous run\n" * 50)
+    old_inode = log.stat().st_ino
+    subprocess.run(["sh", "-c", f"{fresh_log_line(str(log))}echo new run"], check=True)
+    assert log.read_text() == "new run\n"
+    assert log.stat().st_ino != old_inode

@@ -206,7 +206,7 @@ class PreviewCompositionService:
         return PreviewComposition(
             workspace_id=workspace.id,
             preview_alias_enabled=bool(workspace.preview_alias_enabled),
-            proxy_base_url=self.settings.daytona_preview_proxy_base_url,
+            proxy_base_url=self.settings.preview_proxy_base_url,
             entry_point_service_id=entry_point_id,
             services=composed,
             advisories=advisories,
@@ -225,7 +225,7 @@ class PreviewCompositionService:
             try:
                 netloc = data["public_url"].split("//", 1)[-1].split("/", 1)[0]
                 capability_value = capability_from_host(
-                    netloc, base_url=self.settings.daytona_preview_proxy_base_url
+                    netloc, base_url=self.settings.preview_proxy_base_url
                 )
             except Exception:  # noqa: BLE001 - a malformed public_url just means no prime url
                 capability_value = None
@@ -239,12 +239,12 @@ class PreviewCompositionService:
             )
             if alias_row is not None and alias_row.enabled:
                 alias_url_value = alias_url(
-                    alias_row.alias, base_url=self.settings.daytona_preview_proxy_base_url
+                    alias_row.alias, base_url=self.settings.preview_proxy_base_url
                 )
                 if capability_value:
                     alias_prime_url_value = alias_prime_url(
                         alias_row.alias,
-                        base_url=self.settings.daytona_preview_proxy_base_url,
+                        base_url=self.settings.preview_proxy_base_url,
                         capability=capability_value,
                         capability_query_param=self.settings.preview_alias_capability_query_param,
                     )

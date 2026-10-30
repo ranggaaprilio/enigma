@@ -14,13 +14,13 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from app.core.config import get_settings
 from app.core.security import hash_password
 from app.models import CustomCommand, User, Workspace
-from app.services.daytona_runtime import DaytonaRuntimeError
 from app.services.preview_alias import PreviewAliasService
 from app.services.preview_composition import (
     PreviewCompositionService,
     classify_service,
     entry_point_service,
 )
+from app.services.sandbox import SandboxRuntimeError
 from app.services.workspace_services import WorkspaceServiceManager
 
 # ---------------------------------------------------------------------------
@@ -191,10 +191,10 @@ class FailingRuntime:
     """Any exec must raise -- proves `check_proxy=False` never touches the sandbox."""
 
     async def exec(self, *args, **kwargs):
-        raise DaytonaRuntimeError("must not be called")
+        raise SandboxRuntimeError("must not be called")
 
     async def preview_link(self, *args, **kwargs):
-        raise DaytonaRuntimeError("must not be called")
+        raise SandboxRuntimeError("must not be called")
 
     async def close(self) -> None:
         return None

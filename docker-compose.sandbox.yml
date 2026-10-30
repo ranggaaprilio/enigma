@@ -1,0 +1,68 @@
+# Opt-in: run sandboxes as local Docker/Podman containers (runtime="docker") instead of, or
+# next to, Daytona. See docs/local-docker-runtime/.
+#
+#   ./sandbox/build-local-image.sh                     # once: builds enigma-sandbox:latest
+#   podman compose -f docker-compose.yml -f docker-compose.sandbox.yml up
+#   # queue mode: add --profile queue (the worker executes runs, so it needs the daemon too)
+#
+# SECURITY: the container daemon socket is root-equivalent on the host. Only the services
+# that drive sandboxes get it — the backend (provision, files, terminals) and the worker
+# (queue-mode runs) — and only through this file. Sandbox containers never get it
+# (DockerRuntime refuses any sandbox spec with mounts), and the agent's command denylist
+# keeps `docker`/`docker-compose` blocked inside them. Never use this on a shared host.
+#
+# NETWORKS (local-docker-runtime Epic 05): every sandbox gets its own bridge network
+# (`enigma-sbx-<workspace>`, a /28 from DOCKER_SANDBOX_SUBNET_POOL), so sandboxes cannot
+# reach each other. The backend attaches the preview proxy, found by the
+# `enigma.preview-proxy` label, to each of them under the alias DOCKER_PREVIEW_PROXY_HOST,
+# and re-attaches it on every reconciler pass (compose drops those connections when it
+# recreates the proxy). The proxy dials app previews and the editor at the sandbox's
+# address; it never gets the socket: it parses untrusted traffic, and building a preview
+# address needs no daemon call. The backend and worker reach sandboxes through
+# `docker exec` only and are on no sandbox network. A sandbox CAN reach the proxy's port;
+# every preview host there needs a capability or grant, and /health and /metrics need
+# METRICS_TOKEN. Loopback-only servers and the editor are carried by a per-port relay that
+# admits only the proxy's addresses.
+
+# DOCKER_SOCKET is the daemon socket path *where the containers run*:
+#   - Docker (Linux / Docker Desktop):  /var/run/docker.sock (default)
+#   - Podman machine (macOS/Windows):   the VM's socket — `podman machine inspect` shows it;
+#     for a rootful machine /var/run/docker.sock is a symlink to /run/podman/podman.sock
+#   - Podman on Linux (rootless):       $XDG_RUNTIME_DIR/podman/podman.sock, with
+#     `systemctl --user enable --now podman.socket` (or `podman system service --time=0`)
+
+x-sandbox-access: &sandbox-access
+  volumes:
+    - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+  # SELinux hosts (Podman machine, Fedora/RHEL) deny a container the daemon socket without
+  # this; hosts without SELinux ignore it. Applies to the socket holders only.
+  security_opt:
+    - label=disable
+
+x-sandbox-env: &sandbox-env
+  SANDBOX_RUNTIME_DEFAULT: ${SANDBOX_RUNTIME_DEFAULT:-docker}
+  DOCKER_SANDBOX_IMAGE: ${DOCKER_SANDBOX_IMAGE:-enigma-sandbox:latest}
+  DOCKER_SANDBOX_CPUS: ${DOCKER_SANDBOX_CPUS:-2}
+  DOCKER_SANDBOX_MEMORY_MB: ${DOCKER_SANDBOX_MEMORY_MB:-4096}
+  DOCKER_SANDBOX_PIDS_LIMIT: ${DOCKER_SANDBOX_PIDS_LIMIT:-4096}
+  DOCKER_MAX_CONCURRENT_EXECS: ${DOCKER_MAX_CONCURRENT_EXECS:-64}
+  DOCKER_PREVIEW_PROXY_HOST: ${DOCKER_PREVIEW_PROXY_HOST:-preview-proxy}
+  DOCKER_SANDBOX_SUBNET_POOL: ${DOCKER_SANDBOX_SUBNET_POOL:-10.213.0.0/16}
+  SANDBOX_NETWORK_BLOCK_ALL: ${SANDBOX_NETWORK_BLOCK_ALL:-false}
+
+services:
+  backend:
+    <<: *sandbox-access
+    environment: *sandbox-env
+  worker:
+    <<: *sandbox-access
+    environment: *sandbox-env
+  preview-proxy:
+    environment:
+      # Which provider the proxy's /health reports on.
+      SANDBOX_RUNTIME_DEFAULT: ${SANDBOX_RUNTIME_DEFAULT:-docker}
+    labels:
+      enigma.preview-proxy: "1"
+    # It sits on every sandbox network: it must never route between them.
+    sysctls:
+      net.ipv4.ip_forward: "0"

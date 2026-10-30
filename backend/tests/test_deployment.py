@@ -173,6 +173,51 @@ def test_compose_keeps_building_the_dev_targets():
         assert compose["services"][service]["build"].get("target") == "dev", service
 
 
+def _socket_mounts(service: dict) -> list[str]:
+    return [str(v) for v in service.get("volumes", []) if "docker.sock" in str(v)]
+
+
+def test_base_compose_never_mounts_the_container_daemon_socket():
+    """The socket is root-equivalent on the host: Daytona-only stacks must never get it."""
+    compose = yaml.safe_load((REPO / "docker-compose.yml").read_text())
+    for name, service in compose["services"].items():
+        assert _socket_mounts(service) == [], name
+
+
+def test_sandbox_override_gives_the_socket_only_to_the_daemon_clients():
+    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
+    clients = {"backend", "worker"}
+    assert set(override["services"]) == clients | {"preview-proxy"}
+    for name in clients:
+        service = override["services"][name]
+        assert _socket_mounts(service) == [
+            "${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
+        ]
+        # They reach sandboxes through `docker exec`, never the network, so they stay off
+        # the sandboxes' bridge and a sandbox cannot reach the API or the worker.
+        assert "networks" not in service, name
+
+
+def test_sandbox_override_marks_the_preview_proxy_for_the_backend_to_attach():
+    """local-docker-runtime Epic 05: every sandbox has its own network, and the backend
+    attaches the proxy (found by this label) to each. The proxy parses untrusted traffic,
+    so it never gets the daemon socket, and no shared sandbox network exists any more."""
+    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
+    proxy = override["services"]["preview-proxy"]
+    assert _socket_mounts(proxy) == []
+    assert proxy["labels"] == {"enigma.preview-proxy": "1"}
+    # On every sandbox network at once, so it must never forward packets between them.
+    assert proxy["sysctls"] == {"net.ipv4.ip_forward": "0"}
+    assert "networks" not in proxy
+    assert "networks" not in override
+
+
+def test_production_manifests_never_reference_the_container_daemon():
+    """The Kustomize production profile is Daytona-only (docs/local-docker-runtime)."""
+    for manifest in (REPO / "deploy" / "k8s").rglob("*.yaml"):
+        assert "docker.sock" not in manifest.read_text(), manifest
+
+
 # --- kustomize layout ---------------------------------------------------------------------
 
 

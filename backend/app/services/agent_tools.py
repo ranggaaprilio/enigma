@@ -9,7 +9,6 @@ from typing import Any
 import structlog
 
 from app.models import Workspace
-from app.services.daytona_runtime import DaytonaRuntime
 from app.services.repositories import (
     GitFileStatus,
     RepositoryPathError,
@@ -17,6 +16,7 @@ from app.services.repositories import (
     sanitize_git_output,
     validate_diff_path,
 )
+from app.services.sandbox import SandboxRuntime
 
 logger = structlog.get_logger(__name__)
 
@@ -112,7 +112,7 @@ class WorkspaceTools:
     def __init__(
         self,
         workspace: Workspace,
-        runtime: DaytonaRuntime,
+        runtime: SandboxRuntime,
         command_timeout_seconds: int,
         max_command_output_chars: int,
         working_dir: str | None = None,
@@ -146,7 +146,7 @@ class WorkspaceTools:
         return self.root if not candidate else f"{self.root}/{pure.as_posix()}"
 
     async def list_files(self, path: str | None = None, limit: int = 200) -> list[str]:
-        sandbox = await self.runtime.get_sandbox(self.workspace)
+        fs = await self.runtime.fs(self.workspace)
         root = self.resolve_path(path)
         bounded_limit = max(1, min(limit, 200))
         results: list[str] = []
@@ -157,7 +157,7 @@ class WorkspaceTools:
             while directories and len(results) < bounded_limit:
                 directory = directories.popleft()
                 async with asyncio.timeout(self.command_timeout_seconds):
-                    entries = await sandbox.fs.list_files(directory)
+                    entries = await fs.list_files(directory)
                 entries = sorted(entries, key=lambda entry: self._entry_name(entry).lower())
                 for entry in entries:
                     remote = self._entry_path(directory, entry)
@@ -196,9 +196,9 @@ class WorkspaceTools:
         return bool(value() if callable(value) else value)
 
     async def read_file(self, path: str, max_chars: int = 20_000) -> str:
-        sandbox = await self.runtime.get_sandbox(self.workspace)
+        fs = await self.runtime.fs(self.workspace)
         try:
-            content = await sandbox.fs.download_file(self.resolve_path(path))
+            content = await fs.download_file(self.resolve_path(path))
         except Exception as error:
             raise WorkspaceToolError("File does not exist") from error
         return (content or b"").decode("utf-8", errors="replace")[:max_chars]
@@ -206,19 +206,19 @@ class WorkspaceTools:
     async def _download_text(self, path: str) -> str:
         # Non-truncating read used by apply_patch: read_file caps to max_chars,
         # which would silently corrupt a large file when written back.
-        sandbox = await self.runtime.get_sandbox(self.workspace)
+        fs = await self.runtime.fs(self.workspace)
         try:
-            content = await sandbox.fs.download_file(self.resolve_path(path))
+            content = await fs.download_file(self.resolve_path(path))
         except Exception as error:
             raise WorkspaceToolError("File does not exist") from error
         return (content or b"").decode("utf-8", errors="replace")
 
     async def write_file(self, path: str, content: str) -> str:
-        sandbox = await self.runtime.get_sandbox(self.workspace)
+        fs = await self.runtime.fs(self.workspace)
         remote = self.resolve_path(path)
         parent = str(PurePosixPath(remote).parent)
-        await sandbox.fs.create_folder(parent, "755")
-        await sandbox.fs.upload_file(content.encode("utf-8"), remote)
+        await fs.create_folder(parent, "755")
+        await fs.upload_file(content.encode("utf-8"), remote)
         return PurePosixPath(path).as_posix()
 
     async def apply_patch(self, path: str, patch: str) -> PatchResult:
@@ -353,7 +353,7 @@ class WorkspaceTools:
         """Whether the search binary itself was absent, as opposed to simply not matching.
 
         Keyed off exit code 127 — the only reliable signal. Sniffing output for "not found"
-        misfired constantly: ``DaytonaRuntime.exec`` returns *combined* output in ``stdout``,
+        misfired constantly: ``SandboxRuntime.exec`` returns *combined* output in ``stdout``,
         so any repository containing the phrase (``detail="Workspace not found"``, say) looked
         like a missing ripgrep. The correct hits were then thrown away and the search re-ran
         as POSIX-BRE ``grep``, silently returning wrong or zero matches for any ERE/PCRE

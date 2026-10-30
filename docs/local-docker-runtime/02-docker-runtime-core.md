@@ -199,3 +199,88 @@ None. `workspace.sandbox_id` (alias of `daytona_sandbox_id`) stores the containe
 - Warm pool of pre-created containers to cut provision latency to near zero.
 - Image variants per stack (node-only, python-only) selected via `workspace.snapshot`.
 - Podman rootless as a first-class tested profile (currently: documented, best-effort).
+
+## Implementation Notes (shipped)
+
+Built on the Epic 01 branch. Verified on Podman 5.8 (Docker-API compatible socket) with the
+real image: unit + conformance suites, `tests/test_docker_integration.py`, and a sandbox
+provisioned from inside the compose `backend` container through `docker-compose.sandbox.yml`.
+The code and security reviews' findings are fixed below; each has a regression test.
+
+- **Provider** — `services/sandbox/docker.py`, registered as `"docker"` in `factory.py`. Two
+  SDK clients: a control `DockerClient` with `DOCKER_PROVISION_TIMEOUT_SECONDS` and an exec
+  `APIClient` with no read timeout (a command may be silent for longer than any request
+  timeout), pooled for `DOCKER_MAX_CONCURRENT_EXECS`. `provision(workspace)` follows the
+  Epic 01 signature; container name `execute-<hex>`, labels `enigma.managed` /
+  `enigma.workspace-id` / `enigma.owner-id`, `init=True` + `sleep infinity` (the init reaps
+  orphans that background dev servers leave), the `enigma-sandboxes` network (created on
+  demand, exact-name match — Docker's name filter is a substring match). `status` maps
+  `running→ready`, `created|restarting→creating`, `paused|exited→stopped`, anything else
+  `error`; every operation auto-starts (or unpauses).
+- **Adopt-by-name is guarded** — an existing `execute-<hex>` container is adopted only if it
+  carries `enigma.managed=1` and this workspace's id label; the workspace directory is
+  re-created on adopt, and a container whose directory step fails is removed, so a retry never
+  adopts a half-made sandbox.
+- **Threads** — the SDK is synchronous. Calls run on the runtime's own pools, never
+  `asyncio.to_thread`: an exec pool (one thread per in-flight command, bounded by
+  `DOCKER_MAX_CONCURRENT_EXECS`) and a control pool (inspect/start/create and the kill).
+  On the shared default executor, a handful of long streams starved the kill path and a
+  cancelled command survived (reproduced in review); `test_kill_is_never_starved_…` pins it.
+- **Home/user parity** — the shared image keeps the base's `daytona` user and
+  `/home/daytona`, so `DAYTONA_SANDBOX_HOME` is right for both providers and no consumer
+  changed; the provider-neutral `sandbox_home` rename moves to Epic 06's config cleanup.
+  Relative cwds (`workspace_path = "workspace"`) resolve against that home.
+- **Exec** — `/bin/sh -c <wrapper> <pidfile> <command>`: the wrapper starts
+  `timeout -k 5 <secs|0> /bin/sh -c <command>` in the background, records its pid (= its
+  process group, GNU `timeout` calls `setpgid`), waits, removes the pidfile. Exit 124/137
+  after the limit → `CommandTimeoutError`; an early 124 is an ordinary exit code. On
+  cancellation (shutdown drain) or the host-side guard (`timeout + 5 + 15` s) the runtime
+  inspects the exec (nothing to do if it already finished), then a second exec leaves a
+  `.cancel` tombstone (stops a command whose exec had not started), TERMs the group — or the
+  pid, if `setpgid` has not happened yet — and KILLs only what survives the grace period, so
+  a cancel returns in well under a second when the command dies on TERM. Failures to kill are
+  logged (`docker_exec_kill_failed`). Non-login `sh -c` (not `-lc`): Debian's `/etc/profile`
+  resets `PATH` and would drop `~/.local/bin`. Output is combined in `stdout` with an empty
+  `stderr`, Daytona's shape — but stdout/stderr are separate pipes, so their relative
+  interleaving is not guaranteed (each stream stays ordered). The exit code is re-read while
+  the daemon still reports the exec as running.
+- **Streaming** — `exec_start(stream=True, demux=True)` on an exec thread; each chunk is
+  handed to the async callback with `run_coroutine_threadsafe` and awaited in 0.5 s slices
+  (backpressure, but never blocked forever on a gone consumer or a closed loop); per-stream
+  incremental UTF-8 decoding; exit code from `exec_inspect`. Delivery stops the moment the
+  caller is cancelled.
+- **Security floor** (Gate 1 decision: from day one, not Epic 05; widened after review) —
+  non-root `DOCKER_SANDBOX_USER` (any uid-0 spelling refused), `no-new-privileges` (which also
+  disables the base image's passwordless sudo), `cap_drop=["ALL"]` (verified: `CapEff` and
+  `CapBnd` are zero inside the sandbox), `pids_limit` (`DOCKER_SANDBOX_PIDS_LIMIT`, 4096), no
+  mounts/devices/added caps/host namespaces, no `host`/`none`/`container:` network, no
+  unconfined seccomp/AppArmor — enforced by `assert_safe_container_spec` before every create.
+  The image is always the operator's `DOCKER_SANDBOX_IMAGE`: `workspace.snapshot` is
+  user-settable (a Daytona snapshot name) and is ignored on Docker, so it cannot pick an
+  arbitrary local image or probe which images exist. Errors never carry the daemon URL (all
+  `requests` exceptions, including read timeouts, map to "Docker is unavailable").
+- **Image** — `daytona/Dockerfile` → `sandbox/Dockerfile` (same `daytonaio/sandbox:0.8.0`
+  base, multi-arch, ~9 GB; adds tmux for Epic 03). `daytona/build-snapshot.sh` builds from
+  it; `sandbox/build-local-image.sh` tags `enigma-sandbox:latest` (podman or docker).
+- **Compose** (Gate 1 decision: opt-in override, not the main file; narrowed after review) —
+  `docker-compose.sandbox.yml` gives the socket (`DOCKER_SOCKET`), `label=disable` (SELinux
+  hosts, including the Podman machine VM, deny the socket otherwise) and
+  `SANDBOX_RUNTIME_DEFAULT=docker` to the **backend and worker only**. The preview proxy
+  parses untrusted traffic and does not drive sandboxes until Epic 04, and no trusted service
+  joins `enigma-sandboxes`, so a sandbox cannot reach the API, worker or proxy.
+  `tests/test_deployment.py` guards: base compose and `deploy/k8s` never mention the socket;
+  the override touches exactly those two services and adds no network.
+- **Selecting the provider** — `SANDBOX_RUNTIME_DEFAULT` (`daytona` default) is read at
+  workspace creation; the per-request picker is Epic 06.
+- **Not yet on Docker** — `fs`, the PTY and `preview_link` raise `RuntimeUnavailableError`
+  ("… is not available on the Docker sandbox runtime yet") → 503; `kill_pty` is a no-op. So
+  blank/template workspace initialisation and repository clone need Epic 03; a repository
+  workspace that is not cloned yet runs commands and agent `run_command` today. The
+  conformance suite marks exactly those cases strict-xfail for Docker.
+- **Left for later** — sandbox-to-sandbox traffic on `enigma-sandboxes` is still allowed
+  (inter-container isolation and the egress policy are Epic 05; Epic 04 must decide how the
+  proxy reaches sandboxes without opening that up). No metrics (task 11 was optional). No
+  dedicated `queue`-mode end-to-end run: the worker executes the same provider code with the
+  same image and mount verified from the backend container, and the command-run path is
+  covered by the real-DB integration test. Only Podman was exercised; Docker Engine is
+  expected to behave the same through the same API but was not run.

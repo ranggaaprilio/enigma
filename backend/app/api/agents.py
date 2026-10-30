@@ -35,8 +35,8 @@ from app.services.agents import (
     event_payload,
 )
 from app.services.budgets import BudgetExceededError
-from app.services.daytona_runtime import get_daytona_runtime
 from app.services.rate_limit import RedisRateLimiter
+from app.services.sandbox import get_sandbox_runtime
 from app.services.workspaces import WorkspaceNotFoundError
 from app.services.worktrees import WorktreeNotFoundError, WorktreeService
 
@@ -127,7 +127,7 @@ async def get_worktree_service(
 ) -> WorktreeService:
     return WorktreeService(
         session=session,
-        runtime=get_daytona_runtime(),
+        runtime=get_sandbox_runtime(),
         settings=settings,
     )
 

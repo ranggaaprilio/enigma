@@ -182,6 +182,21 @@ def test_relative_workspace_path_resolves_to_sandbox_home():
     assert "/home/daytona/workspace" in command
 
 
+def test_launch_guard_checks_the_port_not_a_process_pattern_its_own_shell_matches():
+    """local-docker-runtime Epic 04: `pgrep -f 'code-server.*13337'` also matches the very
+    shell running this script (its argv holds the launch line), so on a provider that runs
+    commands as `sh -c <script>` the editor was never launched. "Is the port listening" is
+    what the guard means, and nothing in the script's own argv can satisfy it."""
+    service = EditorService.__new__(EditorService)
+    service.settings = get_settings()
+
+    command = service._ensure_command("/home/daytona/workspace")
+
+    assert "pgrep" not in command
+    port_hex = f"{service.settings.editor_port:04X}"
+    assert f"':{port_hex} [0-9A-F:]* 0A' /proc/net/tcp /proc/net/tcp6" in command
+
+
 def test_absolute_workspace_path_is_left_untouched():
     service = EditorService.__new__(EditorService)
     service.settings = get_settings()
@@ -225,3 +240,68 @@ async def test_editor_workspace_ownership_is_enforced(editor_context):
         response = await client.post(f"/workspaces/{uuid4()}/editor/start")
 
     assert response.status_code == 404
+
+
+# --- bind_host follows the provider (local-docker-runtime Epic 04) ------------------------
+
+
+@pytest.fixture
+async def editor_db_session():
+    from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+    engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
+    maker = async_sessionmaker(engine, expire_on_commit=False)
+    async with maker() as session:
+        # The service commits; flushing instead keeps the shared dev database clean.
+        session.commit = session.flush  # type: ignore[method-assign]
+        yield session
+        await session.rollback()
+    await engine.dispose()
+
+
+@pytest.mark.parametrize("runtime_name", ["daytona", "docker"])
+async def test_editor_session_records_the_workspace_provider_as_bind_host(
+    editor_db_session, runtime_name
+):
+    from tests.sandbox.fakes import FakeSandboxRuntime
+
+    session = editor_db_session
+    user = User(
+        id=uuid4(),
+        email=f"{uuid4().hex}@example.com",
+        password_hash="x",
+        role="owner",
+        is_active=True,
+    )
+    session.add(user)
+    await session.flush()
+    workspace = Workspace(
+        id=uuid4(),
+        owner_id=user.id,
+        name="Demo",
+        slug="demo",
+        repo_url="https://github.com/example/demo",
+        default_branch="main",
+        runtime=runtime_name,
+        daytona_sandbox_id=f"sandbox-{uuid4().hex[:8]}",
+        workspace_path="workspace",
+        status="ready",
+    )
+    session.add(workspace)
+    await session.flush()
+    runtime = FakeSandboxRuntime()
+
+    editor = await EditorService(session, get_settings(), runtime).start_or_reuse(  # type: ignore[arg-type]
+        workspace.id, user.id
+    )
+
+    assert editor.bind_host == runtime_name
+    [launch] = runtime.exec_calls
+    port = get_settings().editor_port
+    if runtime_name == "docker":
+        # Security: sandboxes share one bridge, so code-server (`--auth none`) stays on
+        # loopback and only the proxy-only relay reaches it.
+        assert f"--bind-addr 127.0.0.1:{port}" in launch["command"]
+        assert runtime.exposed_ports == [port]
+    else:
+        assert f"--bind-addr 0.0.0.0:{port}" in launch["command"]

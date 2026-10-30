@@ -12,8 +12,8 @@ from app.core.config import Settings
 from app.core.security import hash_password
 from app.main import app
 from app.models import User, Workspace, WorkspaceEnvVar
-from app.services.daytona_runtime import DaytonaRuntimeError
 from app.services.git_providers import sanitize_repository_url
+from app.services.sandbox import SandboxRuntimeError
 from app.services.templates import TemplateNotFoundError
 from app.services.users import DuplicateUserEmailError
 from app.services.workspace_init import WorkspaceInitializationError
@@ -711,7 +711,8 @@ async def test_env_template_lists_keys_without_values_and_groups_by_scope(worksp
     assert "# Service: API Server" in body
 
 
-async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
+@pytest.mark.parametrize("default_runtime", ["daytona", "docker"])
+async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path, default_runtime):
     class EmptyResult:
         def scalar_one_or_none(self):
             return None
@@ -740,15 +741,16 @@ async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
             workspace.created_at = workspace.created_at or now
             workspace.updated_at = now
 
-    settings = Settings()
+    # New workspaces take the configured provider; pinned so a root `.env` cannot leak in.
+    settings = Settings(sandbox_runtime_default=default_runtime)
     session = FakeSession()
 
     class FakeRuntime:
         def __init__(self, runtime_settings):
             self.settings = runtime_settings
 
-        async def provision(self, workspace_id, owner_id, snapshot):
-            return type("Sandbox", (), {"id": f"sandbox-{workspace_id}"})()
+        async def provision(self, workspace):
+            return f"sandbox-{workspace.id}"
 
     service = SqlAlchemyWorkspaceService(
         session=session,  # type: ignore[arg-type]
@@ -764,6 +766,7 @@ async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path):
     )
 
     assert workspace.status == "ready"
+    assert workspace.runtime == default_runtime
     assert workspace.daytona_sandbox_id == f"sandbox-{workspace.id}"
     assert workspace.workspace_path == "workspace"
     assert session.commits == 2
@@ -940,8 +943,8 @@ class _FakeProvisionRuntime:
     def __init__(self, runtime_settings):
         self.settings = runtime_settings
 
-    async def provision(self, workspace_id, owner_id, snapshot):
-        return type("Sandbox", (), {"id": f"sandbox-{workspace_id}"})()
+    async def provision(self, workspace):
+        return f"sandbox-{workspace.id}"
 
 
 class _RecordingInitializer:
@@ -1091,8 +1094,8 @@ async def test_reprovision_marks_error_when_the_runtime_still_fails():
         def __init__(self, runtime_settings):
             self.settings = runtime_settings
 
-        async def provision(self, workspace_id, owner_id, snapshot):
-            raise DaytonaRuntimeError("snapshot not found")
+        async def provision(self, workspace):
+            raise SandboxRuntimeError("snapshot not found")
 
     service = SqlAlchemyWorkspaceService(
         session=_FakeReprovisionSession(workspace),  # type: ignore[arg-type]

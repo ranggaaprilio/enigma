@@ -16,7 +16,6 @@ from app.schemas.preview import (
     PreviewDetectResponse,
     PreviewSessionResponse,
 )
-from app.services.daytona_runtime import DaytonaRuntimeError, get_daytona_runtime
 from app.services.preview import (
     PreviewNotFoundError,
     PreviewService,
@@ -30,6 +29,7 @@ from app.services.preview_alias import (
 )
 from app.services.preview_alias import alias_url as build_alias_url
 from app.services.preview_composition import PreviewCompositionService
+from app.services.sandbox import SandboxRuntimeError, get_sandbox_runtime
 from app.services.workspace_services import WorkspaceServiceWorkspacePathError
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -58,7 +58,7 @@ async def get_preview_service(
     session: AsyncSession = DB_SESSION_DEP,
     settings: Settings = SETTINGS_DEP,
 ) -> PreviewServiceProtocol:
-    return PreviewService(session, settings, get_daytona_runtime())
+    return PreviewService(session, settings, get_sandbox_runtime())
 
 
 PREVIEW_SERVICE_DEP = Depends(get_preview_service)
@@ -123,7 +123,7 @@ async def detect_preview_session(
         return PreviewDetectResponse(status="inactive", session=None)
     except PreviewWorkspacePathError:
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
-    except DaytonaRuntimeError as error:
+    except SandboxRuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return PreviewDetectResponse(status="active", session=preview)
 
@@ -141,7 +141,7 @@ async def refresh_preview_session(
         raise not_found() from None
     except PreviewSessionNotFoundError:
         raise HTTPException(status_code=404, detail="Preview session not found") from None
-    except DaytonaRuntimeError as error:
+    except SandboxRuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
 
 
@@ -182,7 +182,7 @@ async def get_preview_composition(
         raise not_found() from None
     except WorkspaceServiceWorkspacePathError:
         raise HTTPException(status_code=409, detail="Workspace sandbox is not ready") from None
-    except DaytonaRuntimeError as error:
+    except SandboxRuntimeError as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return PreviewCompositionResponse.model_validate(composition)
 
@@ -254,5 +254,5 @@ async def regenerate_preview_alias(
 
     return PreviewAliasRegenerateResponse(
         alias=row.alias,
-        alias_url=build_alias_url(row.alias, base_url=settings.daytona_preview_proxy_base_url),
+        alias_url=build_alias_url(row.alias, base_url=settings.preview_proxy_base_url),
     )
