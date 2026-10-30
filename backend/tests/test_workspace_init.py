@@ -18,7 +18,7 @@ def _workspace(name: str = "Demo", branch: str = "main") -> Workspace:
         source="blank",
         default_branch=branch,
         runtime="daytona",
-        daytona_sandbox_id="sandbox-1",
+        sandbox_id="sandbox-1",
         workspace_path="/workspace",
         status="creating",
         created_at=datetime.now(UTC),

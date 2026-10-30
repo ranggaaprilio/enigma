@@ -187,7 +187,7 @@ def test_base_compose_never_mounts_the_container_daemon_socket():
 def test_sandbox_override_gives_the_socket_only_to_the_daemon_clients():
     override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
     clients = {"backend", "worker"}
-    assert set(override["services"]) == clients | {"preview-proxy"}
+    assert set(override["services"]) == clients | {"preview-proxy", "egress-proxy"}
     for name in clients:
         service = override["services"][name]
         assert _socket_mounts(service) == [
@@ -209,7 +209,35 @@ def test_sandbox_override_marks_the_preview_proxy_for_the_backend_to_attach():
     # On every sandbox network at once, so it must never forward packets between them.
     assert proxy["sysctls"] == {"net.ipv4.ip_forward": "0"}
     assert "networks" not in proxy
-    assert "networks" not in override
+    assert set(override.get("networks", {})) == {"egress"}  # the egress proxy's own
+
+
+def test_sandbox_override_runs_a_locked_down_egress_proxy_with_no_secrets():
+    """SANDBOX_NETWORK_ALLOW_LIST on Docker: sandbox networks are internal and the egress
+    proxy is their only way out. It parses every tenant's traffic, so it gets no socket and
+    no secret, runs unprivileged, never routes, and its own network reaches nothing else."""
+    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
+    proxy = override["services"]["egress-proxy"]
+    assert _socket_mounts(proxy) == []
+    assert proxy["volumes"] == ["./backend/app:/app/app:ro"]
+    assert "env_file" not in proxy
+    assert set(proxy["environment"]) == {
+        "SANDBOX_NETWORK_ALLOW_LIST",
+        "DOCKER_SANDBOX_SUBNET_POOL",
+    }
+    assert proxy["environment"]["SANDBOX_NETWORK_ALLOW_LIST"] == (
+        "${SANDBOX_NETWORK_ALLOW_LIST:-${DAYTONA_NETWORK_ALLOW_LIST:-}}"
+    )
+    assert proxy["labels"] == {"enigma.egress-proxy": "1"}
+    assert proxy["user"] == "65534:65534" and proxy["read_only"] is True
+    assert proxy["cap_drop"] == ["ALL"]
+    assert proxy["security_opt"] == ["no-new-privileges:true"]
+    assert proxy["sysctls"] == {"net.ipv4.ip_forward": "0"}
+    assert proxy["networks"] == ["egress"]
+    assert "ports" not in proxy
+    for name, service in override["services"].items():
+        if name != "egress-proxy":
+            assert "egress" not in (service.get("networks") or []), name
 
 
 def _merged_env(service: str) -> dict[str, str]:

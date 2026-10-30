@@ -62,7 +62,7 @@ async def seed_workspace(session) -> tuple[User, Workspace]:
         repo_url="https://github.com/example/demo",
         default_branch="main",
         runtime="daytona",
-        daytona_sandbox_id=f"sandbox-{uuid4().hex[:8]}",
+        sandbox_id=f"sandbox-{uuid4().hex[:8]}",
         workspace_path="workspace",
         status="ready",
         created_at=now,

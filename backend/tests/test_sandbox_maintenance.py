@@ -45,7 +45,7 @@ async def _workspace(maker, *, runtime: str = "docker", sandbox_id: str | None =
                     role="owner", is_active=True)
         workspace = Workspace(id=uuid4(), owner_id=user.id, name="Upkeep", slug=uuid4().hex[:12],
                               default_branch="main", runtime=runtime, status="ready",
-                              workspace_path="workspace", daytona_sandbox_id=sandbox_id)
+                              workspace_path="workspace", sandbox_id=sandbox_id)
         session.add(user)
         await session.flush()
         session.add(workspace)
@@ -68,7 +68,7 @@ async def _sandboxed(maker, client, runtime, **kwargs) -> Workspace:
     sandbox_id = await runtime.provision(workspace)
     async with maker() as session:
         row = await session.get(Workspace, workspace.id)
-        row.daytona_sandbox_id = sandbox_id
+        row.sandbox_id = sandbox_id
         await session.commit()
     workspace.sandbox_id = sandbox_id
     return workspace
@@ -269,7 +269,7 @@ async def test_a_legacy_sandbox_of_ours_is_moved_off_the_shared_network(maker) -
     shared.connect(ours_ctr)
     async with maker() as session:
         row = await session.get(Workspace, ours.id)
-        row.daytona_sandbox_id = ours_ctr.id
+        row.sandbox_id = ours_ctr.id
         await session.commit()
     stranger_id = uuid4()
     stranger_ctr = client.add_container(

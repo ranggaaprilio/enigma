@@ -32,7 +32,7 @@ class RuntimeHealth(BaseModel):
     status and a generic reason -- never a socket path, URL or version (Epic 06)."""
 
     configured: bool
-    status: str  # ok | error | unconfigured
+    status: str  # ok | error | unconfigured | disabled (SANDBOX_RUNTIMES_ALLOWED)
     reason: str | None = None
     # Docker only: this installation's sandboxes on the daemon, and when this process last
     # ran the upkeep pass (None where it does not run it, e.g. the API in queue mode). Shown
@@ -141,9 +141,12 @@ async def health(request: Request) -> HealthResponse | JSONResponse:
             name: entry.model_copy(update={"managed_containers": None, "upkeep_last_pass_at": None})
             for name, entry in runtimes.items()
         }
-    # An unconfigured provider is not a fault (a Docker-only install has no Daytona key),
-    # but a configured one that is down is, and so is having nowhere to put a workspace.
-    configured = [entry for entry in runtimes.values() if entry.configured]
+    # An unconfigured or disabled provider is not a fault (a Docker-only install has no
+    # Daytona key), but a configured, enabled one that is down is, and so is having nowhere
+    # to put a workspace.
+    configured = [
+        entry for entry in runtimes.values() if entry.configured and entry.status != "disabled"
+    ]
     runtimes_ok = bool(configured) and all(entry.status == "ok" for entry in configured)
 
     status = (

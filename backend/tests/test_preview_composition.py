@@ -174,7 +174,7 @@ async def _make_workspace(
         repo_url="https://github.com/example/demo",
         default_branch="main",
         runtime="daytona",
-        daytona_sandbox_id=f"sandbox-{uuid4().hex[:8]}",
+        sandbox_id=f"sandbox-{uuid4().hex[:8]}",
         workspace_path="/workspace",
         status="ready",
         preview_alias_enabled=preview_alias_enabled,

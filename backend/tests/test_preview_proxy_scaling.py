@@ -63,7 +63,7 @@ def make_workspace() -> Workspace:
         repo_url="https://github.com/example/demo",
         default_branch="main",
         runtime="daytona",
-        daytona_sandbox_id="sandbox-demo",
+        sandbox_id="sandbox-demo",
         workspace_path="/workspace",
         status="ready",
         preview_alias_enabled=True,

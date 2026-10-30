@@ -43,6 +43,6 @@ async def test_real_daytona_sandbox_lifecycle_and_command() -> None:
         assert result.exit_code == 0
         assert result.stdout == "daytona-ready"
     finally:
-        if workspace.daytona_sandbox_id:
+        if workspace.sandbox_id:
             await runtime.delete(workspace)
         await runtime.close()

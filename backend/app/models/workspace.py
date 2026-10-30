@@ -68,8 +68,8 @@ class Workspace(Base):
     default_branch: Mapped[str] = mapped_column(String(120), nullable=False, default="main")
     runtime: Mapped[str] = mapped_column(String(32), nullable=False, default="daytona")
     daytona_sandbox_id: Mapped[str | None] = mapped_column(String(160), nullable=True)
-    # Epic 06 expand: written alongside ``daytona_sandbox_id`` (migration 0037), which stays
-    # the one read until the contract release drops it. Use ``sandbox_id``, never these two.
+    # Epic 06: read since migration 0038; ``daytona_sandbox_id`` is still written for the 0037
+    # release, which reads it, until 0039 drops it. Use ``sandbox_id``, never these two.
     sandbox_id_column: Mapped[str | None] = mapped_column(
         "sandbox_id", String(160), nullable=True, index=True
     )
@@ -120,7 +120,7 @@ class Workspace(Base):
     # A hybrid, so the provider-neutral name also works in queries (`Workspace.sandbox_id`).
     @hybrid_property
     def sandbox_id(self) -> str | None:
-        return self.daytona_sandbox_id
+        return self.sandbox_id_column
 
     @sandbox_id.inplace.setter
     def _sandbox_id_setter(self, value: str | None) -> None:

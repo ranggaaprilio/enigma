@@ -3,7 +3,8 @@ export type RuntimeName = "daytona" | "docker";
 /** One sandbox provider on `/health`: never more than configured yes/no and a generic reason. */
 export type RuntimeHealth = {
   configured: boolean;
-  status: "ok" | "error" | "unconfigured";
+  // "disabled": left out of SANDBOX_RUNTIMES_ALLOWED; never offered, not a fault.
+  status: "ok" | "error" | "unconfigured" | "disabled";
   reason: string | null;
   /** Docker only: this installation's sandboxes on the daemon. */
   managed_containers: number | null;
@@ -16,7 +17,7 @@ export type HealthResponse = {
   database: "ok" | "error";
   redis: "ok" | "error";
   /** Kept for existing monitors; the same as `runtimes.daytona.status`. */
-  daytona: "ok" | "error" | "unconfigured";
+  daytona: RuntimeHealth["status"];
   sandbox_runtime_default: RuntimeName;
   runtimes: Record<RuntimeName, RuntimeHealth>;
 };

@@ -141,6 +141,9 @@ class Settings(BaseSettings):
     )
     # Provider for newly created workspaces ("daytona" | "docker"). Existing rows keep theirs.
     sandbox_runtime_default: Literal["daytona", "docker"] = "daytona"
+    # Providers users may pick for new workspaces (comma-separated); empty = every provider.
+    # Existing workspaces keep running on theirs. Must include sandbox_runtime_default.
+    sandbox_runtimes_allowed: str | list[str] = Field(default_factory=list)
     # Local Docker/Podman provider (docs/local-docker-runtime). Unset docker_host = the
     # default unix socket; Podman: point it at `podman system service`'s socket.
     docker_host: str | None = None
@@ -157,6 +160,12 @@ class Settings(BaseSettings):
     # connections from this name's addresses only (Epic 04).
     docker_preview_proxy_host: str = "preview-proxy"
     docker_preview_proxy_label: str = "enigma.preview-proxy=1"
+    # With SANDBOX_NETWORK_ALLOW_LIST, sandbox networks are internal and their only way out
+    # is the egress proxy (app/egress_proxy.py), attached to each under this name; sandbox
+    # commands and terminals get HTTP(S)_PROXY pointing at it.
+    docker_egress_proxy_host: str = "egress-proxy"
+    docker_egress_proxy_label: str = "enigma.egress-proxy=1"
+    docker_egress_proxy_port: int = Field(default=3128, gt=0, lt=65536)
     # Must exist in the image and must not be root (enforced at provision).
     docker_sandbox_user: str = "daytona"
     docker_sandbox_cpus: float = Field(default=2.0, gt=0)
@@ -170,6 +179,11 @@ class Settings(BaseSettings):
     # open-file limit is explicit rather than the daemon's default.
     docker_sandbox_tmp_mb: int = Field(default=1024, gt=0)
     docker_sandbox_nofile: int = Field(default=65536, gt=0)
+    # Per-sandbox disk quota on the container's writable layer (the workspace lives there:
+    # sandboxes get no mounts). 0 = none. Needs a daemon storage driver that supports
+    # `--storage-opt size` (overlay2 on xfs mounted with pquota, btrfs, zfs); elsewhere the
+    # daemon refuses the create and provisioning fails saying so.
+    docker_sandbox_disk_mb: int = Field(default=0, ge=0)
     # A sandbox with a live exec or terminal is spared by the idle reaper, but only until it
     # has been idle this long: "busy" is read from the sandbox, which its tenant controls.
     sandbox_busy_max_minutes: int = Field(default=240, gt=0)
@@ -296,6 +310,9 @@ class Settings(BaseSettings):
         default_factory=lambda: ["http://localhost:5173", "http://127.0.0.1:5173"]
     )
 
+    def runtime_allowed(self, provider: str) -> bool:
+        return not self.sandbox_runtimes_allowed or provider in self.sandbox_runtimes_allowed
+
     @property
     def docker_upkeep_enabled(self) -> bool:
         if self.docker_upkeep is not None:
@@ -334,7 +351,12 @@ class Settings(BaseSettings):
             return [origin.strip() for origin in value.split(",") if origin.strip()]
         return value
 
-    @field_validator("agent_command_allowlist", "sandbox_network_allow_list", mode="before")
+    @field_validator(
+        "agent_command_allowlist",
+        "sandbox_network_allow_list",
+        "sandbox_runtimes_allowed",
+        mode="before",
+    )
     @classmethod
     def parse_command_allowlist(cls, value: str | list[str]) -> list[str]:
         if isinstance(value, str):
@@ -352,6 +374,18 @@ class Settings(BaseSettings):
 
             return json.loads(stripped)
         return value
+
+    @model_validator(mode="after")
+    def check_runtimes_allowed(self) -> "Settings":
+        unknown = sorted(set(self.sandbox_runtimes_allowed) - {"daytona", "docker"})
+        if unknown:
+            raise ValueError(f"sandbox_runtimes_allowed names unknown providers: {unknown}")
+        if not self.runtime_allowed(self.sandbox_runtime_default):
+            raise ValueError(
+                "sandbox_runtimes_allowed must include sandbox_runtime_default "
+                f"({self.sandbox_runtime_default!r})"
+            )
+        return self
 
     @model_validator(mode="after")
     def check_lease_timing(self) -> "Settings":

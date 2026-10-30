@@ -115,6 +115,38 @@ def test_container_security_spec_is_exactly_the_tested_floor() -> None:
     assert_safe_container_spec({**spec, "network": "enigma-sbx-x"})
 
 
+async def test_a_disk_quota_sizes_the_writable_layer() -> None:
+    client = FakeDockerClient()
+    await provisioned(client, docker_sandbox_disk_mb=10240)
+
+    [spec] = client.containers.run_specs
+    assert spec["storage_opt"] == {"size": "10240m"}
+
+
+async def test_no_disk_quota_by_default() -> None:
+    client = FakeDockerClient()
+    await provisioned(client)
+
+    [spec] = client.containers.run_specs
+    assert "storage_opt" not in spec
+
+
+async def test_a_driver_without_quota_support_is_a_clear_provisioning_error() -> None:
+    client = FakeDockerClient()
+
+    def refuse(**spec):
+        raise APIError(
+            "500 Server Error",
+            explanation="--storage-opt is supported only for overlay over xfs with 'pquota'",
+        )
+
+    client.containers.run = refuse  # type: ignore[method-assign]
+    runtime = docker_runtime_with(client, docker_sandbox_disk_mb=1024)
+
+    with pytest.raises(ProvisioningError, match="DOCKER_SANDBOX_DISK_MB"):
+        await runtime.provision(docker_workspace())
+
+
 @pytest.mark.parametrize(
     ("drift", "problem"),
     [
@@ -939,3 +971,106 @@ async def test_close_releases_both_clients() -> None:
     await runtime.close()
 
     assert client.closed and client.api.closed
+
+
+# --- egress allow-list: internal networks + the egress proxy ------------------------------
+
+
+def _egress_proxy(client: FakeDockerClient, name: str = "enigma-egress-proxy-1"):
+    return client.add_container(name, labels={"enigma.egress-proxy": "1"})
+
+
+async def test_an_allow_list_makes_the_network_internal_with_the_egress_proxy_attached() -> None:
+    client = FakeDockerClient()
+    preview = _proxy(client)
+    egress = _egress_proxy(client)
+    runtime, workspace = await provisioned(client, sandbox_network_allow_list="140.82.112.0/20")
+
+    network = client.networks.get(f"enigma-sbx-{workspace.id.hex}")
+    assert network.attrs["Internal"] is True
+    assert network.aliases[egress.id] == ["egress-proxy"]
+    assert network.aliases[preview.id] == ["preview-proxy"]
+
+
+async def test_without_an_allow_list_the_egress_proxy_stays_off_sandbox_networks() -> None:
+    client = FakeDockerClient()
+    egress = _egress_proxy(client)
+    runtime, workspace = await provisioned(client)
+
+    network = client.networks.get(f"enigma-sbx-{workspace.id.hex}")
+    assert network.attrs["Internal"] is False
+    assert egress.id not in network.attrs["Containers"]
+
+
+async def test_turning_block_all_on_detaches_the_egress_proxy() -> None:
+    """block_all wins over the allow list (as on Daytona). The network is internal either
+    way, so it is not rebuilt: the proxy must be taken off it, or sandboxes would keep the
+    allow-listed way out."""
+    client = FakeDockerClient()
+    egress = _egress_proxy(client)
+    runtime, workspace = await provisioned(client, sandbox_network_allow_list="1.2.3.0/24")
+    network = client.networks.get(f"enigma-sbx-{workspace.id.hex}")
+    assert egress.id in network.attrs["Containers"]
+
+    runtime.settings.sandbox_network_block_all = True
+    await runtime.reconcile_networks()
+    await runtime.exec(workspace, "true")
+    *_, record = client.api.execs.values()
+    assert record["environment"] is None  # no proxy to point at any more
+
+    network = client.networks.get(f"enigma-sbx-{workspace.id.hex}")
+    assert network.attrs["Internal"] is True
+    assert egress.id not in network.attrs["Containers"]
+    assert workspace.sandbox_id in network.attrs["Containers"]
+
+
+async def test_commands_get_the_egress_proxy_in_their_environment() -> None:
+    client = FakeDockerClient()
+    runtime, workspace = await provisioned(client, sandbox_network_allow_list="1.2.3.0/24")
+
+    await runtime.exec(workspace, "git fetch", env={"FOO": "1", "NO_PROXY": "internal.test"})
+
+    *_, record = client.api.execs.values()
+    env = dict(item.split("=", 1) for item in record["environment"])
+    assert env["HTTPS_PROXY"] == env["https_proxy"] == "http://egress-proxy:3128"
+    assert env["HTTP_PROXY"] == env["http_proxy"] == "http://egress-proxy:3128"
+    assert env["no_proxy"] == "localhost,127.0.0.1,::1"
+    assert env["NO_PROXY"] == "internal.test"  # the caller's value wins
+    assert env["FOO"] == "1"
+
+
+async def test_commands_get_no_proxy_environment_without_an_allow_list() -> None:
+    client = FakeDockerClient()
+    runtime, workspace = await provisioned(client)
+
+    await runtime.exec(workspace, "true")
+
+    *_, record = client.api.execs.values()
+    assert record["environment"] is None
+
+
+async def test_terminals_get_the_egress_proxy_in_their_session_environment() -> None:
+    client = FakeDockerClient()
+    runtime, workspace = await provisioned(client, sandbox_network_allow_list="1.2.3.0/24")
+
+    async def on_data(data: bytes) -> None:
+        pass
+
+    handle = await runtime.create_or_connect_pty(
+        workspace, "execute-ab", on_data, env=None, cols=80, rows=24
+    )
+    (record,) = [r for r in client.api.execs.values() if r["tty"]]
+    assert "HTTPS_PROXY=http://egress-proxy:3128" in record["cmd"]
+    await handle.disconnect()
+
+
+async def test_a_missing_egress_proxy_is_logged_on_each_upkeep_pass() -> None:
+    from structlog.testing import capture_logs
+
+    client = FakeDockerClient()
+    runtime, _ = await provisioned(client, sandbox_network_allow_list="1.2.3.0/24")
+
+    with capture_logs() as logs:
+        await runtime.reconcile_networks()
+
+    assert "docker_egress_proxy_missing" in [entry["event"] for entry in logs]

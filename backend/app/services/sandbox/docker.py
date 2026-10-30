@@ -33,6 +33,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from datetime import datetime
 from functools import partial
 from posixpath import join as posix_join
@@ -203,9 +204,13 @@ def container_security_spec(settings: Settings) -> dict[str, Any]:
     run as the unprivileged sandbox user without one. Adding a capability needs a comment
     and a test. ``no-new-privileges`` also defuses the base image's passwordless sudo.
     ``init`` reaps the orphans that backgrounded dev servers leave. Swap is capped at the
-    memory limit, ``/tmp`` is a tmpfs, and the open-file limit is explicit.
+    memory limit, ``/tmp`` is a tmpfs, and the open-file limit is explicit. With
+    ``DOCKER_SANDBOX_DISK_MB`` the writable layer gets a size quota.
     """
     memory = f"{settings.docker_sandbox_memory_mb}m"
+    disk: dict[str, Any] = {}
+    if settings.docker_sandbox_disk_mb:
+        disk["storage_opt"] = {"size": f"{settings.docker_sandbox_disk_mb}m"}
     return {
         "user": settings.docker_sandbox_user,
         "init": True,
@@ -223,6 +228,7 @@ def container_security_spec(settings: Settings) -> dict[str, Any]:
                 hard=settings.docker_sandbox_nofile,
             )
         ],
+        **disk,
     }
 
 
@@ -312,6 +318,12 @@ def _network_subnets(network: Any) -> list[ipaddress.IPv4Network | ipaddress.IPv
         except ValueError:
             continue
     return subnets
+
+
+@dataclass(frozen=True)
+class _Proxies:
+    preview: list[Any]
+    egress: list[Any]
 
 
 def container_name(workspace: Workspace) -> str:
@@ -519,18 +531,60 @@ class DockerRuntime:
             self._project_known = True
         return self._project
 
-    def _proxies(self, client: Any) -> list[Any]:
-        filters = [self.settings.docker_preview_proxy_label]
+    def _labelled(self, client: Any, label: str) -> list[Any]:
+        filters = [label]
         project = self._compose_project(client)
         if project:
             filters.append(f"{COMPOSE_PROJECT_LABEL}={project}")
         return client.containers.list(filters={"label": filters})
 
+    def _proxies(self, client: Any) -> _Proxies:
+        """This stack's preview proxies and egress proxies (Epics 04/05, egress allow-list)."""
+        return _Proxies(
+            preview=self._labelled(client, self.settings.docker_preview_proxy_label),
+            egress=self._labelled(client, self.settings.docker_egress_proxy_label),
+        )
+
+    # --- egress policy ------------------------------------------------------------------
+
+    def _egress_via_proxy(self) -> bool:
+        """An allow list is enforced by the egress proxy, the sandbox's only way out. As on
+        Daytona, ``block_all`` wins: no way out at all, the allow list notwithstanding."""
+        return bool(self.settings.sandbox_network_allow_list) and not (
+            self.settings.sandbox_network_block_all
+        )
+
+    def _network_internal(self) -> bool:
+        return bool(self.settings.sandbox_network_block_all) or self._egress_via_proxy()
+
+    def _proxy_env(self) -> dict[str, str]:
+        """Points proxy-aware tools (git, curl, npm, pip, uv, mise) at the egress proxy. A
+        convenience, not the control: the network is internal, so the proxy is the only
+        way out whether or not a command honours these."""
+        if not self._egress_via_proxy():
+            return {}
+        url = (
+            f"http://{self.settings.docker_egress_proxy_host}:"
+            f"{self.settings.docker_egress_proxy_port}"
+        )
+        no_proxy = "localhost,127.0.0.1,::1"
+        return {
+            "HTTP_PROXY": url,
+            "HTTPS_PROXY": url,
+            "http_proxy": url,
+            "https_proxy": url,
+            "NO_PROXY": no_proxy,
+            "no_proxy": no_proxy,
+        }
+
+    def _environment(self, env: dict[str, str] | None) -> list[str] | None:
+        return _validate_env({**self._proxy_env(), **(env or {})})
+
     # --- networks: one per sandbox (Epic 05) -------------------------------------------
 
     def _ensure_sandbox_network(self, client: Any, workspace: Workspace) -> Any:
         name = sandbox_network_name(workspace)
-        internal = bool(self.settings.sandbox_network_block_all)
+        internal = self._network_internal()
         for network in client.networks.list(names=[name]):
             if network.name != name:  # the name filter is a substring match
                 continue
@@ -573,15 +627,26 @@ class DockerRuntime:
             "No free sandbox subnet is left; widen DOCKER_SANDBOX_SUBNET_POOL"
         )
 
-    def _attach_proxies(self, network: Any, proxies: list[Any]) -> None:
-        """Put this stack's preview-proxy containers on ``network`` under their alias."""
+    def _attach_proxies(self, network: Any, proxies: _Proxies) -> None:
+        """Put this stack's preview proxies on ``network`` under their alias, and its egress
+        proxies too while an allow list is in force (taken off again once it is not)."""
         network.reload()
         attached = set((network.attrs or {}).get("Containers") or {})
-        for proxy in proxies:
+        wanted = [(proxy, self.settings.docker_preview_proxy_host) for proxy in proxies.preview]
+        if self._egress_via_proxy():
+            wanted += [(proxy, self.settings.docker_egress_proxy_host) for proxy in proxies.egress]
+        else:
+            for proxy in proxies.egress:
+                if proxy.id in attached:
+                    try:
+                        network.disconnect(proxy, force=True)
+                    except NotFound:
+                        pass
+        for proxy, alias in wanted:
             if proxy.id in attached:
                 continue
             try:
-                network.connect(proxy, aliases=[self.settings.docker_preview_proxy_host])
+                network.connect(proxy, aliases=[alias])
             except APIError as error:
                 if error.status_code != 409:  # 409: it joined meanwhile
                     logger.warning(
@@ -589,7 +654,7 @@ class DockerRuntime:
                     )
 
     def _isolate(
-        self, client: Any, container: Any, workspace: Workspace, proxies: list[Any]
+        self, client: Any, container: Any, workspace: Workspace, proxies: _Proxies
     ) -> None:
         """Ensure ``container`` is on its own network only (moving it off the legacy shared
         one) and that the preview proxy can reach it there."""
@@ -631,6 +696,11 @@ class DockerRuntime:
         """Every sandbox of this installation on its own network with this stack's proxy
         attached; returns how many were checked. Idempotent, so safe to run concurrently."""
         proxies = self._proxies(client)
+        if self._egress_via_proxy() and not proxies.egress:
+            # Fails closed (the networks are internal), but every sandbox is offline.
+            logger.warning(
+                "docker_egress_proxy_missing", label=self.settings.docker_egress_proxy_label
+            )
         checked = 0
         for container in client.containers.list(all=True, filters={"label": self._ours()}):
             workspace_id = (container.labels or {}).get(WORKSPACE_LABEL)
@@ -714,7 +784,16 @@ class DockerRuntime:
         network = self._ensure_sandbox_network(client, workspace)
         spec = self._container_spec(workspace, name)
         assert_safe_container_spec(spec)
-        container = client.containers.run(**spec)
+        try:
+            container = client.containers.run(**spec)
+        except APIError as error:
+            text = str(getattr(error, "explanation", "") or error).lower()
+            if "storage_opt" in spec and ("storage-opt" in text or "storage opt" in text):
+                raise ProvisioningError(
+                    "The Docker storage driver does not support a per-sandbox disk quota; "
+                    "unset DOCKER_SANDBOX_DISK_MB or use overlay2 on xfs with pquota"
+                ) from error
+            raise
         try:
             self._attach_proxies(network, self._proxies(client))
             self._ensure_workspace_dir(container, workspace)
@@ -899,7 +978,7 @@ class DockerRuntime:
         env: dict[str, str] | None,
         timeout: int | None,
     ) -> tuple[Any, str, str]:
-        environment = _validate_env(env)
+        environment = self._environment(env)
         container = await self._container(workspace)
         client, _ = await self._clients()
         pidfile = f"{_EXEC_DIR}/{uuid4().hex}.pid"
@@ -1067,7 +1146,7 @@ class DockerRuntime:
             cols=cols,
             rows=rows,
             cwd=self._resolve_cwd(workspace, cwd),
-            environment=_validate_env(env),
+            environment=self._environment(env),
         )
         container = await self._container(workspace)
         client, exec_api = await self._clients()
