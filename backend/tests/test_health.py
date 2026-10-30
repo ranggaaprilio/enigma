@@ -216,3 +216,13 @@ async def test_provider_probes_are_shared_for_a_few_seconds(probes, monkeypatch)
         assert status_code == 200
 
     assert sorted(calls) == ["daytona", "docker"]  # one probe per provider, not five
+
+
+async def test_a_disabled_provider_is_not_a_fault(probes):
+    probes(daytona="ok", docker="disabled")
+
+    status_code, body = await _health()
+
+    assert status_code == 200 and body["status"] == "ok"
+    assert body["runtimes"]["docker"]["status"] == "disabled"
+    assert body["runtimes"]["docker"]["managed_containers"] is None

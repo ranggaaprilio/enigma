@@ -44,7 +44,9 @@ Daytona-only. Running Docker sandboxes on several nodes is not supported (see
   - A sandbox can reach its network gateway, meaning host services bound to `0.0.0.0`.
   - With egress open, a sandbox can reach anything on the internet, including a cloud
     metadata address.
-  - Bind host services to `127.0.0.1`, or set `SANDBOX_NETWORK_BLOCK_ALL=true`.
+  - Bind host services to `127.0.0.1`, or restrict egress with
+    `SANDBOX_NETWORK_BLOCK_ALL=true` or `SANDBOX_NETWORK_ALLOW_LIST` (the egress proxy
+    never forwards to link-local addresses such as cloud metadata).
 
 ## Prerequisites
 
@@ -101,6 +103,8 @@ On SELinux hosts (the Podman machine, Fedora/RHEL), the compose override sets
    The override:
    - mounts the socket into `backend` and `worker` only;
    - labels the `preview-proxy` so the backend can attach it to sandbox networks;
+   - runs the `egress-proxy`, which carries `SANDBOX_NETWORK_ALLOW_LIST` (see
+     [Egress](#egress));
    - sets `SANDBOX_RUNTIME_DEFAULT=docker`.
 
 4. **Check** `http://localhost:8000/health`. It reports each provider:
@@ -149,6 +153,7 @@ On SELinux hosts (the Podman machine, Fedora/RHEL), the compose override sets
 | `DOCKER_SANDBOX_MEMORY_MB` | `4096` | Swap is capped at the same value |
 | `DOCKER_SANDBOX_PIDS_LIMIT` | `4096` | Fork-bomb floor |
 | `DOCKER_SANDBOX_TMP_MB` | `1024` | `/tmp` is a tmpfs and counts against memory |
+| `DOCKER_SANDBOX_DISK_MB` | `0` | Disk quota per sandbox (`0` = none); see below |
 | `DOCKER_SANDBOX_SUBNET_POOL` | `10.213.0.0/16` | One /28 per sandbox (about 4096 sandboxes); pick a range your LAN does not use |
 | `SANDBOX_AUTO_STOP_MINUTES` | `30` | `0` never stops idle sandboxes |
 | `DOCKER_REAPER_INTERVAL_SECONDS` | `60` | Upkeep pass: proxy re-attach and idle stop |
@@ -163,8 +168,36 @@ On SELinux hosts (the Podman machine, Fedora/RHEL), the compose override sets
   - The agent's file, search, run and git tools, and the terminal, keep working.
   - Anything that needs the network fails as an ordinary command error.
   - Existing networks are rebuilt on the next upkeep pass.
-- **`SANDBOX_NETWORK_ALLOW_LIST`** is honoured by Daytona only. On Docker, egress is either
-  open or blocked.
+- **`SANDBOX_NETWORK_ALLOW_LIST`** (comma-separated CIDRs) restricts egress to those
+  addresses. `SANDBOX_NETWORK_BLOCK_ALL=true` wins over it, as on Daytona. On Docker:
+  - Every sandbox network becomes `internal`. The backend attaches the compose
+    `egress-proxy` to each one, and sandbox commands and terminals get
+    `HTTP(S)_PROXY=http://egress-proxy:3128`.
+  - The proxy (`backend/app/egress_proxy.py`) forwards HTTP and `CONNECT` tunnels only to
+    allow-listed addresses. It resolves the name itself and dials the checked address, and
+    it always refuses loopback, link-local (cloud metadata) and the sandbox subnet pool.
+  - Only proxy-aware traffic gets out: git over HTTPS, curl, npm, pip, uv and mise do.
+    SSH (deploy-key git), raw TCP and UDP do not. Use token auth for git.
+  - Allow-list by address, not by name. A host behind a CDN needs its provider's ranges.
+  - The proxy holds no secrets and sits on its own `egress` network. If it is not running,
+    sandboxes have no egress at all, and the upkeep loop logs
+    `docker_egress_proxy_missing`.
+
+### Disk quota
+
+`DOCKER_SANDBOX_DISK_MB` caps each sandbox's writable layer, which holds the whole
+workspace (sandboxes have no mounts). It needs a storage driver that supports
+`--storage-opt size`: Podman's overlay driver, or Docker's overlay2 on an xfs filesystem
+mounted with `pquota` (also btrfs and zfs). Elsewhere the daemon refuses the container and
+provisioning fails with a message naming the setting. A quota applies to new sandboxes;
+existing ones keep theirs until they are re-provisioned.
+
+### Choosing which providers users may pick
+
+`SANDBOX_RUNTIMES_ALLOWED` (for example `docker`) limits the providers offered for **new**
+workspaces. A provider left out shows as `disabled` on `/health`, which is not a fault, and is
+not offered in the create form. Existing workspaces keep running on theirs. The setting must
+include `SANDBOX_RUNTIME_DEFAULT`, or the backend refuses to start.
 
 ## Limits
 
@@ -178,7 +211,8 @@ On SELinux hosts (the Podman machine, Fedora/RHEL), the compose override sets
     `deploy/README.md` describe the multi-replica Kubernetes deployment, which this profile
     does **not** cover. Kubernetes stays Daytona-only.
 - **No provider migration.** A workspace stays on the provider it was created with.
-- **No per-sandbox disk quota.** Watch the daemon's disk.
+- **Disk quota needs driver support.** Without `DOCKER_SANDBOX_DISK_MB` (or a driver that
+  supports it), watch the daemon's disk.
 
 ## Backup and reset
 
@@ -203,5 +237,8 @@ On SELinux hosts (the Podman machine, Fedora/RHEL), the compose override sets
 | Compose fails: `set METRICS_TOKEN in .env` | Set `METRICS_TOKEN`; it is required with the sandbox override |
 | Preview shows "Waking preview…" forever | The app must listen on the configured port; `podman network inspect enigma-sbx-<hex>` should list the proxy |
 | Image pull error at provision | Build the image first; `DOCKER_SANDBOX_IMAGE` must match its tag |
+| Allow list set, but every download fails with "Egress to this destination is not allowed" | The destination's addresses are outside `SANDBOX_NETWORK_ALLOW_LIST`; the `egress-proxy` logs `egress_denied` with the host |
+| Allow list set, and the sandbox has no network at all | `egress-proxy` is not running (log `docker_egress_proxy_missing`), or the tool ignores `HTTP(S)_PROXY` |
+| Provisioning fails naming `DOCKER_SANDBOX_DISK_MB` | The storage driver has no per-container quota; unset it or move the daemon's storage to xfs with `pquota` |
 | Startup log `sandbox_runtime_default_unconfigured` | The default provider is unavailable; new workspaces fall back to the other one |
 | Startup log `deprecated_setting_name` | Rename the `DAYTONA_*` setting it names; the old name works for one more release. Under compose the old names in `.env` are mapped to the new ones before they reach the container, so this log only appears for a backend run outside compose |

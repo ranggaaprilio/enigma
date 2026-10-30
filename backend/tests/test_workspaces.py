@@ -125,7 +125,7 @@ class FakeWorkspaceService:
             template_id=template_id,
             default_branch=default_branch,
             runtime=runtime or "daytona",
-            daytona_sandbox_id=f"sandbox-{workspace_id}",
+            sandbox_id=f"sandbox-{workspace_id}",
             snapshot=snapshot,
             workspace_path="/workspace",
             status="ready",
@@ -779,7 +779,7 @@ async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path, def
 
     assert workspace.status == "ready"
     assert workspace.runtime == default_runtime
-    assert workspace.daytona_sandbox_id == f"sandbox-{workspace.id}"
+    assert workspace.sandbox_id == f"sandbox-{workspace.id}"
     assert workspace.workspace_path == "workspace"
     assert session.commits == 2
     assert session.refreshed == [workspace]
@@ -832,7 +832,7 @@ async def test_viewer_role_maps_team_membership_to_a_workspace_role():
         repo_url="https://github.com/example/demo",
         default_branch="main",
         runtime="daytona",
-        daytona_sandbox_id="sandbox-demo",
+        sandbox_id="sandbox-demo",
         snapshot=None,
         workspace_path="workspace",
         status="ready",
@@ -1139,7 +1139,7 @@ def _errored_workspace(owner_id, *, source: str = "blank", sandbox_id: str | Non
         runtime="daytona",
         workspace_path="workspace",
         status="error",
-        daytona_sandbox_id=sandbox_id,
+        sandbox_id=sandbox_id,
     )
 
 
@@ -1158,7 +1158,7 @@ async def test_reprovision_recovers_a_workspace_whose_sandbox_never_came_up():
     recovered = await service.reprovision(workspace.id, owner_id)
 
     assert recovered.status == "ready"
-    assert recovered.daytona_sandbox_id == f"sandbox-{workspace.id}"
+    assert recovered.sandbox_id == f"sandbox-{workspace.id}"
     # It never finished creating, so the blank seed commit still has to run.
     assert initializer.calls == ["blank"]
 
@@ -1319,7 +1319,7 @@ def _team_workspace() -> Workspace:
         repo_url="https://github.com/example/team",
         default_branch="main",
         runtime="daytona",
-        daytona_sandbox_id="sandbox-team",
+        sandbox_id="sandbox-team",
         workspace_path="workspace",
         status="ready",
         created_at=now,

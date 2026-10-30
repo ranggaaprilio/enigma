@@ -115,7 +115,7 @@ def editor_context(tmp_path):
         repo_url="https://github.com/example/demo",
         default_branch="main",
         runtime="daytona",
-        daytona_sandbox_id="sandbox-demo",
+        sandbox_id="sandbox-demo",
         workspace_path="/workspace",
         status="ready",
         created_at=datetime.now(UTC),
@@ -283,7 +283,7 @@ async def test_editor_session_records_the_workspace_provider_as_bind_host(
         repo_url="https://github.com/example/demo",
         default_branch="main",
         runtime=runtime_name,
-        daytona_sandbox_id=f"sandbox-{uuid4().hex[:8]}",
+        sandbox_id=f"sandbox-{uuid4().hex[:8]}",
         workspace_path="workspace",
         status="ready",
     )

@@ -17,7 +17,10 @@ their env, logs and previews, and no host-published ports.
 Epic 05: sibling isolation, ``block_all`` egress (with the agent tools still working offline),
 pids/OOM limits, and the idle reaper against real rows: an attached terminal spares a sandbox
 until the busy cap, and a terminal wakes it again.
-The template, ``specify init`` and Vite tests need outbound network from the sandbox.
+Follow-ups: the egress allow-list through ``app/egress_proxy.py`` and the per-sandbox disk
+quota (skipped where the storage driver has none).
+The template, ``specify init``, Vite and allow-list tests need outbound network from the
+sandbox.
 """
 
 from __future__ import annotations
@@ -803,6 +806,94 @@ async def test_block_all_cuts_egress_but_the_proxy_still_reaches_the_sandbox(run
     finally:
         await blocked.delete(workspace)
         await blocked.close()
+
+
+@pytest.fixture
+async def egress_proxy(runtime):
+    """``app/egress_proxy.py`` in a container with a way out, labelled for one test only;
+    the sandbox image has the Python it needs (the module is stdlib only)."""
+    from pathlib import Path
+
+    import app.egress_proxy as module
+
+    label = f"enigma.egress-test={uuid4().hex}"
+    key, value = label.split("=")
+    client, _ = await runtime._clients()
+    container = await asyncio.to_thread(
+        client.containers.run,
+        runtime.settings.docker_sandbox_image,
+        entrypoint=["python3", "-c", Path(module.__file__).read_text()],
+        command=[],
+        detach=True,
+        labels={key: value},
+        environment={"SANDBOX_NETWORK_ALLOW_LIST": "1.1.1.1/32"},
+        cap_drop=["ALL"],
+        security_opt=["no-new-privileges:true"],
+    )
+    try:
+        for _ in range(50):
+            logs = await asyncio.to_thread(container.logs)
+            if b"egress_proxy_listening" in logs:
+                break
+            await asyncio.sleep(0.2)
+        else:
+            pytest.fail(f"egress proxy did not start: {logs!r}")
+        yield label
+    finally:
+        await asyncio.to_thread(container.remove, force=True)
+
+
+async def test_the_allow_list_lets_only_listed_destinations_out_through_the_proxy(
+    egress_proxy,
+) -> None:
+    """SANDBOX_NETWORK_ALLOW_LIST on Docker (needs outbound network to 1.1.1.1): the sandbox
+    network is internal; an allow-listed address is reached through the egress proxy, any
+    other one is refused by it, and nothing gets out without it."""
+    allowed = await _private_runtime(
+        sandbox_network_allow_list="1.1.1.1/32", docker_egress_proxy_label=egress_proxy
+    )
+    workspace = _workspace()
+    curl = "curl -sS -m 10 -o /dev/null -w '%{http_code}'"
+    try:
+        workspace.sandbox_id = await allowed.provision(workspace)
+        through = await allowed.exec(workspace, f"{curl} http://1.1.1.1/; echo; echo rc=$?")
+        assert through.stdout.splitlines()[0] in {"200", "301", "302"}, through.stdout
+        tls = await allowed.exec(workspace, f"{curl} https://1.1.1.1/; echo; echo rc=$?")
+        assert "rc=0" in tls.stdout, tls.stdout  # a CONNECT tunnel
+        refused = await allowed.exec(workspace, f"{curl} http://8.8.8.8/; echo")
+        assert refused.stdout.strip() == "403", refused.stdout
+        direct = await allowed.exec(
+            workspace, f"{curl} --noproxy '*' http://1.1.1.1/; echo rc=$?"
+        )
+        assert "rc=0" not in direct.stdout, direct.stdout  # internal: no route without it
+    finally:
+        await allowed.delete(workspace)
+        await allowed.close()
+
+
+async def test_a_disk_quota_caps_the_sandbox_writable_layer() -> None:
+    """DOCKER_SANDBOX_DISK_MB, where the storage driver supports it (Podman's overlay here;
+    Docker needs overlay2 on xfs with pquota) -- elsewhere provisioning says so."""
+    from app.services.sandbox import ProvisioningError
+
+    quota = await _private_runtime(docker_sandbox_disk_mb=256)
+    workspace = _workspace()
+    try:
+        try:
+            workspace.sandbox_id = await quota.provision(workspace)
+        except ProvisioningError as error:
+            assert "DOCKER_SANDBOX_DISK_MB" in str(error)
+            pytest.skip("this daemon's storage driver has no per-container quota")
+        size = await quota.exec(workspace, "df -m / | tail -1")
+        assert size.stdout.split()[1] == "256", size.stdout
+        fill = await quota.exec(
+            workspace, "head -c 300M /dev/zero > ~/big; echo rc=$?; rm -f ~/big", timeout=120
+        )
+        assert "rc=0" not in fill.stdout and "No space" in fill.stdout, fill.stdout
+        assert (await quota.exec(workspace, "echo alive")).stdout.strip() == "alive"
+    finally:
+        await quota.delete(workspace)
+        await quota.close()
 
 
 async def test_a_fork_bomb_hits_the_pids_limit_and_the_sandbox_survives() -> None:

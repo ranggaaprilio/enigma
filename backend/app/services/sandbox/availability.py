@@ -9,6 +9,9 @@ version string from the underlying error.
 that is down fails the request with an actionable message instead of leaving a workspace
 half-provisioned. An explicit choice is honoured or refused, never swapped; no choice takes
 ``SANDBOX_RUNTIME_DEFAULT``, or the other provider when only that one is available.
+
+A provider left out of ``SANDBOX_RUNTIMES_ALLOWED`` is ``disabled``: never probed, never
+chosen, and not a fault -- the operator turned it off for new workspaces.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ from typing import Literal
 
 import structlog
 
-from app.core.config import Settings
+from app.core.config import Settings, get_settings
 from app.services.sandbox.base import SandboxRuntime
 
 logger = structlog.get_logger(__name__)
@@ -28,7 +31,7 @@ logger = structlog.get_logger(__name__)
 PROVIDERS: tuple[str, ...] = ("daytona", "docker")
 HEALTH_TIMEOUT_SECONDS = 3.0
 
-AvailabilityStatus = Literal["ok", "error", "unconfigured"]
+AvailabilityStatus = Literal["ok", "error", "unconfigured", "disabled"]
 
 PROVIDER_LABELS = {"daytona": "Daytona", "docker": "Local Docker"}
 _REASONS = {
@@ -37,6 +40,7 @@ _REASONS = {
     ("docker", "unconfigured"): "No Docker daemon is configured",
     ("docker", "error"): "The Docker daemon is not reachable",
 }
+DISABLED_REASON = "Not enabled on this deployment"
 
 
 @dataclass(frozen=True)
@@ -81,7 +85,10 @@ def _runtime(provider: str) -> SandboxRuntime:
 
 
 async def runtime_availability(provider: str) -> RuntimeAvailability:
-    return await check_runtime(_runtime(provider), provider)
+    runtime = _runtime(provider)
+    if not get_settings().runtime_allowed(provider):
+        return RuntimeAvailability(provider, runtime.configured, "disabled", DISABLED_REASON)
+    return await check_runtime(runtime, provider)
 
 
 def warn_if_default_runtime_unconfigured(settings: Settings) -> None:
@@ -90,7 +97,7 @@ def warn_if_default_runtime_unconfigured(settings: Settings) -> None:
     if _runtime(default).configured:
         return
     other = next(p for p in PROVIDERS if p != default)
-    if _runtime(other).configured:
+    if settings.runtime_allowed(other) and _runtime(other).configured:
         logger.warning("sandbox_runtime_default_unconfigured", default=default, fallback=other)
 
 
@@ -142,6 +149,10 @@ async def choose_runtime(
     requested: str | None, settings: Settings, availability: Availability = runtime_availability
 ) -> str:
     if requested is not None:
+        if not settings.runtime_allowed(requested):
+            raise RuntimeChoiceError(
+                f"{PROVIDER_LABELS[requested]} is not available: {DISABLED_REASON}"
+            )
         found = await availability(requested)
         if not found.available:
             raise _refusal(found)
@@ -154,6 +165,8 @@ async def choose_runtime(
         _check_placement(default, settings)
         return default
     other = next(p for p in PROVIDERS if p != default)
+    if not settings.runtime_allowed(other):
+        raise _refusal(found)
     fallback = await availability(other)
     if not fallback.available:
         raise _refusal(found)

@@ -201,3 +201,69 @@ def test_an_unconfigured_default_with_a_configured_other_logs_a_warning(monkeypa
     with capture_logs() as logs:
         availability.warn_if_default_runtime_unconfigured(_settings())
     assert logs == []
+
+
+async def test_a_provider_left_out_of_the_allow_list_is_refused_when_picked() -> None:
+    choose = _availability(daytona="ok", docker="ok")
+    with pytest.raises(RuntimeChoiceError) as raised:
+        await choose_runtime("docker", _settings(sandbox_runtimes_allowed="daytona"), choose)
+    assert raised.value.message == "Local Docker is not available: Not enabled on this deployment"
+
+
+async def test_no_choice_never_falls_back_to_a_disallowed_provider() -> None:
+    allowed = _settings(sandbox_runtimes_allowed="daytona")
+    with pytest.raises(RuntimeChoiceError) as raised:
+        await choose_runtime(None, allowed, _availability(docker="ok"))
+    assert raised.value.message == "Daytona is not available: daytona unconfigured"
+
+
+def test_the_allow_list_must_name_known_providers_and_include_the_default() -> None:
+    assert _settings(sandbox_runtimes_allowed="daytona, docker").sandbox_runtimes_allowed == [
+        "daytona",
+        "docker",
+    ]
+    with pytest.raises(ValueError, match="unknown providers"):
+        _settings(sandbox_runtimes_allowed="daytona,k8s")
+    with pytest.raises(ValueError, match="must include sandbox_runtime_default"):
+        _settings(sandbox_runtimes_allowed="docker")
+
+
+async def test_runtime_availability_reports_a_disallowed_provider_as_disabled(
+    monkeypatch,
+) -> None:
+    from app.services.sandbox import availability
+
+    probed = False
+
+    async def probe() -> str:
+        nonlocal probed
+        probed = True
+        return "ok"
+
+    monkeypatch.setattr(availability, "_runtime", lambda _: _Runtime(health=probe))
+    monkeypatch.setattr(
+        availability, "get_settings", lambda: _settings(sandbox_runtimes_allowed="daytona")
+    )
+
+    found = await availability.runtime_availability("docker")
+
+    assert (found.status, found.available, found.reason) == (
+        "disabled",
+        False,
+        "Not enabled on this deployment",
+    )
+    assert probed is False
+
+
+def test_the_startup_warning_ignores_a_disallowed_fallback(monkeypatch) -> None:
+    from structlog.testing import capture_logs
+
+    from app.services.sandbox import availability
+
+    runtimes = {"daytona": _Runtime(configured=False), "docker": _Runtime()}
+    monkeypatch.setattr(availability, "_runtime", runtimes.__getitem__)
+    with capture_logs() as logs:
+        availability.warn_if_default_runtime_unconfigured(
+            _settings(sandbox_runtimes_allowed="daytona")
+        )
+    assert logs == []

@@ -42,7 +42,7 @@ def make_workspace(sandbox_id: str | None = "sandbox-1", runtime: str = "daytona
         repo_url="https://github.com/example/demo.git",
         default_branch="main",
         runtime=runtime,
-        daytona_sandbox_id=sandbox_id,
+        sandbox_id=sandbox_id,
         workspace_path="/workspace",
         status="ready",
     )

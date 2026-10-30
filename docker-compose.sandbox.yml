@@ -23,6 +23,14 @@
 # every preview host there needs a capability or grant, and /health and /metrics need
 # METRICS_TOKEN. Loopback-only servers and the editor are carried by a per-port relay that
 # admits only the proxy's addresses.
+#
+# EGRESS ALLOW-LIST: with SANDBOX_NETWORK_ALLOW_LIST set (CIDRs), every sandbox network is
+# `internal` (no route out) and the backend also attaches `egress-proxy` (found by the
+# `enigma.egress-proxy` label) under DOCKER_EGRESS_PROXY_HOST. Sandbox commands and terminals
+# get HTTP(S)_PROXY pointing at it; it tunnels only to allow-listed addresses and never to
+# loopback, link-local (cloud metadata) or the sandbox subnet pool. Traffic that ignores the
+# proxy (SSH, raw TCP) has no way out. The proxy holds no secrets and sits on its own
+# `egress` network, so it cannot reach postgres, redis or the API either.
 
 # DOCKER_SOCKET is the daemon socket path *where the containers run*:
 #   - Docker (Linux / Docker Desktop):  /var/run/docker.sock (default)
@@ -74,3 +82,33 @@ services:
     # It sits on every sandbox network: it must never route between them.
     sysctls:
       net.ipv4.ip_forward: "0"
+  egress-proxy:
+    build:
+      context: ./backend
+      target: dev
+    # Stdlib only (app/egress_proxy.py): no `uv sync`, no secrets, no .env.
+    command: ["python", "-m", "app.egress_proxy"]
+    environment:
+      SANDBOX_NETWORK_ALLOW_LIST: ${SANDBOX_NETWORK_ALLOW_LIST:-${DAYTONA_NETWORK_ALLOW_LIST:-}}
+      # Always refused, whatever the allow list says: the other sandboxes.
+      DOCKER_SANDBOX_SUBNET_POOL: ${DOCKER_SANDBOX_SUBNET_POOL:-10.213.0.0/16}
+    volumes:
+      - ./backend/app:/app/app:ro
+    labels:
+      enigma.egress-proxy: "1"
+    user: "65534:65534"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    # It sits on every sandbox network: it must never route between them.
+    sysctls:
+      net.ipv4.ip_forward: "0"
+    networks:
+      - egress
+    restart: unless-stopped
+
+networks:
+  # The egress proxy's way out, shared with nothing else in the stack.
+  egress: {}

@@ -21,10 +21,12 @@ export type RuntimeOption = {
   reason: string | null;
 };
 
-/** The create form's choices, from `/health`. Unknown health yields none: the server picks. */
+/** The create form's choices, from `/health`. Unknown health yields none: the server picks.
+ * A provider the operator disabled (`SANDBOX_RUNTIMES_ALLOWED`) is not offered at all. */
 export function runtimeOptions(health: HealthResponse | null): RuntimeOption[] {
   if (!health?.runtimes) return [];
-  return RUNTIMES.map((value) => {
+  const offered = RUNTIMES.filter((value) => health.runtimes[value]?.status !== "disabled");
+  return offered.map((value) => {
     const entry = health.runtimes[value];
     return {
       value,

@@ -57,6 +57,16 @@ describe("runtimeOptions", () => {
     expect(options[1]).toMatchObject({ value: "docker", available: true });
   });
 
+  it("does not offer a provider the operator disabled", () => {
+    const options = runtimeOptions(
+      health(entry("ok"), { ...entry("disabled", "Not enabled on this deployment"), configured: true }),
+    );
+    expect(options.map((o) => o.value)).toEqual(["daytona"]);
+    expect(
+      defaultRuntime(health(entry("unconfigured"), entry("disabled"), "daytona")),
+    ).toBeNull();
+  });
+
   it("marks neither available when both are down", () => {
     const options = runtimeOptions(
       health(entry("unconfigured", "no key"), entry("error", "daemon down")),

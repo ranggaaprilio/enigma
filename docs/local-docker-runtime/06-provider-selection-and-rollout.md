@@ -291,3 +291,23 @@ already ran both fakes, the base compose never mounted the socket, and the migra
   - An operator allow-list of runtimes users may pick (security review, LOW).
   - Pinning actions to SHAs (the main CI uses tags too).
   - The contract migration.
+
+### Follow-ups (shipped after the epic)
+
+- **Runtime allow-list** (security review, LOW). `SANDBOX_RUNTIMES_ALLOWED` is a
+  comma-separated list; empty means every provider.
+  - Settings refuse unknown names, and a list that leaves out `SANDBOX_RUNTIME_DEFAULT`.
+  - `choose_runtime` refuses an explicit pick of a left-out provider (422, "Not enabled on
+    this deployment") and never falls back to one.
+  - `runtime_availability` reports it as `disabled` without probing it. `/health` shows
+    `disabled`, which is not a fault, and the create form does not offer it.
+  - Existing workspaces keep running on their provider.
+- **Column contract, step 1** (migration `0038`, expand-only). It backfills
+  `workspaces.sandbox_id` once more, for rows the pre-0037 release wrote during 0037's
+  rollout. The `Workspace.sandbox_id` hybrid now **reads `sandbox_id`** and still writes
+  both columns, because the 0037 release reads `daytona_sandbox_id` while it overlaps this
+  one. Tests build workspaces with `sandbox_id=`.
+- **Column contract, step 2** (migration `0039`, `# contract:`) drops `daytona_sandbox_id`
+  and its unique index, and makes `ix_workspaces_sandbox_id` unique. It must ship in the
+  **next** release, once no deployed replica reads the old column.
+

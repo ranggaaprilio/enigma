@@ -285,3 +285,39 @@ How each acceptance criterion is verified:
   services bound to `0.0.0.0`) and, with egress open, the cloud metadata address; the
   proxy holds `DATABASE_URL` and `AUTH_SECRET_KEY` while sitting on every sandbox network,
   so it is the one pivot to harden (read-only DB role, `METRICS_TOKEN` required on Docker).
+
+### Follow-ups (shipped after the epic)
+
+The two items deferred above.
+
+- **Egress allow-list on Docker.** `SANDBOX_NETWORK_ALLOW_LIST` makes every sandbox network
+  `internal`, and the backend attaches an egress proxy to each one, the same way it
+  attaches the preview proxy. The proxy is `backend/app/egress_proxy.py`, the compose
+  service `egress-proxy`, found by `DOCKER_EGRESS_PROXY_LABEL` and the backend's own compose
+  project, and aliased `DOCKER_EGRESS_PROXY_HOST`.
+  - Every exec and terminal gets `HTTP(S)_PROXY`/`NO_PROXY`; the caller's env wins. That
+    is a convenience only: the network is internal, so the proxy is the only way out.
+  - The proxy handles `CONNECT` and absolute-form HTTP. It resolves the name, picks the
+    first allowed address and dials that address (no rebinding window). Loopback,
+    link-local, multicast, unspecified, reserved and `DOCKER_SANDBOX_SUBNET_POOL` are
+    refused whatever is listed. IPv4-mapped IPv6 is normalised first.
+  - It is stdlib only and gets no secret. It runs as `65534`, read-only, `cap_drop ALL`,
+    `ip_forward=0`, on its own `egress` network.
+  - **`block_all` wins**, as on Daytona: with both set, the egress proxy is detached and no
+    proxy env is injected. Detaching happens on the upkeep pass, because the network stays
+    internal and is not rebuilt.
+  - A missing proxy fails closed (no egress), logged as `docker_egress_proxy_missing` on
+    each pass.
+  - Limits: only proxy-aware traffic leaves (no SSH deploy-key git, raw TCP or UDP); the
+    list is by address, so CDN-fronted hosts need their ranges.
+  - Verified: 24 unit tests on the proxy (policy matrix, tunnel, origin-form forwarding,
+    rebinding, malformed input); runtime wiring with fakes; real daemon: an allow-listed
+    address over HTTP and a `CONNECT` tunnel, a 403 for an unlisted one, and no route
+    with `--noproxy`.
+- **Disk quota.** `DOCKER_SANDBOX_DISK_MB` (0 = none) adds `storage_opt={"size": …}` to
+  `container_security_spec`. A daemon whose driver cannot do it refuses the create;
+  provisioning then fails with a `ProvisioningError` that names the setting. Existing
+  containers are adopted unchanged, like other outdated limits. Verified on Podman 5.8:
+  `df` shows the quota, and writing past it fails with "No space left on device" while the
+  sandbox keeps working.
+

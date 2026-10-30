@@ -26,7 +26,7 @@ async def _workspace(maker) -> Workspace:
                     role="owner", is_active=True)
         workspace = Workspace(id=uuid4(), owner_id=user.id, name="Idle", slug=uuid4().hex[:12],
                               default_branch="main", runtime="docker", status="ready",
-                              workspace_path="workspace", daytona_sandbox_id=uuid4().hex)
+                              workspace_path="workspace", sandbox_id=uuid4().hex)
         session.add(user)
         await session.flush()
         session.add(workspace)
