@@ -186,7 +186,9 @@ async def test_sandbox_floor_is_enforced_on_the_real_container(runtime, sandbox)
     assert host_config.get("PidsLimit") == 4096
     effective = await runtime.exec(sandbox, "grep -E '^Cap(Eff|Bnd):' /proc/self/status")
     assert effective.stdout.split() == ["CapEff:", "0" * 16, "CapBnd:", "0" * 16]
-    assert list(container.attrs["NetworkSettings"]["Networks"]) == ["enigma-sandboxes"]
+    assert list(container.attrs["NetworkSettings"]["Networks"]) == [
+        f"enigma-sbx-{sandbox.id.hex}"
+    ]
 
 
 async def test_agent_run_command_executes_in_the_container(runtime, sandbox) -> None:
@@ -505,7 +507,11 @@ async def peer(runtime):
 
     workspace = _workspace()
     workspace.sandbox_id = await runtime.provision(workspace)
+    # Play the proxy: the backend attaches containers carrying the proxy label to every
+    # sandbox network under the proxy's name, and the relay admits that name only.
     runtime.settings.docker_preview_proxy_host = container_name(workspace)
+    runtime.settings.docker_preview_proxy_label = f"{WORKSPACE_LABEL}={workspace.id}"
+    await runtime.reconcile_networks()
     yield workspace
     await runtime.delete(workspace)
 
@@ -558,6 +564,29 @@ NO_RELAY = "! ls /tmp/enigma-port-relay-*.pid >/dev/null 2>&1"
 async def _relays(runtime, workspace) -> int:
     result = await runtime.exec(workspace, "ls /tmp/enigma-port-relay-*.pid 2>/dev/null | wc -l")
     return int(result.stdout.strip() or 0)
+
+
+async def test_sibling_sandboxes_cannot_reach_each_other_but_the_proxy_can(
+    runtime, sandbox, peer, stranger
+) -> None:
+    """Epic 05: each sandbox is on its own network. A server bound to 0.0.0.0 (no relay
+    involved) is reachable from the proxy, which the backend attached, and from no other
+    tenant's sandbox, by name or by address."""
+    runtime._resolve_host = _resolve_from(runtime, peer)
+    await _sh(
+        runtime,
+        sandbox,
+        "(setsid nohup python3 -m http.server 8000 --bind 0.0.0.0 >/tmp/http.log 2>&1 &)",
+    )
+    await _wait_for(runtime, sandbox, _listening(8000))
+    link = await runtime.preview_link(sandbox, 8000)
+
+    assert (await _fetch(runtime, peer, link.url))[0] == "200"
+    assert (await _fetch(runtime, stranger, link.url))[0] == "000"
+    name_url = f"http://execute-{sandbox.id.hex}:8000/"
+    assert (await _fetch(runtime, stranger, name_url))[0] == "000"
+    lookup = await runtime.exec(stranger, f"getent hosts execute-{sandbox.id.hex}.")
+    assert lookup.exit_code != 0  # not even resolvable from another tenant's network
 
 
 async def test_sandbox_ports_are_never_published_to_the_host(runtime, sandbox) -> None:
@@ -729,3 +758,108 @@ async def test_two_services_start_preview_log_and_stop_on_docker(
         await _wait_for(runtime, workspace, NO_RELAY, seconds=10)
     finally:
         await runtime.delete(workspace)
+
+
+# --- Epic 05: lifecycle, limits and egress on a real daemon --------------------------------
+
+
+async def _private_runtime(**settings) -> DockerRuntime:
+    runtime = DockerRuntime(
+        Settings(**{"docker_sandbox_memory_mb": 1024, "docker_sandbox_cpus": 1, **settings})
+    )
+    runtime.activity.touch = _no_activity  # type: ignore[method-assign]  # no DB rows here
+    return runtime
+
+
+async def _no_activity(_workspace_id) -> None:
+    return None
+
+
+async def test_block_all_cuts_egress_but_the_proxy_still_reaches_the_sandbox(runtime, peer) -> None:
+    blocked = await _private_runtime(sandbox_network_block_all=True)
+    blocked.settings.docker_preview_proxy_label = runtime.settings.docker_preview_proxy_label
+    blocked.settings.docker_preview_proxy_host = runtime.settings.docker_preview_proxy_host
+    blocked._resolve_host = _resolve_from(runtime, peer)
+    workspace = _workspace()
+    try:
+        workspace.sandbox_id = await blocked.provision(workspace)
+        out = await blocked.exec(
+            workspace, "curl -sS -m 5 -o /dev/null https://example.com; echo rc=$?"
+        )
+        assert "rc=0" not in out.stdout
+        lookup = await blocked.exec(workspace, "getent hosts example.com; echo rc=$?")
+        assert "rc=0" not in lookup.stdout  # no DNS to the outside either
+        await _sh(
+            blocked, workspace, "(setsid nohup python3 -m http.server 8000 >/dev/null 2>&1 &)"
+        )
+        await _wait_for(blocked, workspace, _listening(8000))
+        link = await blocked.preview_link(workspace, 8000)
+        assert (await _fetch(runtime, peer, link.url))[0] == "200"
+    finally:
+        await blocked.delete(workspace)
+        await blocked.close()
+
+
+async def test_a_fork_bomb_hits_the_pids_limit_and_the_sandbox_survives() -> None:
+    limited = await _private_runtime(docker_sandbox_pids_limit=64)
+    workspace = _workspace()
+    try:
+        workspace.sandbox_id = await limited.provision(workspace)
+        # The bomb runs short sleepers; while they hold every pid even the exec that
+        # started them cannot report back, so read the outcome once they have exited.
+        await limited.exec(
+            workspace,
+            "for i in $(seq 1 200); do sleep 4 & done 2>/tmp/fork.err; true",
+            timeout=60,
+        )
+        await asyncio.sleep(6)
+        failed = await limited.exec(workspace, "grep -c -i 'fork\\|resource' /tmp/fork.err")
+        assert int(failed.stdout.strip() or 0) > 0, failed.stdout
+        assert (await limited.exec(workspace, "echo alive")).stdout == "alive\n"
+    finally:
+        await limited.delete(workspace)
+        await limited.close()
+
+
+async def test_an_oom_kill_surfaces_as_a_status_detail() -> None:
+    small = await _private_runtime(docker_sandbox_memory_mb=256)
+    workspace = _workspace()
+    try:
+        workspace.sandbox_id = await small.provision(workspace)
+        assert await small.status_detail(workspace) is None
+        await small.exec(workspace, "python3 -c 'b = bytearray(600 * 1024 * 1024)'", timeout=60)
+        detail = await small.status_detail(workspace)
+        assert detail is not None and "256 MB" in detail
+        assert await small.status(workspace) == "ready"  # the sandbox itself lives on
+    finally:
+        await small.delete(workspace)
+        await small.close()
+
+
+async def test_idle_stop_keeps_the_sandbox_and_the_next_use_wakes_it(runtime, sandbox) -> None:
+    await _sh(runtime, sandbox, f"echo kept > {ROOT}/note.txt")
+    assert "tmpfs" in await _sh(runtime, sandbox, "grep ' /tmp ' /proc/mounts")
+
+    assert await runtime.stop_if_running(sandbox) is True
+    assert await runtime.status(sandbox) == "stopped"
+    assert await runtime.stop_if_running(sandbox) is False
+
+    assert (await runtime.exec(sandbox, f"cat {ROOT}/note.txt")).stdout == "kept\n"
+    assert await runtime.status(sandbox) == "ready"
+
+
+async def test_upkeep_only_ever_sees_containers_enigma_created(runtime, sandbox) -> None:
+    client, _ = await runtime._clients()
+    decoy = await asyncio.to_thread(
+        client.containers.run,
+        "enigma-sandbox:latest",
+        entrypoint=["sleep", "300"],
+        detach=True,
+        labels={"app": "not-enigma"},
+    )
+    try:
+        listed = {container_id for container_id, _ in await runtime.managed_sandboxes()}
+        assert sandbox.sandbox_id in listed
+        assert decoy.id not in listed
+    finally:
+        await asyncio.to_thread(decoy.remove, force=True)

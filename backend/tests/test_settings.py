@@ -32,17 +32,28 @@ def test_command_allowlist_parses_comma_separated_string():
     assert settings.agent_command_allowlist == ["pytest", "ls", "cat"]
 
 
-def test_daytona_network_defaults_to_open_egress():
+def test_sandbox_network_defaults_to_open_egress():
     settings = Settings()
 
-    assert settings.daytona_network_block_all is False
-    assert settings.daytona_network_allow_list == []
+    assert settings.sandbox_network_block_all is False
+    assert settings.sandbox_network_allow_list == []
 
 
-def test_daytona_network_allow_list_parses_comma_separated_string():
-    settings = Settings(daytona_network_allow_list="10.0.0.0/16, 10.1.0.0/16 ")
+def test_sandbox_network_allow_list_parses_comma_separated_string():
+    settings = Settings(sandbox_network_allow_list="10.0.0.0/16, 10.1.0.0/16 ")
 
-    assert settings.daytona_network_allow_list == ["10.0.0.0/16", "10.1.0.0/16"]
+    assert settings.sandbox_network_allow_list == ["10.0.0.0/16", "10.1.0.0/16"]
+
+
+def test_egress_settings_accept_the_legacy_daytona_names(monkeypatch):
+    """local-docker-runtime Epic 05: the egress policy is provider-neutral; the
+    DAYTONA_NETWORK_* names keep working for existing deployments."""
+    monkeypatch.delenv("SANDBOX_NETWORK_BLOCK_ALL", raising=False)
+    monkeypatch.setenv("DAYTONA_NETWORK_BLOCK_ALL", "true")
+
+    assert Settings().sandbox_network_block_all is True
+    legacy = Settings(daytona_network_allow_list="10.0.0.0/8")
+    assert legacy.sandbox_network_allow_list == ["10.0.0.0/8"]
 
 
 def test_non_local_environment_requires_https_or_localhost_preview_proxy():

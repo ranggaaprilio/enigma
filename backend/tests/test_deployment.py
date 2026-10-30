@@ -198,18 +198,18 @@ def test_sandbox_override_gives_the_socket_only_to_the_daemon_clients():
         assert "networks" not in service, name
 
 
-def test_sandbox_override_puts_only_the_preview_proxy_on_the_sandbox_network():
-    """local-docker-runtime Epic 04: the proxy dials `execute-<id>:<port>` directly. It parses
-    untrusted traffic, so it gets the network but never the daemon socket."""
+def test_sandbox_override_marks_the_preview_proxy_for_the_backend_to_attach():
+    """local-docker-runtime Epic 05: every sandbox has its own network, and the backend
+    attaches the proxy (found by this label) to each. The proxy parses untrusted traffic,
+    so it never gets the daemon socket, and no shared sandbox network exists any more."""
     override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
     proxy = override["services"]["preview-proxy"]
     assert _socket_mounts(proxy) == []
-    assert set(proxy["networks"]) == {"default", "sandboxes"}
-    network = override["networks"]["sandboxes"]
-    # DockerRuntime and sandbox/build-local-image.sh create it; compose must not try to own
-    # it (a network without compose's labels is refused) or remove it on `down`.
-    assert network["external"] is True
-    assert network["name"] == "${DOCKER_SANDBOX_NETWORK:-enigma-sandboxes}"
+    assert proxy["labels"] == {"enigma.preview-proxy": "1"}
+    # On every sandbox network at once, so it must never forward packets between them.
+    assert proxy["sysctls"] == {"net.ipv4.ip_forward": "0"}
+    assert "networks" not in proxy
+    assert "networks" not in override
 
 
 def test_production_manifests_never_reference_the_container_daemon():

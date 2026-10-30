@@ -277,6 +277,8 @@ async def test_pty_relays_input_output_and_resizes() -> None:
             break
         await asyncio.sleep(0.01)
     assert b"".join(received) == b"$ ls\npwd\n"
+    # Terminal output is activity: an open, busy terminal keeps the sandbox from idling.
+    assert workspace.id in runtime.activity.touches
     await handle.resize(PtySize(cols=120, rows=40))
     assert client.api.resizes[-1][1:] == (120, 40)
     await handle.disconnect()

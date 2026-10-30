@@ -11,6 +11,7 @@ Two layers:
 
 from __future__ import annotations
 
+import ipaddress
 import queue
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -290,6 +291,10 @@ class FakeSandboxRuntime:
     async def expose_port(self, workspace: Workspace, port: int) -> None:
         self._require(workspace)
         self.exposed_ports.append(port)
+
+    async def status_detail(self, workspace: Workspace) -> str | None:
+        self._require(workspace)
+        return None
 
     async def fs(self, workspace: Workspace) -> FakeFileSystem:
         self._require(workspace)
@@ -644,12 +649,40 @@ class FakeDockerContainer:
         self.labels = dict(spec.get("labels") or {})
         self.status = "running"
         self.start_calls = 0
+        self.stop_calls = 0
+        self.memory_events = "low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n"
+        self.oom_killed = False
+        self.busy = False  # an exec or terminal client alive inside
+        self.leaked_caps = False  # inspect says dropped, the live process disagrees
         self.removed = False
         self.exec_runs: list[list[str]] = []
         self.fs = FakeContainerFs()
         self.tmux_sessions: set[str] = set()
         # pidfile -> socket of the attached tmux client it names
         self.tmux_clients: dict[str, FakePtySocket] = {}
+        self.networks: set[str] = set()
+
+    @property
+    def attrs(self) -> dict[str, Any]:
+        """Docker's inspect shape, derived from the run spec (``HostConfig`` the daemon's)."""
+        spec = self.spec
+        return {
+            "Config": {"User": spec.get("user", "")},
+            "Mounts": [{"Destination": v} for v in spec.get("volumes") or []],
+            "HostConfig": {
+                "Privileged": bool(spec.get("privileged", False)),
+                "CapDrop": spec.get("cap_drop"),
+                "CapAdd": spec.get("cap_add"),
+                "SecurityOpt": spec.get("security_opt"),
+                "PidsLimit": spec.get("pids_limit"),
+                "NetworkMode": spec.get("network_mode") or spec.get("network") or "bridge",
+                "Devices": spec.get("devices"),
+                "Sysctls": spec.get("sysctls"),
+                "PortBindings": spec.get("ports"),
+            },
+            "NetworkSettings": {"Networks": {name: {} for name in sorted(self.networks)}},
+            "State": {"OOMKilled": self.oom_killed},
+        }
 
     def reload(self) -> None:
         if self.removed:
@@ -663,6 +696,7 @@ class FakeDockerContainer:
         self.status = "running"
 
     def stop(self, timeout: int = 10) -> None:
+        self.stop_calls += 1
         self.status = "exited"
 
     def remove(self, force: bool = False) -> None:
@@ -689,6 +723,16 @@ class FakeDockerContainer:
                 return SimpleNamespace(exit_code=1, output=b"can't find session")
             self.tmux_sessions.discard(name)
             return SimpleNamespace(exit_code=0, output=b"")
+        if cmd == ["/bin/cat", "/sys/fs/cgroup/memory.events"]:
+            return SimpleNamespace(exit_code=0, output=self.memory_events.encode())
+        if cmd == ["/bin/cat", "/proc/1/status"]:
+            spec = self.spec
+            dropped = bool(spec.get("cap_drop")) and not spec.get("cap_add")
+            mask = "0000000000000000" if dropped and not self.leaked_caps else "00000000a80425fb"
+            status = f"CapEff:\t{mask}\nCapBnd:\t{mask}\n"
+            return SimpleNamespace(exit_code=0, output=status.encode())
+        if cmd[:2] == ["/bin/sh", "-c"] and "enigma-pty" in cmd[2]:
+            return SimpleNamespace(exit_code=0, output=b"busy\n" if self.busy else b"idle\n")
         if cmd[:2] == ["mkdir", "-p"] and self.client.fail_mkdir:
             return SimpleNamespace(exit_code=1, output=b"read-only")
         if cmd[:3] == ["mkdir", "-p", "--"]:
@@ -712,10 +756,16 @@ class _FakeContainers:
         self.run_specs.append(spec)
         container = FakeDockerContainer(self.client, spec)
         self.by_id[container.id] = container
+        network = self.client.networks.by_name.get(spec.get("network") or "")
+        if network is not None:
+            network.connect(container)
         return container
 
     def list(self, all: bool = False, filters: dict | None = None) -> list[FakeDockerContainer]:
-        return list(self.by_id.values())
+        containers = list(self.by_id.values())
+        for label in _label_filters(filters):
+            containers = [c for c in containers if _has_label(c.labels, label)]
+        return containers
 
 
 class _FakeImages:
@@ -730,20 +780,128 @@ class _FakeImages:
         return SimpleNamespace(tags=[name])
 
 
+class FakeNetwork:
+    def __init__(
+        self,
+        owner: _FakeNetworks,
+        name: str,
+        *,
+        labels: dict | None = None,
+        internal: bool = False,
+        subnet: str | None = None,
+    ) -> None:
+        self.owner = owner
+        self.id = f"net-{uuid4().hex[:12]}"
+        self.name = name
+        self.removed = False
+        self.aliases: dict[str, list[str]] = {}  # container id -> aliases
+        self.attrs: dict[str, Any] = {
+            "Name": name,
+            "Internal": internal,
+            "Labels": dict(labels or {}),
+            "IPAM": {"Config": [{"Subnet": subnet}] if subnet else []},
+            "Containers": {},
+        }
+
+    def reload(self) -> None:
+        if self.removed:
+            raise _docker_not_found()
+
+    def connect(self, container: Any, aliases: list[str] | None = None, **_: Any) -> None:
+        container_id = getattr(container, "id", container)
+        if container_id in self.attrs["Containers"]:
+            from docker.errors import APIError
+
+            raise APIError("409 Conflict", explanation="endpoint already exists in network")
+        self.attrs["Containers"][container_id] = {"Name": getattr(container, "name", "")}
+        self.aliases[container_id] = list(aliases or [])
+        target = self.owner.client.containers.by_id.get(container_id)
+        if target is not None:
+            target.networks.add(self.name)
+
+    def disconnect(self, container: Any, force: bool = False) -> None:
+        container_id = getattr(container, "id", container)
+        self.attrs["Containers"].pop(container_id, None)
+        self.aliases.pop(container_id, None)
+        target = self.owner.client.containers.by_id.get(container_id)
+        if target is not None:
+            target.networks.discard(self.name)
+
+    def remove(self) -> None:
+        if self.attrs["Containers"]:
+            from docker.errors import APIError
+
+            raise APIError("403 Forbidden", explanation="network has active endpoints")
+        self.removed = True
+        self.owner.by_name.pop(self.name, None)
+
+
 class _FakeNetworks:
-    def __init__(self, names: set[str]) -> None:
-        self.names = names
+    def __init__(self, client: FakeDockerClient, names: set[str]) -> None:
+        self.client = client
+        self.by_name: dict[str, FakeNetwork] = {n: FakeNetwork(self, n) for n in names}
         self.created: list[str] = []
+        self.create_kwargs: list[dict[str, Any]] = []
 
-    def list(self, names: list[str] | None = None) -> list[Any]:
+    @property
+    def names(self) -> set[str]:
+        return set(self.by_name)
+
+    def get(self, key: str) -> FakeNetwork:
+        for network in self.by_name.values():
+            if key in (network.id, network.name):
+                return network
+        raise _docker_not_found()
+
+    def list(
+        self, names: list[str] | None = None, filters: dict | None = None
+    ) -> list[FakeNetwork]:
         # Docker's ``name`` filter is a substring match, not an exact one.
-        wanted = names or []
-        return [SimpleNamespace(name=n) for n in self.names if any(w in n for w in wanted)]
+        networks = list(self.by_name.values())
+        if names:
+            networks = [n for n in networks if any(w in n.name for w in names)]
+        for label in _label_filters(filters):
+            networks = [n for n in networks if _has_label(n.attrs["Labels"], label)]
+        return networks
 
-    def create(self, name: str, driver: str = "bridge", labels: dict | None = None) -> Any:
+    def create(
+        self,
+        name: str,
+        driver: str = "bridge",
+        labels: dict | None = None,
+        internal: bool = False,
+        ipam: Any = None,
+        **_: Any,
+    ) -> FakeNetwork:
+        from docker.errors import APIError
+
+        if name in self.by_name:
+            raise APIError("409 Conflict", explanation=f"network with name {name} already exists")
+        subnet = None
+        if ipam is not None:
+            subnet = ipam["Config"][0]["Subnet"]
+            wanted = ipaddress.ip_network(subnet)
+            for other in self.by_name.values():
+                for config in other.attrs["IPAM"]["Config"]:
+                    if wanted.overlaps(ipaddress.ip_network(config["Subnet"])):
+                        raise APIError(
+                            "500 Server Error", explanation=f"subnet {subnet} is already used"
+                        )
         self.created.append(name)
-        self.names.add(name)
-        return SimpleNamespace(name=name)
+        self.create_kwargs.append({"name": name, "labels": labels, "internal": internal})
+        network = FakeNetwork(self, name, labels=labels, internal=internal, subnet=subnet)
+        self.by_name[name] = network
+        return network
+
+
+def _label_filters(filters: dict | None) -> list[str]:
+    value = (filters or {}).get("label") or []
+    return [value] if isinstance(value, str) else list(value)
+
+
+def _has_label(labels: dict, wanted: str) -> bool:
+    key, sep, value = wanted.partition("=")
+    return key in labels and (not sep or labels[key] == value)
 
 
 class _FakeDockerAPI:
@@ -861,7 +1019,7 @@ class FakeDockerClient:
     ) -> None:
         self.containers = _FakeContainers(self)
         self.images = _FakeImages(images if images is not None else {"enigma-sandbox:latest"})
-        self.networks = _FakeNetworks(networks if networks is not None else {"enigma-sandboxes"})
+        self.networks = _FakeNetworks(self, networks if networks is not None else set())
         self.api = _FakeDockerAPI(self)
         self.exec_handler = exec_handler
         self.killed_pidfiles: list[str] = []
@@ -876,8 +1034,23 @@ class FakeDockerClient:
     def close(self) -> None:
         self.closed = True
 
-    def add_container(self, name: str, *, status: str = "running", labels: dict | None = None):
-        container = self.containers.run(name=name, labels=labels or {})
+    def add_container(
+        self,
+        name: str,
+        *,
+        status: str = "running",
+        labels: dict | None = None,
+        spec: dict | None = None,
+    ):
+        """A pre-existing container; by default it carries the sandbox security floor, so a
+        provision adopts it. ``spec`` overrides fields to model a drifted container."""
+        safe = {
+            "user": "daytona",
+            "cap_drop": ["ALL"],
+            "security_opt": ["no-new-privileges:true"],
+            "pids_limit": 4096,
+        }
+        container = self.containers.run(name=name, labels=labels or {}, **{**safe, **(spec or {})})
         self.containers.run_specs.clear()
         container.status = status
         return container
@@ -902,4 +1075,16 @@ def docker_runtime_with(client: FakeDockerClient, **settings: Any):
         return ["10.89.0.2"]
 
     runtime._resolve_host = resolve  # type: ignore[method-assign]
+    runtime.activity = FakeActivityRecorder()  # type: ignore[assignment]
+    runtime._installation = "test-installation"  # what Postgres' sandbox_installation holds
     return runtime
+
+
+class FakeActivityRecorder:
+    """Records ``touch`` calls instead of writing ``sandbox_activity``."""
+
+    def __init__(self) -> None:
+        self.touches: list[Any] = []
+
+    async def touch(self, workspace_id: Any) -> None:
+        self.touches.append(workspace_id)

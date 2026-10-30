@@ -7,6 +7,7 @@ a real daemon is in ``tests/test_docker_integration.py`` (``DOCKER_INTEGRATION_T
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import threading
 import time
 
@@ -69,20 +70,119 @@ async def test_provision_runs_a_labelled_locked_down_container() -> None:
     assert spec["image"] == "enigma-sandbox:latest"
     assert spec["labels"] == {
         "enigma.managed": "1",
+        "enigma.installation": "test-installation",
         "enigma.workspace-id": str(workspace.id),
         "enigma.owner-id": str(workspace.owner_id),
     }
-    assert spec["network"] == "enigma-sandboxes"
+    assert spec["network"] == f"enigma-sbx-{workspace.id.hex}"
     assert spec["entrypoint"] == ["sleep", "infinity"] and spec["init"] is True
     assert spec["user"] == "daytona"
     assert spec["security_opt"] == ["no-new-privileges:true"]
     assert spec["cap_drop"] == ["ALL"] and spec["pids_limit"] == 4096
     assert (spec["mem_limit"], spec["nano_cpus"]) == ("2048m", 1_500_000_000)
+    assert spec["memswap_limit"] == "2048m"  # equal to memory: no swap on top
+    assert spec["tmpfs"] == {"/tmp": "rw,nosuid,nodev,size=1024m"}
+    assert [(u["Name"], u["Soft"], u["Hard"]) for u in spec["ulimits"]] == [
+        ("nofile", 65536, 65536)
+    ]
     for forbidden in ("volumes", "mounts", "privileged", "cap_add", "network_mode"):
         assert forbidden not in spec
     container = client.containers.get(workspace.sandbox_id)
     # Parity with Daytona's create_folder(workspace_path): relative to the sandbox home.
     assert container.exec_runs == [["mkdir", "-p", "--", "/home/daytona/workspace"]]
+
+
+def test_container_security_spec_is_exactly_the_tested_floor() -> None:
+    """Epic 05: one helper owns the security profile; adding to it needs a test change."""
+    from app.core.config import Settings
+    from app.services.sandbox.docker import container_security_spec
+
+    spec = container_security_spec(
+        Settings(docker_sandbox_memory_mb=1024, docker_sandbox_cpus=1, docker_sandbox_tmp_mb=256)
+    )
+
+    assert {k: v for k, v in spec.items() if k != "ulimits"} == {
+        "user": "daytona",
+        "init": True,
+        "cap_drop": ["ALL"],
+        "security_opt": ["no-new-privileges:true"],
+        "pids_limit": 4096,
+        "mem_limit": "1024m",
+        "memswap_limit": "1024m",
+        "nano_cpus": 1_000_000_000,
+        "tmpfs": {"/tmp": "rw,nosuid,nodev,size=256m"},
+    }
+    assert_safe_container_spec({**spec, "network": "enigma-sbx-x"})
+
+
+@pytest.mark.parametrize(
+    ("drift", "problem"),
+    [
+        ({"privileged": True}, "privileged"),
+        ({"cap_add": ["SYS_ADMIN"]}, "cap_add"),
+        ({"cap_drop": []}, "cap_drop"),
+        ({"security_opt": []}, "no-new-privileges"),
+        ({"security_opt": ["no-new-privileges:true", "seccomp=unconfined"]}, "unconfined"),
+        ({"user": "root"}, "user"),
+        ({"user": ""}, "user"),
+        ({"volumes": ["/var/run/docker.sock"]}, "mounts"),
+        ({"pids_limit": None}, "pids_limit"),
+        ({"network_mode": "host"}, "network"),
+        ({"devices": ["/dev/kvm"]}, "Devices"),
+        ({"sysctls": {"net.ipv4.ip_forward": "1"}}, "Sysctls"),
+        ({"ports": {"8000/tcp": 8000}}, "PortBindings"),
+        ({"security_opt": ["no-new-privileges", "seccomp=/tmp/allow-all.json"]}, "seccomp"),
+        ({"security_opt": ["no-new-privileges", "label=disable"]}, "label=disable"),
+    ],
+)
+async def test_a_drifted_container_is_refused_not_adopted(drift, problem) -> None:
+    """A hand-edited container under the sandbox's name must not be adopted."""
+    client = FakeDockerClient()
+    workspace = docker_workspace()
+    client.add_container(
+        f"execute-{workspace.id.hex}",
+        labels={"enigma.managed": "1", "enigma.workspace-id": str(workspace.id)},
+        spec=drift,
+    )
+    runtime = docker_runtime_with(client)
+
+    with pytest.raises(ProvisioningError, match=problem):
+        await runtime.provision(workspace)
+
+
+async def test_a_container_whose_live_process_kept_capabilities_is_refused() -> None:
+    """Inspect formats differ (Docker says ALL, Podman lists them): the live process's
+    CapEff/CapBnd is the authority."""
+    client = FakeDockerClient()
+    workspace = docker_workspace()
+    container = client.add_container(
+        f"execute-{workspace.id.hex}",
+        labels={"enigma.managed": "1", "enigma.workspace-id": str(workspace.id)},
+    )
+    container.leaked_caps = True
+    runtime = docker_runtime_with(client)
+
+    with pytest.raises(ProvisioningError, match="capabilities"):
+        await runtime.provision(workspace)
+
+
+async def test_podmans_inspect_format_counts_as_the_floor() -> None:
+    """Podman reports the dropped capabilities one by one and `no-new-privileges` bare."""
+    client = FakeDockerClient()
+    workspace = docker_workspace()
+    client.add_container(
+        f"execute-{workspace.id.hex}",
+        labels={"enigma.managed": "1", "enigma.workspace-id": str(workspace.id)},
+        spec={
+            "cap_drop": ["CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "NET_BIND_SERVICE",
+                         "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT"],
+            "cap_add": [],
+            "security_opt": ["no-new-privileges"],
+        },
+    )
+    runtime = docker_runtime_with(client)
+
+    assert await runtime.provision(workspace)
 
 
 async def test_provision_ignores_the_user_settable_snapshot() -> None:
@@ -111,8 +211,12 @@ async def test_provision_is_idempotent_by_name_and_starts_a_stopped_container() 
     assert await runtime.provision(workspace) == existing.id
     assert client.containers.run_specs == []
     assert existing.status == "running"
-    # Re-created on adopt, so a sandbox whose first provision died half-way is repaired.
-    assert existing.exec_runs == [["mkdir", "-p", "--", "/home/daytona/workspace"]]
+    # Capabilities checked on the live process, then the workspace dir re-created (so a
+    # sandbox whose first provision died half-way is repaired).
+    assert existing.exec_runs == [
+        ["/bin/cat", "/proc/1/status"],
+        ["mkdir", "-p", "--", "/home/daytona/workspace"],
+    ]
 
 
 async def test_provision_refuses_to_adopt_a_container_it_did_not_create() -> None:
@@ -143,19 +247,201 @@ async def test_missing_image_tells_the_operator_how_to_build_it() -> None:
         await runtime.provision(docker_workspace())
 
 
-async def test_provision_creates_the_sandbox_network_only_when_missing() -> None:
-    missing = FakeDockerClient(networks=set())
-    await provisioned(missing)
-    assert missing.networks.created == ["enigma-sandboxes"]
+# --- isolation: one network per sandbox (Epic 05) -----------------------------------------
 
-    present = FakeDockerClient()
-    await provisioned(present)
-    assert present.networks.created == []
 
-    # Docker's name filter matches substrings: a look-alike must not count as present.
-    lookalike = FakeDockerClient(networks={"enigma-sandboxes-old"})
-    await provisioned(lookalike)
-    assert lookalike.networks.created == ["enigma-sandboxes"]
+def _proxy(client: FakeDockerClient, name: str = "enigma-preview-proxy-1"):
+    return client.add_container(name, labels={"enigma.preview-proxy": "1"})
+
+
+def _subnet(network) -> ipaddress.IPv4Network:
+    return ipaddress.ip_network(network.attrs["IPAM"]["Config"][0]["Subnet"])
+
+
+async def test_each_sandbox_gets_its_own_labelled_network_from_the_pool() -> None:
+    """Sandboxes must not share a network: a server one tenant binds to 0.0.0.0 would be
+    reachable from every other tenant's sandbox."""
+    client = FakeDockerClient()
+    runtime, one = await provisioned(client)
+    two = docker_workspace()
+    two.sandbox_id = await runtime.provision(two)
+
+    first = client.networks.get(f"enigma-sbx-{one.id.hex}")
+    second = client.networks.get(f"enigma-sbx-{two.id.hex}")
+    assert first.attrs["Labels"] == {
+        "enigma.managed": "1",
+        "enigma.installation": "test-installation",
+        "enigma.workspace-id": str(one.id),
+    }
+    assert first.attrs["Internal"] is False
+    pool = ipaddress.ip_network("10.213.0.0/16")
+    assert _subnet(first).subnet_of(pool) and _subnet(first).prefixlen == 28
+    assert not _subnet(first).overlaps(_subnet(second))
+    specs = client.containers.run_specs
+    assert [s["network"] for s in specs] == [first.name, second.name]
+    assert client.containers.get(one.sandbox_id).networks == {first.name}
+
+
+async def test_a_subnet_some_other_network_uses_is_skipped() -> None:
+    client = FakeDockerClient()
+    taken = client.networks.create(
+        "someone-else",
+        ipam={"Config": [{"Subnet": "10.213.0.0/27"}]},  # covers the pool's first two /28s
+    )
+    runtime = docker_runtime_with(client, docker_sandbox_subnet_pool="10.213.0.0/26")
+    workspace = docker_workspace()
+
+    await runtime.provision(workspace)
+
+    network = client.networks.get(f"enigma-sbx-{workspace.id.hex}")
+    assert not _subnet(network).overlaps(_subnet(taken))
+
+
+async def test_an_exhausted_subnet_pool_is_a_clear_provisioning_error() -> None:
+    client = FakeDockerClient()
+    client.networks.create("someone-else", ipam={"Config": [{"Subnet": "10.213.0.0/28"}]})
+    runtime = docker_runtime_with(client, docker_sandbox_subnet_pool="10.213.0.0/28")
+
+    with pytest.raises(ProvisioningError, match="DOCKER_SANDBOX_SUBNET_POOL"):
+        await runtime.provision(docker_workspace())
+
+
+async def test_the_preview_proxy_joins_each_sandbox_network_under_its_alias() -> None:
+    client = FakeDockerClient()
+    proxy = _proxy(client)
+    bystander = client.add_container("postgres")
+    runtime, workspace = await provisioned(client, docker_preview_proxy_host="preview-proxy")
+
+    network = client.networks.get(f"enigma-sbx-{workspace.id.hex}")
+    assert set(network.attrs["Containers"]) == {workspace.sandbox_id, proxy.id}
+    assert network.aliases[proxy.id] == ["preview-proxy"]
+    assert bystander.id not in network.attrs["Containers"]
+
+
+async def test_reconcile_networks_attaches_a_restarted_proxy_to_every_sandbox() -> None:
+    """Compose recreates the proxy container on `up`, which drops connections the backend
+    made at provision time; the periodic pass puts them back."""
+    client = FakeDockerClient()
+    runtime, one = await provisioned(client)
+    two = docker_workspace()
+    two.sandbox_id = await runtime.provision(two)
+    proxy = _proxy(client)
+
+    await runtime.reconcile_networks()
+    await runtime.reconcile_networks()  # idempotent
+
+    for workspace in (one, two):
+        network = client.networks.get(f"enigma-sbx-{workspace.id.hex}")
+        assert proxy.id in network.attrs["Containers"]
+
+
+async def test_upkeep_never_touches_another_installations_sandboxes() -> None:
+    """Two Enigma stacks can share one daemon (a second checkout, a test stack); each must
+    only ever see -- and so only ever remove or re-wire -- its own sandboxes."""
+    client = FakeDockerClient()
+    runtime, mine = await provisioned(client)
+    other = docker_runtime_with(client)
+    other._installation = "another-installation"
+    theirs = docker_workspace()
+    theirs.sandbox_id = await other.provision(theirs)
+    proxy = _proxy(client)
+
+    listed = {container_id for container_id, _ in await runtime.managed_sandboxes()}
+    networks = await runtime.managed_network_workspaces()
+    await runtime.reconcile_networks()
+
+    assert listed == {mine.sandbox_id}
+    assert networks == [str(mine.id)]
+    their_network = client.networks.get(f"enigma-sbx-{theirs.id.hex}")
+    assert proxy.id not in their_network.attrs["Containers"]
+
+
+async def test_only_this_stacks_proxy_is_attached_when_the_backend_runs_in_compose(
+    monkeypatch,
+) -> None:
+    client = FakeDockerClient()
+    client.add_container("backend-ctr", labels={"com.docker.compose.project": "enigma"})
+    monkeypatch.setattr(docker_module.socket, "gethostname", lambda: "backend-ctr")
+    ours = client.add_container(
+        "enigma-preview-proxy-1",
+        labels={"enigma.preview-proxy": "1", "com.docker.compose.project": "enigma"},
+    )
+    theirs = client.add_container(
+        "other-preview-proxy-1",
+        labels={"enigma.preview-proxy": "1", "com.docker.compose.project": "other"},
+    )
+    runtime, workspace = await provisioned(client)
+
+    attached = client.networks.get(f"enigma-sbx-{workspace.id.hex}").attrs["Containers"]
+    assert ours.id in attached and theirs.id not in attached
+
+
+async def test_a_changed_egress_policy_rebuilds_an_existing_sandbox_network() -> None:
+    client = FakeDockerClient()
+    _proxy(client)
+    runtime, workspace = await provisioned(client)
+    assert client.networks.get(f"enigma-sbx-{workspace.id.hex}").attrs["Internal"] is False
+
+    runtime.settings.sandbox_network_block_all = True
+    await runtime.reconcile_networks()
+
+    rebuilt = client.networks.get(f"enigma-sbx-{workspace.id.hex}")
+    assert rebuilt.attrs["Internal"] is True
+    assert workspace.sandbox_id in rebuilt.attrs["Containers"]  # reconnected
+    assert len(rebuilt.attrs["Containers"]) == 2  # and the proxy re-attached
+
+
+async def test_a_daemon_error_other_than_a_taken_subnet_is_not_retried() -> None:
+    from docker.errors import APIError
+
+    client = FakeDockerClient()
+    calls = []
+
+    def refuse(*args, **kwargs):
+        calls.append(1)
+        raise APIError("403 Forbidden", explanation="network creation denied by policy")
+
+    client.networks.create = refuse  # type: ignore[method-assign]
+    runtime = docker_runtime_with(client)
+
+    with pytest.raises(ProvisioningError, match="denied by policy"):
+        await runtime.provision(docker_workspace())
+    assert len(calls) == 1
+
+
+async def test_a_sandbox_on_the_old_shared_network_moves_to_its_own() -> None:
+    client = FakeDockerClient(networks={"enigma-sandboxes"})
+    workspace = docker_workspace()
+    legacy = client.add_container(
+        f"execute-{workspace.id.hex}",
+        labels={"enigma.managed": "1", "enigma.workspace-id": str(workspace.id)},
+    )
+    client.networks.get("enigma-sandboxes").connect(legacy)
+    runtime = docker_runtime_with(client)
+
+    assert await runtime.provision(workspace) == legacy.id
+
+    assert legacy.networks == {f"enigma-sbx-{workspace.id.hex}"}
+
+
+async def test_block_all_egress_makes_the_sandbox_network_internal() -> None:
+    """An internal bridge has no route out; the proxy, attached to it, still reaches the
+    sandbox, so previews keep working with outbound traffic blocked."""
+    client = FakeDockerClient()
+    runtime, workspace = await provisioned(client, sandbox_network_block_all=True)
+
+    assert client.networks.get(f"enigma-sbx-{workspace.id.hex}").attrs["Internal"] is True
+
+
+async def test_delete_removes_the_sandbox_network_after_detaching_the_proxy() -> None:
+    client = FakeDockerClient()
+    _proxy(client)
+    runtime, workspace = await provisioned(client)
+
+    await runtime.delete(workspace)
+    await runtime.delete(workspace)  # already gone: still fine
+
+    assert f"enigma-sbx-{workspace.id.hex}" not in client.networks.names
 
 
 async def test_daemon_down_is_runtime_unavailable_not_a_crash() -> None:
@@ -564,6 +850,59 @@ async def test_expose_port_failure_is_logged_not_raised() -> None:
     runtime, workspace = await provisioned(client)
 
     await runtime.expose_port(workspace, 5173)
+
+
+# --- out of memory (Epic 05) -------------------------------------------------------------
+
+
+async def test_status_detail_explains_an_oom_kill_inside_a_running_sandbox() -> None:
+    """The kernel kills the biggest process, not PID 1, so the container keeps running and
+    Docker's State.OOMKilled stays false; the cgroup's oom_kill counter is the signal."""
+    client = FakeDockerClient()
+    runtime, workspace = await provisioned(client, docker_sandbox_memory_mb=256)
+    container = client.containers.get(workspace.sandbox_id)
+    assert await runtime.status_detail(workspace) is None
+
+    container.memory_events = "oom 1\noom_kill 2\n"  # read via /bin/cat, never PATH
+    detail = await runtime.status_detail(workspace)
+
+    assert detail is not None and "2" in detail and "256 MB" in detail
+    assert "DOCKER_SANDBOX_MEMORY_MB" in detail
+    assert runtime.activity.touches == [workspace.id]  # reading it is not activity
+
+
+async def test_status_detail_reports_a_container_the_kernel_stopped_for_memory() -> None:
+    client = FakeDockerClient()
+    runtime, workspace = await provisioned(client)
+    container = client.containers.get(workspace.sandbox_id)
+    container.status, container.oom_killed = "exited", True
+
+    detail = await runtime.status_detail(workspace)
+
+    assert detail is not None and "memory" in detail
+    assert container.start_calls == 0  # asking does not wake it
+
+
+# --- the idle clock (Epic 05) ----------------------------------------------------------
+
+
+async def test_provision_exec_stream_and_preview_each_count_as_activity() -> None:
+    runtime, workspace = await provisioned(FakeDockerClient())
+    touches = runtime.activity.touches
+    assert touches == [workspace.id]  # provision
+
+    await runtime.exec(workspace, "true")
+    await runtime.stream_command(
+        workspace, "s", "true", cwd=None, env=None, timeout=5,
+        on_stdout=_noop, on_stderr=_noop,
+    )
+    await runtime.preview_link(workspace, 3000)
+
+    assert touches == [workspace.id] * 4
+
+
+async def _noop(_text: str) -> None:
+    return None
 
 
 # --- errors ------------------------------------------------------------------------------
