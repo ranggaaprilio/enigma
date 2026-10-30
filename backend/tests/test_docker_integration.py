@@ -974,3 +974,50 @@ async def test_an_attached_terminal_spares_an_idle_sandbox_until_the_busy_cap(ma
             await tab.disconnect()
         await runtime.delete(workspace)
         await runtime.close()
+
+
+async def test_the_service_probe_does_not_mistake_its_own_exec_for_the_service(
+    runtime, sandbox
+) -> None:
+    """Docker runs every exec as ``sh -c <script>``, so the probe script -- which names the
+    service's marker -- is in its own shells' command lines: a ``pgrep -f <marker>`` fallback
+    found those and reported a dead service alive, and a stopped dev server was never
+    relaunched. Only a process other than the probe and its launchers counts."""
+    from app.services.service_scripts import ProbeRow, build_probe_script, parse_probe_output
+    from app.services.service_scripts import service_paths as paths_for
+
+    paths = paths_for(uuid4())
+    row = ProbeRow(id="svc", paths=paths, port=None, health_path=None)
+
+    result = await runtime.exec(sandbox, build_probe_script([row]))
+    assert parse_probe_output(result.stdout)["svc"].pid_alive is False, result.stdout
+
+    marker = paths.grep_token
+    await _sh(
+        runtime,
+        sandbox,
+        f"(setsid nohup python3 -c 'import time; time.sleep(300)' {marker} "
+        ">/dev/null 2>&1 &)",
+    )
+    result = await runtime.exec(sandbox, build_probe_script([row]))
+    assert parse_probe_output(result.stdout)["svc"].pid_alive is True, result.stdout
+
+
+async def test_a_concurrent_probe_is_not_mistaken_for_the_service(runtime, sandbox) -> None:
+    """Two probes of one workspace can overlap (two requests, or a request and upkeep); each
+    names every marker in its own command line, so neither may count the other."""
+    from app.services.service_scripts import ProbeRow, build_probe_script, parse_probe_output
+    from app.services.service_scripts import service_paths as paths_for
+
+    row = ProbeRow(id="svc", paths=paths_for(uuid4()), port=None, health_path=None)
+    # A probe that is still running (stalled on its health check) while the next one looks.
+    stall = "import time\ntime.sleep(20)\nimport http.client"
+    slow = build_probe_script([row]).replace("import http.client", stall, 1)
+    stalled = asyncio.create_task(runtime.exec(sandbox, slow, timeout=60))
+    await asyncio.sleep(2)
+    try:
+        result = await runtime.exec(sandbox, build_probe_script([row]))
+        assert parse_probe_output(result.stdout)["svc"].pid_alive is False, result.stdout
+    finally:
+        stalled.cancel()
+        await asyncio.gather(stalled, return_exceptions=True)
