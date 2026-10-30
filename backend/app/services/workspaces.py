@@ -24,12 +24,22 @@ APP_ROOT_UNSET = object()
 ENV_FILE_PATH_UNSET = object()
 
 
+# Team roles allowed to change a teammate's workspace (the owner always can). Everyone on the
+# team can read it through ``get_for_owner``.
+MANAGE_TEAM_ROLES = ("lead",)
+DRIVE_TEAM_ROLES = ("lead", "member")
+
+
 class WorkspaceAlreadyExistsError(Exception):
     pass
 
 
 class WorkspaceNotFoundError(Exception):
     pass
+
+
+class WorkspaceAccessDeniedError(Exception):
+    """Raised when a user has some access to a workspace but not enough to drive it."""
 
 
 class WorkspaceRuntimeError(Exception):
@@ -107,6 +117,44 @@ class SqlAlchemyWorkspaceService:
             )
         )
         return result.scalar_one_or_none() is not None
+
+    async def _team_role(self, team_id: UUID, user_id: UUID) -> str | None:
+        result = await self.session.execute(
+            select(TeamMember.role).where(
+                TeamMember.team_id == team_id,
+                TeamMember.user_id == user_id,
+            )
+        )
+        return result.scalar_one_or_none()
+
+    async def _get_for_change(
+        self, workspace_id: UUID, user_id: UUID, team_roles: tuple[str, ...]
+    ) -> Workspace:
+        """The workspace, for a caller allowed to change it: its owner, or a teammate whose
+        team role is in ``team_roles``. Any other teammate can see it but not change it."""
+        workspace = await self.session.get(Workspace, workspace_id)
+        if workspace is None:
+            raise WorkspaceNotFoundError
+        if workspace.owner_id == user_id:
+            return workspace
+        role = (
+            await self._team_role(workspace.team_id, user_id)
+            if workspace.team_id is not None
+            else None
+        )
+        if role is None:
+            raise WorkspaceNotFoundError
+        if role not in team_roles:
+            raise WorkspaceAccessDeniedError
+        return workspace
+
+    async def get_for_manager(self, workspace_id: UUID, user_id: UUID) -> Workspace:
+        """Owner or team lead: settings, delete."""
+        return await self._get_for_change(workspace_id, user_id, MANAGE_TEAM_ROLES)
+
+    async def get_for_driver(self, workspace_id: UUID, user_id: UUID) -> Workspace:
+        """Owner, team lead or team member: env vars, reprovision. Never a viewer."""
+        return await self._get_for_change(workspace_id, user_id, DRIVE_TEAM_ROLES)
 
     async def list_for_owner(self, owner_id: UUID) -> list[Workspace]:
         result = await self.session.execute(
@@ -252,7 +300,7 @@ class SqlAlchemyWorkspaceService:
         no sandbox id; nothing retries it, and `status` cannot recover it because there is no
         sandbox to query. This is the repair path — typically after correcting the snapshot.
         """
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_driver(workspace_id, owner_id)
 
         template: WorkspaceTemplate | None = None
         if workspace.source == "template" and workspace.template_id is not None:
@@ -275,7 +323,12 @@ class SqlAlchemyWorkspaceService:
         app_root: str | None | object = APP_ROOT_UNSET,
         env_file_path: str | None | object = ENV_FILE_PATH_UNSET,
     ) -> Workspace:
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_manager(workspace_id, owner_id)
+        # The stored git credential is the owner's and follows `repo_url`, so only the owner
+        # may point it somewhere else (a teammate could otherwise send it to their own host).
+        if repo_url is not None and workspace.owner_id != owner_id:
+            if sanitize_repository_url(repo_url) != workspace.repo_url:
+                raise WorkspaceAccessDeniedError
         if name is not None:
             workspace.name = name
             workspace.slug = slugify(name)
@@ -295,7 +348,7 @@ class SqlAlchemyWorkspaceService:
         return workspace
 
     async def delete(self, workspace_id: UUID, owner_id: UUID) -> None:
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_manager(workspace_id, owner_id)
         try:
             await self.runtime.delete(workspace)
         except SandboxRuntimeError as error:
@@ -331,7 +384,7 @@ class SqlAlchemyWorkspaceService:
         custom_command_id: UUID | None = None,
     ) -> tuple[WorkspaceEnvVar, EnvVarWriteStatus]:
         normalized_key = validate_env_key(key)
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_driver(workspace_id, owner_id)
         await self._validate_custom_command_id(workspace.id, custom_command_id)
         env_var, write_status = await self._upsert_one(
             workspace.id, normalized_key, value, custom_command_id=custom_command_id
@@ -392,7 +445,7 @@ class SqlAlchemyWorkspaceService:
         custom_command_id: UUID | None = None,
         dry_run: bool = False,
     ) -> list[BulkItem]:
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_driver(workspace_id, owner_id)
         await self._validate_custom_command_id(workspace.id, custom_command_id)
 
         valid_keys: dict[str, str] = {}
@@ -462,7 +515,7 @@ class SqlAlchemyWorkspaceService:
         custom_command_id: UUID | None = None,
     ) -> None:
         normalized_key = validate_env_key(key)
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_driver(workspace_id, owner_id)
         command_filter = (
             WorkspaceEnvVar.custom_command_id.is_(None)
             if custom_command_id is None
@@ -488,7 +541,7 @@ class SqlAlchemyWorkspaceService:
         *,
         custom_command_id: UUID | None = None,
     ) -> tuple[list[str], list[str]]:
-        workspace = await self.get_for_owner(workspace_id, owner_id)
+        workspace = await self.get_for_driver(workspace_id, owner_id)
         await self._validate_custom_command_id(workspace.id, custom_command_id)
 
         deleted: list[str] = []

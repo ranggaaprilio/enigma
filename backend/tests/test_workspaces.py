@@ -22,6 +22,7 @@ from app.services.workspaces import (
     InvalidEnvScopeError,
     InvalidEnvVarKeyError,
     SqlAlchemyWorkspaceService,
+    WorkspaceAccessDeniedError,
     WorkspaceAlreadyExistsError,
     WorkspaceNotFoundError,
     WorkspaceRuntimeError,
@@ -79,6 +80,9 @@ class FakeWorkspaceService:
         if workspace is None or workspace.owner_id != owner_id:
             raise WorkspaceNotFoundError
         return workspace
+
+    async def get_for_manager(self, workspace_id: UUID, user_id: UUID) -> Workspace:
+        return await self.get_for_owner(workspace_id, user_id)
 
     async def create(
         self,
@@ -1269,3 +1273,141 @@ async def test_patch_env_file_path_accepts_and_echoes_a_valid_value(workspace_co
 
     assert response.status_code == 200
     assert response.json()["env_file_path"] == "apps/api/.env"
+
+
+# --- team roles on a teammate's workspace -------------------------------------------------
+
+
+class _TeamRoleSession:
+    """`get` returns the workspace; `execute` answers the single `TeamMember.role` lookup."""
+
+    def __init__(self, workspace: Workspace, team_role: str | None) -> None:
+        self.workspace = workspace
+        self.team_role = team_role
+        self.committed = False
+
+    async def get(self, _model, _id):
+        return self.workspace
+
+    async def execute(self, _statement):
+        team_role = self.team_role
+
+        class _Result:
+            def scalar_one_or_none(self):
+                return team_role
+
+        return _Result()
+
+    def add(self, _row) -> None:
+        return None
+
+    async def commit(self) -> None:
+        self.committed = True
+
+    async def refresh(self, _row) -> None:
+        return None
+
+
+def _team_workspace() -> Workspace:
+    now = datetime.now(UTC)
+    return Workspace(
+        id=uuid4(),
+        owner_id=uuid4(),
+        team_id=uuid4(),
+        name="Team",
+        slug="team",
+        repo_url="https://github.com/example/team",
+        default_branch="main",
+        runtime="daytona",
+        daytona_sandbox_id="sandbox-team",
+        workspace_path="workspace",
+        status="ready",
+        created_at=now,
+        updated_at=now,
+    )
+
+
+def _team_service(workspace: Workspace, team_role: str | None):
+    settings = Settings()
+    session = _TeamRoleSession(workspace, team_role)
+    service = SqlAlchemyWorkspaceService(
+        session=session,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=None,  # type: ignore[arg-type]
+    )
+    return service, session
+
+
+@pytest.mark.parametrize("team_role", ["viewer", "member"])
+async def test_only_a_team_lead_or_the_owner_may_change_a_team_workspace(team_role):
+    workspace = _team_workspace()
+    service, session = _team_service(workspace, team_role)
+
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await service.update(workspace.id, uuid4(), name="Renamed")
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await service.delete(workspace.id, uuid4())
+
+    assert workspace.name == "Team"
+    assert session.committed is False
+
+
+async def test_team_lead_may_rename_but_not_repoint_the_owners_credential():
+    workspace = _team_workspace()
+    service, _session = _team_service(workspace, "lead")
+
+    renamed = await service.update(workspace.id, uuid4(), name="Renamed")
+    assert renamed.name == "Renamed"
+
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await service.update(workspace.id, uuid4(), repo_url="https://evil.example/x/y")
+    assert workspace.repo_url == "https://github.com/example/team"
+
+
+async def test_owner_may_repoint_their_own_workspace():
+    workspace = _team_workspace()
+    service, _session = _team_service(workspace, None)
+
+    updated = await service.update(
+        workspace.id, workspace.owner_id, repo_url="https://github.com/example/other"
+    )
+    assert updated.repo_url == sanitize_repository_url("https://github.com/example/other")
+
+
+async def test_team_viewer_cannot_drive_but_a_member_can():
+    workspace = _team_workspace()
+
+    viewer_service, _ = _team_service(workspace, "viewer")
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await viewer_service.get_for_driver(workspace.id, uuid4())
+    with pytest.raises(WorkspaceAccessDeniedError):
+        await viewer_service.upsert_env_var(workspace.id, uuid4(), "API_KEY", "secret")
+
+    member_service, _ = _team_service(workspace, "member")
+    assert await member_service.get_for_driver(workspace.id, uuid4()) is workspace
+
+
+async def test_non_member_still_gets_not_found_for_a_change():
+    workspace = _team_workspace()
+    service, _session = _team_service(workspace, None)
+
+    with pytest.raises(WorkspaceNotFoundError):
+        await service.update(workspace.id, uuid4(), name="Renamed")
+
+
+async def test_update_route_maps_a_denied_team_role_to_403(workspace_context):
+    _user, service, _tmp_path = workspace_context
+
+    async def denied(**_kwargs):
+        raise WorkspaceAccessDeniedError
+
+    service.update = denied  # type: ignore[method-assign]
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        await client.post(
+            "/auth/login",
+            json={"email": "owner@example.com", "password": "password"},
+        )
+        response = await client.patch(f"/workspaces/{uuid4()}", json={"name": "Renamed"})
+
+    assert response.status_code == 403
