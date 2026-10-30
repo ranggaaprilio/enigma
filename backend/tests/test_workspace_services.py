@@ -18,6 +18,13 @@ from app.models import (
     WorkspaceWorktree,
 )
 from app.services.sandbox import RuntimeCommandResult, SandboxRuntimeError
+from app.services.service_scripts import (
+    build_mise_run_script,
+    build_mise_setup_script,
+    build_registry_script,
+    fresh_log_line,
+    service_paths,
+)
 from app.services.workspace_services import (
     WorkspaceServiceLimitError,
     WorkspaceServiceManager,
@@ -675,3 +682,34 @@ async def test_ensure_running_does_not_relaunch_on_a_transient_probe_failure(db_
     # The row's last-known status is left alone rather than guessed at.
     relaunched = next(r for r in rows if r.id == row.id)
     assert relaunched.status == "installing"
+
+
+@pytest.mark.parametrize(
+    "build",
+    [
+        lambda paths: build_registry_script(
+            paths, "gen", command="serve", install_command=None, serve=True
+        ),
+        lambda paths: build_mise_run_script(paths, "gen", install_deps=False),
+        lambda paths: build_mise_setup_script(
+            paths, "gen", mise_auto_install=False, mise_install_url="https://mise.run"
+        ),
+    ],
+)
+def test_every_launch_writes_a_new_log_file_so_the_live_stream_reads_it_from_the_top(
+    build, tmp_path
+) -> None:
+    # Regression: a launch used to truncate the log in place, and the live stream's `tail -F`
+    # kept its old offset whenever the new log had already grown past the old size -- the
+    # restarted service's first lines (often all of them) never reached the socket.
+    import subprocess
+
+    paths = service_paths(uuid4())
+    assert fresh_log_line(paths.log) in build(paths)
+
+    log = tmp_path / "service.log"
+    log.write_text("old output from the previous run\n" * 50)
+    old_inode = log.stat().st_ino
+    subprocess.run(["sh", "-c", f"{fresh_log_line(str(log))}echo new run"], check=True)
+    assert log.read_text() == "new run\n"
+    assert log.stat().st_ino != old_inode
