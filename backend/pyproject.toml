@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "FastAPI backend for the Execute Dashboard foundation."
 readme = "README.md"
 requires-python = ">=3.12"
+license = "AGPL-3.0-only"
 dependencies = [
   "alembic>=1.13.3",
   "asyncpg>=0.29.0",

@@ -1,0 +1,61 @@
+name: Bug report
+description: Something in Enigma does not work as documented
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Security problems must go through [SECURITY.md](https://github.com/ranggaaprilio/enigma/blob/main/SECURITY.md), not a public issue.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, and what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Create a workspace on the Docker runtime
+        2. Connect a repository and clone
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Sandbox runtime
+      options:
+        - Local Docker
+        - Local Podman
+        - Daytona
+        - Not sandbox related
+    validations:
+      required: true
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: How is Enigma running?
+      options:
+        - Compose (dev / self-host)
+        - Kubernetes (deploy/k8s)
+        - Backend and frontend started by hand
+  - type: input
+    id: version
+    attributes:
+      label: Commit or version
+      placeholder: git rev-parse --short HEAD
+  - type: textarea
+    id: health
+    attributes:
+      label: Output of /health
+      description: Paste the JSON from http://localhost:8000/health with secrets removed.
+      render: json
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Backend, worker, or preview-proxy logs around the failure. Remove tokens and keys.
+      render: shell
