@@ -1,0 +1,99 @@
+import uuid
+from datetime import datetime
+
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, Text, func
+from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.db.base import Base
+
+# One verification loop over a workspace; the lifecycle states a run moves through while
+# the agent plans, tests, observes and finally is approved/rejected by the human reviewer.
+VERIFICATION_RUN_STATUSES = (
+    "planning",
+    "testing",
+    "observing",
+    "review",
+    "approved",
+    "rejected",
+    "error",
+)
+# What a piece of evidence is: an automated test result, a human/agent observation, or a
+# screenshot captured during the run.
+VERIFICATION_EVIDENCE_KINDS = ("test", "observation", "screenshot")
+VERIFICATION_EVIDENCE_STATUSES = ("passed", "failed", "observation_failed", "error")
+
+
+def _sql_in_list(values: tuple[str, ...]) -> str:
+    return ", ".join(f"'{value}'" for value in values)
+
+
+class VerificationRun(Base):
+    __tablename__ = "verification_runs"
+    __table_args__ = (
+        CheckConstraint(
+            f"status in ({_sql_in_list(VERIFICATION_RUN_STATUSES)})",
+            name="ck_verification_runs_status",
+        ),
+        Index("ix_verification_runs_workspace_id", "workspace_id"),
+        Index("ix_verification_runs_status", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    workspace_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("workspaces.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    plan_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+
+    evidence: Mapped[list["VerificationEvidence"]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
+
+class VerificationEvidence(Base):
+    __tablename__ = "verification_evidence"
+    __table_args__ = (
+        CheckConstraint(
+            f"kind in ({_sql_in_list(VERIFICATION_EVIDENCE_KINDS)})",
+            name="ck_verification_evidence_kind",
+        ),
+        CheckConstraint(
+            f"status in ({_sql_in_list(VERIFICATION_EVIDENCE_STATUSES)})",
+            name="ck_verification_evidence_status",
+        ),
+        Index("ix_verification_evidence_run_id", "run_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("verification_runs.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    path: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+    run: Mapped[VerificationRun] = relationship(back_populates="evidence")
