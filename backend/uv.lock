@@ -1052,6 +1052,7 @@ dependencies = [
     { name = "httpx" },
     { name = "openhands-sdk" },
     { name = "openhands-tools" },
+    { name = "opensandbox" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
     { name = "opentelemetry-instrumentation-aiohttp-client" },
     { name = "opentelemetry-instrumentation-fastapi" },
@@ -1089,6 +1090,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27.2" },
     { name = "openhands-sdk", specifier = "==1.28.0" },
     { name = "openhands-tools", specifier = "==1.28.0" },
+    { name = "opensandbox", specifier = "==1.2.1" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = "==1.39.1" },
     { name = "opentelemetry-instrumentation-aiohttp-client", specifier = "==0.60b1" },
     { name = "opentelemetry-instrumentation-fastapi", specifier = "==0.60b1" },
@@ -2760,6 +2762,24 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/eb/03/1a8c599a79721b3a45acba6ade54c98b06918f0e3343f74898828f0e8050/openhands_tools-1.28.0.tar.gz", hash = "sha256:7873df6ff3a0ccea92c21523f3c7da81bb088ff38cda3dbe705f751e06ea1406", size = 142456, upload-time = "2026-06-10T22:23:38.536Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/17/8b/96e949128fbc33444b12e4c0a4acbeca536ecd2dab1753efa6a24909fdf6/openhands_tools-1.28.0-py3-none-any.whl", hash = "sha256:6f84c383e29862c2ba6441cd16036ee90b26e8f68d3994cfb2022ced4e643feb", size = 187637, upload-time = "2026-06-10T22:23:41.39Z" },
+]
+
+[[package]]
+name = "opensandbox"
+version = "1.2.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "attrs" },
+    { name = "httpcore" },
+    { name = "httpx" },
+    { name = "httpx-sse" },
+    { name = "opentelemetry-api" },
+    { name = "pydantic" },
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/ad/44/55e37c760f28b008051dcc0afcdb09a0d526929f54ce952c5e4a1dbe7967/opensandbox-1.2.1.tar.gz", hash = "sha256:079bdde72fb7cd047de09c04928820cbed7394ab5c537ddda9e5ac108b1855df", size = 339085, upload-time = "2026-11-13T00:34:19.168Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/85/a8/f72a8549ff5d076841c9180bfcea251cc8c64adb9ceb3b6d4b919f84f989/opensandbox-1.2.1-py3-none-any.whl", hash = "sha256:67c9210a06cc2c18e621b34b6b21ce143e04226b6773ea17924783b379a75585", size = 742873, upload-time = "2026-11-13T00:34:17.886Z" },
 ]
 
 [[package]]

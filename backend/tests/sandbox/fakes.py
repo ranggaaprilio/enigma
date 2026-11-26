@@ -1101,3 +1101,261 @@ class FakeActivityRecorder:
 
     async def touch(self, workspace_id: Any) -> None:
         self.touches.append(workspace_id)
+
+
+# --- OpenSandbox SDK-level doubles ----------------------------------------------------
+#
+# Mirror the slice of the OpenSandbox Python SDK the adapter uses: a ``Sandbox`` object with
+# ``.files`` (a Filesystem service) and ``.commands`` (a Commands service), plus the
+# management-API ``SandboxManager`` for ``health``/``status``. ``commands.run`` is called with
+# either the user's command string (routed through ``exec_handler``) or a ``grep`` argv —
+# ``find_files`` — which is emulated against the in-memory store.
+
+
+class FakeOpenSandboxStore:
+    """In-memory files shared by the fake ``files`` and ``commands`` services."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.dirs: set[str] = set()
+        self.modes: dict[str, int] = {}
+
+    def _subtree(self, path: str) -> list[str]:
+        prefix = path.rstrip("/") + "/"
+        return [key for key in (*self.files, *self.dirs) if key.startswith(prefix)]
+
+    def _children(self, path: str) -> list[str]:
+        prefix = path.rstrip("/") + "/"
+        return sorted(
+            key
+            for key in (*self.files, *self.dirs)
+            if key.startswith(prefix) and "/" not in key[len(prefix) :]
+        )
+
+    def is_dir(self, path: str) -> bool:
+        return path in self.dirs or bool(self._subtree(path))
+
+    def exists(self, path: str) -> bool:
+        return path in self.files or self.is_dir(path)
+
+    def info(self, path: str) -> SimpleNamespace:
+        if not self.exists(path):
+            raise FileNotFoundError(path)
+        return SimpleNamespace(
+            path=path,
+            entry_type="directory" if self.is_dir(path) else "file",
+            size=len(self.files.get(path, b"")),
+            modified_at="1970-01-01T00:00:00Z",
+        )
+
+    def grep(self, pattern: str, path: str) -> list[str]:
+        prefix = path.rstrip("/") + "/"
+        matches: list[str] = []
+        for key in sorted(self.files):
+            if key == path or key.startswith(prefix):
+                for number, line in enumerate(self.files[key].split(b"\n"), 1):
+                    if pattern.encode() in line:
+                        matches.append(
+                            key + "\0" + str(number) + ":" + line.decode(errors="replace") + "\n"
+                        )
+        return matches
+
+
+class FakeOpenSandboxFiles:
+    """In-memory OpenSandbox SDK ``Filesystem`` service (SDK method names, not Enigma's)."""
+
+    def __init__(self, store: FakeOpenSandboxStore) -> None:
+        self._store = store
+
+    async def write_files(self, entries: list[Any]) -> None:
+        for entry in entries:
+            data = entry.data
+            self._store.files[entry.path] = data if isinstance(data, bytes) else str(data).encode()
+
+    async def read_file(self, path: str, **_: Any) -> str:
+        if path not in self._store.files:
+            raise FileNotFoundError(path)
+        return self._store.files[path].decode()
+
+    async def read_bytes(self, path: str, **_: Any) -> bytes:
+        if path not in self._store.files:
+            raise FileNotFoundError(path)
+        return self._store.files[path]
+
+    async def create_directories(self, entries: list[Any]) -> None:
+        for entry in entries:
+            path = entry.path
+            while path not in self._store.dirs:
+                self._store.dirs.add(path)
+                self._store.modes.setdefault(path, entry.mode)
+                path = dirname(path)
+                if not path or path == "/":
+                    break
+
+    async def list_directory(self, entry: Any) -> list[SimpleNamespace]:
+        return [self._store.info(child) for child in self._store._children(entry.path)]
+
+    async def get_file_info(self, paths: list[str]) -> dict[str, SimpleNamespace]:
+        return {path: self._store.info(path) for path in paths if self._store.exists(path)}
+
+    async def search(self, entry: Any) -> list[SimpleNamespace]:
+        raise NotImplementedError  # glob-based; the adapter never uses it (find_files is grep)
+
+    async def move_files(self, entries: list[Any]) -> None:
+        for entry in entries:
+            source, destination = entry.src, entry.dest
+            if not self._store.exists(source):
+                raise FileNotFoundError(source)
+            for store in (self._store.files, self._store.modes):
+                for key in [k for k in store if k == source or k.startswith(source + "/")]:
+                    store[destination + key[len(source) :]] = store.pop(key)
+            for key in [k for k in self._store.dirs if k == source or k.startswith(source + "/")]:
+                self._store.dirs.remove(key)
+                self._store.dirs.add(destination + key[len(source) :])
+
+    async def delete_files(self, paths: list[str]) -> None:
+        for path in paths:
+            if path not in self._store.files:
+                raise FileNotFoundError(path)
+            del self._store.files[path]
+
+    async def delete_directories(self, paths: list[str]) -> None:
+        for path in paths:
+            if not self._store.is_dir(path):
+                raise FileNotFoundError(path)
+            for key in [path, *self._store._subtree(path)]:
+                self._store.files.pop(key, None)
+                self._store.dirs.discard(key)
+
+    async def set_permissions(self, entries: list[Any]) -> None:
+        for entry in entries:
+            if not self._store.exists(entry.path):
+                raise FileNotFoundError(entry.path)
+            self._store.modes[entry.path] = entry.mode
+
+
+class FakeOpenSandboxCommands:
+    """OpenSandbox SDK ``Commands`` service: strings route to ``exec_handler``, a ``grep``
+    argv is emulated against the store (``find_files``)."""
+
+    def __init__(self, sandbox: FakeOpenSandboxSandbox, exec_handler: ExecHandler | None) -> None:
+        self._sandbox = sandbox
+        self.exec_handler = exec_handler
+        self.run_calls: list[Any] = []
+
+    def _run_result(self, command: str) -> RuntimeCommandResult:
+        if self.exec_handler is not None:
+            return self.exec_handler(command)
+        return RuntimeCommandResult(exit_code=0, stdout="", stderr="")
+
+    @staticmethod
+    def _execution(exit_code: int, stdout: str, stderr: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            exit_code=exit_code,
+            logs=SimpleNamespace(
+                stdout=[SimpleNamespace(text=stdout)] if stdout else [],
+                stderr=[SimpleNamespace(text=stderr)] if stderr else [],
+            ),
+        )
+
+    async def run(self, command: Any, *, opts: Any = None, handlers: Any = None) -> Any:
+        self.run_calls.append(command)
+        if isinstance(command, list) and command and command[0] == "grep":
+            return await self._grep(command, handlers)
+        result = self._run_result(command)
+        if handlers is not None:
+            if result.stdout and getattr(handlers, "on_stdout", None):
+                await handlers.on_stdout(SimpleNamespace(text=result.stdout))
+            if result.stderr and getattr(handlers, "on_stderr", None):
+                await handlers.on_stderr(SimpleNamespace(text=result.stderr))
+        return self._execution(result.exit_code, result.stdout, result.stderr)
+
+    async def _grep(self, argv: list[str], handlers: Any) -> Any:
+        pattern = argv[argv.index("-e") + 1]
+        text = "".join(self._sandbox._store.grep(pattern, argv[-1]))
+        if handlers is not None and text and getattr(handlers, "on_stdout", None):
+            await handlers.on_stdout(SimpleNamespace(text=text))
+        return self._execution(0 if text else 1, text, "")
+
+
+class FakeOpenSandboxSandbox:
+    """OpenSandbox SDK ``Sandbox`` object: id, files, commands, get_info, get_endpoint,
+    destroy/kill/close."""
+
+    def __init__(
+        self,
+        sandbox_id: str = "sandbox-1",
+        *,
+        state: str = "Running",
+        exec_handler: ExecHandler | None = None,
+    ) -> None:
+        self.id = sandbox_id
+        self.state = state
+        self._store = FakeOpenSandboxStore()
+        self.files = FakeOpenSandboxFiles(self._store)
+        self.commands = FakeOpenSandboxCommands(self, exec_handler)
+        self.destroyed = False
+        self.endpoint_ports: list[int] = []
+
+    async def get_info(self) -> SimpleNamespace:
+        return SimpleNamespace(status=SimpleNamespace(state=self.state))
+
+    async def get_endpoint(self, port: int) -> SimpleNamespace:
+        self.endpoint_ports.append(port)
+        return SimpleNamespace(endpoint=f"http://127.0.0.1:8080/proxy/{port}", headers={})
+
+    async def kill(self) -> None:
+        self.destroyed = True
+
+    async def close(self) -> None:
+        return None
+
+    async def destroy(self) -> None:
+        self.destroyed = True
+
+
+class FakeOpenSandboxManager:
+    """Management-API ``SandboxManager`` double for ``health``/``status``."""
+
+    def __init__(self, state: str = "Running") -> None:
+        self.state = state
+        self.listed = False
+
+    async def list_sandbox_infos(self, filter: Any) -> SimpleNamespace:
+        self.listed = True
+        return SimpleNamespace(sandbox_infos=[], pagination=None)
+
+    async def get_sandbox_info(self, sandbox_id: str) -> SimpleNamespace:
+        return SimpleNamespace(status=SimpleNamespace(state=self.state))
+
+    async def close(self) -> None:
+        return None
+
+
+def opensandbox_runtime_with(
+    exec_handler: ExecHandler | None = None,
+    *,
+    sandbox_id: str = "sandbox-1",
+    state: str = "Running",
+) -> Any:
+    """A real ``OpenSandboxRuntime`` wired to the fake sandbox and manager (no live daemon)."""
+    from app.core.config import Settings
+    from app.services.sandbox.opensandbox import OpenSandboxRuntime
+
+    runtime = OpenSandboxRuntime(Settings(opensandbox_api_url="http://127.0.0.1:8080"))
+    sandbox = FakeOpenSandboxSandbox(sandbox_id, state=state, exec_handler=exec_handler)
+    manager = FakeOpenSandboxManager(state=state)
+
+    async def connect(sandbox_id_: str, **_: Any) -> FakeOpenSandboxSandbox:
+        return sandbox
+
+    async def create(*_: Any, **__: Any) -> FakeOpenSandboxSandbox:
+        return sandbox
+
+    async def get_manager() -> FakeOpenSandboxManager:
+        return manager
+
+    runtime._connect = connect  # type: ignore[method-assign]
+    runtime._create = create  # type: ignore[method-assign]
+    runtime._get_manager = get_manager  # type: ignore[method-assign]
+    return runtime

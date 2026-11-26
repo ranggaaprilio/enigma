@@ -26,6 +26,7 @@ from tests.sandbox.fakes import (
     FakeSandboxRuntime,
     docker_runtime_with,
     make_workspace,
+    opensandbox_runtime_with,
 )
 
 STATUSES = {"ready", "stopped", "creating", "error"}
@@ -48,10 +49,18 @@ def echo(command: str) -> RuntimeCommandResult:
 
 # Contract parts a provider does not implement yet: strict xfail, so the marker has to be
 # removed (and the suite proves the contract) the moment the epic lands.
-PENDING: dict[str, dict[str, str]] = {}
+PENDING: dict[str, dict[str, str]] = {
+    "opensandbox": {
+        "test_pty_handle_contract": (
+            "OpenSandbox SDK has no interactive PTY (resize/reconnect); create_session/"
+            "run_in_session are one-shot bash sessions. Terminals need separate work "
+            "(see the spike report)."
+        ),
+    },
+}
 
 
-@pytest.fixture(params=["daytona", "docker", "fake"])
+@pytest.fixture(params=["daytona", "docker", "fake", "opensandbox"])
 def case(request):
     reason = PENDING.get(request.param, {}).get(request.node.originalname)
     if reason:
@@ -68,6 +77,9 @@ def case(request):
         runtime = DaytonaRuntime(Settings(daytona_api_key="test"))
         runtime._client = FakeDaytonaClient([sandbox])  # type: ignore[assignment]
         return runtime, make_workspace("sandbox-1")
+    if request.param == "opensandbox":
+        runtime = opensandbox_runtime_with(exec_handler=echo)
+        return runtime, make_workspace("sandbox-1", runtime="opensandbox")
     return FakeSandboxRuntime(exec_handler=echo), make_workspace("sandbox-1", runtime="fake")
 
 

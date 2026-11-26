@@ -97,6 +97,10 @@ class Settings(BaseSettings):
     daytona_target: str | None = None
     daytona_default_snapshot: str | None = None
     daytona_default_language: str = "python"
+    # OpenSandbox provider (verifiable agent loop). `configured` when the API URL is set;
+    # the key is only required when the OpenSandbox server enforces authentication.
+    opensandbox_api_url: str | None = None
+    opensandbox_api_key: str | None = None
     # Provider-neutral since Epic 06; DAYTONA_WORKSPACE_PATH / DAYTONA_SANDBOX_HOME still
     # accepted for one release (logged as deprecated at startup).
     sandbox_workspace_path: str = Field(
