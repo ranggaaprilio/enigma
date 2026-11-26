@@ -2758,3 +2758,104 @@ export function requestSpecChanges(
     { method: "POST", body: JSON.stringify({ notes }) },
   );
 }
+
+// --- Verification loop (Verifiable Agent Loop, Phase 6) ---
+
+export type VerificationRunStatus =
+  | "planning"
+  | "testing"
+  | "observing"
+  | "review"
+  | "approved"
+  | "rejected"
+  | "error";
+
+export type VerificationEvidenceKind = "test" | "observation" | "screenshot";
+export type VerificationEvidenceStatus = "passed" | "failed" | "observation_failed" | "error";
+
+export type VerificationEvidenceResponse = {
+  id: string;
+  kind: VerificationEvidenceKind;
+  status: VerificationEvidenceStatus;
+  /** Free-form per kind: test → `{command, exit_code}` or `{command, error, timeout?}`;
+   * observation → `{port, url, description, snapshot, screenshot}` or `{port, error}`. */
+  detail: Record<string, unknown>;
+  path: string | null;
+  created_at: string;
+};
+
+export type VerificationRunResponse = {
+  id: string;
+  workspace_id: string;
+  plan_ref: string;
+  status: VerificationRunStatus;
+  created_at: string;
+  updated_at: string;
+};
+
+export type VerificationRunDetailResponse = VerificationRunResponse & {
+  evidence: VerificationEvidenceResponse[];
+};
+
+export type VerificationRunCreatePayload = {
+  plan_ref: string;
+  test_command: string;
+  observe_port?: number;
+  cwd?: string;
+  timeout?: number;
+  max_iterations: number;
+};
+
+function verificationRunsPath(workspaceId: string) {
+  return `/workspaces/${workspaceId}/verification/runs`;
+}
+
+export function listVerificationRuns(
+  workspaceId: string,
+  limit = 20,
+): Promise<VerificationRunResponse[]> {
+  return requestJson<VerificationRunResponse[]>(
+    `${verificationRunsPath(workspaceId)}?limit=${limit}`,
+  );
+}
+
+export function getVerificationRun(
+  workspaceId: string,
+  runId: string,
+): Promise<VerificationRunDetailResponse> {
+  return requestJson<VerificationRunDetailResponse>(
+    `${verificationRunsPath(workspaceId)}/${runId}`,
+  );
+}
+
+/** Runs the whole test → observe → review loop server-side before responding (inline mode),
+ * so this can take as long as the test command's timeout. */
+export function createVerificationRun(
+  workspaceId: string,
+  payload: VerificationRunCreatePayload,
+): Promise<VerificationRunDetailResponse> {
+  return requestJson<VerificationRunDetailResponse>(verificationRunsPath(workspaceId), {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+}
+
+export function approveVerificationRun(
+  workspaceId: string,
+  runId: string,
+): Promise<VerificationRunResponse> {
+  return requestJson<VerificationRunResponse>(
+    `${verificationRunsPath(workspaceId)}/${runId}/approve`,
+    { method: "POST" },
+  );
+}
+
+export function rejectVerificationRun(
+  workspaceId: string,
+  runId: string,
+): Promise<VerificationRunResponse> {
+  return requestJson<VerificationRunResponse>(
+    `${verificationRunsPath(workspaceId)}/${runId}/reject`,
+    { method: "POST" },
+  );
+}
