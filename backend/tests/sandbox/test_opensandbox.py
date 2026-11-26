@@ -19,6 +19,7 @@ from opensandbox.exceptions import (
 
 from app.core.config import Settings
 from app.services.sandbox.base import (
+    RuntimeCommandResult,
     RuntimeUnavailableError,
     SandboxNotFoundError,
     SandboxRuntimeError,
@@ -140,3 +141,49 @@ async def test_pty_reconnect_keeps_one_execd_session() -> None:
 
     await runtime.kill_pty(workspace, "term-1")  # deletes the execd session
     await runtime.kill_pty(workspace, "term-1")  # idempotent: unknown session is a no-op
+
+
+async def test_file_modes_reach_execd_as_octal_digits() -> None:
+    """execd parses ``mode`` as octal digits (``ParseUint(..., 8)``): ``755`` means rwxr-xr-x.
+    Sending the decimal value of 0o755 (493) is rejected live with "invalid syntax"."""
+    runtime = opensandbox_runtime_with(exec_handler=None)
+    fs = await runtime.fs(make_workspace("sandbox-1", runtime="opensandbox"))
+    await fs.create_folder("/workspace/dir", "755")
+    await fs.upload_file(b"x", "/workspace/dir/a.txt")
+    await fs.set_file_permissions("/workspace/dir/a.txt", mode="600")
+
+    modes = fs._sandbox.files._store.modes
+    assert modes["/workspace/dir"] == 755
+    assert modes["/workspace/dir/a.txt"] == 600
+
+
+async def test_relative_paths_resolve_against_the_sandbox_home() -> None:
+    """Workspaces store a relative ``workspace_path`` (``"workspace"``). Daytona resolves it
+    against the sandbox home and the Docker provider mirrors that; execd resolves it against
+    ``/``, where ``mkdir /workspace`` is denied for the sandbox user. So the provider must
+    make relative paths absolute itself, for files and for command working directories."""
+    from app.core.config import get_settings
+
+    home = get_settings().sandbox_home.rstrip("/")
+    runtime = opensandbox_runtime_with(
+        exec_handler=lambda _c: RuntimeCommandResult(exit_code=0, stdout="", stderr="")
+    )
+    workspace = make_workspace("sandbox-1", runtime="opensandbox")
+    workspace.workspace_path = "workspace"
+    fs = await runtime.fs(workspace)
+
+    await fs.create_folder("workspace", "755")
+    await fs.upload_file(b"x", "workspace/a.txt")
+    store = fs._sandbox.files._store
+    assert f"{home}/workspace" in store.dirs
+    assert f"{home}/workspace/a.txt" in store.files
+    assert await fs.download_file("workspace/a.txt") == b"x"
+    # Absolute paths are left alone.
+    await fs.upload_file(b"y", "/tmp/b.txt")
+    assert "/tmp/b.txt" in store.files
+
+    await runtime.exec(workspace, "true")  # no cwd: the workspace, like Daytona
+    await runtime.exec(workspace, "true", cwd="workspace/sub")
+    await runtime.exec(workspace, "true", cwd="/srv")
+    cwds = [opts.working_directory for _cmd, opts, _h in fs._sandbox.commands.run_calls]
+    assert cwds == [f"{home}/workspace", f"{home}/workspace/sub", "/srv"]

@@ -150,3 +150,19 @@ async def test_initialize_raises_on_clone_failure_with_redacted_output():
 
     assert "tok" not in excinfo.value.message
     assert "https://[redacted]@github.com" in excinfo.value.message
+
+
+async def test_a_folder_the_runtime_cannot_create_is_an_initialization_error():
+    """Every sandbox step of initialisation surfaces as WorkspaceInitializationError (a 502 with
+    a reason), never as a raw SandboxRuntimeError (an unhandled 500 that left the workspace in
+    ``creating``): a live OpenSandbox refused ``mkdir /workspace`` this way."""
+    from app.services.sandbox import SandboxRuntimeError
+
+    class RefusingFs(FakeFs):
+        async def create_folder(self, path, mode):
+            raise SandboxRuntimeError("OpenSandbox API error (status 500)")
+
+    initializer = WorkspaceInitializer(FakeRuntime(RefusingFs()))  # type: ignore[arg-type]
+
+    with pytest.raises(WorkspaceInitializationError, match="Could not create"):
+        await initializer.initialize_blank(_workspace())
