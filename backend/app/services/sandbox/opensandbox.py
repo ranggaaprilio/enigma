@@ -3,13 +3,10 @@
 Maps the neutral ``SandboxRuntime`` contract onto the OpenSandbox Python SDK: ``exec`` and
 ``stream_command`` are ``commands.run`` (optionally with streaming ``ExecutionHandlers``),
 the file system wraps the SDK ``Filesystem`` service (whose method names differ from the
-contract's — see ``OpenSandboxFileSystem``), and previews come from ``get_endpoint``.
-``find_files`` stays a fixed-string *content* search: the SDK's ``files.search`` is glob-based,
-so it is implemented with ``grep -F`` run inside the sandbox.
-
-Interactive terminals are not mapped: the SDK's ``create_session``/``run_in_session`` are
-one-shot bash sessions, not resizable, reconnectable PTYs (see the spike report). Until that
-lands, ``create_or_connect_pty`` raises.
+contract's — see ``OpenSandboxFileSystem``), previews come from ``get_endpoint``, and
+interactive terminals talk to the execd ``/pty`` API directly (the SDK does not expose
+it). ``find_files`` stays a fixed-string *content* search: the SDK's ``files.search`` is
+glob-based, so it is implemented with ``grep -F`` run inside the sandbox.
 """
 
 from __future__ import annotations
@@ -51,6 +48,14 @@ from app.services.sandbox.base import (
     RuntimeUnavailableError,
     SandboxNotFoundError,
     SandboxRuntimeError,
+)
+from app.services.sandbox.opensandbox_pty import (
+    EXECD_PORT,
+    create_pty_session,
+    delete_pty_session,
+    open_pty_websocket,
+    pty_base_url,
+    pty_session_status,
 )
 
 logger = structlog.get_logger(__name__)
@@ -298,6 +303,10 @@ class OpenSandboxRuntime:
         self.settings = settings
         self._config: ConnectionConfig | None = None
         self._manager: SandboxManager | None = None
+        # Enigma terminal session id -> execd-assigned PTY session id. execd generates its
+        # own id on POST /pty; this in-process mapping lets a reconnect resolve the same
+        # execd session (and is discarded alongside the sandbox on restart).
+        self._pty_sessions: dict[str, str] = {}
 
     @property
     def configured(self) -> bool:
@@ -328,6 +337,38 @@ class OpenSandboxRuntime:
         if self._manager is None:
             self._manager = await SandboxManager.create(connection_config=self._connection_config())
         return self._manager
+
+    # P des seams (replaced by tests): each talks to the execd ``/pty`` API directly,
+    # because the SDK does not expose those routes.
+    async def _pty_create_session(self, base_url: str, cwd: str | None) -> str:
+        return await create_pty_session(base_url, cwd=cwd)
+
+    async def _pty_session_status(self, base_url: str, server_session_id: str) -> tuple[bool, int]:
+        return await pty_session_status(base_url, server_session_id)
+
+    async def _pty_connect(
+        self,
+        base_url: str,
+        server_session_id: str,
+        on_data: Callable[[bytes], Awaitable[None]],
+        *,
+        offset: int,
+        takeover: bool,
+        cols: int,
+        rows: int,
+    ) -> PtyHandle:
+        return await open_pty_websocket(
+            base_url,
+            server_session_id,
+            on_data,
+            offset=offset,
+            takeover=takeover,
+            cols=cols,
+            rows=rows,
+        )
+
+    async def _pty_delete_session(self, base_url: str, server_session_id: str) -> None:
+        await delete_pty_session(base_url, server_session_id)
 
     async def close(self) -> None:
         manager, self._manager = self._manager, None
@@ -455,13 +496,73 @@ class OpenSandboxRuntime:
         rows: int,
         cwd: str | None = None,
     ) -> PtyHandle:
-        raise SandboxRuntimeError(
-            "OpenSandbox does not support interactive terminals yet"
-        )
+        sandbox = await self._get_sandbox(workspace)
+        try:
+            endpoint = await sandbox.get_endpoint(EXECD_PORT)
+        except Exception as error:
+            raise map_opensandbox_error(error) from error
+        base_url = pty_base_url(str(getattr(endpoint, "endpoint", "") or ""))
+
+        # Environment variables ride on the sandbox env file (execd's ``set_env``), so a
+        # fresh session sees them; they persist for later sessions of the same sandbox.
+        if env:
+            try:
+                for key, value in env.items():
+                    await sandbox.commands.set_env(key, value)
+            except Exception as error:
+                raise map_opensandbox_error(error) from error
+
+        # Map Enigma's session id to the execd-assigned session id. execd generates its own
+        # id on POST /pty, so we keep the pair in-process for reconnect (a terminal survives a
+        # page reload by reconnecting to the same execd session).
+        server_session_id = self._pty_sessions.get(session_id)
+        if server_session_id is None:
+            try:
+                server_session_id = await self._pty_create_session(base_url, cwd)
+            except Exception as error:
+                raise map_opensandbox_error(error) from error
+            self._pty_sessions[session_id] = server_session_id
+
+        try:
+            exists, offset = await self._pty_session_status(base_url, server_session_id)
+        except Exception as error:
+            raise map_opensandbox_error(error) from error
+        if not exists:
+            # The sandbox restarted and its execd sessions are gone: recreate.
+            try:
+                server_session_id = await self._pty_create_session(base_url, cwd)
+            except Exception as error:
+                raise map_opensandbox_error(error) from error
+            self._pty_sessions[session_id] = server_session_id
+            offset = 0
+
+        try:
+            return await self._pty_connect(
+                base_url,
+                server_session_id,
+                on_data,
+                offset=offset,
+                takeover=True,
+                cols=cols,
+                rows=rows,
+            )
+        except Exception as error:
+            raise map_opensandbox_error(error) from error
 
     async def kill_pty(self, workspace: Workspace, session_id: str) -> None:
-        # No interactive PTY sessions exist to kill; ``create_or_connect_pty`` never succeeds.
-        return None
+        server_session_id = self._pty_sessions.pop(session_id, None)
+        if server_session_id is None:
+            return
+        sandbox = await self._get_sandbox(workspace)
+        try:
+            endpoint = await sandbox.get_endpoint(EXECD_PORT)
+        except Exception as error:
+            raise map_opensandbox_error(error) from error
+        base_url = pty_base_url(str(getattr(endpoint, "endpoint", "") or ""))
+        try:
+            await self._pty_delete_session(base_url, server_session_id)
+        except Exception as error:
+            raise map_opensandbox_error(error) from error
 
     async def preview_link(self, workspace: Workspace, port: int) -> RuntimePreviewLink:
         sandbox = await self._get_sandbox(workspace)

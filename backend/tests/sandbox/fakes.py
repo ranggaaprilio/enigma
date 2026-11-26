@@ -1242,6 +1242,7 @@ class FakeOpenSandboxCommands:
         self._sandbox = sandbox
         self.exec_handler = exec_handler
         self.run_calls: list[Any] = []
+        self.set_env_calls: list[tuple[str, str]] = []
 
     def _run_result(self, command: str) -> RuntimeCommandResult:
         if self.exec_handler is not None:
@@ -1279,6 +1280,9 @@ class FakeOpenSandboxCommands:
         skip = handlers is not None and getattr(handlers, "skip_accumulation", False)
         return self._execution(0 if text else 1, "" if skip else text, "")
 
+    async def set_env(self, key: str, value: str) -> None:
+        self.set_env_calls.append((key, value))
+
 
 class FakeOpenSandboxSandbox:
     """OpenSandbox SDK ``Sandbox`` object: id, files, commands, get_info, get_endpoint,
@@ -1298,6 +1302,10 @@ class FakeOpenSandboxSandbox:
         self.commands = FakeOpenSandboxCommands(self, exec_handler)
         self.destroyed = False
         self.endpoint_ports: list[int] = []
+        # execd /pty state: session_id -> FakePtyHandle (what the runtime seam sees).
+        self.ptys: dict[str, FakePtyHandle] = {}
+        self.pty_creates: list[str] = []
+        self.pty_deletes: list[str] = []
 
     async def get_info(self) -> SimpleNamespace:
         return SimpleNamespace(status=SimpleNamespace(state=self.state))
@@ -1357,7 +1365,42 @@ def opensandbox_runtime_with(
     async def get_manager() -> FakeOpenSandboxManager:
         return manager
 
+    # execd /pty seams: an in-memory stand-in for the HTTP+WebSocket API (the real
+    # implementation lives in app.services.sandbox.opensandbox_pty).
+    async def pty_create_session(base_url: str, cwd: str | None) -> str:
+        session_id = f"execd-{uuid4().hex[:8]}"
+        sandbox.pty_creates.append(session_id)
+        sandbox.ptys[session_id] = FakePtyHandle(session_id)
+        return session_id
+
+    async def pty_status(base_url: str, server_session_id: str) -> tuple[bool, int]:
+        return server_session_id in sandbox.ptys, 0
+
+    async def pty_connect(
+        base_url: str,
+        server_session_id: str,
+        on_data: Any,
+        *,
+        offset: int,
+        takeover: bool,
+        cols: int,
+        rows: int,
+    ) -> FakePtyHandle:
+        try:
+            return sandbox.ptys[server_session_id]
+        except KeyError:
+            raise RuntimeError("no such execd PTY session") from None
+
+    async def pty_delete_session(base_url: str, server_session_id: str) -> None:
+        sandbox.pty_deletes.append(server_session_id)
+        sandbox.ptys.pop(server_session_id, None)
+
     runtime._connect = connect  # type: ignore[method-assign]
     runtime._create = create  # type: ignore[method-assign]
     runtime._get_manager = get_manager  # type: ignore[method-assign]
+    runtime._pty_create_session = pty_create_session  # type: ignore[method-assign]
+    runtime._pty_session_status = pty_status  # type: ignore[method-assign]
+    runtime._pty_connect = pty_connect  # type: ignore[method-assign]
+    runtime._pty_delete_session = pty_delete_session  # type: ignore[method-assign]
+    runtime._fake_sandbox = sandbox  # exposed for provider-level assertions
     return runtime

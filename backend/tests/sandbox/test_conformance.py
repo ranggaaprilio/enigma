@@ -49,15 +49,7 @@ def echo(command: str) -> RuntimeCommandResult:
 
 # Contract parts a provider does not implement yet: strict xfail, so the marker has to be
 # removed (and the suite proves the contract) the moment the epic lands.
-PENDING: dict[str, dict[str, str]] = {
-    "opensandbox": {
-        "test_pty_handle_contract": (
-            "OpenSandbox SDK has no interactive PTY (resize/reconnect); create_session/"
-            "run_in_session are one-shot bash sessions. Terminals need separate work "
-            "(see the spike report)."
-        ),
-    },
-}
+PENDING: dict[str, dict[str, str]] = {}
 
 
 @pytest.fixture(params=["daytona", "docker", "fake", "opensandbox"])

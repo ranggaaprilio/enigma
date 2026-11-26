@@ -2,7 +2,7 @@
 
 The conformance suite proves the contract; these cover what is unique to the adapter — the
 ``find_files`` content search (``grep``, not the SDK's glob-based ``files.search``), the
-``SandboxException`` → ``SandboxRuntimeError`` mapping, and the unsupported-PTY behavior.
+``SandboxException`` → ``SandboxRuntimeError`` mapping, and the execd-backed PTY behavior.
 """
 
 from __future__ import annotations
@@ -126,15 +126,17 @@ async def test_preview_link_and_expose_port() -> None:
     await runtime.expose_port(workspace, 5173)
 
 
-async def test_pty_not_supported_yet() -> None:
+async def test_pty_reconnect_keeps_one_execd_session() -> None:
     runtime = opensandbox_runtime_with(exec_handler=None)
     workspace = make_workspace("sandbox-1", runtime="opensandbox")
 
     async def on_data(_data: bytes) -> None:
         return None
 
-    with pytest.raises(SandboxRuntimeError):
-        await runtime.create_or_connect_pty(
-            workspace, "term-1", on_data, env=None, cols=80, rows=24
-        )
-    await runtime.kill_pty(workspace, "term-1")  # no-op: no sessions to kill
+    handle = await runtime.create_or_connect_pty(
+        workspace, "term-1", on_data, env=None, cols=80, rows=24
+    )
+    assert handle is not None
+
+    await runtime.kill_pty(workspace, "term-1")  # deletes the execd session
+    await runtime.kill_pty(workspace, "term-1")  # idempotent: unknown session is a no-op
