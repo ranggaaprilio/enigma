@@ -11,7 +11,7 @@ from app.core.config import get_settings
 from app.core.security import hash_password
 from app.db.session import get_db_session
 from app.main import app
-from app.models import User, VerificationEvidence, VerificationRun, Workspace
+from app.models import User, VerificationRun, Workspace
 from app.services.sandbox.base import RuntimePreviewLink
 
 
@@ -108,11 +108,26 @@ def _patch_deps(monkeypatch, session, session_maker, runtime=None):
         monkeypatch.setattr(orch_mod, "get_sandbox_runtime", lambda: runtime)
 
 
-async def test_create_run_drives_loop_to_review(db_session, monkeypatch):
+def _capture_starts(monkeypatch) -> list:
+    """Record what the endpoint hands to the executor instead of driving it here: the loop runs
+    off-request (its own tests cover it), and this fixture's single connection cannot be shared
+    with a concurrent background task."""
+    from app.api import verification as api_mod
+
+    started: list = []
+
+    async def fake_start(run_id, settings, **_kwargs):
+        started.append(run_id)
+
+    monkeypatch.setattr(api_mod, "start_verification_run", fake_start)
+    return started
+
+
+async def test_create_run_returns_202_and_starts_the_loop(db_session, monkeypatch):
     session, session_maker = db_session
     user, workspace = await make_user_workspace(session)
-    runtime = FakeRuntime()
-    _patch_deps(monkeypatch, session, session_maker, runtime)
+    _patch_deps(monkeypatch, session, session_maker, FakeRuntime())
+    started = _capture_starts(monkeypatch)
 
     override = await override_get_current_user(user)
     app.dependency_overrides[auth_module.get_current_user] = override
@@ -123,25 +138,49 @@ async def test_create_run_drives_loop_to_review(db_session, monkeypatch):
             json={
                 "plan_ref": "spec:1",
                 "test_command": "pytest -q",
-                "observe_port": None,
+                "observe_port": 5173,
+                "max_iterations": 3,
             },
         )
-    assert resp.status_code == 201, resp.text
+    assert resp.status_code == 202, resp.text
     body = resp.json()
-    assert body["status"] == "review"
+    assert body["status"] == "planning"
+    assert body["evidence"] == []
 
     run = (
         await session.execute(select(VerificationRun).where(VerificationRun.id == body["id"]))
     ).scalar_one()
-    assert run.status == "review"
+    # Everything a worker needs to resume the run is on the row.
+    assert run.criteria == {
+        "test_command": "pytest -q",
+        "observe_port": 5173,
+        "cwd": None,
+        "timeout": None,
+        "max_iterations": 3,
+    }
+    assert run.created_by == user.id
+    assert [str(r) for r in started] == [body["id"]]
 
-    evidence = (
-        await session.execute(
-            select(VerificationEvidence).where(VerificationEvidence.run_id == run.id)
+
+async def test_create_run_is_refused_while_draining(db_session, monkeypatch):
+    from app.core.lifecycle import lifecycle
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session)
+    _patch_deps(monkeypatch, session, session_maker, FakeRuntime())
+    started = _capture_starts(monkeypatch)
+    monkeypatch.setattr(lifecycle, "draining", True)
+
+    override = await override_get_current_user(user)
+    app.dependency_overrides[auth_module.get_current_user] = override
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.post(
+            f"/workspaces/{workspace.id}/verification/runs",
+            json={"plan_ref": "spec:1", "test_command": "pytest"},
         )
-    ).scalars().all()
-    assert any(e.kind == "test" and e.status == "passed" for e in evidence)
-    assert any(cmd == "pytest -q" for cmd, _ in runtime.calls)
+    assert resp.status_code == 503
+    assert started == []
 
 
 async def test_list_and_get_runs(db_session, monkeypatch):
@@ -231,6 +270,13 @@ async def test_second_active_run_is_conflicted(db_session, monkeypatch):
         )
     assert resp.status_code == 409
     assert "active" in resp.json()["detail"]
+    # Refused before anything is written: no orphan run parked at planning.
+    runs = (
+        await session.execute(
+            select(VerificationRun).where(VerificationRun.workspace_id == workspace.id)
+        )
+    ).scalars().all()
+    assert [r.id for r in runs] == [active.id]
 
 
 async def test_unknown_run_404(db_session, monkeypatch):

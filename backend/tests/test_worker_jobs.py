@@ -710,11 +710,16 @@ async def test_command_job_records_an_escaping_error_instead_of_leaving_it_runni
 
 
 def test_worker_settings_register_every_job_and_follow_settings():
-    from app.services.jobs import AGENT_RUN_JOB, COMMAND_RUN_JOB, SPEC_FINALIZE_JOB
-    from app.worker import WorkerSettings
+    from app.services.jobs import (
+        AGENT_RUN_JOB,
+        COMMAND_RUN_JOB,
+        SPEC_FINALIZE_JOB,
+        VERIFICATION_RUN_JOB,
+    )
+    from app.worker import WorkerSettings, verification_max_tries
 
     names = {function.name for function in WorkerSettings.functions}
-    assert names == {AGENT_RUN_JOB, COMMAND_RUN_JOB, SPEC_FINALIZE_JOB}
+    assert names == {AGENT_RUN_JOB, COMMAND_RUN_JOB, SPEC_FINALIZE_JOB, VERIFICATION_RUN_JOB}
     settings = get_settings()
     assert WorkerSettings.queue_name == settings.run_queue_name
     assert WorkerSettings.max_jobs == settings.worker_max_jobs
@@ -723,6 +728,8 @@ def test_worker_settings_register_every_job_and_follow_settings():
     assert WorkerSettings.job_completion_wait == int(settings.shutdown_run_grace_seconds)
     finalize = next(f for f in WorkerSettings.functions if f.name == SPEC_FINALIZE_JOB)
     assert finalize.max_tries == spec_finalize_max_tries(settings)
+    verification = next(f for f in WorkerSettings.functions if f.name == VERIFICATION_RUN_JOB)
+    assert verification.max_tries == verification_max_tries(settings)
 
 
 async def test_worker_refuses_to_start_outside_queue_mode(monkeypatch):

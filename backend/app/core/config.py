@@ -70,6 +70,9 @@ class Settings(BaseSettings):
     agent_run_timeout_seconds: int = Field(default=2 * 60 * 60, gt=0)
     worker_job_timeout_seconds: int = Field(default=2 * 60 * 60 + 5 * 60, gt=0)
     spec_finalize_poll_seconds: float = Field(default=5.0, gt=0)
+    # How often a verification run waiting on its fix agent run checks back (inline: sleep;
+    # queue: the job defers itself this long).
+    verification_poll_seconds: float = Field(default=5.0, gt=0)
     # Epic 04: a worker owns a claimed run only while its lease is fresh. It renews every
     # `run_heartbeat_seconds`; once `lease_expires_at` passes, any worker's reaper (every
     # `run_reaper_interval_seconds`) ends the run as `interrupted_worker_died`.

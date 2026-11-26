@@ -17,6 +17,7 @@ from app.models import (
     SpecPhase,
     SpecWorkflow,
     User,
+    VerificationRun,
     Workspace,
 )
 from app.services.agents import AgentRuntime, AgentService
@@ -413,3 +414,53 @@ async def test_worker_scoped_sweep_only_touches_that_workers_runs(db_session):
     assert theirs.status == "executing"
     assert their_command.status == "running"
     assert phase.status == "running"
+
+
+async def test_active_verification_runs_become_errors(db_session):
+    """Plan 2 Task 6: an inline verification run is driven by an in-process task; after a
+    restart nothing would ever advance it, and it would hold the workspace's verification
+    guard forever (every new run a 409)."""
+    session, session_maker = db_session
+    user, workspace = await seed_workspace(session)
+    other_user, other_workspace = await seed_workspace(session)
+    fixing = VerificationRun(workspace_id=workspace.id, plan_ref="p", status="fixing")
+    parked = VerificationRun(workspace_id=other_workspace.id, plan_ref="p", status="review")
+    session.add_all([fixing, parked])
+    await session.commit()
+
+    agents, commands = runtimes()
+    result = await reconcile_interrupted_runs(
+        session_maker, agent_runtime=agents, command_runtime=commands
+    )
+
+    assert fixing.id in result.verification_run_ids
+    assert parked.id not in result.verification_run_ids
+    for row, expected in ((fixing, "error"), (parked, "review")):
+        await session.refresh(row)
+        assert row.status == expected
+
+
+async def test_verification_runs_follow_the_sweep_scope(db_session):
+    """Shutdown sweeps only owned runs; a worker sweep never touches verification runs, whose
+    queue jobs resume them from the row."""
+    session, session_maker = db_session
+    user, workspace = await seed_workspace(session)
+    other_user, other_workspace = await seed_workspace(session)
+    ours = VerificationRun(workspace_id=workspace.id, plan_ref="p", status="testing")
+    theirs = VerificationRun(workspace_id=other_workspace.id, plan_ref="p", status="testing")
+    session.add_all([ours, theirs])
+    await session.commit()
+
+    agents, commands = runtimes()
+    worker = await reconcile_interrupted_runs(
+        session_maker, agent_runtime=agents, command_runtime=commands, worker_id="worker-a"
+    )
+    assert worker.verification_run_ids == []
+
+    scoped = await reconcile_interrupted_runs(
+        session_maker, agent_runtime=agents, command_runtime=commands, run_ids={ours.id}
+    )
+    assert scoped.verification_run_ids == [ours.id]
+    for row, expected in ((ours, "error"), (theirs, "testing")):
+        await session.refresh(row)
+        assert row.status == expected
