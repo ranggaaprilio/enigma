@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -303,5 +303,119 @@ describe("VerificationPanel", () => {
     await waitFor(() =>
       expect(screen.queryByRole("button", { name: "Approve" })).not.toBeInTheDocument(),
     );
+  });
+
+  it("polls an in-flight run until it reaches the gate", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let status: VerificationRunResponse["status"] = "testing";
+      let detailCalls = 0;
+      stubFetch((url) => {
+        if (url.endsWith(`${BASE}?limit=20`)) return jsonResponse([run({ status: "testing" })]);
+        if (url.endsWith(`${BASE}/r1`)) {
+          detailCalls += 1;
+          return jsonResponse(detail({ status, evidence: [] }));
+        }
+        return undefined;
+      });
+
+      render(<VerificationPanel workspace={workspace} />);
+      await screen.findByText("Loading run…").catch(() => undefined);
+      await waitFor(() => expect(detailCalls).toBe(1));
+
+      status = "fixing";
+      await act(() => vi.advanceTimersByTimeAsync(3_000));
+      await waitFor(() => expect(detailCalls).toBe(2));
+      expect((await screen.findAllByText("fixing")).length).toBeGreaterThan(0);
+
+      status = "review";
+      await act(() => vi.advanceTimersByTimeAsync(3_000));
+      expect(await screen.findByRole("button", { name: "Approve" })).toBeInTheDocument();
+
+      // Parked at the gate: no more polling.
+      await act(() => vi.advanceTimersByTimeAsync(10_000));
+      expect(detailCalls).toBe(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows fix attempts and the failing test output", async () => {
+    const user = userEvent.setup();
+    stubFetch((url) => {
+      if (url.endsWith(`${BASE}?limit=20`)) return jsonResponse([run()]);
+      if (url.endsWith(`${BASE}/r1`)) {
+        return jsonResponse(
+          detail({
+            evidence: [
+              {
+                id: "t1",
+                kind: "test",
+                status: "failed",
+                detail: {
+                  command: "pytest -q",
+                  exit_code: 1,
+                  output: "E   AssertionError: boom",
+                  truncated: true,
+                },
+                path: null,
+                created_at: "2026-11-26T00:00:10Z",
+              },
+              {
+                id: "f1",
+                kind: "fix",
+                status: "passed",
+                detail: { agent_run_id: "a1", agent_status: "completed" },
+                path: null,
+                created_at: "2026-11-26T00:00:20Z",
+              },
+              {
+                id: "f2",
+                kind: "fix",
+                status: "error",
+                detail: { error: "an enforcing budget is over its limit" },
+                path: null,
+                created_at: "2026-11-26T00:00:30Z",
+              },
+            ],
+          }),
+        );
+      }
+      return undefined;
+    });
+
+    render(<VerificationPanel workspace={workspace} />);
+    const evidence = await screen.findByRole("region", { name: "Evidence" });
+
+    await user.click(within(evidence).getByText("Output (tail)"));
+    expect(within(evidence).getByText(/AssertionError: boom/)).toBeVisible();
+    expect(within(evidence).getByText("Agent run completed")).toBeInTheDocument();
+    expect(within(evidence).getByText("an enforcing budget is over its limit")).toBeInTheDocument();
+  });
+
+  it("keeps polling after a failed refresh", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      let detailCalls = 0;
+      stubFetch((url) => {
+        if (url.endsWith(`${BASE}?limit=20`)) return jsonResponse([run({ status: "testing" })]);
+        if (url.endsWith(`${BASE}/r1`)) {
+          detailCalls += 1;
+          if (detailCalls === 2) return jsonResponse({ detail: "Bad gateway" }, 502);
+          return jsonResponse(detail({ status: detailCalls >= 3 ? "review" : "testing", evidence: [] }));
+        }
+        return undefined;
+      });
+
+      render(<VerificationPanel workspace={workspace} />);
+      await waitFor(() => expect(detailCalls).toBe(1));
+
+      await act(() => vi.advanceTimersByTimeAsync(3_000)); // fails
+      expect(await screen.findByRole("alert")).toHaveTextContent("Bad gateway");
+      await act(() => vi.advanceTimersByTimeAsync(3_000)); // retried
+      expect(await screen.findByRole("button", { name: "Approve" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

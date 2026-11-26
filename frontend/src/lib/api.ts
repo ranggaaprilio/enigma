@@ -2764,21 +2764,23 @@ export function requestSpecChanges(
 export type VerificationRunStatus =
   | "planning"
   | "testing"
+  | "fixing"
   | "observing"
   | "review"
   | "approved"
   | "rejected"
   | "error";
 
-export type VerificationEvidenceKind = "test" | "observation" | "screenshot";
+export type VerificationEvidenceKind = "test" | "observation" | "screenshot" | "fix";
 export type VerificationEvidenceStatus = "passed" | "failed" | "observation_failed" | "error";
 
 export type VerificationEvidenceResponse = {
   id: string;
   kind: VerificationEvidenceKind;
   status: VerificationEvidenceStatus;
-  /** Free-form per kind: test → `{command, exit_code}` or `{command, error, timeout?}`;
-   * observation → `{port, url, description, snapshot, screenshot}` or `{port, error}`. */
+  /** Free-form per kind: test → `{command, exit_code, output, truncated}` or
+   * `{command, error, timeout?}`; observation → `{port, url, description, snapshot,
+   * screenshot}` or `{port, error}`; fix → `{agent_run_id, agent_status}` or `{error}`. */
   detail: Record<string, unknown>;
   path: string | null;
   created_at: string;
@@ -2828,8 +2830,8 @@ export function getVerificationRun(
   );
 }
 
-/** Runs the whole test → observe → review loop server-side before responding (inline mode),
- * so this can take as long as the test command's timeout. */
+/** Starts a run and returns it at `planning` (HTTP 202); the test → fix → observe loop then
+ * runs server-side, so poll {@link getVerificationRun} until it reaches `review`. */
 export function createVerificationRun(
   workspaceId: string,
   payload: VerificationRunCreatePayload,
