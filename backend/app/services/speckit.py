@@ -402,7 +402,7 @@ class SpecKitService:
         self.session.add_all([phase, workflow])
         if phase_name == "implement":
             # The code is about to change: evidence still awaiting review no longer applies.
-            await supersede_review_runs(self.session, workflow.id)
+            await supersede_review_runs(self.session, workflow.id, include_active=True)
         await self.session.commit()
         await self.session.refresh(phase)
 

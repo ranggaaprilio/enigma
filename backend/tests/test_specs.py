@@ -1250,3 +1250,23 @@ async def test_request_changes_on_implement_closes_its_old_evidence(db_session, 
     async with session_maker() as s:
         assert (await s.get(VerificationRun, old.id)).status == "rejected"
     assert await approve_verification_run(session_maker, old.id, user.id) is False
+
+
+async def test_rerunning_implement_also_closes_a_linked_run_still_in_flight(db_session, monkeypatch):
+    """Security review: a linked run still testing when implement re-runs would otherwise reach
+    review later with evidence for the old code, and could be approved."""
+    from app.models import VerificationRun
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g9-{uuid4()}@example.com")
+    workflow, running = await _implement_awaiting_with_run(
+        session, user, workspace, run_status="testing"
+    )
+    monkeypatch.setattr("app.services.agents.AgentService.create_run", _fake_create_run())
+    monkeypatch.setattr(SpecKitService, "_finalize_phase", _noop_finalize)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    await service.request_changes(workspace.id, workflow.id, "implement", user.id, "again")
+
+    async with session_maker() as s:
+        assert (await s.get(VerificationRun, running.id)).status == "rejected"

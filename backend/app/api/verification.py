@@ -159,8 +159,22 @@ async def get_verification_run(
 async def _finalize_gate(
     workspace_id: UUID, run_id: UUID, user: User, session: AsyncSession, approve: bool
 ) -> VerificationRunResponse:
-    await _get_workspace(session, workspace_id, user)
+    workspace, _role = await _get_workspace(session, workspace_id, user)
     orch = VerificationOrchestrator(PlanCriteria(test_command=""))
+    # Scope first: nothing is written for a run outside the workspace in the URL.
+    try:
+        run = await orch.get_run(workspace_id, run_id)
+    except (VerificationRunNotFoundError, VerificationRunNotInWorkspaceError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Verification run not found"
+        ) from None
+    # A Spec Kit-linked run gates the workflow, which only its owner may approve or reject
+    # (the same rule as approve_phase).
+    if run.spec_workflow_id is not None and workspace.owner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the workspace owner can review a Spec Kit verification",
+        )
     # Approval also completes a linked Spec Kit workflow's implement phase (same transaction).
     changed = await (
         approve_run(orch.session_maker, run_id, user.id)

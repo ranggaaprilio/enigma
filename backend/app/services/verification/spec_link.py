@@ -24,7 +24,11 @@ from app.services.notifications import NotificationService
 from app.services.run_paths import join_subpath
 from app.services.sandbox import SandboxRuntime
 from app.services.verification.execution import build_orchestrator, start_verification_run
-from app.services.verification.orchestrator import PlanCriteria, VerificationOrchestrator
+from app.services.verification.orchestrator import (
+    ACTIVE_STATUSES,
+    PlanCriteria,
+    VerificationOrchestrator,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -73,17 +77,24 @@ async def criteria_for_workflow(
 
 
 async def supersede_review_runs(
-    session: AsyncSession, workflow_id: UUID, *, except_run_id: UUID | None = None
+    session: AsyncSession,
+    workflow_id: UUID,
+    *,
+    except_run_id: UUID | None = None,
+    include_active: bool = False,
 ) -> None:
-    """Close a workflow's linked runs still awaiting review (``review -> rejected``).
+    """Close a workflow's linked runs still awaiting review (``-> rejected``).
 
     Their evidence verified code that has since changed (implement re-runs) or that a newer
-    run re-verifies, so they must not stay approvable. Not committed: callers commit it with
-    the change that made the evidence stale.
+    run re-verifies, so they must not stay approvable. ``include_active`` also closes runs
+    still in flight -- needed when implement re-runs, or such a run would reach review later
+    with evidence for the old code. Not committed: callers commit it with the change that made
+    the evidence stale.
     """
+    statuses = ("review", *ACTIVE_STATUSES) if include_active else ("review",)
     statement = update(VerificationRun).where(
         VerificationRun.spec_workflow_id == workflow_id,
-        VerificationRun.status == "review",
+        VerificationRun.status.in_(statuses),
     )
     if except_run_id is not None:
         statement = statement.where(VerificationRun.id != except_run_id)

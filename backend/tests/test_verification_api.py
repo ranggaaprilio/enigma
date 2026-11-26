@@ -83,7 +83,7 @@ async def make_user_workspace(session) -> tuple[User, Workspace]:
         repo_url="https://github.com/example/demo",
         default_branch="main",
         runtime="daytona",
-        sandbox_id="sandbox-verify",
+        sandbox_id=f"sandbox-verify-{uuid4().hex[:8]}",  # unique: tests may need two
         workspace_path="workspace",
         status="ready",
         created_at=datetime.now(UTC),
@@ -328,3 +328,81 @@ async def test_runs_can_be_filtered_by_spec_workflow(db_session, monkeypatch):
         )
     assert resp.status_code == 200
     assert [r["id"] for r in resp.json()] == [str(linked.id)]
+
+
+async def test_a_run_of_another_workspace_cannot_be_gated(db_session, monkeypatch):
+    """Security: the gate must check the run belongs to the workspace in the URL before it
+    writes anything (an approval also completes a linked Spec Kit workflow)."""
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session)
+    other_user, other_workspace = await make_user_workspace(session)
+    foreign = VerificationRun(
+        workspace_id=other_workspace.id, plan_ref="theirs", status="review"
+    )
+    session.add(foreign)
+    await session.flush()
+    _patch_deps(monkeypatch, session, session_maker, FakeRuntime())
+
+    app.dependency_overrides[auth_module.get_current_user] = await override_get_current_user(user)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        approve = await client.post(
+            f"/workspaces/{workspace.id}/verification/runs/{foreign.id}/approve"
+        )
+        reject = await client.post(
+            f"/workspaces/{workspace.id}/verification/runs/{foreign.id}/reject"
+        )
+
+    assert approve.status_code == 404
+    assert reject.status_code == 404
+    await session.refresh(foreign)
+    assert foreign.status == "review"  # untouched
+
+
+async def test_only_the_owner_can_gate_a_spec_linked_run(db_session, monkeypatch):
+    """Security: approving a Spec Kit-linked run completes the workflow, which approve_phase
+    reserves to the workspace owner -- a team member who may drive must not bypass that."""
+    from app.models import Project, SpecWorkflow, Team, TeamMember
+
+    session, session_maker = db_session
+    owner, workspace = await make_user_workspace(session)
+    member, _member_ws = await make_user_workspace(session)
+    project = Project(name="P", slug=f"p-{uuid4().hex[:6]}")
+    session.add(project)
+    await session.flush()
+    team = Team(project_id=project.id, name="T", slug=f"t-{uuid4().hex[:6]}")
+    session.add(team)
+    await session.flush()
+    session.add(TeamMember(team_id=team.id, user_id=member.id, role="member"))
+    workspace.team_id = team.id
+    workflow = SpecWorkflow(
+        workspace_id=workspace.id,
+        user_id=owner.id,
+        feature_name="F",
+        feature_slug=f"f-{uuid4().hex[:6]}",
+        description="d",
+        branch="f",
+        spec_dir="specs/f",
+    )
+    session.add(workflow)
+    await session.flush()
+    linked = VerificationRun(
+        workspace_id=workspace.id,
+        plan_ref="specs/f/plan.md",
+        status="review",
+        spec_workflow_id=workflow.id,
+    )
+    session.add(linked)
+    await session.flush()
+    _patch_deps(monkeypatch, session, session_maker, FakeRuntime())
+
+    app.dependency_overrides[auth_module.get_current_user] = await override_get_current_user(
+        member
+    )
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        approve = await client.post(
+            f"/workspaces/{workspace.id}/verification/runs/{linked.id}/approve"
+        )
+
+    assert approve.status_code == 403
+    await session.refresh(linked)
+    assert linked.status == "review"
