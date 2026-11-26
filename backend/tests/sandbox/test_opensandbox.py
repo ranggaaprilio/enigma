@@ -140,3 +140,18 @@ async def test_pty_reconnect_keeps_one_execd_session() -> None:
 
     await runtime.kill_pty(workspace, "term-1")  # deletes the execd session
     await runtime.kill_pty(workspace, "term-1")  # idempotent: unknown session is a no-op
+
+
+async def test_file_modes_reach_execd_as_octal_digits() -> None:
+    """execd parses ``mode`` as octal digits (``ParseUint(..., 8)``): ``755`` means rwxr-xr-x.
+    Sending the decimal value of 0o755 (493) is rejected live with "invalid syntax"."""
+    runtime = opensandbox_runtime_with(exec_handler=None)
+    fs = await runtime.fs(make_workspace("sandbox-1", runtime="opensandbox"))
+    await fs.create_folder("/workspace/dir", "755")
+    await fs.upload_file(b"x", "/workspace/dir/a.txt")
+    await fs.set_file_permissions("/workspace/dir/a.txt", mode="600")
+
+    modes = fs._sandbox.files._store.modes
+    assert modes["/workspace/dir"] == 755
+    assert modes["/workspace/dir/a.txt"] == 600
+

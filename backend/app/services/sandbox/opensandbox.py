@@ -106,6 +106,14 @@ def map_opensandbox_error(error: Exception) -> SandboxRuntimeError:
     return SandboxRuntimeError(f"OpenSandbox operation failed ({type(error).__name__})")
 
 
+def _execd_mode(mode: str) -> int:
+    """``"755"`` -> ``755``: execd reads ``mode`` as octal *digits* (``ParseUint(s, 8, 32)``), so
+    the SDK must send the digits as written, not their value (``int("755", 8)`` is 493, which
+    execd rejects as invalid octal). ``int(mode, 8)`` still validates the input is octal."""
+    int(mode, 8)
+    return int(mode)
+
+
 def _build_connection_config(settings: Settings) -> ConnectionConfig:
     """A ``ConnectionConfig`` from ``OPENSANDBOX_API_URL`` / ``OPENSANDBOX_API_KEY``."""
     url = (settings.opensandbox_api_url or "").strip().rstrip("/")
@@ -232,7 +240,9 @@ class OpenSandboxFileSystem:
 
     async def create_folder(self, path: str, mode: str) -> None:
         try:
-            await self._sandbox.files.create_directories([WriteEntry(path=path, mode=int(mode, 8))])
+            await self._sandbox.files.create_directories(
+                [WriteEntry(path=path, mode=_execd_mode(mode))]
+            )
         except Exception as error:
             raise map_opensandbox_error(error) from error
 
@@ -290,7 +300,7 @@ class OpenSandboxFileSystem:
     async def set_file_permissions(self, path: str, *, mode: str) -> None:
         try:
             await self._sandbox.files.set_permissions(
-                [SetPermissionEntry(path=path, mode=int(mode, 8))]
+                [SetPermissionEntry(path=path, mode=_execd_mode(mode))]
             )
         except Exception as error:
             raise map_opensandbox_error(error) from error
