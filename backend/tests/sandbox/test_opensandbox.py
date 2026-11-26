@@ -187,3 +187,19 @@ async def test_relative_paths_resolve_against_the_sandbox_home() -> None:
     await runtime.exec(workspace, "true", cwd="/srv")
     cwds = [opts.working_directory for _cmd, opts, _h in fs._sandbox.commands.run_calls]
     assert cwds == [f"{home}/workspace", f"{home}/workspace/sub", "/srv"]
+
+
+async def test_file_info_finds_a_relative_path() -> None:
+    """The SDK answers ``get_file_info`` keyed by the absolute path it was asked about; looking
+    the result up by the caller's relative path reported every relative path as missing --
+    found live when Spec Kit's commit could not see ``workspace/.git``."""
+    runtime = opensandbox_runtime_with(exec_handler=None)
+    workspace = make_workspace("sandbox-1", runtime="opensandbox")
+    workspace.workspace_path = "workspace"
+    fs = await runtime.fs(workspace)
+    await fs.create_folder("workspace/.git", "755")
+
+    info = await fs.get_file_info("workspace/.git")
+    assert info is not None
+    with pytest.raises(FileNotFoundError):
+        await fs.get_file_info("workspace/missing")

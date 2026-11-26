@@ -226,11 +226,13 @@ class OpenSandboxFileSystem:
         return [_translate_entry(entry) for entry in entries]
 
     async def get_file_info(self, path: str) -> Any:
+        absolute = self._abs(path)
         try:
-            infos = await self._sandbox.files.get_file_info([self._abs(path)])
+            infos = await self._sandbox.files.get_file_info([absolute])
         except Exception as error:
             raise map_opensandbox_error(error) from error
-        info = infos.get(path)
+        # The SDK keys its answer by the path it was asked about: the absolute one.
+        info = infos.get(absolute)
         if info is None:
             raise FileNotFoundError(path)
         return _translate_entry(info)
