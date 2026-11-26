@@ -1270,3 +1270,47 @@ async def test_rerunning_implement_also_closes_a_linked_run_still_in_flight(db_s
 
     async with session_maker() as s:
         assert (await s.get(VerificationRun, running.id)).status == "rejected"
+
+
+class InitRuntime(FakeRuntime):
+    """FakeRuntime whose HEAD may or may not hold the Spec Kit scaffold."""
+
+    def __init__(self, existing, *, committed):
+        super().__init__(existing)
+        self.committed = committed
+
+    async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
+        if command.startswith("git cat-file -e "):
+            self.calls.append((command, cwd))
+            code = 0 if self.committed else 1
+            return type("R", (), {"exit_code": code, "stdout": "", "stderr": ""})()
+        return await super().exec(workspace, command, cwd=cwd, env=env, timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    ("existing", "committed", "expect_init"),
+    [
+        ((".git",), False, True),  # fresh repo
+        ((".git", ".specify"), False, True),  # earlier init/commit failed mid-way
+        ((".git", ".specify"), True, False),  # scaffold already committed
+    ],
+)
+async def test_ensure_initialized_commits_until_scaffold_is_in_head(
+    db_session, monkeypatch, existing, committed, expect_init
+):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"{uuid4()}@example.com")
+    runtime = InitRuntime(existing, committed=committed)
+    commits: list[str] = []
+
+    async def fake_commit(self, workspace_id, owner_id, message, **kwargs):
+        commits.append(message)
+
+    monkeypatch.setattr("app.services.speckit.RepositoryService.commit", fake_commit)
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+
+    await service.ensure_initialized(workspace.id, user.id)
+
+    init_ran = any(cmd.startswith("specify init") for cmd, _ in runtime.calls)
+    assert init_ran is expect_init
+    assert commits == (["chore: initialize Spec Kit (SDD)"] if expect_init else [])
