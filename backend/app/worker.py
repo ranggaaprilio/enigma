@@ -22,7 +22,7 @@ from app.core.lifecycle import lifecycle
 from app.core.logging import configure_logging
 from app.core.tracing import configure_tracing, run_span, shutdown_tracing
 from app.db.session import async_session_maker, engine
-from app.models import AgentRun, CommandRun, SpecPhase, SpecWorkflow
+from app.models import AgentRun, CommandRun, SpecPhase, SpecWorkflow, VerificationRun
 from app.services.agents import ACTIVE_RUN_STATUSES, AgentService, agent_runtime
 from app.services.commands import CommandService, command_runtime
 from app.services.jobs import (
@@ -31,6 +31,7 @@ from app.services.jobs import (
     DEAD_LETTER,
     JOB_TIMEOUT,
     SPEC_FINALIZE_JOB,
+    VERIFICATION_RUN_JOB,
     WORKER_ERROR,
     WORKER_LOST,
     ArqDispatcher,
@@ -50,6 +51,12 @@ from app.services.speckit import (
     _TERMINAL_RUN_STATUSES,
     PHASE_FINALIZE_TIMEOUT_SECONDS,
     SpecKitService,
+)
+from app.services.verification.execution import build_orchestrator
+from app.services.verification.orchestrator import (
+    Step,
+    VerificationRunAlreadyActiveError,
+    VerificationRunNotFoundError,
 )
 from app.worker_metrics import run_redis_probe, start_if_possible
 
@@ -344,6 +351,53 @@ async def finalize_spec_phase_job(ctx: dict[str, Any], phase_id: str, run_id: st
     return await _status(session_maker, SpecPhase, phase_uuid) or "stale"
 
 
+# The API caps ``max_iterations`` at this (``VerificationRunCreateRequest``).
+VERIFICATION_MAX_ITERATIONS = 20
+
+
+def verification_max_tries(settings: Settings) -> int:
+    """Enough deferred polls for every fix attempt to run to the agent run timeout."""
+    waiting = VERIFICATION_MAX_ITERATIONS * settings.agent_run_timeout_seconds
+    return math.ceil(waiting / settings.verification_poll_seconds) + 1 + FINALIZE_RETRY_SLACK
+
+
+async def run_verification_job(ctx: dict[str, Any], run_id: str) -> str:
+    """Advance a verification run until it is parked at the gate or must wait.
+
+    While its fix agent run is in progress the job re-queues itself (``Retry``) instead of
+    sleeping, so a verification run never holds a worker slot that its own agent run may need.
+    Replays are harmless: every step is a conditional UPDATE on the persisted state.
+    """
+    settings: Settings = ctx["settings"]
+    job_try: int = ctx.get("job_try", 1)
+    orchestrator = build_orchestrator(
+        settings, session_maker=ctx["session_maker"], runtime=ctx.get("sandbox_runtime")
+    )
+    run_uuid = UUID(run_id)
+    try:
+        while (step := await orchestrator.advance(run_uuid)) is not Step.DONE:
+            if step is Step.WAIT:
+                if job_try >= verification_max_tries(settings):
+                    await orchestrator.fail(run_uuid)
+                    return "error"
+                raise Retry(defer=settings.verification_poll_seconds)
+    except VerificationRunNotFoundError:
+        return "stale"
+    except VerificationRunAlreadyActiveError:
+        await orchestrator.fail(run_uuid)
+        return "error"
+    except Retry:
+        raise
+    except Exception:
+        # Retrying would only replay the failure. End the run so it never holds the
+        # workspace's guard: ``advance`` does that for a failing step, but not for one that
+        # failed before it (entering the loop, reading the row).
+        logger.exception("verification_job_failed", run_id=run_id)
+        await orchestrator.fail(run_uuid)
+        return "error"
+    return await _status(ctx["session_maker"], VerificationRun, run_uuid) or "stale"
+
+
 # --- worker process -----------------------------------------------------------------------
 
 
@@ -428,6 +482,15 @@ class WorkerSettings:
             finalize_spec_phase_job,
             name=SPEC_FINALIZE_JOB,
             max_tries=spec_finalize_max_tries(_settings),
+            keep_result=0,
+        ),
+        func(
+            run_verification_job,
+            name=VERIFICATION_RUN_JOB,
+            max_tries=verification_max_tries(_settings),
+            # One attempt runs the tests and observes; waiting on a fix agent run is a deferred
+            # retry, never part of an attempt.
+            timeout=_settings.worker_job_timeout_seconds,
             keep_result=0,
         ),
     ]

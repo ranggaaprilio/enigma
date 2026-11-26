@@ -1,6 +1,7 @@
 """Close out runs whose owning process is gone.
 
-Agent runs, command runs and Spec Kit phase finalizers are driven by in-process asyncio tasks.
+Agent runs, command runs, Spec Kit phase finalizers and (inline) verification runs are driven by
+in-process asyncio tasks.
 When the process dies (crash, deploy, OOM) their rows stay in an active status forever, and the
 per-workspace guard in ``AgentService.create_run`` then blocks every new agent run in that
 workspace. This sweep marks them ``error`` with ``error_reason = "interrupted_by_restart"``.
@@ -26,9 +27,10 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models import AgentEvent, AgentRun, CommandRun, SpecPhase, SpecWorkflow
+from app.models import AgentEvent, AgentRun, CommandRun, SpecPhase, SpecWorkflow, VerificationRun
 from app.services.agents import ACTIVE_RUN_STATUSES, AgentRuntime, agent_runtime, event_payload
 from app.services.commands import CommandRuntime, command_runtime, command_status_frame
+from app.services.verification.orchestrator import ACTIVE_STATUSES as VERIFICATION_ACTIVE
 
 logger = structlog.get_logger(__name__)
 
@@ -41,10 +43,16 @@ class ReconciliationResult:
     agent_run_ids: list[UUID] = field(default_factory=list)
     command_run_ids: list[UUID] = field(default_factory=list)
     spec_phase_ids: list[UUID] = field(default_factory=list)
+    verification_run_ids: list[UUID] = field(default_factory=list)
 
     @property
     def total(self) -> int:
-        return len(self.agent_run_ids) + len(self.command_run_ids) + len(self.spec_phase_ids)
+        return (
+            len(self.agent_run_ids)
+            + len(self.command_run_ids)
+            + len(self.spec_phase_ids)
+            + len(self.verification_run_ids)
+        )
 
 
 async def reconcile_interrupted_runs(
@@ -66,15 +74,21 @@ async def reconcile_interrupted_runs(
         agent_query = select(AgentRun).where(AgentRun.status.in_(ACTIVE_RUN_STATUSES))
         command_query = select(CommandRun).where(CommandRun.status == "running")
         phase_query = select(SpecPhase).where(SpecPhase.status == "running")
+        verification_query = select(VerificationRun).where(
+            VerificationRun.status.in_(VERIFICATION_ACTIVE)
+        )
         if run_ids is not None:
             ids = list(run_ids)
             agent_query = agent_query.where(AgentRun.id.in_(ids))
             command_query = command_query.where(CommandRun.id.in_(ids))
             phase_query = phase_query.where(SpecPhase.id.in_(ids))
+            verification_query = verification_query.where(VerificationRun.id.in_(ids))
         if worker_id is not None:
             agent_query = agent_query.where(AgentRun.worker_id == worker_id)
             command_query = command_query.where(CommandRun.worker_id == worker_id)
             phase_query = phase_query.where(False)
+            # In queue mode a verification run's job resumes it from the row after a restart.
+            verification_query = verification_query.where(False)
 
         agent_runs = (await session.execute(agent_query.with_for_update())).scalars().all()
         for run in agent_runs:
@@ -124,6 +138,15 @@ async def reconcile_interrupted_runs(
         for workflow in workflows:
             workflow.status = "error"
 
+        # Inline verification runs are driven by an in-process task: with the process gone
+        # nothing advances them, and an active one holds the workspace's verification guard.
+        verification_runs = (
+            (await session.execute(verification_query.with_for_update())).scalars().all()
+        )
+        for verification_run in verification_runs:
+            verification_run.status = "error"
+            result.verification_run_ids.append(verification_run.id)
+
         await session.flush()
         for event in events:
             await session.refresh(event)
@@ -148,5 +171,6 @@ async def reconcile_interrupted_runs(
             command_runs=len(result.command_run_ids),
             spec_phases=len(result.spec_phase_ids),
             spec_workflows=len(workflows),
+            verification_runs=len(result.verification_run_ids),
         )
     return result

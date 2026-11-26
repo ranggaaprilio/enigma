@@ -82,3 +82,55 @@ async def test_verification_run_and_evidence_round_trip(maker) -> None:
             assert run.evidence[0].detail == {"exit_code": 0}
     finally:
         await _cleanup(maker, workspace)
+
+
+async def test_verification_run_persists_loop_state(maker) -> None:
+    """Plan 2 Task 1: criteria, author, iteration and the fix agent run survive a round trip,
+    so a run can be resumed by another process."""
+    workspace = await _workspace(maker)
+    try:
+        criteria = {"test_command": "pytest -q", "observe_port": 5173, "max_iterations": 3}
+        async with maker() as session:
+            run = VerificationRun(
+                workspace_id=workspace.id,
+                plan_ref="spec:1",
+                status="fixing",
+                criteria=criteria,
+                created_by=workspace.owner_id,
+                iteration=2,
+            )
+            run.evidence.append(
+                VerificationEvidence(
+                    kind="fix", status="passed", detail={"agent_status": "completed"}
+                )
+            )
+            session.add(run)
+            await session.commit()
+            run_id = run.id
+
+        async with maker() as session:
+            loaded = await session.get(VerificationRun, run_id)
+            assert loaded.status == "fixing"
+            assert loaded.criteria == criteria
+            assert loaded.created_by == workspace.owner_id
+            assert loaded.iteration == 2
+            assert loaded.agent_run_id is None
+    finally:
+        await _cleanup(maker, workspace)
+
+
+async def test_verification_run_defaults_for_loop_state(maker) -> None:
+    workspace = await _workspace(maker)
+    try:
+        async with maker() as session:
+            run = VerificationRun(workspace_id=workspace.id, plan_ref="spec:1", status="planning")
+            session.add(run)
+            await session.commit()
+            run_id = run.id
+        async with maker() as session:
+            loaded = await session.get(VerificationRun, run_id)
+            assert loaded.criteria == {}
+            assert loaded.iteration == 0
+            assert loaded.created_by is None
+    finally:
+        await _cleanup(maker, workspace)

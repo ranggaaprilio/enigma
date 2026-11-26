@@ -2,12 +2,11 @@
 
 Prefix: ``/workspaces/{workspace_id}/verification``.
 
-The trigger endpoint runs the whole ``test -> observe -> iterate -> review`` loop
-synchronously in the request (inline mode; there is no queue/worker path for
-verification runs yet). A run is created at ``planning`` and returned at
-``review`` — or ``error`` if a non-provider exception escaped the loop (the
-orchestrator guarantees the run lands in a terminal state before re-raising).
-The gate endpoints finalize a ``review`` run to ``approved``/``rejected``.
+The trigger endpoint persists the run at ``planning`` (with its criteria and author) and
+returns 202; the ``test -> (fix -> test)* -> observe -> review`` loop then runs off-request
+(``services/verification/execution.py``: an in-process task inline, a worker job in queue
+mode). Clients poll ``GET /runs/{id}``. The gate endpoints finalize a ``review`` run to
+``approved``/``rejected``.
 """
 
 from __future__ import annotations
@@ -19,6 +18,8 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
+from app.core.config import get_settings
+from app.core.lifecycle import lifecycle
 from app.db.session import get_db_session
 from app.models import User, VerificationEvidence, VerificationRun
 from app.schemas.verification import (
@@ -28,6 +29,7 @@ from app.schemas.verification import (
     VerificationRunResponse,
 )
 from app.services.access import WorkspaceAccessDeniedError, require_workspace_access
+from app.services.verification.execution import build_orchestrator, start_verification_run
 from app.services.verification.orchestrator import (
     PlanCriteria,
     VerificationOrchestrator,
@@ -63,7 +65,7 @@ def _run_response(run: VerificationRun) -> VerificationRunResponse:
 @router.post(
     "/runs",
     response_model=VerificationRunDetailResponse,
-    status_code=status.HTTP_201_CREATED,
+    status_code=status.HTTP_202_ACCEPTED,
 )
 async def create_verification_run(
     workspace_id: UUID,
@@ -71,6 +73,7 @@ async def create_verification_run(
     current_user: User = CURRENT_USER_DEP,
     session: AsyncSession = DB_SESSION_DEP,
 ) -> VerificationRunDetailResponse:
+    lifecycle.ensure_accepting_work()
     await _get_workspace(session, workspace_id, current_user)
 
     criteria = PlanCriteria(
@@ -80,41 +83,23 @@ async def create_verification_run(
         timeout=payload.timeout,
         max_iterations=payload.max_iterations,
     )
-    orch = VerificationOrchestrator(criteria)
+    settings = get_settings()
+    orch = build_orchestrator(settings)
     try:
-        run = await orch.create_run(workspace_id, payload.plan_ref)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create verification run",
-        ) from None
-
-    # Drive the loop inline; the orchestrator parks the run at review (or error).
-    try:
-        workspace, _ = await _get_workspace(session, workspace_id, current_user)
-        final = await orch.run(workspace, run.id)
+        run = await orch.create_run(
+            workspace_id, payload.plan_ref, criteria=criteria, created_by=current_user.id
+        )
     except VerificationRunAlreadyActiveError:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Workspace already has an active verification run",
         ) from None
-    except (VerificationRunNotFoundError, VerificationRunNotInWorkspaceError):
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Verification run not found"
-        ) from None
 
-    async with orch.session_maker() as s:
-        final = await s.get(VerificationRun, final.id)
-        evidence = (
-            await s.scalars(
-                select(VerificationEvidence)
-                .where(VerificationEvidence.run_id == final.id)
-                .order_by(VerificationEvidence.created_at)
-            )
-        ).all()
+    # Off-request from here: an in-process task (inline) or a worker job (queue). A queue
+    # failure ends the run and surfaces as 503 via the global RunQueueUnavailableError handler.
+    await start_verification_run(run.id, settings)
     return VerificationRunDetailResponse(
-        **VerificationRunResponse.model_validate(final).model_dump(),
-        evidence=[VerificationEvidenceResponse.model_validate(e) for e in evidence],
+        **VerificationRunResponse.model_validate(run).model_dump(), evidence=[]
     )
 
 

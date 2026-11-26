@@ -25,6 +25,7 @@ from app.core.lifecycle import RETRY_AFTER_SECONDS
 AGENT_RUN_JOB = "run_agent_job"
 COMMAND_RUN_JOB = "run_command_job"
 SPEC_FINALIZE_JOB = "finalize_spec_phase_job"
+VERIFICATION_RUN_JOB = "run_verification_job"
 
 # Stable `error_reason` codes for runs the queue path ends.
 ENQUEUE_FAILED = "enqueue_failed"
@@ -41,6 +42,10 @@ def agent_run_job_id(run_id: UUID) -> str:
 
 def command_run_job_id(run_id: UUID) -> str:
     return f"command_run:{run_id}"
+
+
+def verification_run_job_id(run_id: UUID) -> str:
+    return f"verification_run:{run_id}"
 
 
 async def job_is_known(redis: ArqRedis, queue_name: str, job_id: str) -> bool:
@@ -73,6 +78,8 @@ class RunDispatcher(Protocol):
     async def enqueue_command_run(self, run_id: UUID) -> None: ...
 
     async def enqueue_spec_finalize(self, phase_id: UUID, run_id: UUID) -> None: ...
+
+    async def enqueue_verification_run(self, run_id: UUID) -> None: ...
 
 
 def arq_redis_settings(settings: Settings) -> RedisSettings:
@@ -116,6 +123,11 @@ class ArqDispatcher:
             str(phase_id),
             str(run_id),
             job_id=f"spec_finalize:{phase_id}:{run_id}",
+        )
+
+    async def enqueue_verification_run(self, run_id: UUID) -> None:
+        await self._enqueue(
+            VERIFICATION_RUN_JOB, str(run_id), job_id=verification_run_job_id(run_id)
         )
 
     async def aclose(self) -> None:

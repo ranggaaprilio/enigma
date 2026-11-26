@@ -101,12 +101,23 @@ async def test_run_tests_maps_exit_codes(maker) -> None:
 
             assert passed.kind == "test"
             assert passed.status == "passed"
-            assert passed.detail == {"exit_code": 0, "command": "echo hi"}
+            assert passed.detail == {
+                "exit_code": 0,
+                "command": "echo hi",
+                "output": "ok",
+                "truncated": False,
+            }
             assert passed.run_id == run.id
 
             assert failed.kind == "test"
             assert failed.status == "failed"
-            assert failed.detail == {"exit_code": 3, "command": "fail"}
+            # stderr is kept too: providers differ on whether they merge it into stdout.
+            assert failed.detail == {
+                "exit_code": 3,
+                "command": "fail",
+                "output": "boom",
+                "truncated": False,
+            }
             assert failed.run_id == run.id
 
             # Both rows were persisted, not just returned.
@@ -145,5 +156,27 @@ async def test_run_tests_sandbox_error_maps_to_error(maker) -> None:
             assert ev.kind == "test"
             assert ev.status == "error"
             assert ev.detail == {"command": "pytest", "error": "sandbox vanished"}
+    finally:
+        await _cleanup(maker, workspace, user_id)
+
+
+async def test_run_tests_keeps_only_the_output_tail(maker) -> None:
+    """Plan 2 Task 2: the failure output is evidence for the fix agent and the human, but it
+    is stored in JSONB, so only the last OUTPUT_TAIL_CHARS are kept."""
+    from app.services.verification.test_runner import OUTPUT_TAIL_CHARS
+
+    workspace, run, user_id = await _seed(maker)
+    long_output = "x" * (OUTPUT_TAIL_CHARS + 100) + "LAST LINE"
+    runtime = FakeSandboxRuntime(
+        exec_handler=lambda _c: RuntimeCommandResult(exit_code=1, stdout=long_output, stderr="")
+    )
+    try:
+        async with maker() as session:
+            ev = await run_tests(workspace, run, "pytest", runtime=runtime, session=session)
+
+            assert ev.status == "failed"
+            assert ev.detail["truncated"] is True
+            assert len(ev.detail["output"]) == OUTPUT_TAIL_CHARS
+            assert ev.detail["output"].endswith("LAST LINE")
     finally:
         await _cleanup(maker, workspace, user_id)

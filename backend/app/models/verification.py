@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, String, Text, func
+from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -12,15 +12,16 @@ from app.db.base import Base
 VERIFICATION_RUN_STATUSES = (
     "planning",
     "testing",
+    "fixing",
     "observing",
     "review",
     "approved",
     "rejected",
     "error",
 )
-# What a piece of evidence is: an automated test result, a human/agent observation, or a
-# screenshot captured during the run.
-VERIFICATION_EVIDENCE_KINDS = ("test", "observation", "screenshot")
+# What a piece of evidence is: an automated test result, a human/agent observation, a
+# screenshot captured during the run, or an agent fix attempt between test iterations.
+VERIFICATION_EVIDENCE_KINDS = ("test", "observation", "screenshot", "fix")
 VERIFICATION_EVIDENCE_STATUSES = ("passed", "failed", "observation_failed", "error")
 
 
@@ -47,6 +48,19 @@ class VerificationRun(Base):
     )
     plan_ref: Mapped[str] = mapped_column(Text, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    # Persisted loop inputs (test_command, observe_port, cwd, timeout, max_iterations) so any
+    # process can resume the run from its row.
+    criteria: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    # Who triggered the run; the fix agent's runs are attributed (and budgeted) to them.
+    created_by: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
+    )
+    # Agent fix attempts made so far (bounded by criteria["max_iterations"] - 1).
+    iteration: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
+    # The agent run of the current/last fix attempt, if any.
+    agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

@@ -1,5 +1,5 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Check, Eye, FlaskConical, Loader2, Play, X } from "lucide-react";
+import { Check, Eye, FlaskConical, Loader2, Play, Wrench, X } from "lucide-react";
 
 import {
   approveVerificationRun,
@@ -14,7 +14,18 @@ import {
   type VerificationRunStatus,
   type WorkspaceResponse,
 } from "../lib/api";
+import { Link, useInRouterContext } from "react-router";
+
 import { usePermissions } from "../auth/permissions";
+
+/** Runs in these statuses are still moving; the panel polls the selected one. */
+const ACTIVE_STATUSES: ReadonlySet<VerificationRunStatus> = new Set([
+  "planning",
+  "testing",
+  "fixing",
+  "observing",
+]);
+const POLL_MS = 3_000;
 
 /** Human Evidence View: trigger a verification run, inspect the evidence it collected, and
  * approve or reject it at the human gate. */
@@ -54,6 +65,12 @@ export function VerificationPanel({ workspace }: { workspace: WorkspaceResponse 
   const loadDetail = useCallback(
     async (runId: string) => {
       const value = await getVerificationRun(workspace.id, runId);
+      // Keep the list's status in step with the detail.
+      setRuns((current) =>
+        (current ?? []).map((r) =>
+          r.id === value.id ? { ...r, status: value.status, updated_at: value.updated_at } : r,
+        ),
+      );
       // Ignore a response for a run that is no longer selected.
       if (selectedRef.current === value.id) setDetail(value);
     },
@@ -66,6 +83,23 @@ export function VerificationPanel({ workspace }: { workspace: WorkspaceResponse 
       setError(messageOf(err, "Unable to load verification run")),
     );
   }, [selectedId, detail?.id, loadDetail]);
+
+  // The loop runs server-side after the trigger returns: follow the selected run until it
+  // parks at the gate or ends.
+  const polledId = detail && ACTIVE_STATUSES.has(detail.status) ? detail.id : null;
+  // Bumped when a refresh fails, so a transient error does not stop the polling for good.
+  const [pollRetry, setPollRetry] = useState(0);
+  useEffect(() => {
+    if (!polledId) return;
+    const timer = window.setTimeout(() => {
+      loadDetail(polledId).catch((err: unknown) => {
+        setError(messageOf(err, "Unable to refresh verification run"));
+        setPollRetry((n) => n + 1);
+      });
+    }, POLL_MS);
+    return () => window.clearTimeout(timer);
+    // `detail` re-arms the timer after every refresh, even when nothing changed.
+  }, [polledId, detail, pollRetry, loadDetail]);
 
   function handleCreated(created: VerificationRunDetailResponse) {
     setRuns((current) => [created, ...(current ?? []).filter((r) => r.id !== created.id)]);
@@ -268,13 +302,8 @@ function TriggerForm({
         ) : (
           <Play className="h-4 w-4" aria-hidden="true" />
         )}
-        {busy ? "Running verification…" : "Run verification"}
+        {busy ? "Starting…" : "Run verification"}
       </button>
-      {busy && (
-        <p className="text-xs text-ink/60">
-          The run tests, observes and parks at review before returning; this can take a while.
-        </p>
-      )}
     </form>
   );
 }
@@ -380,9 +409,11 @@ function RunDetail({
 
 function EvidenceCard({ evidence }: { evidence: VerificationEvidenceResponse }) {
   const d = evidence.detail;
-  const Icon = evidence.kind === "test" ? FlaskConical : Eye;
+  const Icon = evidence.kind === "test" ? FlaskConical : evidence.kind === "fix" ? Wrench : Eye;
   const url = stringField(d, "url");
   const errorText = stringField(d, "error");
+  const output = stringField(d, "output");
+  const agentStatus = stringField(d, "agent_status");
 
   return (
     <article className="rounded-md border border-line p-3">
@@ -403,6 +434,7 @@ function EvidenceCard({ evidence }: { evidence: VerificationEvidenceResponse }) 
           </code>
         )}
         {typeof d.exit_code === "number" && <p>Exit code {d.exit_code}</p>}
+        {agentStatus && <AgentRunNote status={agentStatus} />}
         {typeof d.timeout === "number" && <p>Timeout {d.timeout}s</p>}
         {stringField(d, "description") && <p>{stringField(d, "description")}</p>}
         {url &&
@@ -419,14 +451,40 @@ function EvidenceCard({ evidence }: { evidence: VerificationEvidenceResponse }) 
           </p>
         )}
         {errorText && <p className="text-danger">{errorText}</p>}
+        {output && (
+          <details>
+            <summary className="cursor-pointer font-semibold">
+              {d.truncated === true ? "Output (tail)" : "Output"}
+            </summary>
+            <pre className="mt-1 max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-panel p-2 font-mono">
+              {output}
+            </pre>
+          </details>
+        )}
       </div>
     </article>
+  );
+}
+
+/** The fix agent's outcome, linking to the Agent view where its run can be inspected. */
+function AgentRunNote({ status }: { status: string }) {
+  const inRouter = useInRouterContext();
+  const label = `Agent run ${status}`;
+  if (!inRouter) return <p>{label}</p>;
+  return (
+    <p>
+      {label} ·{" "}
+      <Link to="../agents" relative="path" className="text-primary underline">
+        Open Agent
+      </Link>
+    </p>
   );
 }
 
 const RUN_TONE: Record<VerificationRunStatus, string> = {
   planning: "bg-line text-warn",
   testing: "bg-line text-warn",
+  fixing: "bg-line text-warn",
   observing: "bg-line text-warn",
   review: "bg-white text-primary ring-1 ring-primary/40",
   approved: "bg-line text-signal",

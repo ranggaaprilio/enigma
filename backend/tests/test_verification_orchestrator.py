@@ -277,3 +277,73 @@ async def test_orchestrator_marks_run_error_on_unexpected_exception(maker) -> No
         assert await _evidence(maker, run.id) == []  # crashed before any result
     finally:
         await _cleanup(maker, workspace, user_id)
+
+
+# --- Plan 2 Task 3: resumable, persisted-state driven loop ---------------------------------
+
+
+async def _seed_with_criteria(maker, status: str, criteria: dict):
+    workspace, run, user_id = await _seed(maker, status=status)
+    async with maker() as session:
+        row = await session.get(VerificationRun, run.id)
+        row.criteria = criteria
+        await session.commit()
+    return workspace, run, user_id
+
+
+async def test_advance_walks_one_step_at_a_time_from_persisted_criteria(maker) -> None:
+    from app.services.verification.orchestrator import Step
+
+    # The row's criteria win over the constructor's: any process can resume from the row.
+    workspace, run, user_id = await _seed_with_criteria(
+        maker, "planning", {"test_command": "fail", "max_iterations": 1}
+    )
+    runtime = FakeSandboxRuntime(exec_handler=_exit_handler)
+    orch = VerificationOrchestrator(PlanCriteria("ignored"), session_maker=maker, runtime=runtime)
+    try:
+        assert await orch.advance(run.id) is Step.CONTINUE
+        assert await _run_status(maker, run.id) == "testing"
+        assert await orch.advance(run.id) is Step.CONTINUE
+        assert await _run_status(maker, run.id) == "observing"
+        assert await orch.advance(run.id) is Step.DONE
+        assert await _run_status(maker, run.id) == "review"
+        # Replaying on a parked run is a no-op.
+        assert await orch.advance(run.id) is Step.DONE
+
+        [test_ev] = await _evidence(maker, run.id)
+        assert test_ev.detail["command"] == "fail"
+        assert test_ev.status == "failed"
+    finally:
+        await _cleanup(maker, workspace, user_id)
+
+
+async def test_drive_resumes_a_run_left_mid_loop(maker) -> None:
+    """A run another process left in ``testing`` (redelivered job) is resumed, not wedged."""
+    workspace, run, user_id = await _seed_with_criteria(
+        maker, "testing", {"test_command": "pytest", "max_iterations": 1}
+    )
+    runtime = FakeSandboxRuntime(exec_handler=_exit_handler)
+    orch = VerificationOrchestrator(PlanCriteria("ignored"), session_maker=maker, runtime=runtime)
+    try:
+        final = await orch.drive(run.id)
+
+        assert final.status == "review"
+        assert [ev.status for ev in await _evidence(maker, run.id)] == ["passed"]
+    finally:
+        await _cleanup(maker, workspace, user_id)
+
+
+async def test_advance_retests_without_a_fixer_and_counts_iterations(maker) -> None:
+    workspace, run, user_id = await _seed_with_criteria(
+        maker, "testing", {"test_command": "fail", "max_iterations": 3}
+    )
+    runtime = FakeSandboxRuntime(exec_handler=_exit_handler)
+    orch = VerificationOrchestrator(PlanCriteria("ignored"), session_maker=maker, runtime=runtime)
+    try:
+        final = await orch.drive(run.id)
+
+        assert final.status == "review"
+        assert final.iteration == 2  # two re-tests after the first attempt
+        assert len(await _evidence(maker, run.id)) == 3
+    finally:
+        await _cleanup(maker, workspace, user_id)
