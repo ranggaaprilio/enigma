@@ -15,6 +15,10 @@ serialisation for inline mode) plus a transaction-scoped Postgres advisory lock 
 guard check and the first status transition (cross-replica). Status transitions are always
 conditional UPDATEs, mirroring ``AgentService._transition``: a write that no longer matches
 returns ``False`` and must not publish. There is no module-level in-flight run state.
+
+Crash-safety: ``run`` enters ``testing`` only from ``planning``, and any non-provider
+exception escaping the loop moves the run to the terminal ``error`` status before it is
+re-raised, so the one-active guard can never wedge a workspace on a crash.
 """
 
 from __future__ import annotations
@@ -93,10 +97,14 @@ class VerificationOrchestrator:
     async def run(self, workspace: Workspace, run_id: UUID) -> VerificationRun:
         """Drive ``run_id`` through test -> observe -> review and return the final run.
 
-        Idempotent against a terminal run (already ``review``/``approved``/``rejected``/
-        ``error``): it is returned unchanged and no evidence is recorded. Raises
-        ``VerificationRunAlreadyActiveError`` when another run in the same workspace is still
-        active, and ``VerificationRunNotFoundError`` when ``run_id`` does not exist.
+        Idempotent against a run that already left ``planning`` (``testing``/``observing``/
+        ``review``/``approved``/``rejected``/``error``): it is returned unchanged and no
+        evidence is recorded. Raises ``VerificationRunAlreadyActiveError`` when another run in
+        the same workspace is still active, and ``VerificationRunNotFoundError`` when ``run_id``
+        does not exist.
+
+        A non-provider exception escaping the loop moves the run to ``error`` before it is
+        re-raised, so the one-active guard can never wedge a workspace on a crash.
         """
         criteria = self.plan_criteria
         lock_key = self._lock_key(workspace.id)
@@ -122,50 +130,58 @@ class VerificationOrchestrator:
                 )
                 if other is not None:
                     raise VerificationRunAlreadyActiveError(other)
-                if not await self._transition(
-                    session, run_id, "testing", ACTIVE_STATUSES
-                ):
-                    # Already terminal (e.g. a replayed call): nothing to drive.
+                if not await self._transition(session, run_id, "testing", ("planning",)):
+                    # Already active or terminal (e.g. a replayed call): nothing to drive.
                     await session.commit()
                     return await session.get(VerificationRun, run_id)
                 await session.commit()
 
-            # Iterate the test until it passes (bounded by max_iterations).
-            for _ in range(max(1, criteria.max_iterations)):
+            try:
+                # Iterate the test until it passes (bounded by max_iterations).
+                for _ in range(max(1, criteria.max_iterations)):
+                    async with self.session_maker() as session:
+                        run = await session.get(VerificationRun, run_id)
+                        evidence = await run_tests(
+                            workspace,
+                            run,
+                            criteria.test_command,
+                            cwd=criteria.cwd,
+                            timeout=criteria.timeout,
+                            runtime=self.runtime,
+                            session=session,
+                        )
+                        if evidence.status == "passed":
+                            break
+
+                # Observe after tests pass (best effort; a failure records evidence, not a raise).
                 async with self.session_maker() as session:
                     run = await session.get(VerificationRun, run_id)
-                    evidence = await run_tests(
-                        workspace,
-                        run,
-                        criteria.test_command,
-                        cwd=criteria.cwd,
-                        timeout=criteria.timeout,
-                        runtime=self.runtime,
-                        session=session,
-                    )
-                    if evidence.status == "passed":
-                        break
+                    await self._transition(session, run_id, "observing", ("testing",))
+                    await session.commit()
+                    if criteria.observe_port is not None:
+                        await observe(
+                            workspace,
+                            run,
+                            criteria.observe_port,
+                            runtime=self.runtime,
+                            session=session,
+                            transport=self.observe_transport,
+                        )
 
-            # Observe after the tests pass (best effort; a failure records evidence, not a raise).
-            async with self.session_maker() as session:
-                run = await session.get(VerificationRun, run_id)
-                await self._transition(session, run_id, "observing", ("testing",))
-                await session.commit()
-                if criteria.observe_port is not None:
-                    await observe(
-                        workspace,
-                        run,
-                        criteria.observe_port,
-                        runtime=self.runtime,
-                        session=session,
-                        transport=self.observe_transport,
-                    )
-
-            # Hand off to the human gate.
-            async with self.session_maker() as session:
-                await self._transition(session, run_id, "review", ("observing",))
-                await session.commit()
-                run = await session.get(VerificationRun, run_id)
+                # Hand off to the human gate.
+                async with self.session_maker() as session:
+                    await self._transition(session, run_id, "review", ("observing",))
+                    await session.commit()
+                    run = await session.get(VerificationRun, run_id)
+            except Exception:
+                # Crash-safety: a non-provider exception that escapes the loop (a DB blip, a
+                # dependency bug — anything the runner's SandboxRuntimeError/CommandTimeoutError
+                # and the observer's httpx handling do not absorb) must still land the run in a
+                # terminal state, or the one-active guard wedges the workspace forever.
+                async with self.session_maker() as session:
+                    await self._transition(session, run_id, "error", ACTIVE_STATUSES)
+                    await session.commit()
+                raise
 
         logger.info("verification_run_review", run_id=str(run_id), status=run.status)
         return run

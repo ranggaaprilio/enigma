@@ -235,3 +235,45 @@ async def test_orchestrator_run_on_terminal_run_is_a_no_op(maker) -> None:
         assert await _evidence(maker, run.id) == []  # no loop ran, no evidence
     finally:
         await _cleanup(maker, workspace, user_id)
+
+
+async def test_orchestrator_does_not_redrive_active_run(maker) -> None:
+    """An already-active run (``testing``) is not silently re-driven: the entry transition
+    only accepts ``planning``, so ``run`` is a no-op on a run that already left planning."""
+    workspace, run, user_id = await _seed(maker, status="testing")
+    runtime = FakeSandboxRuntime(exec_handler=_exit_handler)
+    orch = VerificationOrchestrator(
+        PlanCriteria("pytest"), session_maker=maker, runtime=runtime
+    )
+    try:
+        driven = await orch.run(workspace, run.id)
+
+        assert driven.status == "testing"  # unchanged — not re-driven
+        assert await _run_status(maker, run.id) == "testing"
+        assert await _evidence(maker, run.id) == []  # never entered the loop
+    finally:
+        await _cleanup(maker, workspace, user_id)
+
+
+async def test_orchestrator_marks_run_error_on_unexpected_exception(maker) -> None:
+    """A non-provider exception escaping the loop (a DB blip, a dependency bug — anything the
+    test runner's ``SandboxRuntimeError``/``CommandTimeoutError`` handling does not absorb)
+    must move the run to the terminal ``error`` status so the one-active guard cannot wedge
+    the workspace forever."""
+    workspace, run, user_id = await _seed(maker)
+
+    def raising_handler(command: str) -> RuntimeCommandResult:
+        raise RuntimeError("dependency bug")
+
+    runtime = FakeSandboxRuntime(exec_handler=raising_handler)
+    orch = VerificationOrchestrator(
+        PlanCriteria("pytest"), session_maker=maker, runtime=runtime
+    )
+    try:
+        with pytest.raises(RuntimeError, match="dependency bug"):
+            await orch.run(workspace, run.id)
+
+        assert await _run_status(maker, run.id) == "error"
+        assert await _evidence(maker, run.id) == []  # crashed before any result
+    finally:
+        await _cleanup(maker, workspace, user_id)
