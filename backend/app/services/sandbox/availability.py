@@ -28,17 +28,23 @@ from app.services.sandbox.base import SandboxRuntime
 
 logger = structlog.get_logger(__name__)
 
-PROVIDERS: tuple[str, ...] = ("daytona", "docker")
+PROVIDERS: tuple[str, ...] = ("daytona", "docker", "opensandbox")
 HEALTH_TIMEOUT_SECONDS = 3.0
 
 AvailabilityStatus = Literal["ok", "error", "unconfigured", "disabled"]
 
-PROVIDER_LABELS = {"daytona": "Daytona", "docker": "Local Docker"}
+PROVIDER_LABELS = {
+    "daytona": "Daytona",
+    "docker": "Local Docker",
+    "opensandbox": "OpenSandbox",
+}
 _REASONS = {
     ("daytona", "unconfigured"): "No Daytona API key is configured",
     ("daytona", "error"): "Daytona is not reachable",
     ("docker", "unconfigured"): "No Docker daemon is configured",
     ("docker", "error"): "The Docker daemon is not reachable",
+    ("opensandbox", "unconfigured"): "No OpenSandbox server is configured",
+    ("opensandbox", "error"): "The OpenSandbox server is not reachable",
 }
 DISABLED_REASON = "Not enabled on this deployment"
 
@@ -92,13 +98,14 @@ async def runtime_availability(provider: str) -> RuntimeAvailability:
 
 
 def warn_if_default_runtime_unconfigured(settings: Settings) -> None:
-    """At startup: say so when new workspaces will fall back to the other provider."""
+    """At startup: say so when new workspaces will fall back to another provider."""
     default = settings.sandbox_runtime_default
     if _runtime(default).configured:
         return
-    other = next(p for p in PROVIDERS if p != default)
-    if settings.runtime_allowed(other) and _runtime(other).configured:
-        logger.warning("sandbox_runtime_default_unconfigured", default=default, fallback=other)
+    for other in (p for p in PROVIDERS if p != default):
+        if settings.runtime_allowed(other) and _runtime(other).configured:
+            logger.warning("sandbox_runtime_default_unconfigured", default=default, fallback=other)
+            return
 
 
 def require_metrics_token_for_docker(settings: Settings) -> None:
@@ -164,12 +171,13 @@ async def choose_runtime(
     if found.available:
         _check_placement(default, settings)
         return default
-    other = next(p for p in PROVIDERS if p != default)
-    if not settings.runtime_allowed(other):
-        raise _refusal(found)
-    fallback = await availability(other)
-    if not fallback.available:
-        raise _refusal(found)
-    _check_placement(other, settings)
-    logger.warning("sandbox_runtime_default_fallback", default=default, chosen=other)
-    return other
+    for other in (p for p in PROVIDERS if p != default):
+        if not settings.runtime_allowed(other):
+            continue
+        fallback = await availability(other)
+        if not fallback.available:
+            continue
+        _check_placement(other, settings)
+        logger.warning("sandbox_runtime_default_fallback", default=default, chosen=other)
+        return other
+    raise _refusal(found)

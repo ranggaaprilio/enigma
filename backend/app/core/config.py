@@ -144,7 +144,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("sandbox_network_allow_list", "daytona_network_allow_list"),
     )
     # Provider for newly created workspaces ("daytona" | "docker"). Existing rows keep theirs.
-    sandbox_runtime_default: Literal["daytona", "docker"] = "daytona"
+    sandbox_runtime_default: Literal["daytona", "docker", "opensandbox"] = "daytona"
     # Providers users may pick for new workspaces (comma-separated); empty = every provider.
     # Existing workspaces keep running on theirs. Must include sandbox_runtime_default.
     sandbox_runtimes_allowed: str | list[str] = Field(default_factory=list)
@@ -381,7 +381,7 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def check_runtimes_allowed(self) -> "Settings":
-        unknown = sorted(set(self.sandbox_runtimes_allowed) - {"daytona", "docker"})
+        unknown = sorted(set(self.sandbox_runtimes_allowed) - {"daytona", "docker", "opensandbox"})
         if unknown:
             raise ValueError(f"sandbox_runtimes_allowed names unknown providers: {unknown}")
         if not self.runtime_allowed(self.sandbox_runtime_default):

@@ -95,9 +95,24 @@ def _settings(**values) -> Settings:
 
 
 async def test_an_explicit_available_runtime_is_used() -> None:
-    choose = _availability(daytona="ok", docker="ok")
+    choose = _availability(daytona="ok", docker="ok", opensandbox="ok")
     assert await choose_runtime("docker", _settings(), choose) == "docker"
     assert await choose_runtime("daytona", _settings(), choose) == "daytona"
+    assert await choose_runtime("opensandbox", _settings(), choose) == "opensandbox"
+
+
+async def test_opensandbox_unavailable_is_refused_not_swapped() -> None:
+    with pytest.raises(RuntimeChoiceError) as raised:
+        await choose_runtime(
+            "opensandbox", _settings(), _availability(daytona="ok", opensandbox="error")
+        )
+    assert raised.value.message == "OpenSandbox is not available: opensandbox error"
+
+
+async def test_no_choice_falls_back_to_opensandbox_when_default_and_docker_are_down() -> None:
+    """With three providers the fallback walks all the others, not just one."""
+    choose = _availability(docker="error", opensandbox="ok")  # no Daytona key
+    assert await choose_runtime(None, _settings(), choose) == "opensandbox"
 
 
 async def test_an_explicit_unavailable_runtime_is_refused_not_swapped() -> None:

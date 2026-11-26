@@ -1,11 +1,16 @@
 import type { HealthResponse, RuntimeName } from "./api";
 
-export const RUNTIMES: RuntimeName[] = ["daytona", "docker"];
+export const RUNTIMES: RuntimeName[] = ["daytona", "docker", "opensandbox"];
 
-const LABELS: Record<RuntimeName, string> = { daytona: "Daytona", docker: "Local Docker" };
+const LABELS: Record<RuntimeName, string> = {
+  daytona: "Daytona",
+  docker: "Local Docker",
+  opensandbox: "OpenSandbox",
+};
 const DESCRIPTIONS: Record<RuntimeName, string> = {
   daytona: "Cloud sandbox",
   docker: "Container on this server's Docker daemon",
+  opensandbox: "Sandbox managed by an OpenSandbox server",
 };
 
 /** The user-facing name of a sandbox provider (`Workspace.runtime`). */

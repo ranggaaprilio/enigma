@@ -1,4 +1,4 @@
-export type RuntimeName = "daytona" | "docker";
+export type RuntimeName = "daytona" | "docker" | "opensandbox";
 
 /** One sandbox provider on `/health`: never more than configured yes/no and a generic reason. */
 export type RuntimeHealth = {

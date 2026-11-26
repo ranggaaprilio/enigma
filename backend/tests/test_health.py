@@ -215,7 +215,7 @@ async def test_provider_probes_are_shared_for_a_few_seconds(probes, monkeypatch)
         status_code, _ = await _health()
         assert status_code == 200
 
-    assert sorted(calls) == ["daytona", "docker"]  # one probe per provider, not five
+    assert sorted(calls) == ["daytona", "docker", "opensandbox"]  # one probe per provider, not five
 
 
 async def test_a_disabled_provider_is_not_a_fault(probes):

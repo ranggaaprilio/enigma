@@ -16,7 +16,8 @@ function entry(status: RuntimeHealth["status"], reason: string | null = null): R
 function health(
   daytona: RuntimeHealth,
   docker: RuntimeHealth,
-  sandboxDefault: "daytona" | "docker" = "daytona",
+  sandboxDefault: "daytona" | "docker" | "opensandbox" = "daytona",
+  opensandbox: RuntimeHealth = entry("unconfigured"),
 ): HealthResponse {
   return {
     status: "ok",
@@ -24,7 +25,7 @@ function health(
     redis: "ok",
     daytona: daytona.status,
     sandbox_runtime_default: sandboxDefault,
-    runtimes: { daytona, docker },
+    runtimes: { daytona, docker, opensandbox },
   };
 }
 
@@ -32,16 +33,20 @@ describe("runtimeLabel", () => {
   it("names each provider and falls back for anything else", () => {
     expect(runtimeLabel("daytona")).toBe("Daytona");
     expect(runtimeLabel("docker")).toBe("Local Docker");
+    expect(runtimeLabel("opensandbox")).toBe("OpenSandbox");
     expect(runtimeLabel(undefined)).toBe("Sandbox");
   });
 });
 
 describe("runtimeOptions", () => {
-  it("offers both providers when both are available", () => {
-    const options = runtimeOptions(health(entry("ok"), entry("ok")));
+  it("offers every provider when all are available", () => {
+    const options = runtimeOptions(
+      health(entry("ok"), entry("ok"), "daytona", entry("ok")),
+    );
     expect(options.map((o) => [o.value, o.available, o.reason])).toEqual([
       ["daytona", true, null],
       ["docker", true, null],
+      ["opensandbox", true, null],
     ]);
   });
 
@@ -59,11 +64,18 @@ describe("runtimeOptions", () => {
 
   it("does not offer a provider the operator disabled", () => {
     const options = runtimeOptions(
-      health(entry("ok"), { ...entry("disabled", "Not enabled on this deployment"), configured: true }),
+      health(
+        entry("ok"),
+        { ...entry("disabled", "Not enabled on this deployment"), configured: true },
+        "daytona",
+        { ...entry("disabled", "Not enabled on this deployment"), configured: true },
+      ),
     );
     expect(options.map((o) => o.value)).toEqual(["daytona"]);
     expect(
-      defaultRuntime(health(entry("unconfigured"), entry("disabled"), "daytona")),
+      defaultRuntime(
+        health(entry("unconfigured"), entry("disabled"), "daytona", entry("disabled")),
+      ),
     ).toBeNull();
   });
 
