@@ -12,7 +12,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
@@ -77,6 +77,9 @@ class SpecWorkflow(Base):
     branch: Mapped[str] = mapped_column(String(220), nullable=False)
     spec_dir: Mapped[str] = mapped_column(String(255), nullable=False)
     worktree_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Verification criteria for the ``implement`` phase (test_command, observe_port,
+    # max_iterations). ``None``: fall back to the workspace's ``test`` command, or skip.
+    verification: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     current_phase: Mapped[str] = mapped_column(String(32), nullable=False, default="specify")
     created_at: Mapped[datetime] = mapped_column(

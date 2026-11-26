@@ -37,6 +37,7 @@ from app.services.verification.orchestrator import (
     VerificationRunNotFoundError,
     VerificationRunNotInWorkspaceError,
 )
+from app.services.verification.spec_link import approve_verification_run as approve_run
 from app.services.workspaces import WorkspaceNotFoundError
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/verification", tags=["verification"])
@@ -108,12 +109,15 @@ async def list_verification_runs(
     workspace_id: UUID,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
+    spec_workflow_id: UUID | None = Query(None),
     current_user: User = CURRENT_USER_DEP,
     session: AsyncSession = DB_SESSION_DEP,
 ) -> list[VerificationRunResponse]:
     await _get_workspace(session, workspace_id, current_user)
     orch = VerificationOrchestrator(PlanCriteria(test_command=""))
-    runs = await orch.list_runs(workspace_id, limit=limit, offset=offset)
+    runs = await orch.list_runs(
+        workspace_id, limit=limit, offset=offset, spec_workflow_id=spec_workflow_id
+    )
     return [_run_response(r) for r in runs]
 
 
@@ -155,9 +159,28 @@ async def get_verification_run(
 async def _finalize_gate(
     workspace_id: UUID, run_id: UUID, user: User, session: AsyncSession, approve: bool
 ) -> VerificationRunResponse:
-    await _get_workspace(session, workspace_id, user)
+    workspace, _role = await _get_workspace(session, workspace_id, user)
     orch = VerificationOrchestrator(PlanCriteria(test_command=""))
-    changed = await (orch.approve(run_id) if approve else orch.reject(run_id))
+    # Scope first: nothing is written for a run outside the workspace in the URL.
+    try:
+        run = await orch.get_run(workspace_id, run_id)
+    except (VerificationRunNotFoundError, VerificationRunNotInWorkspaceError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Verification run not found"
+        ) from None
+    # A Spec Kit-linked run gates the workflow, which only its owner may approve or reject
+    # (the same rule as approve_phase).
+    if run.spec_workflow_id is not None and workspace.owner_id != user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the workspace owner can review a Spec Kit verification",
+        )
+    # Approval also completes a linked Spec Kit workflow's implement phase (same transaction).
+    changed = await (
+        approve_run(orch.session_maker, run_id, user.id)
+        if approve
+        else orch.reject(run_id)
+    )
     if not changed:
         # Either the run does not exist, or it is no longer in review.
         try:

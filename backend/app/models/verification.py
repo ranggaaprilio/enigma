@@ -38,6 +38,7 @@ class VerificationRun(Base):
         ),
         Index("ix_verification_runs_workspace_id", "workspace_id"),
         Index("ix_verification_runs_status", "status"),
+        Index("ix_verification_runs_spec_workflow_id", "spec_workflow_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -60,6 +61,10 @@ class VerificationRun(Base):
     # The agent run of the current/last fix attempt, if any.
     agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
+    )
+    # The Spec Kit workflow whose ``implement`` phase this run verifies, if any.
+    spec_workflow_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("spec_workflows.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),

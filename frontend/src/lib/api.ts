@@ -2605,6 +2605,9 @@ export type SpecWorkflowResponse = {
   branch: string;
   spec_dir: string;
   worktree_path: string | null;
+  /** How `implement` is verified before the workflow completes; `null`: the workspace's `test`
+   * command if it has one, else no verification. */
+  verification?: SpecVerificationCriteria | null;
   status: SpecWorkflowStatus;
   current_phase: SpecPhaseName;
   created_at: string;
@@ -2642,9 +2645,16 @@ export type OpenQuestionsResponse = {
   items: OpenQuestion[];
 };
 
+export type SpecVerificationCriteria = {
+  test_command: string;
+  observe_port?: number | null;
+  max_iterations?: number;
+};
+
 export type SpecWorkflowCreatePayload = {
   feature_name: string;
   description: string;
+  verification?: SpecVerificationCriteria;
 };
 
 export function listSpecWorkflows(
@@ -2791,6 +2801,8 @@ export type VerificationRunResponse = {
   workspace_id: string;
   plan_ref: string;
   status: VerificationRunStatus;
+  /** The Spec Kit workflow whose `implement` phase this run verifies, if any. */
+  spec_workflow_id?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -2815,9 +2827,11 @@ function verificationRunsPath(workspaceId: string) {
 export function listVerificationRuns(
   workspaceId: string,
   limit = 20,
+  specWorkflowId?: string,
 ): Promise<VerificationRunResponse[]> {
+  const filter = specWorkflowId ? `&spec_workflow_id=${encodeURIComponent(specWorkflowId)}` : "";
   return requestJson<VerificationRunResponse[]>(
-    `${verificationRunsPath(workspaceId)}?limit=${limit}`,
+    `${verificationRunsPath(workspaceId)}?limit=${limit}${filter}`,
   );
 }
 
@@ -2848,6 +2862,17 @@ export function approveVerificationRun(
 ): Promise<VerificationRunResponse> {
   return requestJson<VerificationRunResponse>(
     `${verificationRunsPath(workspaceId)}/${runId}/approve`,
+    { method: "POST" },
+  );
+}
+
+/** (Re)starts verification of a workflow's `implement` phase while it awaits review (202). */
+export function verifySpecImplement(
+  workspaceId: string,
+  workflowId: string,
+): Promise<VerificationRunResponse> {
+  return requestJson<VerificationRunResponse>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/verify`,
     { method: "POST" },
   );
 }

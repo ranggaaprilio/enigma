@@ -44,6 +44,7 @@ class VerificationRunResponse(BaseModel):
     workspace_id: UUID
     plan_ref: str
     status: VerificationRunStatus
+    spec_workflow_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
 

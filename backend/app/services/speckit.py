@@ -27,7 +27,7 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
 from app.core.lifecycle import ServiceDrainingError, lifecycle
-from app.models import AgentRun, SpecPhase, SpecWorkflow, User, Workspace
+from app.models import AgentRun, SpecPhase, SpecWorkflow, User, VerificationRun, Workspace
 from app.services.agents import AgentService
 from app.services.audit import AuditLogService
 from app.services.jobs import (
@@ -45,6 +45,12 @@ from app.services.repositories import (
 )
 from app.services.runtime import run_registry
 from app.services.sandbox import SandboxRuntime, get_sandbox_runtime
+from app.services.verification.orchestrator import PlanCriteria, VerificationRunAlreadyActiveError
+from app.services.verification.spec_link import (
+    criteria_for_workflow,
+    start_spec_verification,
+    supersede_review_runs,
+)
 from app.services.workspaces import WorkspaceNotFoundError, WorkspaceSecretCipher
 
 logger = structlog.get_logger(__name__)
@@ -117,6 +123,18 @@ class InvalidSpecPhaseError(SpecKitError):
 
 class SpecPhaseNotReviewableError(SpecKitError):
     pass
+
+
+class SpecPhaseRequiresVerificationError(SpecKitError):
+    """``implement`` is approved through its verification evidence, not directly."""
+
+    def __init__(self) -> None:
+        super().__init__("Approve the implement phase by approving its verification run")
+
+
+class SpecVerificationNotConfiguredError(SpecKitError):
+    def __init__(self) -> None:
+        super().__init__("This workflow has no verification test command")
 
 
 class InvalidArtifactPathError(SpecKitError):
@@ -261,6 +279,8 @@ class SpecKitService:
         user_id: UUID,
         feature_name: str,
         description: str,
+        *,
+        verification: dict | None = None,
     ) -> SpecWorkflow:
         lifecycle.ensure_accepting_work()
         await self.ensure_initialized(workspace_id, user_id)
@@ -286,6 +306,7 @@ class SpecKitService:
             branch=slug,
             spec_dir=f"specs/{slug}",
             worktree_path=None,
+            verification=verification,
             status="pending",
             current_phase=first_phase,
         )
@@ -379,6 +400,9 @@ class SpecKitService:
         workflow.status = "running"
         workflow.current_phase = phase_name
         self.session.add_all([phase, workflow])
+        if phase_name == "implement":
+            # The code is about to change: evidence still awaiting review no longer applies.
+            await supersede_review_runs(self.session, workflow.id, include_active=True)
         await self.session.commit()
         await self.session.refresh(phase)
 
@@ -424,6 +448,11 @@ class SpecKitService:
         phase = await self._get_phase_row(workflow_id, phase_name)
         if phase.status != "awaiting_review":
             raise SpecPhaseNotReviewableError(phase_name)
+        if phase_name == "implement":
+            workspace = await self._get_workspace(workspace_id, user_id)
+            workflow = await self._get_workflow_row(workspace_id, workflow_id)
+            if await criteria_for_workflow(self.session, workspace, workflow) is not None:
+                raise SpecPhaseRequiresVerificationError
         phase.status = "approved"
         phase.reviewed_by = user_id
         phase.reviewed_at = datetime.now(UTC)
@@ -459,7 +488,7 @@ class SpecKitService:
         lifecycle.ensure_accepting_work()
         await self._get_workspace(workspace_id, user_id)
         await self._get_workflow_row(workspace_id, workflow_id)
-        phase = await self._get_phase_row(workflow_id, phase_name)
+        phase = await self._get_phase_row(workflow_id, phase_name, for_update=True)
         if phase.status != "awaiting_review":
             raise SpecPhaseNotReviewableError(phase_name)
         phase.status = "changes_requested"
@@ -959,6 +988,7 @@ class SpecKitService:
                     specify_phase is not None and specify_phase.status == "pending"
                 )
             ws_id = workflow.workspace_id
+            verify_criteria: PlanCriteria | None = None
 
             if auto_chain_specify:
                 phase.status = "completed"
@@ -975,11 +1005,23 @@ class SpecKitService:
                 else:
                     phase.status = "completed"
                     workflow.status = "running"
+            elif phase_name == "implement" and (
+                verify_criteria := await criteria_for_workflow(session, workspace, workflow)
+            ):
+                # Self-test before the workflow can complete: the evidence is the gate.
+                phase.status = "awaiting_review"
+                workflow.status = "awaiting_review"
             else:
                 phase.status = "completed"
                 workflow.status = "completed" if phase_name == "implement" else "running"
             session.add_all([phase, workflow])
             await session.commit()
+
+            if phase_name == "implement" and phase.status == "awaiting_review":
+                await self._start_implement_verification(
+                    session, workflow, phase, user_id, verify_criteria
+                )
+                return
 
             if phase.status == "awaiting_review":
                 await self._notify_and_audit(
@@ -1202,10 +1244,20 @@ class SpecKitService:
             raise SpecWorkflowNotFoundError
         return workflow
 
-    async def _get_phase_row(self, workflow_id: UUID, phase_name: str) -> SpecPhase:
+    async def _get_phase_row(
+        self, workflow_id: UUID, phase_name: str, *, for_update: bool = False
+    ) -> SpecPhase:
         if phase_name not in PHASE_PLANS:
             raise InvalidSpecPhaseError(phase_name)
-        phase = await self._load_phase(self.session, workflow_id, phase_name)
+        if for_update:
+            phase = await self.session.scalar(
+                select(SpecPhase)
+                .where(SpecPhase.workflow_id == workflow_id, SpecPhase.phase == phase_name)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            )
+        else:
+            phase = await self._load_phase(self.session, workflow_id, phase_name)
         if phase is None:
             raise SpecPhaseNotFoundError(phase_name)
         return phase
@@ -1221,6 +1273,82 @@ class SpecKitService:
             )
         )
         return result.scalar_one_or_none()
+
+    async def verify_implement(
+        self, workspace_id: UUID, workflow_id: UUID, user_id: UUID
+    ) -> VerificationRun:
+        """(Re)start the linked verification run for ``implement`` awaiting review."""
+        lifecycle.ensure_accepting_work()
+        workspace = await self._get_workspace(workspace_id, user_id)
+        workflow = await self._get_workflow_row(workspace_id, workflow_id)
+        phase = await self._get_phase_row(workflow_id, "implement")
+        if phase.status != "awaiting_review":
+            raise SpecPhaseNotReviewableError("implement")
+        criteria = await criteria_for_workflow(self.session, workspace, workflow)
+        if criteria is None:
+            raise SpecVerificationNotConfiguredError
+        return await start_spec_verification(
+            settings=self.settings,
+            session_maker=self.session_maker,
+            workflow=workflow,
+            user_id=user_id,
+            criteria=criteria,
+            runtime=self.runtime,
+            dispatcher=self._dispatcher,
+        )
+
+    async def _start_implement_verification(
+        self,
+        session: AsyncSession,
+        workflow: SpecWorkflow,
+        phase: SpecPhase,
+        user_id: UUID,
+        criteria: PlanCriteria,
+    ) -> None:
+        """Start the linked verification run; a refusal still leaves implement for review."""
+        try:
+            await start_spec_verification(
+                settings=self.settings,
+                session_maker=self.session_maker,
+                workflow=workflow,
+                user_id=user_id,
+                criteria=criteria,
+                runtime=self.runtime,
+                dispatcher=self._dispatcher,
+            )
+        except Exception as error:
+            # Never silent: implement is already parked for review, so tell the human why
+            # nothing is verifying it (they can re-run verification).
+            if isinstance(error, VerificationRunAlreadyActiveError):
+                reason = "another verification run is active in this workspace"
+            elif isinstance(error, RunQueueUnavailableError):
+                reason = "the run queue is unavailable"
+            else:
+                logger.exception(
+                    "spec_verification_start_failed", workflow_id=str(workflow.id)
+                )
+                reason = "it could not be started"
+            await self._notify_and_audit(
+                session,
+                workspace_id=workflow.workspace_id,
+                user_id=user_id,
+                action="spec_verification_not_started",
+                phase=phase,
+                notification_type="spec_verification_not_started",
+                title="Verification not started",
+                message=f"The implement phase was not verified: {reason}. Re-run verification.",
+            )
+            return
+        await self._notify_and_audit(
+            session,
+            workspace_id=workflow.workspace_id,
+            user_id=user_id,
+            action="spec_verification_started",
+            phase=phase,
+            notification_type="spec_phase_awaiting_review",
+            title="Implement is being verified",
+            message="The implement phase finished; its tests are running before review.",
+        )
 
     @staticmethod
     async def _notify_and_audit(

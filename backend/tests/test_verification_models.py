@@ -134,3 +134,65 @@ async def test_verification_run_defaults_for_loop_state(maker) -> None:
             assert loaded.created_by is None
     finally:
         await _cleanup(maker, workspace)
+
+
+async def test_verification_run_links_to_a_spec_workflow(maker) -> None:
+    """Plan 3 Task 1: a run started for a Spec Kit ``implement`` phase points at its workflow,
+    and the workflow carries its own verification criteria."""
+    from app.models import SpecWorkflow
+
+    workspace = await _workspace(maker)
+    try:
+        async with maker() as session:
+            workflow = SpecWorkflow(
+                workspace_id=workspace.id,
+                user_id=workspace.owner_id,
+                feature_name="Login",
+                feature_slug=f"login-{uuid4().hex[:6]}",
+                description="d",
+                branch="login",
+                spec_dir="specs/login",
+                worktree_path="worktrees/login",
+                verification={"test_command": "pytest -q", "max_iterations": 2},
+            )
+            session.add(workflow)
+            await session.flush()
+            run = VerificationRun(
+                workspace_id=workspace.id,
+                plan_ref="specs/login/plan.md",
+                status="planning",
+                spec_workflow_id=workflow.id,
+            )
+            session.add(run)
+            await session.commit()
+            run_id, workflow_id = run.id, workflow.id
+
+        async with maker() as session:
+            loaded = await session.get(VerificationRun, run_id)
+            assert loaded.spec_workflow_id == workflow_id
+            wf = await session.get(SpecWorkflow, workflow_id)
+            assert wf.verification == {"test_command": "pytest -q", "max_iterations": 2}
+    finally:
+        await _cleanup(maker, workspace)
+
+
+async def test_spec_workflow_verification_defaults_to_none(maker) -> None:
+    from app.models import SpecWorkflow
+
+    workspace = await _workspace(maker)
+    try:
+        async with maker() as session:
+            workflow = SpecWorkflow(
+                workspace_id=workspace.id,
+                user_id=workspace.owner_id,
+                feature_name="Plain",
+                feature_slug=f"plain-{uuid4().hex[:6]}",
+                description="d",
+                branch="plain",
+                spec_dir="specs/plain",
+            )
+            session.add(workflow)
+            await session.commit()
+            assert workflow.verification is None
+    finally:
+        await _cleanup(maker, workspace)
