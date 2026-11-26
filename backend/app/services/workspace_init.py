@@ -139,7 +139,10 @@ class WorkspaceInitializer:
         try:
             await fs.get_file_info(path)
         except Exception:
-            await fs.create_folder(path, "755")
+            try:
+                await fs.create_folder(path, "755")
+            except Exception as error:
+                raise WorkspaceInitializationError(f"Could not create {path}: {error}") from error
 
     @staticmethod
     async def _upload(fs: RuntimeFileSystem, content: str, remote_path: str) -> None:

@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Literal
 from uuid import UUID
 
+import structlog
 from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +16,8 @@ from app.services.sandbox.availability import Availability, choose_runtime
 from app.services.templates import TemplateService
 from app.services.utils import slugify
 from app.services.workspace_init import WorkspaceInitializationError, WorkspaceInitializer
+
+logger = structlog.get_logger(__name__)
 
 ENV_KEY_PATTERN = re.compile(r"^[A-Z_][A-Z0-9_]*$")
 SNAPSHOT_UNSET = object()
@@ -246,6 +249,26 @@ class SqlAlchemyWorkspaceService:
 
         return await self._provision(workspace, template)
 
+    async def _discard_new_sandbox(self, workspace: Workspace, previous: str | None) -> None:
+        """Remove a sandbox provisioned for an initialisation that then failed.
+
+        It is new (its id differs from the row's), so it holds nothing yet. The previous id is
+        always restored, so ``reprovision`` sees a new sandbox and seeds it: keeping this id
+        would make a provider that finds the same sandbox by name skip seeding and mark an
+        empty workspace ready. If the removal fails, the sandbox is logged for an operator
+        (the Docker upkeep also removes orphans).
+        """
+        try:
+            await self.runtime.delete(workspace)
+        except Exception:
+            logger.warning(
+                "workspace_init_sandbox_discard_failed",
+                workspace_id=str(workspace.id),
+                sandbox_id=workspace.sandbox_id,
+                exc_info=True,
+            )
+        workspace.sandbox_id = previous
+
     async def _mark_error(self, workspace: Workspace) -> None:
         workspace.status = "error"
         self.session.add(workspace)
@@ -282,8 +305,12 @@ class SqlAlchemyWorkspaceService:
                 await self.initializer.initialize_from_template(workspace, template)
             elif initialize and workspace.source == "blank":
                 await self.initializer.initialize_blank(workspace)
-        except WorkspaceInitializationError:
+        except Exception as error:
+            # Never leave the row `creating`, whatever failed.
+            await self._discard_new_sandbox(workspace, previous)
             await self._mark_error(workspace)
+            if isinstance(error, SandboxRuntimeError):
+                raise WorkspaceInitializationError(str(error)) from error
             raise
 
         workspace.status = "ready"

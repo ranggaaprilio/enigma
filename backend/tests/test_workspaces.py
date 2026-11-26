@@ -983,20 +983,30 @@ class _FakeCreateSession:
 
 
 class _FakeProvisionRuntime:
-    def __init__(self, runtime_settings):
+    def __init__(self, runtime_settings, *, delete_fails: bool = False):
         self.settings = runtime_settings
+        self.deleted: list[str | None] = []
+        self.delete_fails = delete_fails
 
     async def provision(self, workspace):
         return f"sandbox-{workspace.id}"
 
+    async def delete(self, workspace):
+        self.deleted.append(workspace.sandbox_id)
+        if self.delete_fails:
+            raise SandboxRuntimeError("daemon unreachable")
+
 
 class _RecordingInitializer:
-    def __init__(self, fail: bool = False) -> None:
+    def __init__(self, fail: bool = False, error: Exception | None = None) -> None:
         self.calls: list[str] = []
         self.fail = fail
+        self.error = error
 
     async def initialize_blank(self, workspace):
         self.calls.append("blank")
+        if self.error is not None:
+            raise self.error
         if self.fail:
             raise WorkspaceInitializationError("git init failed")
 
@@ -1040,6 +1050,85 @@ async def test_sqlalchemy_create_marks_error_when_initializer_fails():
         )
 
     assert session.added[-1].status == "error"
+
+
+async def test_a_failed_initialization_discards_the_new_sandbox():
+    """Found live on OpenSandbox: initialisation failed after the sandbox was provisioned, the
+    row stayed ``creating`` with no ``sandbox_id`` committed, and the sandbox kept running --
+    deleting the workspace then skipped it (no id), leaking it. The fresh sandbox holds nothing
+    yet, so it is discarded and the row ends ``error`` with no id: ``reprovision`` then starts
+    over with a new sandbox and seeds it."""
+    settings = Settings()
+    session = _FakeCreateSession()
+    runtime = _FakeProvisionRuntime(settings)
+    service = SqlAlchemyWorkspaceService(
+        session=session,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=runtime,  # type: ignore[arg-type]
+        # A raw runtime error from a step the initializer did not wrap.
+        initializer=_RecordingInitializer(error=SandboxRuntimeError("status 500")),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(WorkspaceInitializationError):
+        await service.create(
+            owner_id=uuid4(), name="Scratch", repo_url=None, default_branch="main", source="blank"
+        )
+
+    workspace = session.added[-1]
+    assert runtime.deleted == [f"sandbox-{workspace.id}"]
+    assert workspace.status == "error"
+    assert workspace.sandbox_id is None
+
+
+async def test_a_failed_discard_still_lets_reprovision_seed_the_workspace():
+    """If the discard fails, the previous id is restored anyway: keeping the new one would make
+    a provider that finds the same sandbox by name (Daytona, Docker) skip seeding on
+    ``reprovision`` and mark an empty workspace ready."""
+    settings = Settings()
+    session = _FakeCreateSession()
+    runtime = _FakeProvisionRuntime(settings, delete_fails=True)
+    initializer = _RecordingInitializer(fail=True)
+    service = SqlAlchemyWorkspaceService(
+        session=session,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=runtime,  # type: ignore[arg-type]
+        initializer=initializer,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(WorkspaceInitializationError):
+        await service.create(
+            owner_id=uuid4(), name="Scratch", repo_url=None, default_branch="main", source="blank"
+        )
+
+    workspace = session.added[-1]
+    assert workspace.status == "error"
+    assert workspace.sandbox_id is None
+
+    initializer.fail = False
+    reprovisioned = await service._provision(workspace, None)
+    assert reprovisioned.status == "ready"
+    assert initializer.calls == ["blank", "blank"]  # seeded on the retry
+
+
+async def test_an_unexpected_initializer_error_still_marks_the_workspace_error():
+    settings = Settings()
+    session = _FakeCreateSession()
+    runtime = _FakeProvisionRuntime(settings)
+    service = SqlAlchemyWorkspaceService(
+        session=session,  # type: ignore[arg-type]
+        cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
+        runtime=runtime,  # type: ignore[arg-type]
+        initializer=_RecordingInitializer(error=KeyError("surprise")),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(KeyError):
+        await service.create(
+            owner_id=uuid4(), name="Scratch", repo_url=None, default_branch="main", source="blank"
+        )
+
+    workspace = session.added[-1]
+    assert workspace.status == "error"  # never left `creating`
+    assert runtime.deleted == [f"sandbox-{workspace.id}"]
 
 
 def _availability(**statuses: str):
