@@ -59,6 +59,13 @@ logger = structlog.get_logger(__name__)
 # carry mise + code-server like the Daytona snapshot (see sandbox/Dockerfile).
 DEFAULT_IMAGE = "enigma-sandbox:latest"
 
+# Upper bound on ``find_files`` output kept in backend memory, and on how long the search may
+# run — the same bounds the Docker provider applies (``docker_fs.py``). The SDK accumulates
+# stdout into ``execution.logs`` by default, so a large tree would hold the whole match set in
+# memory; ``find_files`` streams with ``skip_accumulation`` and caps what it keeps.
+MAX_SEARCH_OUTPUT_BYTES = 8 * 1024 * 1024
+SEARCH_TIMEOUT_SECONDS = 60
+
 # OpenSandbox state -> the contract's four states.
 _STATUS = {
     "running": "ready",
@@ -241,17 +248,39 @@ class OpenSandboxFileSystem:
 
     async def find_files(self, path: str, pattern: str) -> Sequence[Any]:
         # A fixed-string content search, as Daytona's is — not the SDK's glob ``files.search``.
+        # Bounded like the Docker provider: a hard timeout, and stdout is streamed with
+        # ``skip_accumulation`` so the SDK never buffers the whole match set in memory; we keep
+        # only the first ``MAX_SEARCH_OUTPUT_BYTES`` and drop the record the cap cut.
         if "\n" in pattern:
             return []
         argv = ["grep", "-r", "-n", "-H", "-I", "-F", "--null", "-e", pattern, "--", path]
+        chunks: list[str] = []
+        kept = 0
+
+        async def on_stdout(message: Any) -> None:
+            nonlocal kept
+            if kept >= MAX_SEARCH_OUTPUT_BYTES:
+                return
+            text = message.text
+            remaining = MAX_SEARCH_OUTPUT_BYTES - kept
+            if len(text) > remaining:
+                text = text[:remaining]
+            chunks.append(text)
+            kept += len(text)
+
+        opts = RunCommandOpts(timeout=timedelta(seconds=SEARCH_TIMEOUT_SECONDS))
+        handlers = ExecutionHandlers(on_stdout=on_stdout, skip_accumulation=True)
         try:
-            execution = await self._sandbox.commands.run(argv)
+            execution = await self._sandbox.commands.run(argv, opts=opts, handlers=handlers)
         except Exception as error:
             raise map_opensandbox_error(error) from error
         exit_code = execution.exit_code if execution.exit_code is not None else 1
         if exit_code not in (0, 1):  # grep: 1 = no match, 2 = error
             raise SandboxRuntimeError("OpenSandbox file search failed")
-        return parse_grep_matches("".join(msg.text for msg in execution.logs.stdout))
+        output = "".join(chunks)
+        if len(output) >= MAX_SEARCH_OUTPUT_BYTES:
+            output = output[: output.rfind("\n") + 1]  # drop the record the cap cut
+        return parse_grep_matches(output)
 
     async def set_file_permissions(self, path: str, *, mode: str) -> None:
         try:
@@ -460,4 +489,6 @@ __all__ = [
     "parse_grep_matches",
     "OpenSandboxFileInfo",
     "OpenSandboxMatch",
+    "MAX_SEARCH_OUTPUT_BYTES",
+    "SEARCH_TIMEOUT_SECONDS",
 ]

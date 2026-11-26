@@ -7,6 +7,8 @@ The conformance suite proves the contract; these cover what is unique to the ada
 
 from __future__ import annotations
 
+from datetime import timedelta
+
 import pytest
 from opensandbox.exceptions import (
     SandboxApiException,
@@ -22,6 +24,7 @@ from app.services.sandbox.base import (
     SandboxRuntimeError,
 )
 from app.services.sandbox.opensandbox import (
+    SEARCH_TIMEOUT_SECONDS,
     OpenSandboxMatch,
     OpenSandboxRuntime,
     map_opensandbox_error,
@@ -70,6 +73,36 @@ async def test_find_files_is_content_search_not_glob() -> None:
     ]
     # A glob pattern matches nothing by filename: this is grep, not ``files.search``.
     assert await fs.find_files("/workspace", "*.txt") == []
+
+
+async def test_find_files_is_bounded_and_timeout_passed_through(monkeypatch) -> None:
+    runtime = opensandbox_runtime_with(exec_handler=None)
+    fs = await runtime.fs(make_workspace("sandbox-1", runtime="opensandbox"))
+    await fs.create_folder("/workspace/dir", "755")
+    await fs.upload_file(b"needle one\n", "/workspace/dir/a.txt")
+    await fs.upload_file(b"needle two\n", "/workspace/dir/b.txt")
+
+    assert [(m.file, m.line) for m in await fs.find_files("/workspace", "needle")] == [
+        ("/workspace/dir/a.txt", 1),
+        ("/workspace/dir/b.txt", 1),
+    ]
+
+    # The search is bounded: a timeout and ``skip_accumulation`` reach the SDK, so the command
+    # cannot run forever and its output is never buffered in ``execution.logs`` (unbounded on a
+    # large tree otherwise).
+    (command, opts, handlers), *_ = fs._sandbox.commands.run_calls
+    assert command[0] == "grep"
+    assert opts.timeout == timedelta(seconds=SEARCH_TIMEOUT_SECONDS)
+    assert handlers.skip_accumulation is True
+
+    # A match set larger than the cap is truncated, and the record the cap cut is dropped.
+    record = "/workspace/dir/a.txt\x001:needle\n"
+    monkeypatch.setattr(
+        "app.services.sandbox.opensandbox.MAX_SEARCH_OUTPUT_BYTES", len(record) + 5
+    )
+    assert [(m.file, m.line) for m in await fs.find_files("/workspace", "needle")] == [
+        ("/workspace/dir/a.txt", 1)
+    ]
 
 
 def test_parse_grep_matches() -> None:

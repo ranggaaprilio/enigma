@@ -1259,7 +1259,7 @@ class FakeOpenSandboxCommands:
         )
 
     async def run(self, command: Any, *, opts: Any = None, handlers: Any = None) -> Any:
-        self.run_calls.append(command)
+        self.run_calls.append((command, opts, handlers))
         if isinstance(command, list) and command and command[0] == "grep":
             return await self._grep(command, handlers)
         result = self._run_result(command)
@@ -1275,7 +1275,9 @@ class FakeOpenSandboxCommands:
         text = "".join(self._sandbox._store.grep(pattern, argv[-1]))
         if handlers is not None and text and getattr(handlers, "on_stdout", None):
             await handlers.on_stdout(SimpleNamespace(text=text))
-        return self._execution(0 if text else 1, text, "")
+        # ``skip_accumulation`` means the SDK never buffers stdout into the Execution logs.
+        skip = handlers is not None and getattr(handlers, "skip_accumulation", False)
+        return self._execution(0 if text else 1, "" if skip else text, "")
 
 
 class FakeOpenSandboxSandbox:
