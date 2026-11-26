@@ -15,6 +15,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from posixpath import basename
+from posixpath import join as posix_join
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -206,19 +207,27 @@ def _command_opts(
 class OpenSandboxFileSystem:
     """``RuntimeFileSystem`` over one SDK sandbox's ``files`` (method names differ — see above)."""
 
-    def __init__(self, sandbox: Sandbox) -> None:
+    def __init__(self, sandbox: Sandbox, home: str) -> None:
         self._sandbox = sandbox
+        self._home = home
+
+    def _abs(self, path: str) -> str:
+        """Relative paths resolve against the sandbox home, as Daytona's do (execd would
+        resolve them against ``/``)."""
+        return path if path.startswith("/") else posix_join(self._home, path)
 
     async def list_files(self, path: str) -> Sequence[Any]:
         try:
-            entries = await self._sandbox.files.list_directory(DirectoryListEntry(path=path))
+            entries = await self._sandbox.files.list_directory(
+                DirectoryListEntry(path=self._abs(path))
+            )
         except Exception as error:
             raise map_opensandbox_error(error) from error
         return [_translate_entry(entry) for entry in entries]
 
     async def get_file_info(self, path: str) -> Any:
         try:
-            infos = await self._sandbox.files.get_file_info([path])
+            infos = await self._sandbox.files.get_file_info([self._abs(path)])
         except Exception as error:
             raise map_opensandbox_error(error) from error
         info = infos.get(path)
@@ -228,36 +237,38 @@ class OpenSandboxFileSystem:
 
     async def download_file(self, path: str) -> bytes:
         try:
-            return await self._sandbox.files.read_bytes(path)
+            return await self._sandbox.files.read_bytes(self._abs(path))
         except Exception as error:
             raise map_opensandbox_error(error) from error
 
     async def upload_file(self, content: bytes, path: str) -> None:
         try:
-            await self._sandbox.files.write_files([WriteEntry(path=path, data=content)])
+            await self._sandbox.files.write_files([WriteEntry(path=self._abs(path), data=content)])
         except Exception as error:
             raise map_opensandbox_error(error) from error
 
     async def create_folder(self, path: str, mode: str) -> None:
         try:
             await self._sandbox.files.create_directories(
-                [WriteEntry(path=path, mode=_execd_mode(mode))]
+                [WriteEntry(path=self._abs(path), mode=_execd_mode(mode))]
             )
         except Exception as error:
             raise map_opensandbox_error(error) from error
 
     async def move_files(self, source: str, destination: str) -> None:
         try:
-            await self._sandbox.files.move_files([MoveEntry(src=source, dest=destination)])
+            await self._sandbox.files.move_files(
+                [MoveEntry(src=self._abs(source), dest=self._abs(destination))]
+            )
         except Exception as error:
             raise map_opensandbox_error(error) from error
 
     async def delete_file(self, path: str, recursive: bool = False) -> None:
         try:
             if recursive:
-                await self._sandbox.files.delete_directories([path])
+                await self._sandbox.files.delete_directories([self._abs(path)])
             else:
-                await self._sandbox.files.delete_files([path])
+                await self._sandbox.files.delete_files([self._abs(path)])
         except Exception as error:
             raise map_opensandbox_error(error) from error
 
@@ -268,7 +279,8 @@ class OpenSandboxFileSystem:
         # only the first ``MAX_SEARCH_OUTPUT_BYTES`` and drop the record the cap cut.
         if "\n" in pattern:
             return []
-        argv = ["grep", "-r", "-n", "-H", "-I", "-F", "--null", "-e", pattern, "--", path]
+        target = self._abs(path)
+        argv = ["grep", "-r", "-n", "-H", "-I", "-F", "--null", "-e", pattern, "--", target]
         chunks: list[str] = []
         kept = 0
 
@@ -300,7 +312,7 @@ class OpenSandboxFileSystem:
     async def set_file_permissions(self, path: str, *, mode: str) -> None:
         try:
             await self._sandbox.files.set_permissions(
-                [SetPermissionEntry(path=path, mode=_execd_mode(mode))]
+                [SetPermissionEntry(path=self._abs(path), mode=_execd_mode(mode))]
             )
         except Exception as error:
             raise map_opensandbox_error(error) from error
@@ -317,6 +329,14 @@ class OpenSandboxRuntime:
         # own id on POST /pty; this in-process mapping lets a reconnect resolve the same
         # execd session (and is discarded alongside the sandbox on restart).
         self._pty_sessions: dict[str, str] = {}
+
+    def _home(self) -> str:
+        return self.settings.sandbox_home.rstrip("/") or "/"
+
+    def _resolve_cwd(self, workspace: Workspace, cwd: str | None) -> str:
+        """``cwd`` (default: the workspace), relative to the sandbox home as on Daytona."""
+        path = cwd or workspace.workspace_path or ""
+        return path if path.startswith("/") else posix_join(self._home(), path)
 
     @property
     def configured(self) -> bool:
@@ -411,7 +431,7 @@ class OpenSandboxRuntime:
             raise map_opensandbox_error(error) from error
 
     async def fs(self, workspace: Workspace) -> OpenSandboxFileSystem:
-        return OpenSandboxFileSystem(await self._get_sandbox(workspace))
+        return OpenSandboxFileSystem(await self._get_sandbox(workspace), self._home())
 
     async def status(self, workspace: Workspace) -> str:
         if not workspace.sandbox_id:
@@ -456,7 +476,9 @@ class OpenSandboxRuntime:
     ) -> RuntimeCommandResult:
         sandbox = await self._get_sandbox(workspace)
         try:
-            execution = await sandbox.commands.run(command, opts=_command_opts(cwd, env, timeout))
+            execution = await sandbox.commands.run(
+                command, opts=_command_opts(self._resolve_cwd(workspace, cwd), env, timeout)
+            )
         except Exception as error:
             raise map_opensandbox_error(error) from error
         return RuntimeCommandResult(
@@ -489,7 +511,9 @@ class OpenSandboxRuntime:
         handlers = ExecutionHandlers(on_stdout=on_stdout_msg, on_stderr=on_stderr_msg)
         try:
             execution = await sandbox.commands.run(
-                command, opts=_command_opts(cwd, env, timeout), handlers=handlers
+                command,
+                opts=_command_opts(self._resolve_cwd(workspace, cwd), env, timeout),
+                handlers=handlers,
             )
         except Exception as error:
             raise map_opensandbox_error(error) from error
