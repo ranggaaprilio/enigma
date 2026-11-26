@@ -5,9 +5,9 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 VerificationRunStatus = Literal[
-    "planning", "testing", "observing", "review", "approved", "rejected", "error"
+    "planning", "testing", "fixing", "observing", "review", "approved", "rejected", "error"
 ]
-VerificationEvidenceKind = Literal["test", "observation", "screenshot"]
+VerificationEvidenceKind = Literal["test", "observation", "screenshot", "fix"]
 VerificationEvidenceStatus = Literal["passed", "failed", "observation_failed", "error"]
 
 

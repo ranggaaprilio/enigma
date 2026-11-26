@@ -22,6 +22,18 @@ logger = structlog.get_logger(__name__)
 
 TEST_KIND = "test"
 
+# Evidence keeps only the tail of a test command's output: it is what the fix agent and the
+# human reviewer need (failures are summarised last), and it is stored in JSONB.
+OUTPUT_TAIL_CHARS = 8 * 1024
+
+
+def _output_tail(stdout: str, stderr: str) -> tuple[str, bool]:
+    """Combine stdout and stderr (providers differ on merging them) and keep the tail."""
+    combined = "\n".join(part for part in (stdout, stderr) if part)
+    if len(combined) <= OUTPUT_TAIL_CHARS:
+        return combined, False
+    return combined[-OUTPUT_TAIL_CHARS:], True
+
 
 async def run_tests(
     workspace: Workspace,
@@ -58,7 +70,13 @@ async def run_tests(
         detail = {"command": command, "error": str(error)}
     else:
         status = "passed" if result.exit_code == 0 else "failed"
-        detail = {"exit_code": result.exit_code, "command": command}
+        output, truncated = _output_tail(result.stdout, result.stderr)
+        detail = {
+            "exit_code": result.exit_code,
+            "command": command,
+            "output": output,
+            "truncated": truncated,
+        }
 
     evidence = VerificationEvidence(run_id=run.id, kind=TEST_KIND, status=status, detail=detail)
     if session is not None:
