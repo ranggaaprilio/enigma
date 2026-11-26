@@ -20,6 +20,7 @@ from app.api.specs import router as specs_router
 from app.api.teams import router as teams_router
 from app.api.templates import router as templates_router
 from app.api.terminal import router as terminal_router
+from app.api.verification import router as verification_router
 from app.api.workspace_services import router as workspace_services_router
 from app.api.workspaces import router as workspaces_router
 
@@ -44,5 +45,6 @@ api_router.include_router(specs_router)
 api_router.include_router(teams_router)
 api_router.include_router(templates_router)
 api_router.include_router(terminal_router)
+api_router.include_router(verification_router)
 api_router.include_router(workspace_services_router)
 api_router.include_router(workspaces_router)

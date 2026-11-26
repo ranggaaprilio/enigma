@@ -186,6 +186,38 @@ class VerificationOrchestrator:
         logger.info("verification_run_review", run_id=str(run_id), status=run.status)
         return run
 
+    async def create_run(self, workspace_id: UUID, plan_ref: str) -> VerificationRun:
+        """Create a new run parked at ``planning`` (not yet driven)."""
+        async with self.session_maker() as session:
+            run = VerificationRun(workspace_id=workspace_id, plan_ref=plan_ref, status="planning")
+            session.add(run)
+            await session.commit()
+            await session.refresh(run)
+            return run
+
+    async def get_run(self, workspace_id: UUID, run_id: UUID) -> VerificationRun:
+        """Fetch a run by id, refusing runs of another workspace."""
+        async with self.session_maker() as session:
+            run = await session.get(VerificationRun, run_id)
+            if run is None:
+                raise VerificationRunNotFoundError(run_id)
+            if run.workspace_id != workspace_id:
+                raise VerificationRunNotInWorkspaceError(run_id)
+            return run
+
+    async def list_runs(
+        self, workspace_id: UUID, *, limit: int = 20, offset: int = 0
+    ) -> list[VerificationRun]:
+        async with self.session_maker() as session:
+            rows = await session.scalars(
+                select(VerificationRun)
+                .where(VerificationRun.workspace_id == workspace_id)
+                .order_by(VerificationRun.created_at.desc())
+                .limit(limit)
+                .offset(offset)
+            )
+            return list(rows)
+
     async def approve(self, run_id: UUID) -> bool:
         """Approve at the human gate; ``True`` iff it moved ``review -> approved``."""
         return await self._finalize(run_id, "approved")

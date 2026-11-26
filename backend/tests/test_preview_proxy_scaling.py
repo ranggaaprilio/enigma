@@ -390,6 +390,7 @@ def test_health_on_the_probe_host_checks_postgres_and_daytona():
             "daytona": {"configured": True, "status": "ok", "reason": None},
             # Only its default provider is probed (Epic 06).
             "docker": {"configured": None, "status": "skipped", "reason": None},
+            "opensandbox": {"configured": None, "status": "skipped", "reason": None},
         },
     }
     assert runtime.health_calls == 1
@@ -419,6 +420,7 @@ def test_health_on_a_docker_install_reports_docker_without_a_daemon_call():
         "runtimes": {
             "daytona": {"configured": None, "status": "skipped", "reason": None},
             "docker": {"configured": None, "status": "skipped", "reason": None},
+            "opensandbox": {"configured": None, "status": "skipped", "reason": None},
         },
     }
     assert runtime.health_calls == 0
