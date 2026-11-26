@@ -25,9 +25,26 @@ SpecPhaseStatus = Literal[
 ]
 
 
+class SpecVerificationCriteria(BaseModel):
+    """How the ``implement`` phase is verified before the workflow can complete."""
+
+    test_command: str = Field(min_length=1, max_length=20_000)
+    observe_port: int | None = Field(default=None, ge=1, le=65_535)
+    max_iterations: int = Field(default=2, ge=1, le=20)
+
+    @field_validator("test_command")
+    @classmethod
+    def strip_command(cls, value: str) -> str:
+        stripped = value.strip()
+        if not stripped:
+            raise ValueError("Value cannot be empty")
+        return stripped
+
+
 class SpecWorkflowCreateRequest(BaseModel):
     feature_name: str = Field(min_length=1, max_length=200)
     description: str = Field(min_length=1, max_length=40_000)
+    verification: SpecVerificationCriteria | None = None
 
     @field_validator("feature_name", "description")
     @classmethod
@@ -77,6 +94,7 @@ class SpecWorkflowResponse(BaseModel):
     branch: str
     spec_dir: str
     worktree_path: str | None
+    verification: dict | None = None
     status: SpecWorkflowStatus
     current_phase: SpecPhaseName
     created_at: datetime

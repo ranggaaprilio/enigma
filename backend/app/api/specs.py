@@ -21,9 +21,11 @@ from app.schemas.specs import (
     SpecWorkflowCreateRequest,
     SpecWorkflowResponse,
 )
+from app.schemas.verification import VerificationRunResponse
 from app.services.access import WorkspaceAccessDeniedError
 from app.services.agents import AgentConfigurationError, AgentRunAlreadyActiveError
 from app.services.budgets import BudgetExceededError
+from app.services.jobs import RunQueueUnavailableError
 from app.services.speckit import (
     InvalidArtifactPathError,
     InvalidSpecPhaseError,
@@ -33,8 +35,11 @@ from app.services.speckit import (
     SpecKitService,
     SpecPhaseNotFoundError,
     SpecPhaseNotReviewableError,
+    SpecPhaseRequiresVerificationError,
+    SpecVerificationNotConfiguredError,
     SpecWorkflowNotFoundError,
 )
+from app.services.verification.orchestrator import VerificationRunAlreadyActiveError
 from app.services.workspaces import WorkspaceNotFoundError
 
 router = APIRouter(prefix="/workspaces/{workspace_id}/spec", tags=["spec"])
@@ -84,6 +89,13 @@ def _map_spec_error(error: Exception) -> HTTPException:
             status_code=status.HTTP_409_CONFLICT,
             detail="Phase is not awaiting review",
         )
+    if isinstance(error, (SpecPhaseRequiresVerificationError, SpecVerificationNotConfiguredError)):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
+    if isinstance(error, VerificationRunAlreadyActiveError):
+        return HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Workspace already has an active verification run",
+        )
     if isinstance(error, AgentRunAlreadyActiveError):
         return HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -115,7 +127,11 @@ async def create_spec_workflow(
 ) -> SpecWorkflowResponse:
     try:
         workflow = await service.start_workflow(
-            workspace_id, current_user.id, payload.feature_name, payload.description
+            workspace_id,
+            current_user.id,
+            payload.feature_name,
+            payload.description,
+            verification=payload.verification.model_dump() if payload.verification else None,
         )
     except Exception as error:  # noqa: BLE001 - re-raised by _map_spec_error
         raise _map_spec_error(error) from None
@@ -276,6 +292,28 @@ async def approve_spec_phase(
     except Exception as error:  # noqa: BLE001
         raise _map_spec_error(error) from None
     return SpecPhaseResponse.model_validate(result)
+
+
+@router.post(
+    "/workflows/{workflow_id}/verify",
+    response_model=VerificationRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[SPEC_RUN_RATE_LIMIT_DEP],
+)
+async def verify_spec_implement(
+    workspace_id: UUID,
+    workflow_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    service: SpecKitService = SPECKIT_SERVICE_DEP,
+) -> VerificationRunResponse:
+    """(Re)run verification of the ``implement`` phase while it awaits review."""
+    try:
+        run = await service.verify_implement(workspace_id, workflow_id, current_user.id)
+    except RunQueueUnavailableError:
+        raise  # the global handler answers 503
+    except Exception as error:  # noqa: BLE001
+        raise _map_spec_error(error) from None
+    return VerificationRunResponse.model_validate(run)
 
 
 @router.post(

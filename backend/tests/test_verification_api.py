@@ -292,3 +292,39 @@ async def test_unknown_run_404(db_session, monkeypatch):
             f"/workspaces/{workspace.id}/verification/runs/{uuid4()}"
         )
     assert resp.status_code == 404
+
+
+async def test_runs_can_be_filtered_by_spec_workflow(db_session, monkeypatch):
+    from app.models import SpecWorkflow
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session)
+    _patch_deps(monkeypatch, session, session_maker, FakeRuntime())
+    workflow = SpecWorkflow(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        feature_name="F",
+        feature_slug=f"f-{uuid4().hex[:6]}",
+        description="d",
+        branch="f",
+        spec_dir="specs/f",
+    )
+    session.add(workflow)
+    await session.flush()
+    linked = VerificationRun(
+        workspace_id=workspace.id, plan_ref="specs/f/plan.md", status="review",
+        spec_workflow_id=workflow.id,
+    )
+    other = VerificationRun(workspace_id=workspace.id, plan_ref="other", status="review")
+    session.add_all([linked, other])
+    await session.flush()
+
+    override = await override_get_current_user(user)
+    app.dependency_overrides[auth_module.get_current_user] = override
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get(
+            f"/workspaces/{workspace.id}/verification/runs",
+            params={"spec_workflow_id": str(workflow.id)},
+        )
+    assert resp.status_code == 200
+    assert [r["id"] for r in resp.json()] == [str(linked.id)]

@@ -905,3 +905,348 @@ def test_spec_budget_exceeded_maps_to_402():
 
     error = specs_module._map_spec_error(BudgetExceededError("workspace", "monthly"))
     assert error.status_code == 402
+
+
+async def test_start_workflow_stores_verification_criteria(db_session, monkeypatch):
+    """Plan 3: criteria given at creation are kept on the workflow for its implement phase."""
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"vc-{uuid4()}@example.com")
+    await session.commit()
+
+    monkeypatch.setattr("app.services.agents.AgentService.create_run", _fake_create_run())
+    monkeypatch.setattr(SpecKitService, "_finalize_phase", _noop_finalize)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    criteria = {"test_command": "pytest -q", "observe_port": None, "max_iterations": 2}
+    workflow = await service.start_workflow(
+        workspace.id, user.id, "Add Auth", "We need login", verification=criteria
+    )
+    assert workflow.verification == criteria
+
+
+
+# --- Plan 3: implement is verified before the workflow completes -------------------------
+
+
+async def _completed_implement(session, user, workspace, *, verification=None):
+    workflow = await make_workflow(
+        session,
+        workspace,
+        user,
+        phase_status={"plan": "approved", "tasks": "approved", "implement": "running"},
+    )
+    workflow.verification = verification
+    run = AgentRun(
+        workspace_id=workspace.id,
+        user_id=user.id,
+        prompt="implement",
+        status="completed",
+        provider="mock",
+        model="mock-agent",
+    )
+    session.add(run)
+    await session.commit()
+    return workflow, run
+
+
+def _capture_verification_starts(monkeypatch) -> list:
+    from app.services.verification import spec_link
+
+    started: list = []
+
+    async def fake_start(run_id, settings, **kwargs):
+        started.append((run_id, kwargs))
+
+    monkeypatch.setattr(spec_link, "start_verification_run", fake_start)
+    return started
+
+
+async def _phase_and_workflow(session_maker, workflow_id):
+    async with session_maker() as s:
+        phase = (
+            await s.execute(
+                select(SpecPhase).where(
+                    SpecPhase.workflow_id == workflow_id, SpecPhase.phase == "implement"
+                )
+            )
+        ).scalar_one()
+        return phase.status, (await s.get(SpecWorkflow, workflow_id)).status
+
+
+async def test_implement_with_criteria_starts_a_linked_verification(db_session, monkeypatch):
+    from app.models import VerificationRun
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"v1-{uuid4()}@example.com")
+    criteria = {"test_command": "pytest -q", "observe_port": None, "max_iterations": 2}
+    workflow, run = await _completed_implement(session, user, workspace, verification=criteria)
+    started = _capture_verification_starts(monkeypatch)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    await service._finalize_phase(workflow.id, "implement", run.id, user.id)
+
+    assert await _phase_and_workflow(session_maker, workflow.id) == (
+        "awaiting_review",
+        "awaiting_review",
+    )
+    async with session_maker() as s:
+        [vrun] = (
+            await s.execute(
+                select(VerificationRun).where(VerificationRun.spec_workflow_id == workflow.id)
+            )
+        ).scalars().all()
+    assert vrun.status == "planning"
+    assert vrun.plan_ref == "specs/001-add-auth/plan.md"
+    assert vrun.created_by == user.id
+    assert vrun.criteria["test_command"] == "pytest -q"
+    assert vrun.criteria["cwd"] == "worktrees/001-add-auth"
+    assert [rid for rid, _ in started] == [vrun.id]
+
+
+async def test_implement_without_criteria_completes_as_before(db_session, monkeypatch):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"v2-{uuid4()}@example.com")
+    workflow, run = await _completed_implement(session, user, workspace)
+    started = _capture_verification_starts(monkeypatch)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    await service._finalize_phase(workflow.id, "implement", run.id, user.id)
+
+    assert await _phase_and_workflow(session_maker, workflow.id) == ("completed", "completed")
+    assert started == []
+
+
+async def test_a_refused_verification_still_parks_implement_for_review(db_session, monkeypatch):
+    """Another verification run is active: nothing is lost -- implement waits for review and
+    the human is told why, then can re-run verification."""
+    from app.models import VerificationRun
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"v3-{uuid4()}@example.com")
+    criteria = {"test_command": "pytest -q", "max_iterations": 1}
+    workflow, run = await _completed_implement(session, user, workspace, verification=criteria)
+    session.add(VerificationRun(workspace_id=workspace.id, plan_ref="other", status="testing"))
+    await session.commit()
+    started = _capture_verification_starts(monkeypatch)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    await service._finalize_phase(workflow.id, "implement", run.id, user.id)
+
+    assert await _phase_and_workflow(session_maker, workflow.id) == (
+        "awaiting_review",
+        "awaiting_review",
+    )
+    assert started == []
+    async with session_maker() as s:
+        notes = (
+            await s.execute(
+                select(Notification).where(
+                    Notification.user_id == user.id,
+                    Notification.notification_type == "spec_verification_not_started",
+                )
+            )
+        ).scalars().all()
+    assert len(notes) == 1
+
+
+# --- Plan 3 Task 4: one gate for the evidence and the phase ------------------------------
+
+
+async def _implement_awaiting_with_run(session, user, workspace, *, run_status="review"):
+    from app.models import VerificationRun
+
+    workflow = await make_workflow(
+        session,
+        workspace,
+        user,
+        phase_status={"plan": "approved", "tasks": "approved", "implement": "awaiting_review"},
+    )
+    workflow.verification = {"test_command": "pytest -q", "max_iterations": 2}
+    workflow.status = "awaiting_review"
+    run = VerificationRun(
+        workspace_id=workspace.id,
+        plan_ref="specs/001-add-auth/plan.md",
+        status=run_status,
+        spec_workflow_id=workflow.id,
+    )
+    session.add(run)
+    await session.commit()
+    return workflow, run
+
+
+async def test_approving_the_latest_linked_run_completes_the_workflow(db_session):
+    from app.services.verification.spec_link import approve_verification_run
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g1-{uuid4()}@example.com")
+    workflow, run = await _implement_awaiting_with_run(session, user, workspace)
+
+    assert await approve_verification_run(session_maker, run.id, user.id) is True
+
+    assert await _phase_and_workflow(session_maker, workflow.id) == ("approved", "completed")
+    async with session_maker() as s:
+        audits = (
+            await s.execute(select(AuditLog).where(AuditLog.action == "spec_phase_approved"))
+        ).scalars().all()
+    assert any(a.target_type == "spec_phase" for a in audits)
+
+
+async def test_approving_an_old_run_while_implement_reruns_changes_nothing(db_session):
+    """Request changes re-runs implement: the old run's approval must not complete a workflow
+    whose new code it never verified."""
+    from app.services.verification.spec_link import approve_verification_run
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g2-{uuid4()}@example.com")
+    workflow, old = await _implement_awaiting_with_run(session, user, workspace)
+    phase = (
+        await session.execute(
+            select(SpecPhase).where(
+                SpecPhase.workflow_id == workflow.id, SpecPhase.phase == "implement"
+            )
+        )
+    ).scalar_one()
+    phase.status = "running"
+    workflow.status = "running"
+    await session.commit()
+
+    assert await approve_verification_run(session_maker, old.id, user.id) is True
+
+    assert await _phase_and_workflow(session_maker, workflow.id) == ("running", "running")
+
+
+async def test_a_new_verification_supersedes_an_old_run_awaiting_review(db_session, monkeypatch):
+    from app.models import VerificationRun
+    from app.services.verification.spec_link import approve_verification_run
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g2b-{uuid4()}@example.com")
+    workflow, old = await _implement_awaiting_with_run(session, user, workspace)
+    _capture_verification_starts(monkeypatch)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    await service.verify_implement(workspace.id, workflow.id, user.id)
+
+    async with session_maker() as s:
+        assert (await s.get(VerificationRun, old.id)).status == "rejected"
+    assert await approve_verification_run(session_maker, old.id, user.id) is False
+    assert await _phase_and_workflow(session_maker, workflow.id) == (
+        "awaiting_review",
+        "awaiting_review",
+    )
+
+
+async def test_approving_a_run_not_in_review_changes_nothing(db_session):
+    from app.services.verification.spec_link import approve_verification_run
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g3-{uuid4()}@example.com")
+    workflow, run = await _implement_awaiting_with_run(session, user, workspace, run_status="testing")
+
+    assert await approve_verification_run(session_maker, run.id, user.id) is False
+    assert await _phase_and_workflow(session_maker, workflow.id) == (
+        "awaiting_review",
+        "awaiting_review",
+    )
+
+
+async def test_implement_cannot_be_approved_around_its_evidence(db_session):
+    from app.services.speckit import SpecPhaseRequiresVerificationError
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g4-{uuid4()}@example.com")
+    workflow, _run = await _implement_awaiting_with_run(session, user, workspace)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    with pytest.raises(SpecPhaseRequiresVerificationError):
+        await service.approve_phase(workspace.id, workflow.id, "implement", user.id)
+
+
+async def test_verify_implement_starts_a_new_linked_run(db_session, monkeypatch):
+    from app.models import VerificationRun
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g5-{uuid4()}@example.com")
+    workflow, old = await _implement_awaiting_with_run(session, user, workspace, run_status="rejected")
+    started = _capture_verification_starts(monkeypatch)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    run = await service.verify_implement(workspace.id, workflow.id, user.id)
+
+    assert run.spec_workflow_id == workflow.id
+    assert run.id != old.id
+    assert [rid for rid, _ in started] == [run.id]
+    async with session_maker() as s:
+        linked = (
+            await s.execute(
+                select(VerificationRun).where(VerificationRun.spec_workflow_id == workflow.id)
+            )
+        ).scalars().all()
+    assert len(linked) == 2
+
+
+async def test_verify_implement_requires_implement_awaiting_review(db_session, monkeypatch):
+    from app.services.speckit import SpecPhaseNotReviewableError
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g6-{uuid4()}@example.com")
+    workflow = await make_workflow(
+        session, workspace, user, phase_status={"implement": "running"}
+    )
+    workflow.verification = {"test_command": "pytest -q"}
+    await session.commit()
+    _capture_verification_starts(monkeypatch)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    with pytest.raises(SpecPhaseNotReviewableError):
+        await service.verify_implement(workspace.id, workflow.id, user.id)
+
+
+async def test_verify_route_starts_a_run_and_refuses_a_second_one(db_session, monkeypatch):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g7-{uuid4()}@example.com")
+    workflow, _old = await _implement_awaiting_with_run(
+        session, user, workspace, run_status="rejected"
+    )
+    _capture_verification_starts(monkeypatch)
+
+    app.dependency_overrides[auth_module.get_current_user] = await override_get_current_user(user)
+    app.dependency_overrides[specs_module.get_speckit_service] = speckit_override(
+        session, session_maker, FakeRuntime()
+    )
+    url = f"/workspaces/{workspace.id}/spec/workflows/{workflow.id}/verify"
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            first = await client.post(url)
+            second = await client.post(url)  # the first run is still active (planning)
+            approve = await client.post(
+                f"/workspaces/{workspace.id}/spec/workflows/{workflow.id}/phases/implement/approve"
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first.status_code == 202, first.text
+    assert first.json()["spec_workflow_id"] == str(workflow.id)
+    assert first.json()["status"] == "planning"
+    assert second.status_code == 409
+    assert approve.status_code == 409  # only through the evidence
+
+
+async def test_request_changes_on_implement_closes_its_old_evidence(db_session, monkeypatch):
+    """Review HIGH: once implement re-runs, its old evidence verified code that is about to
+    change -- it must not stay approvable, even if the next verification can't be created."""
+    from app.models import VerificationRun
+    from app.services.verification.spec_link import approve_verification_run
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"g8-{uuid4()}@example.com")
+    workflow, old = await _implement_awaiting_with_run(session, user, workspace)
+    monkeypatch.setattr("app.services.agents.AgentService.create_run", _fake_create_run())
+    monkeypatch.setattr(SpecKitService, "_finalize_phase", _noop_finalize)
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=FakeRuntime())
+    await service.request_changes(workspace.id, workflow.id, "implement", user.id, "fix it")
+
+    async with session_maker() as s:
+        assert (await s.get(VerificationRun, old.id)).status == "rejected"
+    assert await approve_verification_run(session_maker, old.id, user.id) is False
