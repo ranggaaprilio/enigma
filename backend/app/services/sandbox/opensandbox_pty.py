@@ -102,14 +102,22 @@ async def open_pty_websocket(
     if takeover:
         ws_url += "&takeover=1"
     ws = await websockets.connect(ws_url, max_size=2**22)
-    # First frame must be the connect acknowledgment; wait for it so a 409-style
-    # refusal surfaces as an error here instead of a silently dead socket.
+    # Wait for the ``connected`` acknowledgment; a reconnect with ``since=`` can replay
+    # scrollback (binary 0x01 frames) *before* it, and that output belongs to the terminal.
+    # Pump it through, then fail loudly on an unexpected role so a refusal (409-style)
+    # surfaces as an error here instead of a silently dead socket.
     try:
-        first = await asyncio.wait_for(ws.recv(), timeout=10)
-        frame = json.loads(first)
-        if frame.get("role") not in ("holder", "viewer"):
-            await ws.close()
-            raise RuntimeError(f"unexpected execd PTY frame: {frame!r}")
+        while True:
+            first = await asyncio.wait_for(ws.recv(), timeout=10)
+            if isinstance(first, bytes):
+                if first and first[0] == 0x01:
+                    await on_data(first[1:])
+                continue
+            frame = json.loads(first)
+            if frame.get("role") not in ("holder", "viewer"):
+                await ws.close()
+                raise RuntimeError(f"unexpected execd PTY frame: {frame!r}")
+            break
     except TimeoutError as error:
         await ws.close()
         raise RuntimeError("execd PTY connect timed out") from error

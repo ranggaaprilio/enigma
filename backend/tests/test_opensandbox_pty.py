@@ -188,6 +188,35 @@ async def test_open_pty_rejects_non_holder_frames(monkeypatch):
         await pty.open_pty_websocket("http://h:1", "s1", lambda _d: asyncio.sleep(0))
 
 
+async def test_replay_before_connected_is_pumped(monkeypatch):
+    """A reconnect can replay scrollback (0x01 frames) *before* the connected ack;
+    that output must reach on_data, and connect must still succeed."""
+    ws = FakeWs(
+        [
+            b"\x01earlier scrollback\r\n",
+            _connected_frame(),
+            b"\x01later output\r\n",
+        ]
+    )
+
+    async def fake_connect(url, **_: Any):
+        return ws
+
+    monkeypatch.setattr(pty.websockets, "connect", fake_connect)
+
+    received: list[bytes] = []
+
+    async def on_data(chunk: bytes) -> None:
+        received.append(chunk)
+
+    handle = await pty.open_pty_websocket("http://h:1", "s1", on_data, offset=0, takeover=True)
+    # the pre-ack replay frame is delivered during connect
+    assert b"earlier scrollback\r\n" in received
+
+    await handle._reader
+    assert b"later output\r\n" in received
+
+
 # --- runtime reconnect mapping (seams faked by the conformance double) ------------------
 
 
