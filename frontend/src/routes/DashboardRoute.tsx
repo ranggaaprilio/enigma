@@ -12,6 +12,7 @@ import { FileManagementPanel } from "../components/FileManagementPanel";
 import { PreviewPanel } from "../components/PreviewPanel";
 import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
+import { VerificationPanel } from "../components/VerificationPanel";
 import { WorktreesPanel } from "../components/WorktreesPanel";
 import { ConfirmModal } from "../components/ui/ConfirmModal";
 import { Spinner } from "../components/ui/Spinner";
@@ -88,6 +89,7 @@ type DashboardViewId =
   | "preview"
   | "spec"
   | "agent"
+  | "verify"
   | "usage"
   | "audit";
 type PreviewStatusSnapshot = {
@@ -330,6 +332,10 @@ export function DashboardView({ view }: { view: DashboardViewId }) {
 
   if (view === "agent") {
     return <AgentTab workspaceId={workspace.id} />;
+  }
+
+  if (view === "verify") {
+    return <VerificationPanel key={workspace.id} workspace={workspace} />;
   }
 
   if (view === "usage") {

@@ -285,7 +285,8 @@ function fallbackResponse(url: string) {
     url.includes("/terminal/sessions") ||
     url.includes("/preview/sessions") ||
     url.includes("/comments") ||
-    url.includes("/budgets")
+    url.includes("/budgets") ||
+    url.includes("/verification/runs")
   ) {
     return Promise.resolve(jsonResponse([]));
   }
@@ -479,6 +480,7 @@ describe("App auth routing", () => {
       ["Commands", `${workspaceBase}/commands`],
       ["Spec", `${workspaceBase}/spec`],
       ["Agent", `${workspaceBase}/agents`],
+      ["Verify", `${workspaceBase}/verify`],
       ["Usage", `${workspaceBase}/usage`],
       ["Editor", `${workspaceBase}/editor`],
       ["Terminal", `${workspaceBase}/terminal`],
