@@ -121,7 +121,7 @@
 ### Task 6: Docs + live check
 
 - [x] Add an AGENTS.md note (implement → verification → gate; criteria precedence; `0042`) and tick this plan.
-- [ ] Live E2E (recipe in memory: OpenSandbox + host backend): a workflow with a test command, through implement, a failing test, the agent fix, approval, then `completed`. Record the result in the PR.
+- [x] Live E2E (recipe in memory: OpenSandbox + host backend): a workflow with a test command, through implement, a failing test, the agent fix, approval, then `completed`. Record the result in the PR.
 - [x] Commit `docs: spec kit verification gate`.
 
 ## Review fixes (applied)
