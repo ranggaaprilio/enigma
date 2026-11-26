@@ -11,6 +11,7 @@ import {
   Lock,
   Play,
   RotateCcw,
+  ShieldCheck,
   XCircle,
 } from "lucide-react";
 
@@ -23,9 +24,11 @@ import {
   getSpecWorkflow,
   listSpecArtifacts,
   listSpecWorkflows,
+  listVerificationRuns,
   requestSpecChanges,
   runSpecPhase,
   submitAnalyzeAnswers,
+  verifySpecImplement,
   type OpenQuestion,
   type SpecArtifactItem,
   type SpecPhaseName,
@@ -38,6 +41,7 @@ import { useAgentRunStream } from "../../lib/useAgentRunStream";
 import { useRetryCountdown } from "../../lib/useRetryCountdown";
 import { ToolCard, pairToolEvents } from "../AgentTab/ToolCard";
 import { CommentThread } from "../comments/CommentThread";
+import { VerificationRunView } from "../VerificationPanel";
 import { ConfirmModal } from "../ui/ConfirmModal";
 
 const PHASE_ORDER: SpecPhaseName[] = [
@@ -189,6 +193,8 @@ function CreateWorkflowForm({
 }) {
   const [featureName, setFeatureName] = useState("");
   const [description, setDescription] = useState("");
+  const [testCommand, setTestCommand] = useState("");
+  const [maxIterations, setMaxIterations] = useState("2");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const { waiting: retryWaiting, notice: retryNotice, arm: armRetry } = useRetryCountdown();
@@ -199,13 +205,19 @@ function CreateWorkflowForm({
     setSubmitting(true);
     setError(null);
     try {
+      const command = testCommand.trim();
       const workflow = await createSpecWorkflow(workspaceId, {
         feature_name: featureName.trim(),
         description: description.trim(),
+        // Optional: without it the workspace's `test` command (if any) verifies implement.
+        ...(command
+          ? { verification: { test_command: command, max_iterations: Number(maxIterations) || 2 } }
+          : {}),
       });
       onCreated(workflow);
       setFeatureName("");
       setDescription("");
+      setTestCommand("");
     } catch (err) {
       if (!armRetry(err)) setError(err instanceof ApiError ? err.message : "Failed to start workflow");
     } finally {
@@ -227,6 +239,28 @@ function CreateWorkflowForm({
         value={description}
         onChange={(event) => setDescription(event.target.value)}
       />
+      <div className="flex gap-2">
+        <label className="flex-1 text-xs font-semibold text-ink/70">
+          Verification test command (optional)
+          <input
+            className="mt-1 w-full rounded-md border border-line bg-white px-3 py-2 font-mono text-sm outline-none transition focus:border-ink"
+            placeholder="pytest -q"
+            value={testCommand}
+            onChange={(event) => setTestCommand(event.target.value)}
+          />
+        </label>
+        <label className="w-28 text-xs font-semibold text-ink/70">
+          Max attempts
+          <input
+            className="mt-1 w-full rounded-md border border-line bg-white px-3 py-2 text-sm outline-none transition focus:border-ink"
+            type="number"
+            min={1}
+            max={20}
+            value={maxIterations}
+            onChange={(event) => setMaxIterations(event.target.value)}
+          />
+        </label>
+      </div>
       {(retryNotice ?? error) && <p className="text-xs text-danger">{retryNotice ?? error}</p>}
       <button
         type="submit"
@@ -402,6 +436,7 @@ function WorkflowDetail({
           onApprove={() => handleApprove(activePhase)}
           onRequestChanges={(notes) => handleRequestChanges(activePhase, notes)}
           onSubmitAnswers={handleSubmitAnswers}
+          onWorkflowChanged={() => void refresh()}
         />
       )}
     </div>
@@ -420,6 +455,7 @@ function PhaseDetail({
   onApprove,
   onRequestChanges,
   onSubmitAnswers,
+  onWorkflowChanged,
 }: {
   workspaceId: string;
   workflow: SpecWorkflowResponse;
@@ -433,7 +469,9 @@ function PhaseDetail({
   onApprove: () => void;
   onRequestChanges: (notes: string) => void;
   onSubmitAnswers: (answers: { id: string; answer: string }[]) => void;
+  onWorkflowChanged?: () => void;
 }) {
+  const [linkedRunFound, setLinkedRunFound] = useState(false);
   const [artifact, setArtifact] = useState<string | null>(null);
   const [artifactError, setArtifactError] = useState<string | null>(null);
   const [items, setItems] = useState<SpecArtifactItem[]>([]);
@@ -517,6 +555,8 @@ function PhaseDetail({
   }, [workspaceId, workflow.id, phase.phase, phase.status, phase.attempt, isAnalyzeReview]);
 
   const isImplement = phase.phase === "implement";
+  // implement is approved through its verification evidence, not directly.
+  const evidenceGated = isImplement && (Boolean(workflow.verification) || linkedRunFound);
   const runDisabled = busy || !canRun || (isImplement && !implementUnlocked);
   const answeredCount = questions.filter((q) => (answers[q.id] ?? "").trim().length > 0).length;
 
@@ -533,6 +573,7 @@ function PhaseDetail({
         <div className="flex items-center gap-2">
           {phase.status === "awaiting_review" && (
             <>
+              {!evidenceGated && (
               <button
                 type="button"
                 onClick={onApprove}
@@ -541,6 +582,7 @@ function PhaseDetail({
               >
                 <CheckCircle2 className="h-4 w-4" /> Approve
               </button>
+              )}
               <button
                 type="button"
                 onClick={() => setNotesOpen((open) => !open)}
@@ -580,6 +622,16 @@ function PhaseDetail({
         <p className="mt-3 rounded-md border border-warn/30 bg-[#fffbf0] p-3 text-sm text-warn">
           Requested changes: {phase.review_notes}
         </p>
+      )}
+
+      {isImplement && (phase.status === "awaiting_review" || phase.status === "approved") && (
+        <ImplementVerification
+          workspaceId={workspaceId}
+          workflowId={workflow.id}
+          canRerun={phase.status === "awaiting_review"}
+          onLinkedRun={setLinkedRunFound}
+          onGateChanged={onWorkflowChanged}
+        />
       )}
 
       {notesOpen && phase.status === "awaiting_review" && (
@@ -888,5 +940,91 @@ function SpecStatusBadge({ status }: { status: string }) {
     >
       {status.replace("_", " ")}
     </span>
+  );
+}
+
+/** The latest verification run of a workflow's `implement` phase, with its evidence and gate. */
+function ImplementVerification({
+  workspaceId,
+  workflowId,
+  canRerun,
+  onLinkedRun,
+  onGateChanged,
+}: {
+  workspaceId: string;
+  workflowId: string;
+  canRerun: boolean;
+  onLinkedRun: (found: boolean) => void;
+  onGateChanged?: () => void;
+}) {
+  // undefined: still looking; null: none yet.
+  const [runId, setRunId] = useState<string | null | undefined>(undefined);
+  const [error, setError] = useState<string | null>(null);
+  const [starting, setStarting] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    // Newest first, filtered server-side: never misses the run in a busy workspace.
+    listVerificationRuns(workspaceId, 1, workflowId)
+      .then((runs) => {
+        if (cancelled) return;
+        const latest = runs[0];
+        setRunId(latest?.id ?? null);
+        onLinkedRun(Boolean(latest));
+      })
+      .catch(() => {
+        if (!cancelled) setRunId(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [workspaceId, workflowId, onLinkedRun]);
+
+  async function handleRerun() {
+    setStarting(true);
+    setError(null);
+    try {
+      const run = await verifySpecImplement(workspaceId, workflowId);
+      setRunId(run.id);
+      onLinkedRun(true);
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Unable to start verification");
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  return (
+    <section className="mt-4 space-y-2">
+      <div className="flex items-center justify-between gap-2">
+        <h4 className="flex items-center gap-1.5 text-sm font-semibold text-ink">
+          <ShieldCheck className="h-4 w-4 text-ink/60" aria-hidden="true" /> Verification
+        </h4>
+        {canRerun && (
+          <button
+            type="button"
+            onClick={() => void handleRerun()}
+            disabled={starting}
+            className="inline-flex items-center gap-1.5 rounded-md border border-line px-3 py-1.5 text-sm font-semibold text-body transition hover:bg-panel disabled:opacity-50"
+          >
+            {starting ? <Loader2 className="h-4 w-4 animate-spin" /> : <RotateCcw className="h-4 w-4" />}
+            Re-run verification
+          </button>
+        )}
+      </div>
+      {error && <p className="text-xs text-danger">{error}</p>}
+      {runId === undefined ? (
+        <p className="text-sm text-muted">Loading verification…</p>
+      ) : runId === null ? (
+        <p className="text-sm text-muted">No verification run for this implement yet.</p>
+      ) : (
+        <VerificationRunView
+          key={runId}
+          workspaceId={workspaceId}
+          runId={runId}
+          onGateChanged={() => onGateChanged?.()}
+        />
+      )}
+    </section>
   );
 }

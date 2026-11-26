@@ -532,3 +532,74 @@ function formatTime(value: string): string {
 function messageOf(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback;
 }
+
+/** One verification run with its evidence, kept fresh while it is in flight, and its human gate.
+ * Used where a run belongs to something else (a Spec Kit `implement` phase). */
+export function VerificationRunView({
+  workspaceId,
+  runId,
+  onGateChanged,
+}: {
+  workspaceId: string;
+  runId: string;
+  /** Called after an approve/reject lands, so the owner can refresh its own state. */
+  onGateChanged?: (run: VerificationRunResponse) => void;
+}) {
+  const [run, setRun] = useState<VerificationRunDetailResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [gateBusy, setGateBusy] = useState(false);
+  const [pollRetry, setPollRetry] = useState(0);
+
+  const load = useCallback(async () => {
+    setRun(await getVerificationRun(workspaceId, runId));
+  }, [workspaceId, runId]);
+
+  useEffect(() => {
+    load().catch((err: unknown) => setError(messageOf(err, "Unable to load verification run")));
+  }, [load]);
+
+  const active = run !== null && ACTIVE_STATUSES.has(run.status);
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setTimeout(() => {
+      load().catch((err: unknown) => {
+        setError(messageOf(err, "Unable to refresh verification run"));
+        setPollRetry((n) => n + 1);
+      });
+    }, POLL_MS);
+    return () => window.clearTimeout(timer);
+  }, [active, run, pollRetry, load]);
+
+  async function handleGate(approve: boolean) {
+    setGateBusy(true);
+    setError(null);
+    try {
+      const updated = await (approve ? approveVerificationRun : rejectVerificationRun)(
+        workspaceId,
+        runId,
+      );
+      setRun((current) => (current ? { ...current, ...updated } : current));
+      onGateChanged?.(updated);
+    } catch (err) {
+      setError(messageOf(err, "Unable to update verification run"));
+      await load().catch(() => undefined);
+    } finally {
+      setGateBusy(false);
+    }
+  }
+
+  return (
+    <div className="rounded-md border border-line bg-white">
+      {error && (
+        <div role="alert" className="m-3 rounded-md border border-danger/30 bg-[#fff5f2] p-2 text-sm text-danger">
+          {error}
+        </div>
+      )}
+      {run ? (
+        <RunDetail run={run} gateBusy={gateBusy} onGate={handleGate} />
+      ) : (
+        <div className="p-4 text-sm text-ink/60">Loading run…</div>
+      )}
+    </div>
+  );
+}
