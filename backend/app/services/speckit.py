@@ -250,7 +250,16 @@ class SpecKitService:
         workspace = await self._get_workspace(workspace_id, user_id)
         if not await self._path_exists(workspace, workspace.workspace_path, ".git"):
             raise SpecKitNotReadyError("Repository is not cloned in the workspace yet")
-        if await self._path_exists(workspace, workspace.workspace_path, ".specify"):
+        # Initialized means committed, not merely present: an init or commit that failed
+        # mid-way leaves an uncommitted `.specify`, which feature worktrees would not inherit.
+        # `--force` makes re-running init over a partial scaffold safe.
+        committed = await self.runtime.exec(
+            workspace,
+            "git cat-file -e HEAD:.specify",
+            cwd=workspace.workspace_path,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if committed.exit_code == 0:
             return
         result = await self.runtime.exec(
             workspace,
