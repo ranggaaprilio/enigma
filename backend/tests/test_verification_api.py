@@ -522,3 +522,107 @@ async def test_only_the_owner_can_stop_a_spec_linked_run(db_session, monkeypatch
     assert response.status_code == 403
     await session.refresh(linked)
     assert linked.status == "testing"
+
+
+# --- Plan 6: serve an evidence screenshot ---------------------------------------------------
+
+PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"pixels"
+
+
+class _MemoryStore:
+    def __init__(self, objects=None, fail=False):
+        self.objects = dict(objects or {})
+        self.fail = fail
+
+    async def get(self, key):
+        from app.services.artifact_store import ArtifactStoreError
+
+        if self.fail:
+            raise ArtifactStoreError("artifact store get failed")
+        return self.objects[key]
+
+
+async def _seed_screenshot(session, workspace):
+    from app.models import VerificationArtifact, VerificationEvidence
+
+    run = VerificationRun(workspace_id=workspace.id, plan_ref="p", status="review")
+    session.add(run)
+    await session.flush()
+    evidence = VerificationEvidence(run_id=run.id, kind="observation", status="passed", detail={})
+    session.add(evidence)
+    await session.flush()
+    key = f"verification/{workspace.id}/{run.id}/{evidence.id}.png"
+    session.add(
+        VerificationArtifact(
+            evidence_id=evidence.id, storage_key=key, content_type="image/png", byte_size=14
+        )
+    )
+    await session.flush()
+    return run, evidence, key
+
+
+async def _get_shot(user, workspace_id, run_id, evidence_id):
+    app.dependency_overrides[auth_module.get_current_user] = await override_get_current_user(user)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        return await client.get(
+            f"/workspaces/{workspace_id}/verification/runs/{run_id}/evidence/{evidence_id}/screenshot"
+        )
+
+
+async def test_screenshot_is_served_as_a_locked_down_png(db_session, monkeypatch):
+    from app.api import verification as api_mod
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session)
+    run, evidence, key = await _seed_screenshot(session, workspace)
+    _patch_deps(monkeypatch, session, session_maker, FakeRuntime())
+    monkeypatch.setattr(api_mod, "get_artifact_store", lambda _s: _MemoryStore({key: PNG_BYTES}))
+
+    response = await _get_shot(user, workspace.id, run.id, evidence.id)
+
+    assert response.status_code == 200, response.text
+    assert response.content == PNG_BYTES
+    assert response.headers["content-type"] == "image/png"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert response.headers["content-security-policy"] == "default-src 'none'"
+    assert response.headers["cache-control"] == "private, max-age=300"
+
+
+async def test_screenshot_lookup_is_scoped_to_the_workspace_and_run(db_session, monkeypatch):
+    from uuid import uuid4 as new_id
+
+    from app.api import verification as api_mod
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session)
+    other_user, other_workspace = await make_user_workspace(session)
+    run, evidence, key = await _seed_screenshot(session, workspace)
+    other_run, other_evidence, other_key = await _seed_screenshot(session, other_workspace)
+    _patch_deps(monkeypatch, session, session_maker, FakeRuntime())
+    store = _MemoryStore({key: PNG_BYTES, other_key: PNG_BYTES})
+    monkeypatch.setattr(api_mod, "get_artifact_store", lambda _s: store)
+
+    # Another workspace's evidence through my workspace, my evidence under another run, and
+    # evidence without an artifact: all simply not found.
+    assert (await _get_shot(user, workspace.id, other_run.id, other_evidence.id)).status_code == 404
+    assert (await _get_shot(user, workspace.id, new_id(), evidence.id)).status_code == 404
+    assert (await _get_shot(user, workspace.id, run.id, new_id())).status_code == 404
+    # And no access to the other workspace at all.
+    assert (
+        await _get_shot(user, other_workspace.id, other_run.id, other_evidence.id)
+    ).status_code in (403, 404)
+
+
+@pytest.mark.parametrize("store", [None, _MemoryStore(fail=True)])
+async def test_screenshot_is_503_when_the_store_is_unavailable(db_session, monkeypatch, store):
+    from app.api import verification as api_mod
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session)
+    run, evidence, _key = await _seed_screenshot(session, workspace)
+    _patch_deps(monkeypatch, session, session_maker, FakeRuntime())
+    monkeypatch.setattr(api_mod, "get_artifact_store", lambda _s: store)
+
+    response = await _get_shot(user, workspace.id, run.id, evidence.id)
+
+    assert response.status_code == 503

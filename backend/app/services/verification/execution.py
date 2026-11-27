@@ -15,6 +15,7 @@ import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
+from app.services.artifact_store import get_artifact_store
 from app.services.jobs import RunDispatcher, RunQueueUnavailableError, get_run_dispatcher
 from app.services.runtime import run_registry
 from app.services.sandbox import SandboxRuntime
@@ -42,6 +43,7 @@ def build_orchestrator(
         poll_seconds=settings.verification_poll_seconds,
     )
     orchestrator.fixer = AgentFixer(session_maker=orchestrator.session_maker, settings=settings)
+    orchestrator.artifact_store = get_artifact_store(settings)
     return orchestrator
 
 

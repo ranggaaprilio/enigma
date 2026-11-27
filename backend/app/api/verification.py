@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -23,7 +23,7 @@ from app.api.rate_limits import SANDBOX_RATE_LIMIT_DEP
 from app.core.config import get_settings
 from app.core.lifecycle import lifecycle
 from app.db.session import get_db_session
-from app.models import User, VerificationEvidence, VerificationRun
+from app.models import User, VerificationArtifact, VerificationEvidence, VerificationRun
 from app.schemas.verification import (
     VerificationEvidenceResponse,
     VerificationRunCreateRequest,
@@ -31,6 +31,7 @@ from app.schemas.verification import (
     VerificationRunResponse,
 )
 from app.services.access import WorkspaceAccessDeniedError, require_workspace_access
+from app.services.artifact_store import ArtifactStoreError, get_artifact_store
 from app.services.audit import AuditLogService
 from app.services.verification.execution import (
     build_orchestrator,
@@ -44,6 +45,7 @@ from app.services.verification.orchestrator import (
     VerificationRunNotFoundError,
     VerificationRunNotInWorkspaceError,
 )
+from app.services.verification.screenshot import PNG_SIGNATURE
 from app.services.verification.spec_link import approve_verification_run as approve_run
 from app.services.workspaces import WorkspaceNotFoundError
 
@@ -201,6 +203,54 @@ async def _finalize_gate(
             detail=f"Verification run is not awaiting review (status={run.status})",
         )
     return _run_response(await orch.get_run(workspace_id, run_id))
+
+
+# A stored screenshot is a tenant-rendered image: serve it so a browser can only ever show it
+# as an image, never sniff or run it, and never let a shared cache keep it.
+SCREENSHOT_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Content-Security-Policy": "default-src 'none'",
+    "Cache-Control": "private, max-age=300",
+    "Content-Disposition": "inline",
+}
+
+
+@router.get("/runs/{run_id}/evidence/{evidence_id}/screenshot")
+async def get_evidence_screenshot(
+    workspace_id: UUID,
+    run_id: UUID,
+    evidence_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    session: AsyncSession = DB_SESSION_DEP,
+) -> Response:
+    """The PNG captured for an observation, read back from the private artifact store."""
+    await _get_workspace(session, workspace_id, current_user)
+    artifact = await session.scalar(
+        select(VerificationArtifact)
+        .join(VerificationEvidence, VerificationEvidence.id == VerificationArtifact.evidence_id)
+        .join(VerificationRun, VerificationRun.id == VerificationEvidence.run_id)
+        .where(
+            VerificationArtifact.evidence_id == evidence_id,
+            VerificationEvidence.run_id == run_id,
+            VerificationRun.workspace_id == workspace_id,
+        )
+    )
+    if artifact is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Screenshot not found")
+    unavailable = HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="Screenshot storage is unavailable",
+    )
+    store = get_artifact_store(get_settings())
+    if store is None:
+        raise unavailable
+    try:
+        data = await store.get(artifact.storage_key)
+    except ArtifactStoreError:
+        raise unavailable from None
+    if not data.startswith(PNG_SIGNATURE):  # only ever serve what was validated as PNG
+        raise unavailable
+    return Response(content=data, media_type="image/png", headers=SCREENSHOT_HEADERS)
 
 
 @router.post(
