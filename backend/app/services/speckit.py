@@ -95,11 +95,16 @@ PREREQUISITES: dict[str, tuple[str, ...]] = {
 }
 
 # `specify init` flags. Build-time network is allowed; this runs offline from bundled
-# templates. NOTE: verify these flags against the installed specify-cli version.
-# The agent-selection flag was renamed `--ai` -> `--integration` in recent spec-kit
-# releases; the Daytona snapshot tracks latest (see daytona/Dockerfile SPEC_KIT_REF).
+# templates. NOTE: verify these flags against the installed specify-cli version
+# (sandbox/Dockerfile SPEC_KIT_REF). Enigma is not one of Spec Kit's named agents, so it
+# uses the bring-your-own-agent `generic` integration: plain `speckit.<phase>.md` command
+# files in SPEC_KIT_COMMANDS_DIR (read into each phase prompt) and an `AGENTS.md` context
+# block (appended, never replacing a repo's own AGENTS.md).
+SPEC_KIT_COMMANDS_DIR = ".enigma/commands"
 SPECIFY_INIT_COMMAND = (
-    "specify init . --integration claude --script sh --ignore-agent-tools --force"
+    "specify init . --integration generic "
+    f'--integration-options="--commands-dir {SPEC_KIT_COMMANDS_DIR}/" '
+    "--script sh --ignore-agent-tools --force"
 )
 
 GIT_TIMEOUT_SECONDS = 120
@@ -780,9 +785,7 @@ class SpecKitService:
         plan = PHASE_PLANS[phase_name]
         artifact_path = plan.artifact.format(spec_dir=workflow.spec_dir) if plan.artifact else None
 
-        command_doc = await self._read_file(
-            workspace, working_dir, f".claude/commands/{plan.command}.md"
-        )
+        command_doc = await self._read_guidance(workspace, working_dir, plan.command)
         template_doc = None
         if plan.template:
             template_doc = await self._read_file(
@@ -1173,6 +1176,25 @@ class SpecKitService:
         return await self.runtime.exec(
             workspace, command, cwd=cwd, timeout=GIT_TIMEOUT_SECONDS
         )
+
+    async def _read_guidance(self, workspace: Workspace, cwd: str, command: str) -> str | None:
+        """The Spec Kit command doc for a phase (``command`` is e.g. ``speckit.plan``).
+
+        Current scaffolds hold it in SPEC_KIT_COMMANDS_DIR; repositories initialised before
+        the switch to the generic integration keep Spec Kit's Claude layouts (skills, or the
+        older commands), which are already committed there, so those are read as fallbacks.
+        """
+        skill = command.replace(".", "-")
+        for rel_path in (
+            f"{SPEC_KIT_COMMANDS_DIR}/{command}.md",
+            f".claude/skills/{skill}/SKILL.md",
+            f".claude/commands/{command}.md",
+        ):
+            doc = await self._read_file(workspace, cwd, rel_path)
+            if doc:
+                return doc
+        logger.warning("spec_kit_guidance_missing", command=command)
+        return None
 
     async def _read_file(self, workspace: Workspace, cwd: str, rel_path: str) -> str | None:
         result = await self.runtime.exec(

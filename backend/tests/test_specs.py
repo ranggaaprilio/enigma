@@ -688,6 +688,55 @@ async def test_non_plan_phase_keeps_single_file_instruction(db_session):
     assert "data-model.md" not in prompt
 
 
+def test_specify_init_uses_the_generic_integration():
+    """Enigma is not Claude Code: scaffold Spec Kit's bring-your-own-agent commands."""
+    from app.services.speckit import SPEC_KIT_COMMANDS_DIR, SPECIFY_INIT_COMMAND
+
+    assert "--integration generic" in SPECIFY_INIT_COMMAND
+    assert f"--commands-dir {SPEC_KIT_COMMANDS_DIR}/" in SPECIFY_INIT_COMMAND
+    assert "claude" not in SPECIFY_INIT_COMMAND
+
+
+@pytest.mark.parametrize(
+    "guidance_path",
+    [
+        ".enigma/commands/speckit.plan.md",  # `--integration generic` (current)
+        ".claude/skills/speckit-plan/SKILL.md",  # repos initialised by spec-kit's claude skills
+        ".claude/commands/speckit.plan.md",  # repos initialised by older spec-kit releases
+    ],
+)
+async def test_phase_prompt_carries_the_spec_kit_guidance(db_session, guidance_path):
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"gd-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user)
+    await session.commit()
+
+    runtime = ScriptedRuntime(files={guidance_path: "PLAN GUIDANCE MARKER"})
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+    working_dir = service._working_dir(workspace, workflow, "plan")
+    prompt = await service._build_prompt(workspace, workflow, "plan", working_dir, None)
+
+    assert "Spec Kit guidance for this phase" in prompt
+    assert "PLAN GUIDANCE MARKER" in prompt
+
+
+async def test_missing_spec_kit_guidance_is_logged(db_session):
+    from structlog.testing import capture_logs
+
+    session, session_maker = db_session
+    user, workspace = await make_user_workspace(session, owner_email=f"ng-{uuid4()}@example.com")
+    workflow = await make_workflow(session, workspace, user)
+    await session.commit()
+
+    service = SpecKitService(session, session_maker, Settings(), runtime=ScriptedRuntime())
+    working_dir = service._working_dir(workspace, workflow, "plan")
+    with capture_logs() as logs:
+        prompt = await service._build_prompt(workspace, workflow, "plan", working_dir, None)
+
+    assert "Spec Kit guidance for this phase" not in prompt
+    assert any(entry["event"] == "spec_kit_guidance_missing" for entry in logs)
+
+
 async def test_list_phase_artifacts_returns_existing_design_files(db_session):
     session, session_maker = db_session
     user, workspace = await make_user_workspace(session, owner_email=f"list-{uuid4()}@example.com")
