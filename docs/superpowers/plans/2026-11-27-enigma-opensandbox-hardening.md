@@ -240,7 +240,22 @@ The second is a cheap live probe per health pass, so a server started with `OPEN
 
 **Files:** `tests/test_opensandbox_integration.py`, `.github/workflows/opensandbox-integration.yml` (weekly, opt-in).
 
-- [ ] Items 1–7 of §7, run locally against the reference config; record the results here.
+- [x] Items 1–7 of §7, run locally (2026-11-27) against opensandbox-server 1.2.1 started from `deploy/opensandbox/sandbox.toml` (only the store path changed), with execd v1.1.0 and egress v1.1.7. **9/9 passed in 112 s**, and no sandbox was left behind:
+
+  | # | Check | Result |
+  |---|---|---|
+  | 1 | Floor (CapEff 0, NoNewPrivs 1, non-root), `memory.max` = 2Gi, installation/workspace metadata | pass |
+  | 2 | Sandbox A → sandbox B's execd by IP | not 200 (blocked) |
+  | 3 | Lifecycle API without the key / execd without the token / with the token | 401 / 401 / 200 |
+  | 3 | A preview without / with the token | 401 / 200 |
+  | 4 | Egress: public open; `10.0.0.1`, `169.254.169.254`, `192.168.1.1` blocked; allow-list `1.1.1.1/32` allows 1.1.1.1 and blocks 8.8.8.8 | pass |
+  | 5 | Terminal: type, resize, disconnect, reconnect to the same shell (its state survives; output resumes from the last offset) | pass |
+  | 6 | Orphan sweep removes this installation's orphan and leaves another installation's; pause, then the next use resumes | pass |
+  | 7 | `extensions` / `volumes` refused | pass |
+
+- [x] `.github/workflows/opensandbox-integration.yml`: weekly or manual. It builds the image, starts the server from the reference config with a masked random key, runs the suite, and checks no sandbox is left.
+- **Exit criterion for Plan 7b met** locally: the suite is green against the reference config, and items 2–3 hold with the chosen strategy (token + `dns+nft`). The weekly workflow is the standing check.
+- Note: the suite surfaced no provider bug. The two first-run failures were test assumptions: a bare sandbox has no `workspace` dir yet, and a reconnect resumes from the last offset rather than replaying the whole backlog.
 
 ## Out of scope (Plan 7b and later)
 
