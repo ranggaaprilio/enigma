@@ -1314,3 +1314,367 @@ async def test_ensure_initialized_commits_until_scaffold_is_in_head(
     init_ran = any(cmd.startswith("specify init") for cmd, _ in runtime.calls)
     assert init_ran is expect_init
     assert commits == (["chore: initialize Spec Kit (SDD)"] if expect_init else [])
+
+
+# --- Plan 4: hand a completed workflow over as a pull request ------------------------------
+
+
+class PullRequestHarness:
+    """Records the git hand-off and answers GitHub's REST calls from a script."""
+
+    def __init__(self, monkeypatch, *, push_error=None, create_status=201):
+        import httpx
+
+        from app.services.github_client import GitHubClient
+
+        self.events: list[tuple] = []
+        self.requests: list[tuple[str, str, dict | None]] = []
+        self.create_status = create_status
+
+        async def fake_commit(_self, workspace_id, owner_id, message, **kwargs):
+            self.events.append(("commit", message, kwargs.get("worktree_path")))
+
+        async def fake_push(_self, workspace_id, owner_id, **kwargs):
+            self.events.append(("push", kwargs.get("worktree_path")))
+            if push_error is not None:
+                raise push_error
+
+        monkeypatch.setattr("app.services.speckit.RepositoryService.commit", fake_commit)
+        monkeypatch.setattr("app.services.speckit.RepositoryService.push", fake_push)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            import json
+
+            body = json.loads(request.content) if request.content else None
+            self.requests.append((request.method, request.url.path, body))
+            pr = {
+                "number": 12,
+                "html_url": "https://github.com/example/demo/pull/12",
+                "state": "open",
+                "title": "Add auth",
+                "head": {"ref": "001-add-auth"},
+                "base": {"ref": "main"},
+                "draft": False,
+            }
+            if request.method == "POST":
+                if self.create_status == 422:
+                    return httpx.Response(
+                        422,
+                        json={
+                            "message": "Validation failed",
+                            "errors": [{"message": "A pull request already exists for x:y."}],
+                        },
+                    )
+                return httpx.Response(201, json=pr)
+            return httpx.Response(200, json=[pr])
+
+        self.client = GitHubClient(Settings(), transport=httpx.MockTransport(handler))
+
+
+class SpecReadRuntime(ScriptedRuntime):
+    """Serves the confined spec read (``readlink -f -- <path> ...``) from ``files``."""
+
+    def __init__(self, files):
+        super().__init__()
+        self.spec_files = files
+
+    async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
+        if command.startswith("p=$(readlink -f -- "):
+            self.calls.append((command, cwd))
+            for path, content in self.spec_files.items():
+                if f"readlink -f -- {path})" in command:
+                    return type("R", (), {"exit_code": 0, "stdout": content, "stderr": ""})()
+            return type("R", (), {"exit_code": 1, "stdout": "", "stderr": ""})()
+        return await super().exec(workspace, command, cwd=cwd, env=env, timeout=timeout)
+
+
+async def _completed_workflow(session, *, with_credential=True):
+    from app.models import RepositoryCredential
+    from app.services.workspaces import WorkspaceSecretCipher
+
+    user, workspace = await make_user_workspace(session, owner_email=f"pr-{uuid4()}@example.com")
+    workflow = await make_workflow(
+        session, workspace, user, phase_status={p: "approved" for p in PHASE_ORDER}
+    )
+    workflow.status = "completed"
+    workflow.current_phase = "implement"
+    if with_credential:
+        cipher = WorkspaceSecretCipher(Settings().workspace_env_encryption_key)
+        session.add(
+            RepositoryCredential(
+                workspace_id=workspace.id,
+                provider="github",
+                auth_type="personal_access_token",
+                encrypted_token=cipher.encrypt("ghp_token"),
+            )
+        )
+    await session.commit()
+    return user, workspace, workflow
+
+
+async def test_open_pull_request_commits_pushes_and_links(db_session, monkeypatch):
+    from app.models import VerificationEvidence, VerificationRun
+
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session)
+    run = VerificationRun(
+        workspace_id=workspace.id,
+        plan_ref=f"{workflow.spec_dir}/plan.md",
+        status="approved",
+        criteria={"test_command": "pytest -q"},
+        iteration=1,
+        spec_workflow_id=workflow.id,
+    )
+    session.add(run)
+    await session.flush()
+    session.add(
+        VerificationEvidence(
+            run_id=run.id, kind="test", status="passed", detail={"output": "SECRET-OUT"}
+        )
+    )
+    await session.commit()
+    harness = PullRequestHarness(monkeypatch)
+    runtime = SpecReadRuntime({f"{workflow.spec_dir}/spec.md": "# Auth spec\nLogin."})
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+
+    pr, created = await service.open_pull_request(
+        workspace.id, workflow.id, user.id, github_client=harness.client
+    )
+
+    assert created is True
+    assert pr.number == 12
+    # The verified working tree is committed before the branch is pushed, both in the worktree.
+    assert harness.events == [
+        ("commit", "spec(001-add-auth): verification fixes", "worktrees/001-add-auth"),
+        ("push", "worktrees/001-add-auth"),
+    ]
+    method, path, body = harness.requests[0]
+    assert (method, path) == ("POST", "/repos/example/demo/pulls")
+    assert body["head"] == "001-add-auth"
+    assert body["base"] == "main"
+    assert body["title"] == "Add auth"
+    assert "| Last test | passed |" in body["body"]
+    assert "Login." in body["body"]
+    assert "SECRET-OUT" not in body["body"]
+    refreshed = await service.get_workflow(workspace.id, workflow.id, user.id)
+    assert refreshed.pull_request_id == pr.id
+    audit = await session.scalar(
+        select(AuditLog).where(
+            AuditLog.workspace_id == workspace.id, AuditLog.action == "spec_pull_request_opened"
+        )
+    )
+    assert audit is not None
+    note = await session.scalar(
+        select(Notification).where(
+            Notification.workspace_id == workspace.id,
+            Notification.notification_type == "pull_request_opened",
+        )
+    )
+    assert note is not None
+
+
+async def test_open_pull_request_is_idempotent_once_linked(db_session, monkeypatch):
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session)
+    harness = PullRequestHarness(monkeypatch)
+    service = SpecKitService(session, session_maker, Settings(), runtime=ScriptedRuntime())
+    first, _ = await service.open_pull_request(
+        workspace.id, workflow.id, user.id, github_client=harness.client
+    )
+    harness.events.clear()
+
+    again, created = await service.open_pull_request(
+        workspace.id, workflow.id, user.id, github_client=harness.client
+    )
+
+    assert created is False
+    assert again.id == first.id
+    assert harness.events == []
+
+
+async def test_open_pull_request_requires_a_completed_workflow(db_session, monkeypatch):
+    from app.services.speckit import SpecWorkflowNotReadyForPullRequestError
+
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session)
+    workflow.status = "awaiting_review"
+    await session.commit()
+    harness = PullRequestHarness(monkeypatch)
+    service = SpecKitService(session, session_maker, Settings(), runtime=ScriptedRuntime())
+
+    with pytest.raises(SpecWorkflowNotReadyForPullRequestError):
+        await service.open_pull_request(
+            workspace.id, workflow.id, user.id, github_client=harness.client
+        )
+    assert harness.events == []
+
+
+async def test_open_pull_request_adopts_an_existing_pr_for_the_branch(db_session, monkeypatch):
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session)
+    harness = PullRequestHarness(monkeypatch, create_status=422)
+    service = SpecKitService(session, session_maker, Settings(), runtime=ScriptedRuntime())
+
+    pr, created = await service.open_pull_request(
+        workspace.id, workflow.id, user.id, github_client=harness.client
+    )
+
+    assert pr.number == 12
+    assert created is True
+    assert [m for m, _, _ in harness.requests] == ["POST", "GET"]
+    refreshed = await service.get_workflow(workspace.id, workflow.id, user.id)
+    assert refreshed.pull_request_id == pr.id
+
+
+async def test_open_pull_request_leaves_the_workflow_unlinked_when_push_fails(
+    db_session, monkeypatch
+):
+    from app.services.repositories import GitCommandError
+
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session)
+    harness = PullRequestHarness(monkeypatch, push_error=GitCommandError("rejected"))
+    service = SpecKitService(session, session_maker, Settings(), runtime=ScriptedRuntime())
+
+    with pytest.raises(GitCommandError):
+        await service.open_pull_request(
+            workspace.id, workflow.id, user.id, github_client=harness.client
+        )
+    assert harness.requests == []
+    refreshed = await service.get_workflow(workspace.id, workflow.id, user.id)
+    assert refreshed.pull_request_id is None
+
+
+async def test_open_pull_request_needs_a_github_token(db_session, monkeypatch):
+    from app.services.repositories import RepositoryCredentialNotFoundError
+
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session, with_credential=False)
+    harness = PullRequestHarness(monkeypatch)
+    service = SpecKitService(session, session_maker, Settings(), runtime=ScriptedRuntime())
+
+    with pytest.raises(RepositoryCredentialNotFoundError):
+        await service.open_pull_request(
+            workspace.id, workflow.id, user.id, github_client=harness.client
+        )
+    # Checked before anything is pushed: no branch is left on the remote without a PR.
+    assert harness.events == []
+
+
+async def test_pull_request_route_opens_once_then_returns_the_link(db_session, monkeypatch):
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session)
+    harness = PullRequestHarness(monkeypatch)
+    monkeypatch.setattr("app.services.github_client.GitHubClient", lambda settings: harness.client)
+
+    app.dependency_overrides[auth_module.get_current_user] = await override_get_current_user(user)
+    app.dependency_overrides[specs_module.get_speckit_service] = speckit_override(
+        session, session_maker, ScriptedRuntime()
+    )
+    base = f"/workspaces/{workspace.id}/spec/workflows/{workflow.id}"
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            first = await client.post(f"{base}/pull-request")
+            second = await client.post(f"{base}/pull-request")
+            detail = await client.get(base)
+    finally:
+        app.dependency_overrides.clear()
+
+    assert first.status_code == 201, first.text
+    expected = {"number": 12, "url": "https://github.com/example/demo/pull/12", "state": "open"}
+    assert first.json() == expected
+    assert second.status_code == 200
+    assert second.json() == expected
+    assert [event[0] for event in harness.events] == ["commit", "push"]  # pushed once
+    assert detail.json()["pull_request"] == expected
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_status"),
+    [("not_completed", 409), ("no_credential", 409), ("other_user", 404)],
+)
+async def test_pull_request_route_refusals(db_session, monkeypatch, case, expected_status):
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(
+        session, with_credential=case != "no_credential"
+    )
+    if case == "not_completed":
+        workflow.status = "awaiting_review"
+        await session.commit()
+    caller = user
+    if case == "other_user":
+        caller = User(
+            id=uuid4(),
+            email=f"o-{uuid4()}@example.com",
+            password_hash=hash_password("password"),
+            role="owner",
+            is_active=True,
+            created_at=datetime.now(UTC),
+            updated_at=datetime.now(UTC),
+        )
+        session.add(caller)
+        await session.commit()
+    harness = PullRequestHarness(monkeypatch)
+    monkeypatch.setattr("app.services.github_client.GitHubClient", lambda settings: harness.client)
+
+    app.dependency_overrides[auth_module.get_current_user] = await override_get_current_user(caller)
+    app.dependency_overrides[specs_module.get_speckit_service] = speckit_override(
+        session, session_maker, ScriptedRuntime()
+    )
+    try:
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.post(
+                f"/workspaces/{workspace.id}/spec/workflows/{workflow.id}/pull-request"
+            )
+    finally:
+        app.dependency_overrides.clear()
+
+    assert response.status_code == expected_status, response.text
+    assert harness.events == []
+
+
+async def test_rerunning_implement_unlinks_the_pull_request(db_session, monkeypatch):
+    """Code review: a re-run implement changes the code, so the next completion must push again
+    (re-adopting the still-open PR) instead of returning the old link without pushing."""
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session)
+    harness = PullRequestHarness(monkeypatch)
+    service = SpecKitService(session, session_maker, Settings(), runtime=ScriptedRuntime())
+    await service.open_pull_request(
+        workspace.id, workflow.id, user.id, github_client=harness.client
+    )
+    monkeypatch.setattr("app.services.agents.AgentService.create_run", _fake_create_run())
+    monkeypatch.setattr(SpecKitService, "_finalize_phase", _noop_finalize)
+
+    await service.run_phase(workspace.id, workflow.id, "implement", user.id)
+
+    async with session_maker() as s:
+        assert (await s.get(SpecWorkflow, workflow.id)).pull_request_id is None
+
+
+async def test_open_pull_request_reraises_when_the_existing_pr_cannot_be_found(
+    db_session, monkeypatch
+):
+    import httpx
+
+    from app.services.github_client import GitHubApiError, GitHubClient
+
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session)
+    PullRequestHarness(monkeypatch)  # stubs commit + push
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(
+                422,
+                json={"message": "Validation failed", "errors": [{"message": "already exists"}]},
+            )
+        return httpx.Response(200, json=[])
+
+    client = GitHubClient(Settings(), transport=httpx.MockTransport(handler))
+    service = SpecKitService(session, session_maker, Settings(), runtime=ScriptedRuntime())
+
+    with pytest.raises(GitHubApiError):
+        await service.open_pull_request(workspace.id, workflow.id, user.id, github_client=client)
+    refreshed = await service.get_workflow(workspace.id, workflow.id, user.id)
+    assert refreshed.pull_request_id is None

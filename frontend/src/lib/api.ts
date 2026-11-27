@@ -2595,6 +2595,12 @@ export type SpecPhaseResponse = {
   updated_at: string;
 };
 
+export type SpecPullRequest = {
+  number: number;
+  url: string;
+  state: string;
+};
+
 export type SpecWorkflowResponse = {
   id: string;
   workspace_id: string;
@@ -2608,6 +2614,8 @@ export type SpecWorkflowResponse = {
   /** How `implement` is verified before the workflow completes; `null`: the workspace's `test`
    * command if it has one, else no verification. */
   verification?: SpecVerificationCriteria | null;
+  /** The pull request a completed workflow was handed over as. */
+  pull_request?: SpecPullRequest | null;
   status: SpecWorkflowStatus;
   current_phase: SpecPhaseName;
   created_at: string;
@@ -2867,6 +2875,17 @@ export function approveVerificationRun(
 }
 
 /** (Re)starts verification of a workflow's `implement` phase while it awaits review (202). */
+/** Commit the verified worktree, push its branch and open (or return) the workflow's PR. */
+export function openSpecPullRequest(
+  workspaceId: string,
+  workflowId: string,
+): Promise<SpecPullRequest> {
+  return requestJson<SpecPullRequest>(
+    `/workspaces/${workspaceId}/spec/workflows/${workflowId}/pull-request`,
+    { method: "POST" },
+  );
+}
+
 export function verifySpecImplement(
   workspaceId: string,
   workflowId: string,

@@ -1,10 +1,11 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.auth import CURRENT_USER_DEP
-from app.api.rate_limits import SPEC_RUN_RATE_LIMIT_DEP
+from app.api.rate_limits import SANDBOX_RATE_LIMIT_DEP, SPEC_RUN_RATE_LIMIT_DEP
+from app.api.workspaces import repository_error
 from app.core.config import Settings, get_settings
 from app.db.session import async_session_maker, get_db_session
 from app.models import User
@@ -18,6 +19,7 @@ from app.schemas.specs import (
     SpecArtifactResponse,
     SpecPhaseName,
     SpecPhaseResponse,
+    SpecPullRequestSummary,
     SpecWorkflowCreateRequest,
     SpecWorkflowResponse,
 )
@@ -25,7 +27,16 @@ from app.schemas.verification import VerificationRunResponse
 from app.services.access import WorkspaceAccessDeniedError
 from app.services.agents import AgentConfigurationError, AgentRunAlreadyActiveError
 from app.services.budgets import BudgetExceededError
+from app.services.github_client import GitHubApiError
 from app.services.jobs import RunQueueUnavailableError
+from app.services.repositories import (
+    GitCommandError,
+    PullRequestsUnsupportedError,
+    RepositoryCredentialNotFoundError,
+    RepositoryNotClonedError,
+    RepositoryTokenError,
+)
+from app.services.sandbox import SandboxRuntimeError
 from app.services.speckit import (
     InvalidArtifactPathError,
     InvalidSpecPhaseError,
@@ -38,6 +49,7 @@ from app.services.speckit import (
     SpecPhaseRequiresVerificationError,
     SpecVerificationNotConfiguredError,
     SpecWorkflowNotFoundError,
+    SpecWorkflowNotReadyForPullRequestError,
 )
 from app.services.verification.orchestrator import VerificationRunAlreadyActiveError
 from app.services.workspaces import WorkspaceNotFoundError
@@ -60,6 +72,19 @@ async def get_speckit_service(
 
 
 SPECKIT_SERVICE_DEP = Depends(get_speckit_service)
+
+
+# Git/GitHub failures while handing a workflow over as a PR; mapped (and redacted) exactly as
+# the repository routes map them.
+_PULL_REQUEST_ERRORS = (
+    GitCommandError,
+    GitHubApiError,
+    PullRequestsUnsupportedError,
+    RepositoryCredentialNotFoundError,
+    RepositoryNotClonedError,
+    RepositoryTokenError,
+    SandboxRuntimeError,
+)
 
 
 def _map_spec_error(error: Exception) -> HTTPException:
@@ -103,6 +128,10 @@ def _map_spec_error(error: Exception) -> HTTPException:
         )
     if isinstance(error, BudgetExceededError):
         return HTTPException(status_code=status.HTTP_402_PAYMENT_REQUIRED, detail=str(error))
+    if isinstance(error, SpecWorkflowNotReadyForPullRequestError):
+        return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
+    if isinstance(error, _PULL_REQUEST_ERRORS):
+        return repository_error(error)
     if isinstance(error, SpecKitNotReadyError):
         return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(error))
     if isinstance(error, AgentConfigurationError):
@@ -314,6 +343,29 @@ async def verify_spec_implement(
     except Exception as error:  # noqa: BLE001
         raise _map_spec_error(error) from None
     return VerificationRunResponse.model_validate(run)
+
+
+@router.post(
+    "/workflows/{workflow_id}/pull-request",
+    response_model=SpecPullRequestSummary,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[SANDBOX_RATE_LIMIT_DEP],
+)
+async def open_spec_pull_request(
+    workspace_id: UUID,
+    workflow_id: UUID,
+    response: Response,
+    current_user: User = CURRENT_USER_DEP,
+    service: SpecKitService = SPECKIT_SERVICE_DEP,
+) -> SpecPullRequestSummary:
+    """Commit the verified worktree, push its branch and open (or return) the workflow's PR."""
+    try:
+        pr, created = await service.open_pull_request(workspace_id, workflow_id, current_user.id)
+    except Exception as error:  # noqa: BLE001
+        raise _map_spec_error(error) from None
+    if not created:
+        response.status_code = status.HTTP_200_OK
+    return SpecPullRequestSummary.model_validate(pr)
 
 
 @router.post(

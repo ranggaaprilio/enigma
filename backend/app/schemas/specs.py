@@ -84,6 +84,14 @@ class SpecPhaseResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class SpecPullRequestSummary(BaseModel):
+    number: int
+    url: str
+    state: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class SpecWorkflowResponse(BaseModel):
     id: UUID
     workspace_id: UUID
@@ -95,6 +103,7 @@ class SpecWorkflowResponse(BaseModel):
     spec_dir: str
     worktree_path: str | None
     verification: dict | None = None
+    pull_request: SpecPullRequestSummary | None = None
     status: SpecWorkflowStatus
     current_phase: SpecPhaseName
     created_at: datetime

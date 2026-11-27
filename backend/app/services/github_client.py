@@ -218,6 +218,20 @@ class PullRequestService:
         )
         return await self._upsert(workspace_id, worktree_id, to_pull_request_data(payload))
 
+    async def ensure_supported(self, workspace_id: UUID, owner_id: UUID) -> None:
+        """Raise why PRs are unavailable for the workspace, before anything is pushed."""
+        await self._require_github_token(await self._get_workspace(workspace_id, owner_id))
+
+    async def find_open(self, workspace_id: UUID, owner_id: UUID, head: str) -> PullRequest | None:
+        """The open PR for ``head`` on GitHub, cached; ``None`` when there is none."""
+        workspace = await self._get_workspace(workspace_id, owner_id)
+        token = await self._require_github_token(workspace)
+        owner, repo = parse_owner_repo(workspace.repo_url or "")
+        payloads = await self.client.list_pull_requests(token, owner, repo, head=head)
+        if not payloads:
+            return None
+        return await self._upsert(workspace_id, None, to_pull_request_data(payloads[0]))
+
     async def get(self, workspace_id: UUID, owner_id: UUID, number: int) -> PullRequest:
         workspace = await self._get_workspace(workspace_id, owner_id)
         token = await self._require_github_token(workspace)

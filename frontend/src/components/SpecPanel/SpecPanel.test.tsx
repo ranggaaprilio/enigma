@@ -9,9 +9,11 @@ import {
   approveVerificationRun,
   createSpecWorkflow,
   getSpecArtifact,
+  getSpecWorkflow,
   getVerificationRun,
   listSpecWorkflows,
   listVerificationRuns,
+  openSpecPullRequest,
   runSpecPhase,
   verifySpecImplement,
   type VerificationRunDetailResponse,
@@ -41,6 +43,7 @@ vi.mock("../../lib/api", async (importOriginal) => {
     approveVerificationRun: vi.fn(),
     rejectVerificationRun: vi.fn(),
     verifySpecImplement: vi.fn(),
+    openSpecPullRequest: vi.fn(),
   };
 });
 
@@ -262,6 +265,7 @@ describe("SpecPanel", () => {
       vi.mocked(listVerificationRuns).mockResolvedValue([linkedRun()]);
       vi.mocked(getVerificationRun).mockResolvedValue(linkedRun());
       vi.mocked(approveVerificationRun).mockResolvedValue({ ...linkedRun(), status: "approved" });
+      vi.mocked(getSpecWorkflow).mockResolvedValue(verifiedWorkflow());
       const user = userEvent.setup();
 
       render(<SpecPanel workspace={workspace} />);
@@ -289,6 +293,75 @@ describe("SpecPanel", () => {
 
       await user.click(await screen.findByRole("button", { name: "Re-run verification" }));
       await waitFor(() => expect(verifySpecImplement).toHaveBeenCalledWith(workspace.id, "wf-1"));
+    });
+  });
+
+  describe("pull request (Plan 4)", () => {
+    const PR = { number: 12, url: "https://github.com/example/demo/pull/12", state: "open" };
+
+    function completedWorkflow(overrides: Partial<SpecWorkflowResponse> = {}): SpecWorkflowResponse {
+      return {
+        ...makeWorkflow("implement", {
+          plan: "approved",
+          tasks: "approved",
+          implement: "approved",
+        }),
+        status: "completed",
+        ...overrides,
+      };
+    }
+
+    it("opens a pull request for a completed workflow and then links it", async () => {
+      vi.mocked(listSpecWorkflows).mockResolvedValue([completedWorkflow()]);
+      vi.mocked(openSpecPullRequest).mockResolvedValue(PR);
+      vi.mocked(getSpecWorkflow).mockResolvedValue(completedWorkflow({ pull_request: PR }));
+      const user = userEvent.setup();
+
+      render(<SpecPanel workspace={workspace} />);
+
+      await user.click(await screen.findByRole("button", { name: "Open pull request" }));
+
+      await waitFor(() => expect(openSpecPullRequest).toHaveBeenCalledWith(workspace.id, "wf-1"));
+      const link = await screen.findByRole("link", { name: /PR #12/ });
+      expect(link).toHaveAttribute("href", PR.url);
+      expect(screen.queryByRole("button", { name: "Open pull request" })).not.toBeInTheDocument();
+    });
+
+    it("shows the linked pull request instead of the button", async () => {
+      vi.mocked(listSpecWorkflows).mockResolvedValue([completedWorkflow({ pull_request: PR })]);
+
+      render(<SpecPanel workspace={workspace} />);
+
+      expect(await screen.findByRole("link", { name: /PR #12/ })).toHaveAttribute("href", PR.url);
+      expect(screen.queryByRole("button", { name: "Open pull request" })).not.toBeInTheDocument();
+    });
+
+    it("shows why a pull request could not be opened", async () => {
+      vi.mocked(listSpecWorkflows).mockResolvedValue([completedWorkflow()]);
+      vi.mocked(openSpecPullRequest).mockRejectedValue(
+        new ApiError("Connect repository credentials before running this operation", 409),
+      );
+      const user = userEvent.setup();
+
+      render(<SpecPanel workspace={workspace} />);
+
+      await user.click(await screen.findByRole("button", { name: "Open pull request" }));
+
+      expect(
+        await screen.findByText("Connect repository credentials before running this operation"),
+      ).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Open pull request" })).toBeEnabled();
+    });
+
+    it("offers no pull request before the workflow is completed", async () => {
+      vi.mocked(listSpecWorkflows).mockResolvedValue([
+        makeWorkflow("specify", { specify: "awaiting_review" }),
+      ]);
+
+      render(<SpecPanel workspace={workspace} />);
+
+      await waitFor(() => expect(screen.getAllByText("Add SSO login").length).toBeGreaterThan(0));
+      expect(screen.queryByRole("button", { name: "Open pull request" })).not.toBeInTheDocument();
     });
   });
 });
