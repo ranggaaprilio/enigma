@@ -191,10 +191,13 @@ The second is a cheap live probe per health pass, so a server started with `OPEN
 
 **Files:** `opensandbox.py`, tests.
 
-- [ ] Failing tests:
-  - a probe failure destroys the new sandbox and raises naming the check
-  - adoption checks once per process
-- [ ] Implement, green.
+- [x] Failing tests:
+  - a probe failure destroys the new sandbox and raises naming the check (CapEff, NoNewPrivs, root, an empty probe)
+  - adoption checks once per process, and refuses but keeps a sandbox below the floor
+- [x] Implement, green (`FLOOR_PROBE`, shell builtins and `/usr/bin/id`).
+- [x] Security review of the Task 2 commit (automated), both fixed:
+  - **Critical: preview path traversal.** OpenSandbox's preview URL shares an origin with execd's control API, and the proxy sends the execd token. A visitor path with dot segments (`..`, `%2e%2e`, double-encoded, backslashes) could climb out of `/proxy/<port>` and run commands. `check_preview_path` now refuses such paths at the HTTP and WebSocket entry (400 / policy close), and `_upstream_url` re-checks that the built path stays under its prefix.
+  - **Medium: observation SSRF.** The fetch follows redirects only within the preview's origin; a redirect elsewhere is observed as the redirect itself, never fetched.
 
 ### Task 4: Refuse an insecure server
 

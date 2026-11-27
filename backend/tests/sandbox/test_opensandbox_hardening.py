@@ -370,6 +370,71 @@ def test_the_preview_proxy_drops_a_visitor_supplied_execd_token() -> None:
     assert "x-execd-access-token" in REQUEST_HEADERS_TO_STRIP
 
 
+# --- Task 3: the security floor is checked in the live sandbox ------------------------------
+
+HEALTHY_FLOOR = "CapEff: 0000000000000000\nNoNewPrivs: 1\n1001\n"
+
+
+def _floor_runtime(floor: str):
+    from app.services.sandbox.opensandbox import FLOOR_PROBE
+
+    runtime = opensandbox_runtime_with()
+    runtime.settings = _settings()
+    fake = runtime._fake_sandbox
+    fake.floor = floor
+    probes = lambda: [c for c, *_ in fake.commands.run_calls if c == FLOOR_PROBE]  # noqa: E731
+    return runtime, fake, probes
+
+
+@pytest.mark.parametrize(
+    ("floor", "named"),
+    [
+        ("CapEff: 00000000a80425fb\nNoNewPrivs: 1\n1001\n", "CapEff"),  # caps not all dropped
+        ("CapEff: 0000000000000000\nNoNewPrivs: 0\n1001\n", "NoNewPrivs"),
+        ("CapEff: 0000000000000000\nNoNewPrivs: 1\n0\n", "root"),
+        ("", "CapEff"),  # the probe printed nothing: never assume the floor
+    ],
+)
+async def test_a_new_sandbox_below_the_floor_is_destroyed_and_refused(floor, named) -> None:
+    runtime, fake, _ = _floor_runtime(floor)
+
+    with pytest.raises(ProvisioningError, match=named):
+        await runtime.provision(_workspace())
+
+    assert fake.destroyed
+
+
+async def test_a_new_sandbox_at_the_floor_is_kept_and_not_probed_again() -> None:
+    runtime, fake, probes = _floor_runtime(HEALTHY_FLOOR)
+    workspace = _workspace()
+
+    workspace.sandbox_id = await runtime.provision(workspace)
+    await runtime.exec(workspace, "true")
+
+    assert not fake.destroyed
+    assert len(probes()) == 1
+
+
+async def test_an_existing_sandbox_is_checked_once_per_process() -> None:
+    runtime, _, probes = _floor_runtime(HEALTHY_FLOOR)
+    workspace = _workspace()
+
+    await runtime.exec(workspace, "true")
+    await runtime.exec(workspace, "true")
+
+    assert len(probes()) == 1
+
+
+async def test_an_existing_sandbox_below_the_floor_is_refused_but_kept() -> None:
+    from app.services.sandbox.base import SandboxRuntimeError
+
+    runtime, fake, _ = _floor_runtime("CapEff: 00000000a80425fb\nNoNewPrivs: 1\n1001\n")
+
+    with pytest.raises(SandboxRuntimeError, match="CapEff"):
+        await runtime.exec(_workspace(), "true")
+    assert not fake.destroyed  # the user's files stay; recreate the workspace to fix it
+
+
 # --- preview paths never leave the preview's own prefix --------------------------------------
 # OpenSandbox's preview URL is execd's own origin (`http://host:<execd>/proxy/<port>`), so a
 # path that climbed out of `/proxy/<port>` would reach execd's control API with the sandbox

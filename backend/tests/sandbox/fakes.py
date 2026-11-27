@@ -1271,6 +1271,10 @@ class FakeOpenSandboxCommands:
 
     async def run(self, command: Any, *, opts: Any = None, handlers: Any = None) -> Any:
         self.run_calls.append((command, opts, handlers))
+        from app.services.sandbox.opensandbox import FLOOR_PROBE
+
+        if command == FLOOR_PROBE:  # the provider's security-floor check (Plan 7a)
+            return self._execution(0, self._sandbox.floor, "")
         if isinstance(command, list) and command and command[0] == "grep":
             return await self._grep(command, handlers)
         result = self._run_result(command)
@@ -1314,6 +1318,8 @@ class FakeOpenSandboxSandbox:
         self.files = FakeOpenSandboxFiles(self._store)
         self.commands = FakeOpenSandboxCommands(self, exec_handler)
         self.destroyed = False
+        # What the security-floor probe sees: caps dropped, no-new-privs, a non-root uid.
+        self.floor = "CapEff: 0000000000000000\nNoNewPrivs: 1\n1001\n"
         self.endpoint_ports: list[int] = []
         # execd /pty state: session_id -> FakePtyHandle (what the runtime seam sees).
         self.ptys: dict[str, FakePtyHandle] = {}

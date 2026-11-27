@@ -92,6 +92,36 @@ SAFE_CREATE_KEYS = frozenset(
 CREATE_READY_TIMEOUT = timedelta(seconds=120)
 
 
+# The security floor, read inside the sandbox (shell builtins and an absolute binary only: the
+# tenant owns the front of PATH). opensandbox-server applies the container profile from its
+# own sandbox.toml, so a server without drop_capabilities=["ALL"] is caught here.
+FLOOR_PROBE = (
+    "while read -r key value _; do case $key in CapEff:|NoNewPrivs:) "
+    'echo "$key $value";; esac; done < /proc/self/status; /usr/bin/id -u'
+)
+FLOOR_PROBE_TIMEOUT = timedelta(seconds=30)
+
+
+def floor_violations(output: str) -> list[str]:
+    """What the probe output says is below the floor (empty when it is all in place)."""
+    fields: dict[str, str] = {}
+    uid = None
+    for line in output.splitlines():
+        key, _, value = line.strip().partition(" ")
+        if key in ("CapEff:", "NoNewPrivs:"):
+            fields[key] = value.strip()
+        elif key.isdigit():
+            uid = key
+    violations = []
+    if fields.get("CapEff:", "").strip("0") != "" or "CapEff:" not in fields:
+        violations.append("CapEff is not 0 (capabilities not all dropped)")
+    if fields.get("NoNewPrivs:") != "1":
+        violations.append("NoNewPrivs is not 1")
+    if uid is None or uid == "0":
+        violations.append("the sandbox user is root")
+    return violations
+
+
 def execd_token(settings: Settings, workspace_id: UUID | str) -> str:
     """The workspace's execd access token: derived, never stored.
 
@@ -466,6 +496,8 @@ class OpenSandboxRuntime:
         # execd session (and is discarded alongside the sandbox on restart).
         self._pty_sessions: dict[str, str] = {}
         self._installation: str | None = None  # this database's id, loaded on first create
+        # Sandboxes whose security floor this process has seen in place (checked once each).
+        self._floor_checked: set[str] = set()
 
     def _home(self) -> str:
         return self.settings.sandbox_home.rstrip("/") or "/"
@@ -571,17 +603,49 @@ class OpenSandboxRuntime:
             sandbox = await self._create(kwargs)
         except Exception as error:
             raise ProvisioningError(str(map_opensandbox_error(error))) from error
+        violations = await self._floor_violations(sandbox)
+        if violations:
+            try:
+                await sandbox.destroy()
+            except Exception:
+                logger.warning(
+                    "opensandbox_unsafe_sandbox_cleanup_failed", sandbox_id=str(sandbox.id)
+                )
+            raise ProvisioningError(
+                "OpenSandbox sandbox failed its security check: " + "; ".join(violations)
+            )
+        self._floor_checked.add(str(sandbox.id))
         return str(sandbox.id)
+
+    async def _floor_violations(self, sandbox: Sandbox) -> list[str]:
+        try:
+            execution = await sandbox.commands.run(
+                FLOOR_PROBE, opts=RunCommandOpts(timeout=FLOOR_PROBE_TIMEOUT)
+            )
+        except Exception as error:
+            raise map_opensandbox_error(error) from error
+        return floor_violations(_joined_lines(execution.logs.stdout))
 
     async def _get_sandbox(self, workspace: Workspace) -> Sandbox:
         if not workspace.sandbox_id:
             raise SandboxNotFoundError("Workspace has no OpenSandbox sandbox")
         try:
-            return await self._connect(
+            sandbox = await self._connect(
                 workspace.sandbox_id, headers=execd_headers(self.settings, workspace)
             )
         except Exception as error:
             raise map_opensandbox_error(error) from error
+        if workspace.sandbox_id not in self._floor_checked:
+            # Adopted (created by another process or before this check existed): refuse to
+            # run anything in it below the floor, but keep the user's files.
+            violations = await self._floor_violations(sandbox)
+            if violations:
+                raise SandboxRuntimeError(
+                    "OpenSandbox sandbox failed its security check (recreate the workspace): "
+                    + "; ".join(violations)
+                )
+            self._floor_checked.add(workspace.sandbox_id)
+        return sandbox
 
     async def fs(self, workspace: Workspace) -> OpenSandboxFileSystem:
         return OpenSandboxFileSystem(await self._get_sandbox(workspace), self._home())

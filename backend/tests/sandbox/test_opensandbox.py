@@ -25,6 +25,7 @@ from app.services.sandbox.base import (
     SandboxRuntimeError,
 )
 from app.services.sandbox.opensandbox import (
+    FLOOR_PROBE,
     SEARCH_TIMEOUT_SECONDS,
     OpenSandboxMatch,
     OpenSandboxRuntime,
@@ -91,7 +92,8 @@ async def test_find_files_is_bounded_and_timeout_passed_through(monkeypatch) -> 
     # The search is bounded: a timeout and ``skip_accumulation`` reach the SDK, so the command
     # cannot run forever and its output is never buffered in ``execution.logs`` (unbounded on a
     # large tree otherwise).
-    (command, opts, handlers), *_ = fs._sandbox.commands.run_calls
+    calls = [c for c in fs._sandbox.commands.run_calls if c[0] != FLOOR_PROBE]
+    (command, opts, handlers), *_ = calls
     assert command[0] == "grep"
     assert opts.timeout == timedelta(seconds=SEARCH_TIMEOUT_SECONDS)
     assert handlers.skip_accumulation is True
@@ -185,7 +187,11 @@ async def test_relative_paths_resolve_against_the_sandbox_home() -> None:
     await runtime.exec(workspace, "true")  # no cwd: the workspace, like Daytona
     await runtime.exec(workspace, "true", cwd="workspace/sub")
     await runtime.exec(workspace, "true", cwd="/srv")
-    cwds = [opts.working_directory for _cmd, opts, _h in fs._sandbox.commands.run_calls]
+    cwds = [
+        opts.working_directory
+        for cmd, opts, _h in fs._sandbox.commands.run_calls
+        if cmd != FLOOR_PROBE  # the provider's one-off security check
+    ]
     assert cwds == [f"{home}/workspace", f"{home}/workspace/sub", "/srv"]
 
 
