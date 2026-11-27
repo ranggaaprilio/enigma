@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.db.session import async_session_maker
 from app.models import VerificationEvidence, VerificationRun, Workspace
+from app.services.artifact_store import ArtifactStore
 from app.services.runtime import RunLock
 from app.services.runtime import run_lock as default_run_lock
 from app.services.sandbox import SandboxRuntime, get_sandbox_runtime
@@ -131,6 +132,8 @@ class VerificationOrchestrator:
         self.poll_seconds = poll_seconds
         # Without a fixer, a failed test is simply re-run (``max_iterations`` attempts).
         self.fixer = fixer
+        # Where observation screenshots go (Plan 6); ``None`` skips them with a reason.
+        self.artifact_store: ArtifactStore | None = None
 
     @staticmethod
     def _lock_key(workspace_id: UUID) -> str:
@@ -384,6 +387,7 @@ class VerificationOrchestrator:
                 runtime=self.runtime,
                 session=session,
                 transport=self.observe_transport,
+                store=self.artifact_store,
             )
         await self._transition(session, run.id, "review", ("observing",))
         await session.commit()

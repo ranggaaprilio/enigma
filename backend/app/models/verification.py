@@ -1,7 +1,17 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, Text, func
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    func,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -116,3 +126,31 @@ class VerificationEvidence(Base):
     )
 
     run: Mapped[VerificationRun] = relationship(back_populates="evidence")
+
+
+class VerificationArtifact(Base):
+    """Object-store metadata for a binary artifact of one evidence row (a screenshot PNG).
+
+    The bytes live in the S3-compatible artifact store under ``storage_key``; the bucket is
+    private and objects are only ever read back through the authenticated API.
+    """
+
+    __tablename__ = "verification_artifacts"
+    __table_args__ = (
+        UniqueConstraint("evidence_id", name="uq_verification_artifacts_evidence_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    evidence_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("verification_evidence.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    storage_key: Mapped[str] = mapped_column(String(512), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    byte_size: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )

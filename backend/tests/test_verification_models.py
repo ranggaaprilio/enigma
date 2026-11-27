@@ -244,3 +244,46 @@ async def test_spec_workflow_links_to_its_pull_request(maker) -> None:
             assert wf.pull_request is None
     finally:
         await _cleanup(maker, workspace)
+
+
+async def test_verification_artifact_round_trips_and_cascades(maker) -> None:
+    """Plan 6 Task 1: a screenshot's object-store metadata belongs to its evidence row."""
+    from sqlalchemy import select
+
+    from app.models import VerificationArtifact
+
+    workspace = await _workspace(maker)
+    try:
+        async with maker() as session:
+            run = VerificationRun(workspace_id=workspace.id, plan_ref="p", status="review")
+            session.add(run)
+            await session.flush()
+            evidence = VerificationEvidence(
+                run_id=run.id, kind="observation", status="passed", detail={}
+            )
+            session.add(evidence)
+            await session.flush()
+            artifact = VerificationArtifact(
+                evidence_id=evidence.id,
+                storage_key=f"verification/{workspace.id}/{run.id}/{evidence.id}.png",
+                content_type="image/png",
+                byte_size=1234,
+            )
+            session.add(artifact)
+            await session.commit()
+            artifact_id, run_id = artifact.id, run.id
+
+        async with maker() as session:
+            loaded = await session.get(VerificationArtifact, artifact_id)
+            assert loaded.byte_size == 1234
+            assert loaded.content_type == "image/png"
+            await session.delete(await session.get(VerificationRun, run_id))
+            await session.commit()
+
+        async with maker() as session:
+            remaining = await session.scalar(
+                select(VerificationArtifact).where(VerificationArtifact.id == artifact_id)
+            )
+            assert remaining is None  # gone with its run -> evidence
+    finally:
+        await _cleanup(maker, workspace)

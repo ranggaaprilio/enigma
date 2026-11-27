@@ -15,7 +15,11 @@ from app.models.speckit import SpecPhase, SpecWorkflow
 from app.models.template import WorkspaceTemplate
 from app.models.terminal import TerminalSession
 from app.models.user import User
-from app.models.verification import VerificationEvidence, VerificationRun
+from app.models.verification import (
+    VerificationArtifact,
+    VerificationEvidence,
+    VerificationRun,
+)
 from app.models.workspace import Workspace, WorkspaceEnvVar
 from app.models.workspace_preview_alias import WorkspacePreviewAlias
 from app.models.workspace_service import WorkspaceService
@@ -48,6 +52,7 @@ __all__ = [
     "TerminalSession",
     "UsageBudget",
     "User",
+    "VerificationArtifact",
     "VerificationEvidence",
     "VerificationRun",
     "Workspace",

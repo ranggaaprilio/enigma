@@ -73,6 +73,13 @@ class Settings(BaseSettings):
     # How often a verification run waiting on its fix agent run checks back (inline: sleep;
     # queue: the job defers itself this long).
     verification_poll_seconds: float = Field(default=5.0, gt=0)
+    # Plan 6: the S3-compatible store (AWS S3, MinIO, R2) for evidence screenshots. Empty
+    # bucket = no store: screenshots are skipped with a reason, nothing else changes.
+    artifact_s3_bucket: str = ""
+    artifact_s3_endpoint_url: str = ""  # empty = AWS
+    artifact_s3_region: str = "us-east-1"
+    artifact_s3_access_key_id: str = ""
+    artifact_s3_secret_access_key: str = Field(default="", repr=False)
     # Epic 04: a worker owns a claimed run only while its lease is fresh. It renews every
     # `run_heartbeat_seconds`; once `lease_expires_at` passes, any worker's reaper (every
     # `run_reaper_interval_seconds`) ends the run as `interrupted_worker_died`.
