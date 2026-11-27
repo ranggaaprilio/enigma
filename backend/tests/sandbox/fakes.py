@@ -1380,13 +1380,13 @@ def opensandbox_runtime_with(
 
     # execd /pty seams: an in-memory stand-in for the HTTP+WebSocket API (the real
     # implementation lives in app.services.sandbox.opensandbox_pty).
-    async def pty_create_session(base_url: str, cwd: str | None) -> str:
+    async def pty_create_session(base_url: str, cwd: str | None, **_: Any) -> str:
         session_id = f"execd-{uuid4().hex[:8]}"
         sandbox.pty_creates.append(session_id)
         sandbox.ptys[session_id] = FakePtyHandle(session_id)
         return session_id
 
-    async def pty_status(base_url: str, server_session_id: str) -> tuple[bool, int]:
+    async def pty_status(base_url: str, server_session_id: str, **_: Any) -> tuple[bool, int]:
         return server_session_id in sandbox.ptys, 0
 
     async def pty_connect(
@@ -1398,13 +1398,14 @@ def opensandbox_runtime_with(
         takeover: bool,
         cols: int,
         rows: int,
+        **_: Any,
     ) -> FakePtyHandle:
         try:
             return sandbox.ptys[server_session_id]
         except KeyError:
             raise RuntimeError("no such execd PTY session") from None
 
-    async def pty_delete_session(base_url: str, server_session_id: str) -> None:
+    async def pty_delete_session(base_url: str, server_session_id: str, **_: Any) -> None:
         sandbox.pty_deletes.append(server_session_id)
         sandbox.ptys.pop(server_session_id, None)
 
@@ -1415,5 +1416,6 @@ def opensandbox_runtime_with(
     runtime._pty_session_status = pty_status  # type: ignore[method-assign]
     runtime._pty_connect = pty_connect  # type: ignore[method-assign]
     runtime._pty_delete_session = pty_delete_session  # type: ignore[method-assign]
+    runtime._installation = "test-installation"  # no database read in unit tests
     runtime._fake_sandbox = sandbox  # exposed for provider-level assertions
     return runtime

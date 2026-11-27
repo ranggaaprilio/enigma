@@ -80,6 +80,8 @@ REQUEST_HEADERS_TO_STRIP = HOP_BY_HOP_HEADERS | {
     "x-forwarded-host",
     "x-daytona-preview-token",
     "x-daytona-skip-preview-warning",
+    # OpenSandbox's execd token: the proxy adds the sandbox's own; a visitor's never passes.
+    "x-execd-access-token",
 }
 WEBSOCKET_HEADERS_TO_STRIP = REQUEST_HEADERS_TO_STRIP | {
     "origin",
@@ -1101,14 +1103,14 @@ async def _send_http_request(
 
 def _sandbox_token_headers(preview_link: RuntimePreviewLink) -> dict[str, str]:
     """The provider's preview-auth headers. Daytona's preview edge wants its token (and the
-    warning-page skip); a provider dialled directly on the sandbox network returns an empty
-    token, and the user's app then sees no provider header at all."""
-    if not preview_link.token:
-        return {}
-    return {
-        "X-Daytona-Preview-Token": preview_link.token,
-        "X-Daytona-Skip-Preview-Warning": "true",
-    }
+    warning-page skip); OpenSandbox's execd port proxy wants the sandbox's access token
+    (``preview_link.headers``); a provider dialled directly on the sandbox network returns
+    neither, and the user's app then sees no provider header at all."""
+    headers = dict(preview_link.headers)
+    if preview_link.token:
+        headers["X-Daytona-Preview-Token"] = preview_link.token
+        headers["X-Daytona-Skip-Preview-Warning"] = "true"
+    return headers
 
 
 async def _send_http_attempt(

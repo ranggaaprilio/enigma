@@ -68,14 +68,13 @@ from app.services.sandbox.docker_pty import (
     new_pidfile,
     tmux_session_name,
 )
+from app.services.sandbox.installation import INSTALLATION_LABEL, load_installation_id
 from app.services.sandbox.port_relay import PORT_RELAY_TIMEOUT_SECONDS, port_relay_command
 
 logger = structlog.get_logger(__name__)
 
 DEFAULT_DOCKER_HOST = "unix:///var/run/docker.sock"
 MANAGED_LABEL = "enigma.managed"
-# This database's id (``sandbox_installation``): the upkeep loop only touches its own.
-INSTALLATION_LABEL = "enigma.installation"
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 # Pure-sh (builtins only, nothing a tenant could shadow on PATH): "busy" while an exec or an
 # attached terminal client is alive in the sandbox.
@@ -487,26 +486,8 @@ class DockerRuntime:
     # --- installation scoping ---------------------------------------------------------
 
     async def _installation_id(self) -> str:
-        if self._installation is None:
-            from sqlalchemy import select
-            from sqlalchemy.ext.asyncio import create_async_engine
-            from sqlalchemy.pool import NullPool
-
-            from app.models import SandboxInstallation
-
-            # Read once per runtime, on a throwaway connection: a pooled one would be bound
-            # to whichever event loop happened to open it.
-            engine = create_async_engine(self.settings.database_url, poolclass=NullPool)
-            try:
-                async with engine.connect() as connection:
-                    value = await connection.scalar(select(SandboxInstallation.id))
-            finally:
-                await engine.dispose()
-            if value is None:
-                raise RuntimeUnavailableError(
-                    "This database has no sandbox installation id; run the migrations"
-                )
-            self._installation = str(value)
+        if self._installation is None:  # read once per runtime
+            self._installation = await load_installation_id(self.settings)
         return self._installation
 
     def _require_installation(self) -> str:

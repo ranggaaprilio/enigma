@@ -156,6 +156,9 @@ async def _store_screenshot(
     )
 
 
+MAX_REDIRECTS = 5
+
+
 async def _capture_snapshot(
     link: RuntimePreviewLink,
     *,
@@ -169,7 +172,18 @@ async def _capture_snapshot(
     async with httpx.AsyncClient(
         timeout=OBSERVE_TIMEOUT_SECONDS, transport=transport
     ) as client:
-        response = await client.get(link.url, follow_redirects=True)
+        # Redirects are followed by hand: httpx keeps custom headers on a cross-origin hop,
+        # and the provider's (OpenSandbox's execd token) must only ever reach the preview's
+        # own origin, never a host the app redirects to.
+        url = httpx.URL(link.url)
+        origin = (url.scheme, url.host, url.port)
+        for _ in range(MAX_REDIRECTS + 1):
+            same_origin = (url.scheme, url.host, url.port) == origin
+            response = await client.get(url, headers=link.headers if same_origin else None)
+            location = response.headers.get("location")
+            if not response.is_redirect or not location:
+                break
+            url = url.join(location)
 
     text = response.text
     title = _extract_title(text)

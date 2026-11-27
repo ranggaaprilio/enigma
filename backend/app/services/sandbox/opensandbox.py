@@ -11,13 +11,17 @@ glob-based, so it is implemented with ``grep -F`` run inside the sandbox.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Sequence
+import hashlib
+import hmac
+import ipaddress
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from posixpath import basename
 from posixpath import join as posix_join
 from typing import Any
 from urllib.parse import urlsplit
+from uuid import UUID
 
 import structlog
 from opensandbox import Sandbox, SandboxManager
@@ -37,7 +41,7 @@ from opensandbox.models.filesystem import (
     SetPermissionEntry,
     WriteEntry,
 )
-from opensandbox.models.sandboxes import SandboxFilter
+from opensandbox.models.sandboxes import NetworkPolicy, NetworkRule, SandboxFilter
 
 from app.core.config import Settings
 from app.models import Workspace
@@ -50,6 +54,7 @@ from app.services.sandbox.base import (
     SandboxNotFoundError,
     SandboxRuntimeError,
 )
+from app.services.sandbox.installation import INSTALLATION_LABEL, load_installation_id
 from app.services.sandbox.opensandbox_pty import (
     EXECD_PORT,
     create_pty_session,
@@ -61,9 +66,123 @@ from app.services.sandbox.opensandbox_pty import (
 
 logger = structlog.get_logger(__name__)
 
-# Placeholder image until provisioning (image/snapshot selection per workspace) lands; it must
-# carry mise + code-server like the Daytona snapshot (see sandbox/Dockerfile).
-DEFAULT_IMAGE = "enigma-sandbox:latest"
+# --- the create request (Plan 7a) ------------------------------------------------------------
+# On opensandbox-server 1.2.1 every sandbox shares one bridge and execd accepts any caller that
+# lacks a token, so a sibling sandbox could exec in another tenant's (verified live, plan Task
+# 1). Each sandbox therefore gets its own execd token (sent on every SDK, PTY and preview call)
+# and an egress policy that never reaches a private address (enforced by a `dns+nft` server).
+EXECD_TOKEN_HEADER = "X-EXECD-ACCESS-TOKEN"
+EXECD_TOKEN_ENV = "EXECD_ACCESS_TOKEN"
+WORKSPACE_LABEL = "enigma.workspace"
+PRIVATE_NETWORKS = (
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "100.64.0.0/10",  # carrier-grade NAT
+    "169.254.0.0/16",  # link-local, cloud metadata
+    "fc00::/7",
+    "fe80::/10",
+    "::ffff:0:0/96",  # IPv4-mapped IPv6: would otherwise reopen every range above
+)
+# Everything else a create request could carry (extensions, volumes, platform, entrypoint,
+# secure access, credential proxy, ...) can widen the sandbox profile or mount host state.
+SAFE_CREATE_KEYS = frozenset(
+    {"image", "timeout", "ready_timeout", "env", "metadata", "resource", "network_policy"}
+)
+CREATE_READY_TIMEOUT = timedelta(seconds=120)
+
+
+def execd_token(settings: Settings, workspace_id: UUID | str) -> str:
+    """The workspace's execd access token: derived, never stored.
+
+    Keyed by OPENSANDBOX_EXECD_TOKEN_KEY (required outside ``local``; there it falls back to
+    AUTH_SECRET_KEY so a dev setup needs nothing extra).
+    """
+    key = settings.opensandbox_execd_token_key or settings.auth_secret_key
+    message = f"opensandbox-execd:{workspace_id}".encode()
+    return hmac.new(key.encode(), message, hashlib.sha256).hexdigest()
+
+
+def execd_headers(settings: Settings, workspace: Workspace) -> dict[str, str]:
+    return {EXECD_TOKEN_HEADER: execd_token(settings, workspace.id)}
+
+
+def _network(target: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+    try:
+        return ipaddress.ip_network(target, strict=False)
+    except ValueError:
+        return None
+
+
+def _is_private(target: str) -> bool:
+    network = _network(target)
+    if network is None:
+        return False
+    return any(
+        network.version == private.version and network.overlaps(private)
+        for private in map(ipaddress.ip_network, PRIVATE_NETWORKS)
+    )
+
+
+def network_policy(settings: Settings) -> NetworkPolicy:
+    """SANDBOX_NETWORK_* as an egress policy; private ranges are denied whatever they say."""
+    deny = [NetworkRule(action="deny", target=network) for network in PRIVATE_NETWORKS]
+    if settings.sandbox_network_block_all:
+        return NetworkPolicy(defaultAction="deny", egress=deny)
+    allow_list = [entry for entry in settings.sandbox_network_allow_list if entry]
+    if allow_list:
+        # SANDBOX_NETWORK_ALLOW_LIST holds CIDRs on every provider; a hostname here could
+        # resolve to a private address, so it is dropped rather than trusted.
+        dropped = [entry for entry in allow_list if _network(entry) is None or _is_private(entry)]
+        if dropped:
+            logger.warning("opensandbox_allow_list_entries_ignored", entries=dropped)
+        allow = [
+            NetworkRule(action="allow", target=entry)
+            for entry in allow_list
+            if entry not in dropped
+        ]
+        return NetworkPolicy(defaultAction="deny", egress=deny + allow)
+    return NetworkPolicy(defaultAction="allow", egress=deny)
+
+
+def build_create_kwargs(
+    settings: Settings, workspace: Workspace, installation: str
+) -> dict[str, Any]:
+    image = settings.opensandbox_sandbox_image
+    if settings.opensandbox_image_digest_required and "@sha256:" not in image:
+        raise ProvisioningError(
+            "OPENSANDBOX_SANDBOX_IMAGE must be pinned by digest (name@sha256:...)"
+        )
+    resource = {
+        "cpu": settings.opensandbox_sandbox_cpu,
+        "memory": settings.opensandbox_sandbox_memory,
+    }
+    if settings.opensandbox_sandbox_disk:
+        resource["disk"] = settings.opensandbox_sandbox_disk
+    return {
+        "image": image,
+        "timeout": None,  # Enigma owns the lifecycle: destroy() on delete, upkeep pauses
+        "ready_timeout": CREATE_READY_TIMEOUT,
+        "env": {EXECD_TOKEN_ENV: execd_token(settings, workspace.id)},
+        "metadata": {INSTALLATION_LABEL: installation, WORKSPACE_LABEL: str(workspace.id)},
+        "resource": resource,
+        "network_policy": network_policy(settings),
+    }
+
+
+def assert_safe_create_kwargs(kwargs: Mapping[str, Any], settings: Settings) -> None:
+    """Refuse a create request that could widen the sandbox profile (defence in depth)."""
+    extra = set(kwargs) - SAFE_CREATE_KEYS
+    if extra:
+        raise ProvisioningError(f"refusing unsafe OpenSandbox create fields: {sorted(extra)}")
+    if kwargs.get("image") != settings.opensandbox_sandbox_image:
+        raise ProvisioningError(
+            "refusing an OpenSandbox image other than OPENSANDBOX_SANDBOX_IMAGE"
+        )
+    if set(kwargs.get("env") or {}) != {EXECD_TOKEN_ENV}:
+        raise ProvisioningError("refusing OpenSandbox create env beyond the execd token")
+    if not isinstance(kwargs.get("network_policy"), NetworkPolicy):
+        raise ProvisioningError("refusing an OpenSandbox sandbox without a network policy")
 
 # Upper bound on ``find_files`` output kept in backend memory, and on how long the search may
 # run — the same bounds the Docker provider applies (``docker_fs.py``). The SDK accumulates
@@ -346,6 +465,7 @@ class OpenSandboxRuntime:
         # own id on POST /pty; this in-process mapping lets a reconnect resolve the same
         # execd session (and is discarded alongside the sandbox on restart).
         self._pty_sessions: dict[str, str] = {}
+        self._installation: str | None = None  # this database's id, loaded on first create
 
     def _home(self) -> str:
         return self.settings.sandbox_home.rstrip("/") or "/"
@@ -366,19 +486,23 @@ class OpenSandboxRuntime:
 
     # The SDK seams (replaced by tests): connect to an existing sandbox, create one, and the
     # management-API client for ``health``/``status``.
-    async def _connect(self, sandbox_id: str) -> Sandbox:
-        return await Sandbox.connect(
-            sandbox_id,
-            connection_config=self._connection_config(),
-            skip_health_check=True,
-        )
+    async def _connect(self, sandbox_id: str, *, headers: dict[str, str]) -> Sandbox:
+        # The sandbox's execd token rides on every data-plane request (the lifecycle server
+        # ignores it); a sandbox created before tokens has none and accepts it all the same.
+        base = self._connection_config()
+        config = base.model_copy(update={"headers": {**base.headers, **headers}})
+        return await Sandbox.connect(sandbox_id, connection_config=config, skip_health_check=True)
 
-    async def _create(self) -> Sandbox:
-        return await Sandbox.create(
-            DEFAULT_IMAGE,
-            timeout=None,  # manual cleanup: Enigma owns the lifecycle, destroy() on delete
-            connection_config=self._connection_config(),
-        )
+    async def _create(self, kwargs: dict[str, Any]) -> Sandbox:
+        token = kwargs["env"][EXECD_TOKEN_ENV]
+        base = self._connection_config()
+        config = base.model_copy(update={"headers": {**base.headers, EXECD_TOKEN_HEADER: token}})
+        return await Sandbox.create(**kwargs, connection_config=config)
+
+    async def _installation_id(self) -> str:
+        if self._installation is None:
+            self._installation = await load_installation_id(self.settings)
+        return self._installation
 
     async def _get_manager(self) -> SandboxManager:
         if self._manager is None:
@@ -387,11 +511,15 @@ class OpenSandboxRuntime:
 
     # P des seams (replaced by tests): each talks to the execd ``/pty`` API directly,
     # because the SDK does not expose those routes.
-    async def _pty_create_session(self, base_url: str, cwd: str | None) -> str:
-        return await create_pty_session(base_url, cwd=cwd)
+    async def _pty_create_session(
+        self, base_url: str, cwd: str | None, *, headers: dict[str, str]
+    ) -> str:
+        return await create_pty_session(base_url, cwd=cwd, headers=headers)
 
-    async def _pty_session_status(self, base_url: str, server_session_id: str) -> tuple[bool, int]:
-        return await pty_session_status(base_url, server_session_id)
+    async def _pty_session_status(
+        self, base_url: str, server_session_id: str, *, headers: dict[str, str]
+    ) -> tuple[bool, int]:
+        return await pty_session_status(base_url, server_session_id, headers=headers)
 
     async def _pty_connect(
         self,
@@ -403,6 +531,7 @@ class OpenSandboxRuntime:
         takeover: bool,
         cols: int,
         rows: int,
+        headers: dict[str, str],
     ) -> PtyHandle:
         return await open_pty_websocket(
             base_url,
@@ -412,10 +541,13 @@ class OpenSandboxRuntime:
             takeover=takeover,
             cols=cols,
             rows=rows,
+            headers=headers,
         )
 
-    async def _pty_delete_session(self, base_url: str, server_session_id: str) -> None:
-        await delete_pty_session(base_url, server_session_id)
+    async def _pty_delete_session(
+        self, base_url: str, server_session_id: str, *, headers: dict[str, str]
+    ) -> None:
+        await delete_pty_session(base_url, server_session_id, headers=headers)
 
     async def close(self) -> None:
         manager, self._manager = self._manager, None
@@ -433,8 +565,10 @@ class OpenSandboxRuntime:
         return "ok"
 
     async def provision(self, workspace: Workspace) -> str:
+        kwargs = build_create_kwargs(self.settings, workspace, await self._installation_id())
+        assert_safe_create_kwargs(kwargs, self.settings)
         try:
-            sandbox = await self._create()
+            sandbox = await self._create(kwargs)
         except Exception as error:
             raise ProvisioningError(str(map_opensandbox_error(error))) from error
         return str(sandbox.id)
@@ -443,7 +577,9 @@ class OpenSandboxRuntime:
         if not workspace.sandbox_id:
             raise SandboxNotFoundError("Workspace has no OpenSandbox sandbox")
         try:
-            return await self._connect(workspace.sandbox_id)
+            return await self._connect(
+                workspace.sandbox_id, headers=execd_headers(self.settings, workspace)
+            )
         except Exception as error:
             raise map_opensandbox_error(error) from error
 
@@ -553,6 +689,7 @@ class OpenSandboxRuntime:
         except Exception as error:
             raise map_opensandbox_error(error) from error
         base_url = pty_base_url(str(getattr(endpoint, "endpoint", "") or ""))
+        headers = execd_headers(self.settings, workspace)
 
         # Environment variables ride on the sandbox env file (execd's ``set_env``), so a
         # fresh session sees them; they persist for later sessions of the same sandbox.
@@ -569,19 +706,21 @@ class OpenSandboxRuntime:
         server_session_id = self._pty_sessions.get(session_id)
         if server_session_id is None:
             try:
-                server_session_id = await self._pty_create_session(base_url, cwd)
+                server_session_id = await self._pty_create_session(base_url, cwd, headers=headers)
             except Exception as error:
                 raise map_opensandbox_error(error) from error
             self._pty_sessions[session_id] = server_session_id
 
         try:
-            exists, offset = await self._pty_session_status(base_url, server_session_id)
+            exists, offset = await self._pty_session_status(
+                base_url, server_session_id, headers=headers
+            )
         except Exception as error:
             raise map_opensandbox_error(error) from error
         if not exists:
             # The sandbox restarted and its execd sessions are gone: recreate.
             try:
-                server_session_id = await self._pty_create_session(base_url, cwd)
+                server_session_id = await self._pty_create_session(base_url, cwd, headers=headers)
             except Exception as error:
                 raise map_opensandbox_error(error) from error
             self._pty_sessions[session_id] = server_session_id
@@ -596,6 +735,7 @@ class OpenSandboxRuntime:
                 takeover=True,
                 cols=cols,
                 rows=rows,
+                headers=headers,
             )
         except Exception as error:
             raise map_opensandbox_error(error) from error
@@ -611,7 +751,9 @@ class OpenSandboxRuntime:
             raise map_opensandbox_error(error) from error
         base_url = pty_base_url(str(getattr(endpoint, "endpoint", "") or ""))
         try:
-            await self._pty_delete_session(base_url, server_session_id)
+            await self._pty_delete_session(
+                base_url, server_session_id, headers=execd_headers(self.settings, workspace)
+            )
         except Exception as error:
             raise map_opensandbox_error(error) from error
 
@@ -624,7 +766,10 @@ class OpenSandboxRuntime:
         url = str(getattr(endpoint, "endpoint", "") or "")
         if not url.startswith(("http://", "https://")):
             url = f"http://{url}"
-        return RuntimePreviewLink(url=url, token="")
+        # execd's port proxy sits behind its token: the preview proxy and the
+        # verification observation send these headers with every request.
+        headers = execd_headers(self.settings, workspace)
+        return RuntimePreviewLink(url=url, token="", headers=headers)
 
     async def expose_port(self, workspace: Workspace, port: int) -> None:
         """Requesting the endpoint is enough (the server publishes it on demand). Best effort."""

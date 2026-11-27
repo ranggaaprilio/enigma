@@ -95,13 +95,14 @@ async def open_pty_websocket(
     takeover: bool = False,
     cols: int = 80,
     rows: int = 24,
+    headers: dict[str, str] | None = None,
 ) -> PtyHandle:
     """Connect to an execd PTY session and return a live handle."""
     ws_url = base_url.replace("http://", "ws://").replace("https://", "wss://")
     ws_url += f"/pty/{server_session_id}/ws?since={offset}"
     if takeover:
         ws_url += "&takeover=1"
-    ws = await websockets.connect(ws_url, max_size=2**22)
+    ws = await websockets.connect(ws_url, max_size=2**22, additional_headers=headers or None)
     # Wait for the ``connected`` acknowledgment; a reconnect with ``since=`` can replay
     # scrollback (binary 0x01 frames) *before* it, and that output belongs to the terminal.
     # Pump it through, then fail loudly on an unexpected role so a refusal (409-style)
@@ -141,18 +142,24 @@ def pty_base_url(endpoint: str) -> str:
 
 
 async def create_pty_session(
-    base_url: str, *, cwd: str | None = None, timeout: float = 10.0
+    base_url: str,
+    *,
+    cwd: str | None = None,
+    timeout: float = 10.0,
+    headers: dict[str, str] | None = None,
 ) -> str:
     """POST /pty and return the server-assigned session id (201 Created)."""
-    async with httpx.AsyncClient(timeout=timeout) as client:
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as client:
         response = await client.post(f"{base_url}/pty", json={"cwd": cwd or "/"})
         response.raise_for_status()
         return response.json()["session_id"]
 
 
-async def pty_session_status(base_url: str, server_session_id: str) -> tuple[bool, int]:
+async def pty_session_status(
+    base_url: str, server_session_id: str, *, headers: dict[str, str] | None = None
+) -> tuple[bool, int]:
     """(exists, output_offset) for a session. A missing session is (False, 0)."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
         response = await client.get(f"{base_url}/pty/{server_session_id}")
     if response.status_code == 404:
         return False, 0
@@ -160,9 +167,11 @@ async def pty_session_status(base_url: str, server_session_id: str) -> tuple[boo
     return True, int(response.json().get("output_offset", 0))
 
 
-async def delete_pty_session(base_url: str, server_session_id: str) -> None:
+async def delete_pty_session(
+    base_url: str, server_session_id: str, *, headers: dict[str, str] | None = None
+) -> None:
     """DELETE /pty/{id}; idempotent (a missing session is a no-op)."""
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
         response = await client.delete(f"{base_url}/pty/{server_session_id}")
     if response.status_code not in (200, 204, 404):
         response.raise_for_status()

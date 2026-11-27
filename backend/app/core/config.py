@@ -1,4 +1,5 @@
 import os
+import re
 import socket
 from collections.abc import Mapping
 from functools import lru_cache
@@ -111,6 +112,18 @@ class Settings(BaseSettings):
     # the key is only required when the OpenSandbox server enforces authentication.
     opensandbox_api_url: str | None = None
     opensandbox_api_key: str | None = None
+    # Every OpenSandbox sandbox is created from these (Plan 7a). The image may be pinned by
+    # digest (`name@sha256:...`); a tag is refused when a digest is required, which is the
+    # default outside `local` (OPENSANDBOX_REQUIRE_IMAGE_DIGEST overrides). Resources use
+    # Kubernetes quantities; an empty disk means no writable-layer quota.
+    # Key for each sandbox's execd access token (HMAC per workspace). Required outside
+    # `local`; rotating it locks Enigma out of every existing sandbox until it is recreated.
+    opensandbox_execd_token_key: str = ""
+    opensandbox_sandbox_image: str = "enigma-sandbox:latest"
+    opensandbox_require_image_digest: bool | None = None
+    opensandbox_sandbox_cpu: str = "2"
+    opensandbox_sandbox_memory: str = "4Gi"
+    opensandbox_sandbox_disk: str = ""
     # Provider-neutral since Epic 06; DAYTONA_WORKSPACE_PATH / DAYTONA_SANDBOX_HOME still
     # accepted for one release (logged as deprecated at startup).
     sandbox_workspace_path: str = Field(
@@ -343,6 +356,29 @@ class Settings(BaseSettings):
         hide_input_in_errors=True,
     )
 
+    @field_validator("opensandbox_sandbox_cpu")
+    @classmethod
+    def validate_opensandbox_cpu(cls, value: str) -> str:
+        if not re.fullmatch(r"\d+(\.\d+)?m?", value.strip()):
+            raise ValueError("OPENSANDBOX_SANDBOX_CPU must be a CPU quantity such as 2 or 500m")
+        return value.strip()
+
+    @field_validator("opensandbox_sandbox_memory", "opensandbox_sandbox_disk")
+    @classmethod
+    def validate_opensandbox_bytes(cls, value: str, info) -> str:
+        value = value.strip()
+        if value == "" and info.field_name == "opensandbox_sandbox_disk":
+            return value
+        if not re.fullmatch(r"\d+(Ki|Mi|Gi|Ti)?", value):
+            raise ValueError(f"{info.field_name.upper()} must be a quantity such as 4Gi or 512Mi")
+        return value
+
+    @property
+    def opensandbox_image_digest_required(self) -> bool:
+        if self.opensandbox_require_image_digest is not None:
+            return self.opensandbox_require_image_digest
+        return self.environment != "local"
+
     @field_validator("workspace_env_encryption_key")
     @classmethod
     def validate_fernet_key(cls, value: str) -> str:
@@ -410,6 +446,24 @@ class Settings(BaseSettings):
             )
         return self
 
+    def insecure_setting_names(self) -> list[str]:
+        """Secrets still at an insecure default (refused outside ``local``)."""
+        insecure = []
+        if self.auth_secret_key == _DEFAULT_AUTH_SECRET_KEY:
+            insecure.append("auth_secret_key")
+        if self.workspace_env_encryption_key == _DEFAULT_ENV_ENCRYPTION_KEY:
+            insecure.append("workspace_env_encryption_key")
+        # `/metrics` reports per-route request volumes and workspace-level counters; it must
+        # not be world-readable outside local development.
+        if not self.metrics_token:
+            insecure.append("metrics_token")
+        # Sandbox execd tokens get their own key: sharing AUTH_SECRET_KEY would let anyone
+        # who can forge sessions derive every sandbox's token, and rotating it would lock
+        # Enigma out of every existing sandbox (the token is fixed at create).
+        if self.opensandbox_api_url and not self.opensandbox_execd_token_key:
+            insecure.append("opensandbox_execd_token_key")
+        return insecure
+
     @model_validator(mode="after")
     def enforce_secure_defaults(self) -> "Settings":
         """Refuse to boot with insecure defaults outside a local environment.
@@ -421,21 +475,16 @@ class Settings(BaseSettings):
         if self.environment == "local":
             return self
 
-        insecure = []
-        if self.auth_secret_key == _DEFAULT_AUTH_SECRET_KEY:
-            insecure.append("auth_secret_key")
-        elif len(self.auth_secret_key) < _MIN_AUTH_SECRET_LENGTH:
+        insecure = self.insecure_setting_names()
+        if (
+            self.auth_secret_key != _DEFAULT_AUTH_SECRET_KEY
+            and len(self.auth_secret_key) < _MIN_AUTH_SECRET_LENGTH
+        ):
             raise ValueError(
                 f"auth_secret_key must be at least {_MIN_AUTH_SECRET_LENGTH} characters when "
                 f"environment={self.environment!r}. Generate one with: "
                 "python -c 'import secrets; print(secrets.token_urlsafe(48))'"
             )
-        if self.workspace_env_encryption_key == _DEFAULT_ENV_ENCRYPTION_KEY:
-            insecure.append("workspace_env_encryption_key")
-        # `/metrics` reports per-route request volumes and workspace-level counters; it must
-        # not be world-readable outside local development.
-        if not self.metrics_token:
-            insecure.append("metrics_token")
         if insecure:
             raise ValueError(
                 f"Insecure default secret(s) {insecure} are not allowed when "
