@@ -27,9 +27,18 @@ from sqlalchemy.orm import selectinload
 
 from app.core.config import Settings
 from app.core.lifecycle import ServiceDrainingError, lifecycle
-from app.models import AgentRun, SpecPhase, SpecWorkflow, User, VerificationRun, Workspace
+from app.models import (
+    AgentRun,
+    PullRequest,
+    SpecPhase,
+    SpecWorkflow,
+    User,
+    VerificationRun,
+    Workspace,
+)
 from app.services.agents import AgentService
 from app.services.audit import AuditLogService
+from app.services.github_client import GitHubApiError, GitHubClient, PullRequestService
 from app.services.jobs import (
     ENQUEUE_FAILED,
     RunDispatcher,
@@ -45,6 +54,11 @@ from app.services.repositories import (
 )
 from app.services.runtime import run_registry
 from app.services.sandbox import SandboxRuntime, get_sandbox_runtime
+from app.services.spec_pull_request import (
+    SPEC_READ_BYTES,
+    build_pr_body,
+    confined_read_command,
+)
 from app.services.verification.orchestrator import PlanCriteria, VerificationRunAlreadyActiveError
 from app.services.verification.spec_link import (
     criteria_for_workflow,
@@ -151,6 +165,11 @@ class SpecFeatureSlugConflictError(SpecKitError):
 
 class SpecKitNotReadyError(SpecKitError):
     """The workspace is not ready for SDD (repo not cloned / init failed)."""
+
+
+class SpecWorkflowNotReadyForPullRequestError(SpecKitError):
+    def __init__(self) -> None:
+        super().__init__("Only a completed workflow can be opened as a pull request")
 
 
 def _slugify(value: str) -> str:
@@ -410,8 +429,10 @@ class SpecKitService:
         workflow.current_phase = phase_name
         self.session.add_all([phase, workflow])
         if phase_name == "implement":
-            # The code is about to change: evidence still awaiting review no longer applies.
+            # The code is about to change: evidence still awaiting review no longer applies,
+            # and the next completion must push again (re-adopting a still-open PR).
             await supersede_review_runs(self.session, workflow.id, include_active=True)
+            workflow.pull_request_id = None
         await self.session.commit()
         await self.session.refresh(phase)
 
@@ -1118,11 +1139,7 @@ class SpecKitService:
         user_id: UUID,
     ) -> None:
         working_dir = self._working_dir(workspace, workflow, phase_name)
-        user = await session.get(User, user_id)
-        name = (
-            user.name if user and user.name else (user.email if user else DEFAULT_COMMIT_AUTHOR)
-        ) or DEFAULT_COMMIT_AUTHOR
-        email = user.email if user else DEFAULT_COMMIT_EMAIL
+        name, email = await self._commit_identity(session, user_id)
         message = f"spec({workflow.feature_slug}): {phase_name}"
 
         await self.runtime.exec(workspace, "git add -A", cwd=working_dir,
@@ -1142,6 +1159,15 @@ class SpecKitService:
 
     # ----- low-level helpers --------------------------------------------------------
 
+    @staticmethod
+    async def _commit_identity(session: AsyncSession, user_id: UUID) -> tuple[str, str]:
+        user = await session.get(User, user_id)
+        name = (
+            user.name if user and user.name else (user.email if user else DEFAULT_COMMIT_AUTHOR)
+        ) or DEFAULT_COMMIT_AUTHOR
+        email = user.email if user else DEFAULT_COMMIT_EMAIL
+        return name, email
+
     async def _run_git(self, workspace: Workspace, args: list[str], *, cwd: str):
         command = "git " + " ".join(shlex.quote(arg) for arg in args)
         return await self.runtime.exec(
@@ -1153,6 +1179,20 @@ class SpecKitService:
             workspace,
             f"cat {shlex.quote(rel_path)}",
             cwd=cwd,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            return None
+        return result.stdout
+
+    async def _read_spec_excerpt(
+        self, workspace: Workspace, workflow: SpecWorkflow
+    ) -> str | None:
+        """The start of ``spec.md``, refused if it resolves outside the worktree."""
+        result = await self.runtime.exec(
+            workspace,
+            confined_read_command(f"{workflow.spec_dir}/spec.md", SPEC_READ_BYTES),
+            cwd=workflow.worktree_path,
             timeout=GIT_TIMEOUT_SECONDS,
         )
         if result.exit_code != 0:
@@ -1305,6 +1345,108 @@ class SpecKitService:
             runtime=self.runtime,
             dispatcher=self._dispatcher,
         )
+
+    async def open_pull_request(
+        self,
+        workspace_id: UUID,
+        workflow_id: UUID,
+        user_id: UUID,
+        *,
+        github_client: GitHubClient | None = None,
+    ) -> tuple[PullRequest, bool]:
+        """Hand a completed workflow over as a GitHub PR; ``(pr, created)``.
+
+        The verified tree is the worktree's *working tree* (verification fixes are never
+        committed), so it is committed before the branch is pushed. Idempotent: a linked
+        workflow returns its PR, and a PR already open for the branch is adopted.
+        """
+        lifecycle.ensure_accepting_work()
+        workspace = await self._get_workspace(workspace_id, user_id)
+        workflow = await self._get_workflow_row(workspace_id, workflow_id)
+        if workflow.pull_request_id is not None:
+            linked = await self.session.get(PullRequest, workflow.pull_request_id)
+            if linked is not None:
+                return linked, False
+        if workflow.status != "completed" or not workflow.worktree_path:
+            raise SpecWorkflowNotReadyForPullRequestError
+
+        cipher = WorkspaceSecretCipher(self.settings.workspace_env_encryption_key)
+        pull_requests = PullRequestService(
+            self.session, cipher, self.settings, client=github_client
+        )
+        # Fail before pushing anything when this workspace cannot open PRs.
+        await pull_requests.ensure_supported(workspace_id, user_id)
+
+        repo = RepositoryService(self.session, cipher, self.runtime)
+        name, email = await self._commit_identity(self.session, workflow.user_id)
+        try:
+            await repo.commit(
+                workspace_id,
+                user_id,
+                f"spec({workflow.feature_slug}): verification fixes",
+                worktree_path=workflow.worktree_path,
+                author_name=name,
+                author_email=email,
+            )
+        except NoChangesToCommitError:
+            pass
+        await repo.push(workspace_id, user_id, worktree_path=workflow.worktree_path)
+
+        body = build_pr_body(
+            workflow,
+            repo_url=workspace.repo_url or "",
+            spec_excerpt=await self._read_spec_excerpt(workspace, workflow),
+            run=await self.session.scalar(
+                select(VerificationRun)
+                .options(selectinload(VerificationRun.evidence))
+                .where(
+                    VerificationRun.spec_workflow_id == workflow.id,
+                    VerificationRun.status == "approved",
+                )
+                .order_by(VerificationRun.updated_at.desc())
+                .limit(1)
+            ),
+            approved_at=(await self._get_phase_row(workflow.id, "implement")).reviewed_at,
+        )
+        try:
+            pr = await pull_requests.create(
+                workspace_id,
+                user_id,
+                head=workflow.branch,
+                base=None,
+                title=workflow.feature_name,
+                body=body,
+                draft=False,
+            )
+        except GitHubApiError as error:
+            # A retry after a lost response, or a PR opened by hand: adopt it.
+            if error.status_code != 422 or "already exists" not in error.message.lower():
+                raise
+            pr = await pull_requests.find_open(workspace_id, user_id, workflow.branch)
+            if pr is None:
+                raise
+
+        workflow.pull_request_id = pr.id
+        await self.session.commit()
+        try:
+            await AuditLogService(self.session).record(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                action="spec_pull_request_opened",
+                target_type="spec_workflow",
+                target_id=workflow.id,
+                metadata={"number": pr.number, "url": pr.url, "head": pr.head},
+            )
+            await NotificationService(self.session).create(
+                user_id=user_id,
+                workspace_id=workspace_id,
+                notification_type="pull_request_opened",
+                title="Pull request opened",
+                message=f"'{workflow.feature_name}' was opened as PR #{pr.number}.",
+            )
+        except Exception:
+            logger.exception("spec_pull_request_record_failed", workflow_id=str(workflow.id))
+        return pr, True
 
     async def _start_implement_verification(
         self,

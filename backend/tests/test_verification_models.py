@@ -196,3 +196,51 @@ async def test_spec_workflow_verification_defaults_to_none(maker) -> None:
             assert workflow.verification is None
     finally:
         await _cleanup(maker, workspace)
+
+
+async def test_spec_workflow_links_to_its_pull_request(maker) -> None:
+    """Plan 4 Task 1: an approved workflow points at the PR it was handed over as; deleting
+    the cached PR row only unlinks it."""
+    from app.models import PullRequest, SpecWorkflow
+
+    workspace = await _workspace(maker)
+    try:
+        async with maker() as session:
+            pr = PullRequest(
+                workspace_id=workspace.id,
+                number=7,
+                url="https://github.com/o/r/pull/7",
+                state="open",
+                head="001-login",
+                base="main",
+                title="Login",
+            )
+            session.add(pr)
+            await session.flush()
+            workflow = SpecWorkflow(
+                workspace_id=workspace.id,
+                user_id=workspace.owner_id,
+                feature_name="Login",
+                feature_slug=f"login-{uuid4().hex[:6]}",
+                description="d",
+                branch="001-login",
+                spec_dir="specs/001-login",
+                pull_request_id=pr.id,
+            )
+            session.add(workflow)
+            await session.commit()
+            workflow_id, pr_id = workflow.id, pr.id
+
+        async with maker() as session:
+            wf = await session.get(SpecWorkflow, workflow_id)
+            assert wf.pull_request_id == pr_id
+            assert wf.pull_request.number == 7
+            await session.delete(await session.get(PullRequest, pr_id))
+            await session.commit()
+
+        async with maker() as session:
+            wf = await session.get(SpecWorkflow, workflow_id)
+            assert wf.pull_request_id is None
+            assert wf.pull_request is None
+    finally:
+        await _cleanup(maker, workspace)

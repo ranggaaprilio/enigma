@@ -58,3 +58,38 @@ def test_run_response_exposes_the_spec_workflow_link() -> None:
         id=uuid4(), workspace_id=uuid4(), plan_ref="p", status="review",
         created_at=now, updated_at=now,
     ).spec_workflow_id is None
+
+
+def test_workflow_response_exposes_its_pull_request() -> None:
+    """Plan 4 Task 1: the workflow response carries the linked PR (or null)."""
+    from types import SimpleNamespace
+
+    from app.schemas.specs import SpecWorkflowResponse
+
+    now = datetime.now(UTC)
+    base = dict(
+        id=uuid4(),
+        workspace_id=uuid4(),
+        user_id=uuid4(),
+        feature_name="F",
+        feature_slug="001-f",
+        description="d",
+        branch="001-f",
+        spec_dir="specs/001-f",
+        worktree_path="worktrees/001-f",
+        verification=None,
+        status="completed",
+        current_phase="implement",
+        created_at=now,
+        updated_at=now,
+        phases=[],
+    )
+    pr = SimpleNamespace(number=12, url="https://github.com/o/r/pull/12", state="open")
+    linked = SpecWorkflowResponse.model_validate(SimpleNamespace(**base, pull_request=pr))
+    assert linked.pull_request.model_dump() == {
+        "number": 12,
+        "url": "https://github.com/o/r/pull/12",
+        "state": "open",
+    }
+    unlinked = SpecWorkflowResponse.model_validate(SimpleNamespace(**base, pull_request=None))
+    assert unlinked.pull_request is None

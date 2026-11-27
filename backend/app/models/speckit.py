@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     CheckConstraint,
@@ -16,6 +17,9 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.base import Base
+
+if TYPE_CHECKING:
+    from app.models.worktree import PullRequest
 
 # Spec Kit phases, in pipeline order.
 SPEC_PHASES = (
@@ -58,6 +62,7 @@ class SpecWorkflow(Base):
         Index("ix_spec_workflows_workspace_id", "workspace_id"),
         Index("ix_spec_workflows_status", "status"),
         Index("ix_spec_workflows_current_phase", "current_phase"),
+        Index("ix_spec_workflows_pull_request_id", "pull_request_id"),
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
@@ -80,6 +85,12 @@ class SpecWorkflow(Base):
     # Verification criteria for the ``implement`` phase (test_command, observe_port,
     # max_iterations). ``None``: fall back to the workspace's ``test`` command, or skip.
     verification: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    # The pull request a completed workflow was handed over as (Plan 4).
+    pull_request_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pull_requests.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, default="pending")
     current_phase: Mapped[str] = mapped_column(String(32), nullable=False, default="specify")
     created_at: Mapped[datetime] = mapped_column(
@@ -99,6 +110,8 @@ class SpecWorkflow(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    # Eager (selectin) so async callers can serialise it without a lazy load.
+    pull_request: Mapped["PullRequest | None"] = relationship(lazy="selectin")
 
 
 class SpecPhase(Base):
