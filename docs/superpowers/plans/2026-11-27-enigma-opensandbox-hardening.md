@@ -233,8 +233,8 @@ The second is a cheap live probe per health pass, so a server started with `OPEN
 
 ### Task 6: Reference config, docs
 
-- [ ] `deploy/opensandbox/sandbox.toml`, `docs/self-host-opensandbox.md`, `.env.example` (`OPENSANDBOX_*`).
-- [ ] AGENTS.md note 32.
+- [x] `deploy/opensandbox/sandbox.toml`, `docs/self-host-opensandbox.md`, `.env.example` (`OPENSANDBOX_*`).
+- [x] AGENTS.md note 32.
 
 ### Task 7: Live security suite
 
