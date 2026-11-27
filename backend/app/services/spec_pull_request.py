@@ -38,6 +38,39 @@ def confined_read_command(rel_path: str, limit: int) -> str:
     )
 
 
+# What `specify init` adds to a repository (the generic integration, plus the Claude layouts
+# of repositories initialised before it). Feature artifacts under specs/ are not scaffold.
+SCAFFOLD_PATHS = (
+    ".specify",
+    ".enigma",
+    "AGENTS.md",
+    ".claude/skills/speckit-*",
+    ".claude/commands/speckit.*",
+)
+
+
+def scaffold_diff_command(base_branch: str) -> str:
+    """Lists the scaffold files the branch adds or changes relative to the remote base.
+
+    The first Spec Kit PR in a repository carries the `chore: initialize Spec Kit` commit,
+    because Enigma commits the scaffold to the sandbox's base branch, which is never pushed.
+    """
+    paths = " ".join(shlex.quote(path) for path in SCAFFOLD_PATHS)
+    return f"git diff --name-only {shlex.quote(f'origin/{base_branch}')}...HEAD -- {paths}"
+
+
+def _scaffold_section(files: int) -> list[str]:
+    return [
+        "",
+        "### Spec Kit scaffold",
+        f"This is the first Spec Kit change in this repository, so it also adds {files} files "
+        "of Spec Kit's own scaffold (`.specify/`, `.enigma/commands/` and a block in "
+        "`AGENTS.md`), in the commit `chore: initialize Spec Kit (SDD)`. They are Spec Kit's "
+        "templates, scripts and phase guidance, not part of this feature, and can be skimmed. "
+        "Later Spec Kit PRs will not carry them once this one is merged.",
+    ]
+
+
 def _artifact_base(repo_url: str, branch: str, spec_dir: str) -> str:
     owner, repo = parse_owner_repo(repo_url)
     host = urlparse(repo_url).hostname or "github.com"
@@ -81,6 +114,7 @@ def build_pr_body(
     spec_excerpt: str | None,
     run,
     approved_at: datetime | None,
+    scaffold_files: int = 0,
 ) -> str:
     base = _artifact_base(repo_url, workflow.branch, workflow.spec_dir)
     lines = [
@@ -106,6 +140,8 @@ def build_pr_body(
             "",
             "</details>",
         ]
+    if scaffold_files > 0:
+        lines += _scaffold_section(scaffold_files)
     lines += [
         "",
         "### Verification",
