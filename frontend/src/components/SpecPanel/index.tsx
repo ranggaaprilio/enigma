@@ -7,6 +7,7 @@ import {
   CircleDashed,
   CircleDot,
   Clock,
+  GitPullRequest,
   Loader2,
   Lock,
   Play,
@@ -25,6 +26,7 @@ import {
   listSpecArtifacts,
   listSpecWorkflows,
   listVerificationRuns,
+  openSpecPullRequest,
   requestSpecChanges,
   runSpecPhase,
   submitAnalyzeAnswers,
@@ -34,6 +36,7 @@ import {
   type SpecPhaseName,
   type SpecPhaseResponse,
   type SpecPhaseStatus,
+  type SpecPullRequest,
   type SpecWorkflowResponse,
   type WorkspaceResponse,
 } from "../../lib/api";
@@ -392,6 +395,15 @@ function WorkflowDetail({
           <SpecStatusBadge status={workflow.status} />
         </div>
 
+        {workflow.status === "completed" && (
+          <PullRequestBar
+            workspaceId={workspaceId}
+            workflowId={workflow.id}
+            pullRequest={workflow.pull_request ?? null}
+            onOpened={() => void refresh()}
+          />
+        )}
+
         <ol className="mt-5 flex flex-wrap gap-2">
           {PHASE_ORDER.map((name) => {
             const phase = phaseByName(name);
@@ -438,6 +450,70 @@ function WorkflowDetail({
           onSubmitAnswers={handleSubmitAnswers}
           onWorkflowChanged={() => void refresh()}
         />
+      )}
+    </div>
+  );
+}
+
+function PullRequestBar({
+  workspaceId,
+  workflowId,
+  pullRequest,
+  onOpened,
+}: {
+  workspaceId: string;
+  workflowId: string;
+  pullRequest: SpecPullRequest | null;
+  onOpened: () => void;
+}) {
+  const [opened, setOpened] = useState<SpecPullRequest | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const pr = pullRequest ?? opened;
+
+  async function handleOpen() {
+    setBusy(true);
+    setError(null);
+    try {
+      setOpened(await openSpecPullRequest(workspaceId, workflowId));
+      onOpened();
+    } catch (err) {
+      setError(err instanceof ApiError ? err.message : "Failed to open the pull request");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (pr) {
+    return (
+      <a
+        href={pr.url}
+        target="_blank"
+        rel="noreferrer"
+        className="mt-4 inline-flex items-center gap-2 text-sm text-body underline-offset-2 hover:underline"
+      >
+        <GitPullRequest className="h-4 w-4" />
+        PR #{pr.number} · {pr.state}
+      </a>
+    );
+  }
+  return (
+    <div className="mt-4 flex flex-wrap items-center gap-3">
+      <button
+        type="button"
+        onClick={() => void handleOpen()}
+        disabled={busy}
+        className="inline-flex items-center gap-2 rounded-lg bg-ink px-3 py-1.5 text-sm text-white transition hover:bg-ink/90 disabled:opacity-60"
+      >
+        {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <GitPullRequest className="h-4 w-4" />}
+        Open pull request
+      </button>
+      <span className="text-xs text-muted">Commits the verified worktree and pushes its branch.</span>
+      {error && (
+        <span className="flex items-center gap-1 text-sm text-danger">
+          <AlertCircle className="h-4 w-4" />
+          {error}
+        </span>
       )}
     </div>
   );
