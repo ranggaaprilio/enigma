@@ -1250,13 +1250,23 @@ class FakeOpenSandboxCommands:
         return RuntimeCommandResult(exit_code=0, stdout="", stderr="")
 
     @staticmethod
-    def _execution(exit_code: int, stdout: str, stderr: str) -> SimpleNamespace:
+    def _messages(text: str) -> list[SimpleNamespace]:
+        """Split output the way execd does (seen live against opensandbox-server 1.2.1): one
+        message per line with its newline stripped, an empty line arriving as ``"\n"``, and
+        a final line without a newline sent as-is. Sending the whole output as one message
+        is how a "".join() that glued every line together went unnoticed."""
+        if not text:
+            return []
+        lines = text.split("\n")
+        if text.endswith("\n"):
+            lines = lines[:-1]
+        return [SimpleNamespace(text=line if line else "\n") for line in lines]
+
+    @classmethod
+    def _execution(cls, exit_code: int, stdout: str, stderr: str) -> SimpleNamespace:
         return SimpleNamespace(
             exit_code=exit_code,
-            logs=SimpleNamespace(
-                stdout=[SimpleNamespace(text=stdout)] if stdout else [],
-                stderr=[SimpleNamespace(text=stderr)] if stderr else [],
-            ),
+            logs=SimpleNamespace(stdout=cls._messages(stdout), stderr=cls._messages(stderr)),
         )
 
     async def run(self, command: Any, *, opts: Any = None, handlers: Any = None) -> Any:
@@ -1265,17 +1275,20 @@ class FakeOpenSandboxCommands:
             return await self._grep(command, handlers)
         result = self._run_result(command)
         if handlers is not None:
-            if result.stdout and getattr(handlers, "on_stdout", None):
-                await handlers.on_stdout(SimpleNamespace(text=result.stdout))
-            if result.stderr and getattr(handlers, "on_stderr", None):
-                await handlers.on_stderr(SimpleNamespace(text=result.stderr))
+            if getattr(handlers, "on_stdout", None):
+                for message in self._messages(result.stdout):
+                    await handlers.on_stdout(message)
+            if getattr(handlers, "on_stderr", None):
+                for message in self._messages(result.stderr):
+                    await handlers.on_stderr(message)
         return self._execution(result.exit_code, result.stdout, result.stderr)
 
     async def _grep(self, argv: list[str], handlers: Any) -> Any:
         pattern = argv[argv.index("-e") + 1]
         text = "".join(self._sandbox._store.grep(pattern, argv[-1]))
-        if handlers is not None and text and getattr(handlers, "on_stdout", None):
-            await handlers.on_stdout(SimpleNamespace(text=text))
+        if handlers is not None and getattr(handlers, "on_stdout", None):
+            for message in self._messages(text):
+                await handlers.on_stdout(message)
         # ``skip_accumulation`` means the SDK never buffers stdout into the Execution logs.
         skip = handlers is not None and getattr(handlers, "skip_accumulation", False)
         return self._execution(0 if text else 1, "" if skip else text, "")

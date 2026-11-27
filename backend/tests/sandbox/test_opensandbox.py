@@ -203,3 +203,43 @@ async def test_file_info_finds_a_relative_path() -> None:
     assert info is not None
     with pytest.raises(FileNotFoundError):
         await fs.get_file_info("workspace/missing")
+
+
+# --- execd delivers stdout one line per message (found by the Plans 4-6 live E2E) ----------
+
+async def test_exec_keeps_the_lines_of_its_output() -> None:
+    """A screenshot capture printed its temp dir and the PNG's size on two lines; joined with
+    "" they arrived as one ``/tmp/tmp.X25957`` and the screenshot was lost."""
+    runtime = opensandbox_runtime_with(
+        lambda _cmd: RuntimeCommandResult(
+            exit_code=0, stdout="/tmp/tmp.X\n25957\n\nend\n", stderr="e1\ne2\n"
+        )
+    )
+    result = await runtime.exec(make_workspace(runtime="opensandbox"), "capture")
+    assert result.stdout.splitlines() == ["/tmp/tmp.X", "25957", "", "end"]
+    assert result.stderr.splitlines() == ["e1", "e2"]
+
+
+async def test_streamed_output_keeps_its_lines() -> None:
+    runtime = opensandbox_runtime_with(
+        lambda _cmd: RuntimeCommandResult(exit_code=0, stdout="one\ntwo\n\nthree\n", stderr="")
+    )
+    chunks: list[str] = []
+
+    async def out(text: str) -> None:
+        chunks.append(text)
+
+    async def err(_text: str) -> None:
+        return None
+
+    await runtime.stream_command(
+        make_workspace(runtime="opensandbox"),
+        "run-1",
+        "x",
+        cwd=None,
+        env=None,
+        timeout=5,
+        on_stdout=out,
+        on_stderr=err,
+    )
+    assert "".join(chunks) == "one\ntwo\n\nthree\n"
