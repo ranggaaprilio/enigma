@@ -28,6 +28,10 @@ class SandboxNotFoundError(SandboxRuntimeError):
     """The workspace has no sandbox, or the provider no longer knows it."""
 
 
+class InsecureRuntimeError(SandboxRuntimeError):
+    """The provider is reachable but not safe to put a tenant on (e.g. it skips auth)."""
+
+
 class ProvisioningError(SandboxRuntimeError):
     """Creating or starting a sandbox failed."""
 

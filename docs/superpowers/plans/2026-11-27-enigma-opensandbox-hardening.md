@@ -203,12 +203,16 @@ The second is a cheap live probe per health pass, so a server started with `OPEN
 
 **Files:** `services/sandbox/availability.py`, `api/health.py`, `opensandbox.py` (`auth_probe`), tests.
 
-- [ ] Failing tests:
+- [x] Failing tests:
   - no key → `insecure`, not offered
   - a server answering 200 unauthenticated → `insecure`
-  - `OPENSANDBOX_ALLOW_INSECURE` → offered with a warning
-  - the key never appears in `/health`
-- [ ] Implement, green.
+  - `OPENSANDBOX_ALLOW_INSECURE` → offered with a warning, refused outside `local`
+  - the key never appears in the reason
+- [x] Implement, green:
+  - `InsecureRuntimeError` from `health()`, mapped to `status: insecure` in `check_runtime`;
+  - `/health` counts it as degraded;
+  - the probe is an unauthenticated `GET /v1/sandboxes`, which must be 401.
+- [x] Automated review of the Task 3 commit: teardown (`delete`, `kill_pty`) skips the floor check, so a sandbox that fails it can always be removed.
 
 ### Task 5: Upkeep for OpenSandbox
 

@@ -1371,7 +1371,9 @@ def opensandbox_runtime_with(
     from app.core.config import Settings
     from app.services.sandbox.opensandbox import OpenSandboxRuntime
 
-    runtime = OpenSandboxRuntime(Settings(opensandbox_api_url="http://127.0.0.1:8080"))
+    runtime = OpenSandboxRuntime(
+        Settings(opensandbox_api_url="http://127.0.0.1:8080", opensandbox_api_key="test-key")
+    )
     sandbox = FakeOpenSandboxSandbox(sandbox_id, state=state, exec_handler=exec_handler)
     manager = FakeOpenSandboxManager(state=state)
 
@@ -1423,5 +1425,10 @@ def opensandbox_runtime_with(
     runtime._pty_connect = pty_connect  # type: ignore[method-assign]
     runtime._pty_delete_session = pty_delete_session  # type: ignore[method-assign]
     runtime._installation = "test-installation"  # no database read in unit tests
+
+    async def auth_probe_status() -> int:
+        return 401  # a server that requires its API key
+
+    runtime._auth_probe_status = auth_probe_status  # type: ignore[method-assign]
     runtime._fake_sandbox = sandbox  # exposed for provider-level assertions
     return runtime

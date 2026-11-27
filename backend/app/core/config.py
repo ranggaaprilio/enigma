@@ -119,6 +119,9 @@ class Settings(BaseSettings):
     # Key for each sandbox's execd access token (HMAC per workspace). Required outside
     # `local`; rotating it locks Enigma out of every existing sandbox until it is recreated.
     opensandbox_execd_token_key: str = ""
+    # Dev only (refused outside `local`): offer an OpenSandbox server that does not require
+    # an API key, e.g. one started with OPENSANDBOX_INSECURE_SERVER=YES.
+    opensandbox_allow_insecure: bool = False
     opensandbox_sandbox_image: str = "enigma-sandbox:latest"
     opensandbox_require_image_digest: bool | None = None
     opensandbox_sandbox_cpu: str = "2"
@@ -462,6 +465,8 @@ class Settings(BaseSettings):
         # Enigma out of every existing sandbox (the token is fixed at create).
         if self.opensandbox_api_url and not self.opensandbox_execd_token_key:
             insecure.append("opensandbox_execd_token_key")
+        if self.opensandbox_api_url and self.opensandbox_allow_insecure:
+            insecure.append("opensandbox_allow_insecure")
         return insecure
 
     @model_validator(mode="after")

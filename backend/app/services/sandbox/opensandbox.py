@@ -46,6 +46,7 @@ from opensandbox.models.sandboxes import NetworkPolicy, NetworkRule, SandboxFilt
 from app.core.config import Settings
 from app.models import Workspace
 from app.services.sandbox.base import (
+    InsecureRuntimeError,
     ProvisioningError,
     PtyHandle,
     RuntimeCommandResult,
@@ -589,7 +590,30 @@ class OpenSandboxRuntime:
         if config is not None:
             await config.close_transport_if_owned()
 
+    async def _auth_probe_status(self) -> int:
+        """The status an unauthenticated lifecycle-API request gets (seam for tests)."""
+        import httpx
+
+        url = (self.settings.opensandbox_api_url or "").rstrip("/")
+        if "://" not in url:
+            url = f"http://{url}"
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            return (await client.get(f"{url}/v1/sandboxes")).status_code
+
     async def health(self) -> str:
+        # Fail closed: a server that does not authenticate lets anyone who can reach it
+        # create, read and destroy every tenant's sandbox.
+        if self.settings.opensandbox_allow_insecure:
+            logger.warning("opensandbox_insecure_server_allowed")
+        elif not self.settings.opensandbox_api_key:
+            raise InsecureRuntimeError("no OPENSANDBOX_API_KEY is configured")
+        else:
+            try:
+                status = await self._auth_probe_status()
+            except Exception as error:
+                raise map_opensandbox_error(error) from error
+            if status != 401:
+                raise InsecureRuntimeError("the server answers without an API key")
         try:
             await (await self._get_manager()).list_sandbox_infos(SandboxFilter())
         except Exception as error:

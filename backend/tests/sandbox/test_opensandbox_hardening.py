@@ -440,16 +440,6 @@ async def test_an_existing_sandbox_below_the_floor_is_refused_but_kept() -> None
     assert not fake.destroyed  # the user's files stay; recreate the workspace to fix it
 
 
-async def test_a_sandbox_below_the_floor_can_always_be_deleted() -> None:
-    """Teardown never runs the floor check: an unsafe sandbox must stay removable."""
-    runtime, fake, probes = _floor_runtime("CapEff: 00000000a80425fb\nNoNewPrivs: 1\n1001\n")
-
-    await runtime.delete(_workspace())
-
-    assert fake.destroyed
-    assert probes() == []
-
-
 # --- preview paths never leave the preview's own prefix --------------------------------------
 # OpenSandbox's preview URL is execd's own origin (`http://host:<execd>/proxy/<port>`), so a
 # path that climbed out of `/proxy/<port>` would reach execd's control API with the sandbox
@@ -484,3 +474,91 @@ def test_ordinary_preview_paths_stay_under_the_prefix(path) -> None:
 
     url = _upstream_url("http://127.0.0.1:46589/proxy/5173", path, "q=1")
     assert httpx.URL(url).path.startswith("/proxy/5173/")
+
+
+async def test_a_sandbox_below_the_floor_can_always_be_deleted() -> None:
+    """Teardown never runs the floor check: an unsafe sandbox must stay removable."""
+    runtime, fake, probes = _floor_runtime("CapEff: 00000000a80425fb\nNoNewPrivs: 1\n1001\n")
+
+    await runtime.delete(_workspace())
+
+    assert fake.destroyed
+    assert probes() == []
+
+
+# --- Task 4: an OpenSandbox server that does not authenticate is never offered ---------------
+
+
+def _auth_runtime(*, probe_status: int | None, **settings: Any):
+    runtime = opensandbox_runtime_with()
+    runtime.settings = _settings(**settings)
+    probes: list[bool] = []
+
+    async def auth_probe_status() -> int:
+        probes.append(True)
+        assert probe_status is not None, "the probe must not run"
+        return probe_status
+
+    runtime._auth_probe_status = auth_probe_status
+    return runtime, probes
+
+
+async def test_a_server_without_an_api_key_is_insecure() -> None:
+    from app.services.sandbox.availability import check_runtime
+
+    runtime, probes = _auth_runtime(probe_status=None, opensandbox_api_key=None)
+
+    found = await check_runtime(runtime, "opensandbox")
+
+    assert (found.status, found.available) == ("insecure", False)
+    assert found.reason == "The OpenSandbox server does not require authentication"
+    assert probes == []
+
+
+async def test_a_server_that_answers_without_the_key_is_insecure() -> None:
+    from app.services.sandbox.availability import check_runtime
+
+    runtime, probes = _auth_runtime(probe_status=200, opensandbox_api_key="s3cret-key")
+
+    found = await check_runtime(runtime, "opensandbox")
+
+    assert found.status == "insecure"
+    assert "s3cret-key" not in (found.reason or "")
+    assert probes == [True]
+
+
+async def test_a_server_that_refuses_requests_without_the_key_is_ok() -> None:
+    from app.services.sandbox.availability import check_runtime
+
+    runtime, _ = _auth_runtime(probe_status=401, opensandbox_api_key="s3cret-key")
+
+    assert (await check_runtime(runtime, "opensandbox")).status == "ok"
+
+
+async def test_a_dev_install_may_allow_an_insecure_server(monkeypatch) -> None:
+    from app.services.sandbox import opensandbox as module
+    from app.services.sandbox.availability import check_runtime
+
+    warnings: list[str] = []
+    # structlog caches a module logger on first use, so capture_logs() would depend on test
+    # order; record the module logger's warnings directly instead.
+    monkeypatch.setattr(module.logger, "warning", lambda event, **_: warnings.append(event))
+    runtime, probes = _auth_runtime(
+        probe_status=None, opensandbox_api_key=None, opensandbox_allow_insecure=True
+    )
+
+    found = await check_runtime(runtime, "opensandbox")
+
+    assert found.status == "ok"
+    assert probes == []
+    assert "opensandbox_insecure_server_allowed" in warnings
+
+
+def test_allowing_an_insecure_server_is_refused_outside_local() -> None:
+    settings = Settings.model_construct(
+        environment="production",
+        opensandbox_api_url="http://os:8080",
+        opensandbox_execd_token_key="e" * 48,
+        opensandbox_allow_insecure=True,
+    )
+    assert "opensandbox_allow_insecure" in settings.insecure_setting_names()
