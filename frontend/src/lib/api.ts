@@ -2896,6 +2896,17 @@ export function verifySpecImplement(
   );
 }
 
+/** Stop an in-flight run (ends it as `rejected`, with its fix agent run). */
+export function stopVerificationRun(
+  workspaceId: string,
+  runId: string,
+): Promise<VerificationRunResponse> {
+  return requestJson<VerificationRunResponse>(
+    `${verificationRunsPath(workspaceId)}/${runId}/stop`,
+    { method: "POST" },
+  );
+}
+
 export function rejectVerificationRun(
   workspaceId: string,
   runId: string,
