@@ -1344,18 +1344,59 @@ class FakeOpenSandboxSandbox:
 
 
 class FakeOpenSandboxManager:
-    """Management-API ``SandboxManager`` double for ``health``/``status``."""
+    """Management-API ``SandboxManager`` double: health, status, a paged listing filtered by
+    metadata (as the server does, AND-matched), and pause/resume/kill."""
 
     def __init__(self, state: str = "Running") -> None:
         self.state = state
         self.listed = False
+        self.sandboxes: list[SimpleNamespace] = []  # id, metadata (what the server stores)
+        self.filters: list[Any] = []
+        self.page_size = 2
+        self.paused: list[str] = []
+        self.resumed: list[str] = []
+        self.killed: list[str] = []
 
     async def list_sandbox_infos(self, filter: Any) -> SimpleNamespace:
         self.listed = True
-        return SimpleNamespace(sandbox_infos=[], pagination=None)
+        self.filters.append(filter)
+        wanted = getattr(filter, "metadata", None) or {}
+        matching = [
+            s for s in self.sandboxes
+            if all((s.metadata or {}).get(key) == value for key, value in wanted.items())
+        ]
+        page = getattr(filter, "page", None) or 1
+        chunk = matching[(page - 1) * self.page_size : page * self.page_size]
+        return SimpleNamespace(
+            sandbox_infos=chunk,
+            pagination=SimpleNamespace(
+                page=page, has_next_page=page * self.page_size < len(matching)
+            ),
+        )
 
     async def get_sandbox_info(self, sandbox_id: str) -> SimpleNamespace:
         return SimpleNamespace(status=SimpleNamespace(state=self.state))
+
+    async def pause_sandbox(self, sandbox_id: str) -> None:
+        self.paused.append(sandbox_id)
+        self.state = "Paused"
+
+    async def resume_sandbox(self, sandbox_id: str) -> None:
+        self.resumed.append(sandbox_id)
+        self.state = "Running"
+
+    async def kill_sandbox(self, sandbox_id: str) -> None:
+        self.killed.append(sandbox_id)
+
+
+class RecordingActivity:
+    """``SandboxActivityRecorder`` double: records which workspaces were touched."""
+
+    def __init__(self) -> None:
+        self.touched: list[Any] = []
+
+    async def touch(self, workspace_id: Any) -> None:
+        self.touched.append(workspace_id)
 
     async def close(self) -> None:
         return None
@@ -1425,6 +1466,8 @@ def opensandbox_runtime_with(
     runtime._pty_connect = pty_connect  # type: ignore[method-assign]
     runtime._pty_delete_session = pty_delete_session  # type: ignore[method-assign]
     runtime._installation = "test-installation"  # no database read in unit tests
+    runtime.activity = RecordingActivity()  # no sandbox_activity writes in unit tests
+    runtime._fake_manager = manager
 
     async def auth_probe_status() -> int:
         return 401  # a server that requires its API key

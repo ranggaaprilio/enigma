@@ -218,13 +218,18 @@ The second is a cheap live probe per health pass, so a server started with `OPEN
 
 **Files:** `services/sandbox_maintenance.py`, `opensandbox.py` (`list_managed`, `pause`, resume in `start`, activity touches), `main.py`/`worker.py` wiring, tests.
 
-- [ ] Failing tests:
-  - scoped orphan sweep
-  - another installation untouched
-  - idle pause respects the busy rules
-  - `start()` resumes
+- [x] Failing tests (`tests/test_opensandbox_maintenance.py`):
+  - scoped orphan sweep; unlabelled sandboxes are never touched
+  - another installation untouched (listing filtered by its metadata, and re-checked)
+  - idle pause leaves busy sandboxes
+  - `start()` and any use resume a paused sandbox (once per minute per process)
   - unscoped listing never used
-- [ ] Implement, green.
+  - execs, streams and terminal output count as activity; a long command keeps a heartbeat
+  - the loop starts only where it is wanted
+- [x] Implement, green:
+  - **Busy rule:** the `sandbox_activity` heartbeat (every 60 s while an exec runs; terminal output as it flows), which is shared across processes through Postgres. Docker's in-sandbox busy probe needs its own exec wrapper, which OpenSandbox does not have.
+  - **Loop:** `start_opensandbox_maintenance` runs next to Docker's, from `main.py` (inline) and `worker.py` (queue), and is gated by `OPENSANDBOX_UPKEEP` (unset means on when the default runtime is opensandbox).
+  - **Not done:** lost-sandbox detection. Sandboxes created before labels are not listed, so a missing listing proves nothing.
 
 ### Task 6: Reference config, docs
 

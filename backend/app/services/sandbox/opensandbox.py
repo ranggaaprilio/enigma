@@ -11,9 +11,12 @@ glob-based, so it is implemented with ``grep -F`` run inside the sandbox.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import hashlib
 import hmac
 import ipaddress
+import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -45,6 +48,7 @@ from opensandbox.models.sandboxes import NetworkPolicy, NetworkRule, SandboxFilt
 
 from app.core.config import Settings
 from app.models import Workspace
+from app.services.sandbox.activity import SandboxActivityRecorder
 from app.services.sandbox.base import (
     InsecureRuntimeError,
     ProvisioningError,
@@ -91,6 +95,13 @@ SAFE_CREATE_KEYS = frozenset(
     {"image", "timeout", "ready_timeout", "env", "metadata", "resource", "network_policy"}
 )
 CREATE_READY_TIMEOUT = timedelta(seconds=120)
+# Upkeep (Plan 7a Task 5). A sandbox is busy while Enigma runs something in it: a running
+# exec renews its `sandbox_activity` row every heartbeat, terminal output renews it as it
+# flows, so the idle pass (another process, maybe) never pauses a sandbox in use. A sandbox
+# this process saw running stays trusted awake for a minute (an idle window is far longer).
+ACTIVITY_HEARTBEAT_SECONDS = 60.0
+AWAKE_CACHE_SECONDS = 60.0
+LIST_PAGE_SIZE = 100
 
 
 # The security floor, read inside the sandbox (shell builtins and an absolute binary only: the
@@ -499,6 +510,8 @@ class OpenSandboxRuntime:
         self._installation: str | None = None  # this database's id, loaded on first create
         # Sandboxes whose security floor this process has seen in place (checked once each).
         self._floor_checked: set[str] = set()
+        self.activity = SandboxActivityRecorder()
+        self._awake_until: dict[str, float] = {}  # sandbox id -> monotonic deadline
 
     def _home(self) -> str:
         return self.settings.sandbox_home.rstrip("/") or "/"
@@ -641,6 +654,95 @@ class OpenSandboxRuntime:
         self._floor_checked.add(str(sandbox.id))
         return str(sandbox.id)
 
+    async def _state(self, sandbox_id: str) -> str:
+        try:
+            info = await (await self._get_manager()).get_sandbox_info(sandbox_id)
+        except Exception as error:
+            raise map_opensandbox_error(error) from error
+        return str(getattr(getattr(info, "status", None), "state", "") or "").lower()
+
+    async def _wake(self, sandbox_id: str) -> None:
+        """Resume a sandbox the idle pass paused; the next exec, terminal or preview wakes it."""
+        if time.monotonic() < self._awake_until.get(sandbox_id, 0.0):
+            return
+        if await self._state(sandbox_id) == "paused":
+            try:
+                await (await self._get_manager()).resume_sandbox(sandbox_id)
+            except Exception as error:
+                raise map_opensandbox_error(error) from error
+            logger.info("opensandbox_sandbox_resumed", sandbox_id=sandbox_id)
+        self._awake_until[sandbox_id] = time.monotonic() + AWAKE_CACHE_SECONDS
+
+    @contextlib.asynccontextmanager
+    async def _busy(self, workspace: Workspace):
+        """Keep the sandbox's activity fresh for as long as Enigma runs something in it."""
+        await self.activity.touch(workspace.id)
+
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(ACTIVITY_HEARTBEAT_SECONDS)
+                await self.activity.touch(workspace.id)
+
+        beating = asyncio.ensure_future(heartbeat())
+        try:
+            yield
+        finally:
+            beating.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await beating
+
+    # --- upkeep (services/sandbox_maintenance.py) ------------------------------------------
+
+    async def managed_sandboxes(self) -> list[tuple[str, str]]:
+        """``(sandbox id, workspace id label)`` for this installation's sandboxes only.
+
+        Always filtered by this database's installation id: an unscoped listing would let the
+        orphan sweep destroy another installation's sandboxes on a shared server.
+        """
+        installation = await self._installation_id()
+        manager = await self._get_manager()
+        found: list[tuple[str, str]] = []
+        page = 1
+        while True:
+            try:
+                result = await manager.list_sandbox_infos(
+                    SandboxFilter(
+                        metadata={INSTALLATION_LABEL: installation},
+                        page=page,
+                        page_size=LIST_PAGE_SIZE,
+                    )
+                )
+            except Exception as error:
+                raise map_opensandbox_error(error) from error
+            for info in result.sandbox_infos:
+                metadata = getattr(info, "metadata", None) or {}
+                if metadata.get(INSTALLATION_LABEL) == installation:  # never trust the filter
+                    found.append((str(info.id), metadata.get(WORKSPACE_LABEL, "")))
+            pagination = getattr(result, "pagination", None)
+            if not getattr(pagination, "has_next_page", False):
+                return found
+            page += 1
+
+    async def pause_if_running(self, workspace: Workspace) -> bool:
+        if not workspace.sandbox_id or await self._state(workspace.sandbox_id) != "running":
+            return False
+        try:
+            await (await self._get_manager()).pause_sandbox(workspace.sandbox_id)
+        except Exception as error:
+            raise map_opensandbox_error(error) from error
+        self._awake_until.pop(workspace.sandbox_id, None)
+        return True
+
+    async def remove_sandbox(self, sandbox_id: str) -> None:
+        try:
+            await (await self._get_manager()).kill_sandbox(sandbox_id)
+        except Exception as error:
+            mapped = map_opensandbox_error(error)
+            if not isinstance(mapped, SandboxNotFoundError):
+                raise mapped from error
+        self._awake_until.pop(sandbox_id, None)
+        self._floor_checked.discard(sandbox_id)
+
     async def _floor_violations(self, sandbox: Sandbox) -> list[str]:
         try:
             execution = await sandbox.commands.run(
@@ -659,6 +761,8 @@ class OpenSandboxRuntime:
             )
         except Exception as error:
             raise map_opensandbox_error(error) from error
+        if check_floor:
+            await self._wake(workspace.sandbox_id)
         if check_floor and workspace.sandbox_id not in self._floor_checked:
             # Adopted (created by another process or before this check existed): refuse to
             # run anything in it below the floor, but keep the user's files.
@@ -688,8 +792,7 @@ class OpenSandboxRuntime:
         return None
 
     async def start(self, workspace: Workspace) -> None:
-        # Connect resolves the sandbox and verifies it is reachable; resume-on-paused lands
-        # with the lifecycle task.
+        # Connecting resumes a sandbox the idle pass paused and verifies its floor.
         await self._get_sandbox(workspace)
 
     async def delete(self, workspace: Workspace) -> None:
@@ -718,9 +821,10 @@ class OpenSandboxRuntime:
     ) -> RuntimeCommandResult:
         sandbox = await self._get_sandbox(workspace)
         try:
-            execution = await sandbox.commands.run(
-                command, opts=_command_opts(self._resolve_cwd(workspace, cwd), env, timeout)
-            )
+            async with self._busy(workspace):
+                execution = await sandbox.commands.run(
+                    command, opts=_command_opts(self._resolve_cwd(workspace, cwd), env, timeout)
+                )
         except Exception as error:
             raise map_opensandbox_error(error) from error
         return RuntimeCommandResult(
@@ -752,11 +856,12 @@ class OpenSandboxRuntime:
 
         handlers = ExecutionHandlers(on_stdout=on_stdout_msg, on_stderr=on_stderr_msg)
         try:
-            execution = await sandbox.commands.run(
-                command,
-                opts=_command_opts(self._resolve_cwd(workspace, cwd), env, timeout),
-                handlers=handlers,
-            )
+            async with self._busy(workspace):
+                execution = await sandbox.commands.run(
+                    command,
+                    opts=_command_opts(self._resolve_cwd(workspace, cwd), env, timeout),
+                    handlers=handlers,
+                )
         except Exception as error:
             raise map_opensandbox_error(error) from error
         return execution.exit_code if execution.exit_code is not None else 1
@@ -815,11 +920,18 @@ class OpenSandboxRuntime:
             self._pty_sessions[session_id] = server_session_id
             offset = 0
 
+        # A terminal is in use while output flows (the recorder debounces the writes).
+        await self.activity.touch(workspace.id)
+
+        async def on_output(data: bytes) -> None:
+            await self.activity.touch(workspace.id)
+            await on_data(data)
+
         try:
             return await self._pty_connect(
                 base_url,
                 server_session_id,
-                on_data,
+                on_output,
                 offset=offset,
                 takeover=True,
                 cols=cols,

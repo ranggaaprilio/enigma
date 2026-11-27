@@ -122,6 +122,9 @@ class Settings(BaseSettings):
     # Dev only (refused outside `local`): offer an OpenSandbox server that does not require
     # an API key, e.g. one started with OPENSANDBOX_INSECURE_SERVER=YES.
     opensandbox_allow_insecure: bool = False
+    # Idle pause and orphan sweep for OpenSandbox sandboxes; unset = on when the default
+    # runtime is opensandbox (as DOCKER_UPKEEP). Same window and interval as Docker's.
+    opensandbox_upkeep: bool | None = None
     opensandbox_sandbox_image: str = "enigma-sandbox:latest"
     opensandbox_require_image_digest: bool | None = None
     opensandbox_sandbox_cpu: str = "2"
@@ -375,6 +378,12 @@ class Settings(BaseSettings):
         if not re.fullmatch(r"\d+(Ki|Mi|Gi|Ti)?", value):
             raise ValueError(f"{info.field_name.upper()} must be a quantity such as 4Gi or 512Mi")
         return value
+
+    @property
+    def opensandbox_upkeep_enabled(self) -> bool:
+        if self.opensandbox_upkeep is not None:
+            return self.opensandbox_upkeep
+        return self.sandbox_runtime_default == "opensandbox"
 
     @property
     def opensandbox_image_digest_required(self) -> bool:
