@@ -281,6 +281,69 @@ describe("VerificationPanel", () => {
     expect(screen.getAllByText("specs/r2/plan.md")).toHaveLength(2);
   });
 
+  it("stops an in-flight run", async () => {
+    const user = userEvent.setup();
+    let status: VerificationRunResponse["status"] = "testing";
+    const fetchMock = stubFetch((url, init) => {
+      if (url.endsWith(`${BASE}?limit=20`)) return jsonResponse([run({ status })]);
+      if (url.endsWith(`${BASE}/r1/stop`) && init?.method === "POST") {
+        status = "rejected";
+        return jsonResponse(run({ status }));
+      }
+      if (url.endsWith(`${BASE}/r1`)) return jsonResponse(detail({ status }));
+      return undefined;
+    });
+
+    render(<VerificationPanel workspace={workspace} />);
+    await user.click(await screen.findByRole("button", { name: "Stop" }));
+
+    await waitFor(() =>
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/r1\/stop$/),
+        expect.objectContaining({ method: "POST" }),
+      ),
+    );
+    await waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument(),
+    );
+    expect(screen.getAllByText("rejected").length).toBeGreaterThan(0);
+  });
+
+  it("offers Stop only while a run is in flight", async () => {
+    stubFetch((url) => {
+      if (url.endsWith(`${BASE}?limit=20`)) return jsonResponse([run()]);
+      if (url.endsWith(`${BASE}/r1`)) return jsonResponse(detail());
+      return undefined;
+    });
+
+    render(<VerificationPanel workspace={workspace} />);
+    await screen.findByRole("button", { name: "Approve" });
+
+    expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+  });
+
+  it("shows why a run could not be stopped", async () => {
+    const user = userEvent.setup();
+    let detailCalls = 0;
+    stubFetch((url, init) => {
+      if (url.endsWith(`${BASE}?limit=20`)) return jsonResponse([run({ status: "testing" })]);
+      if (url.endsWith(`${BASE}/r1/stop`) && init?.method === "POST") {
+        return jsonResponse({ detail: "Verification run is not active (status=review)" }, 409);
+      }
+      if (url.endsWith(`${BASE}/r1`)) {
+        detailCalls += 1;
+        return jsonResponse(detail({ status: detailCalls === 1 ? "testing" : "review" }));
+      }
+      return undefined;
+    });
+
+    render(<VerificationPanel workspace={workspace} />);
+    await user.click(await screen.findByRole("button", { name: "Stop" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("not active");
+    expect(await screen.findByRole("button", { name: "Approve" })).toBeInTheDocument();
+  });
+
   it("refreshes the run after a gate conflict", async () => {
     const user = userEvent.setup();
     let detailCalls = 0;

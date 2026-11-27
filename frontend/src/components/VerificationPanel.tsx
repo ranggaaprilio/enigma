@@ -1,5 +1,5 @@
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
-import { Check, Eye, FlaskConical, Loader2, Play, Wrench, X } from "lucide-react";
+import { Check, Eye, FlaskConical, Loader2, Play, Square, Wrench, X } from "lucide-react";
 
 import {
   approveVerificationRun,
@@ -7,6 +7,7 @@ import {
   getVerificationRun,
   listVerificationRuns,
   rejectVerificationRun,
+  stopVerificationRun,
   type VerificationEvidenceResponse,
   type VerificationRunCreatePayload,
   type VerificationRunDetailResponse,
@@ -26,6 +27,14 @@ const ACTIVE_STATUSES: ReadonlySet<VerificationRunStatus> = new Set([
   "observing",
 ]);
 const POLL_MS = 3_000;
+
+/** What a human can do to a run from its detail header. */
+type GateAction = "approve" | "reject" | "stop";
+const GATE_CALLS = {
+  approve: approveVerificationRun,
+  reject: rejectVerificationRun,
+  stop: stopVerificationRun,
+} as const;
 
 /** Human Evidence View: trigger a verification run, inspect the evidence it collected, and
  * approve or reject it at the human gate. */
@@ -116,16 +125,13 @@ export function VerificationPanel({ workspace }: { workspace: WorkspaceResponse 
   // Only ever show (and gate) the run that is actually selected.
   const shownDetail = detail && detail.id === selectedId ? detail : null;
 
-  async function handleGate(approve: boolean) {
+  async function handleGate(action: GateAction) {
     if (!shownDetail) return;
     const runId = shownDetail.id;
     setGateBusy(true);
     setError(null);
     try {
-      const updated = await (approve ? approveVerificationRun : rejectVerificationRun)(
-        workspace.id,
-        runId,
-      );
+      const updated = await GATE_CALLS[action](workspace.id, runId);
       setRuns((current) => (current ?? []).map((r) => (r.id === updated.id ? updated : r)));
       setDetail((current) => (current && current.id === updated.id ? { ...current, ...updated } : current));
     } catch (err) {
@@ -360,7 +366,7 @@ function RunDetail({
 }: {
   run: VerificationRunDetailResponse;
   gateBusy: boolean;
-  onGate: (approve: boolean) => void;
+  onGate: (action: GateAction) => void;
 }) {
   return (
     <div>
@@ -371,12 +377,23 @@ function RunDetail({
         </div>
         <div className="flex items-center gap-2">
           <RunStatusPill status={run.status} />
+          {ACTIVE_STATUSES.has(run.status) && (
+            <button
+              type="button"
+              disabled={gateBusy}
+              onClick={() => onGate("stop")}
+              className="flex items-center gap-1.5 rounded-lg border border-line bg-white px-3 py-1.5 text-sm font-semibold text-ink transition hover:bg-panel disabled:opacity-60"
+            >
+              <Square className="h-4 w-4" aria-hidden="true" />
+              Stop
+            </button>
+          )}
           {run.status === "review" && (
             <>
               <button
                 type="button"
                 disabled={gateBusy}
-                onClick={() => onGate(true)}
+                onClick={() => onGate("approve")}
                 className="flex items-center gap-1.5 rounded-lg bg-primary px-3 py-1.5 text-sm font-semibold text-white transition hover:bg-primary-active disabled:opacity-60"
               >
                 <Check className="h-4 w-4" aria-hidden="true" />
@@ -385,7 +402,7 @@ function RunDetail({
               <button
                 type="button"
                 disabled={gateBusy}
-                onClick={() => onGate(false)}
+                onClick={() => onGate("reject")}
                 className="flex items-center gap-1.5 rounded-lg border border-line bg-white px-3 py-1.5 text-sm font-semibold text-ink transition hover:bg-panel disabled:opacity-60"
               >
                 <X className="h-4 w-4" aria-hidden="true" />
@@ -542,7 +559,7 @@ export function VerificationRunView({
 }: {
   workspaceId: string;
   runId: string;
-  /** Called after an approve/reject lands, so the owner can refresh its own state. */
+  /** Called after an approve/reject/stop lands, so the owner can refresh its own state. */
   onGateChanged?: (run: VerificationRunResponse) => void;
 }) {
   const [run, setRun] = useState<VerificationRunDetailResponse | null>(null);
@@ -570,14 +587,11 @@ export function VerificationRunView({
     return () => window.clearTimeout(timer);
   }, [active, run, pollRetry, load]);
 
-  async function handleGate(approve: boolean) {
+  async function handleGate(action: GateAction) {
     setGateBusy(true);
     setError(null);
     try {
-      const updated = await (approve ? approveVerificationRun : rejectVerificationRun)(
-        workspaceId,
-        runId,
-      );
+      const updated = await GATE_CALLS[action](workspaceId, runId);
       setRun((current) => (current ? { ...current, ...updated } : current));
       onGateChanged?.(updated);
     } catch (err) {

@@ -31,11 +31,20 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
 from app.core.metrics import reaper_lost_jobs_total, reaper_runs_ended_total, reaper_sweeps_total
-from app.models import AgentRun, CommandRun
+from app.models import AgentRun, CommandRun, VerificationRun
 from app.services.agents import ACTIVE_RUN_STATUSES, AgentRuntime, AgentService, agent_runtime
 from app.services.commands import CommandRuntime, CommandService, command_runtime
-from app.services.jobs import JOB_LOST, agent_run_job_id, command_run_job_id, job_is_known
+from app.services.jobs import (
+    JOB_LOST,
+    agent_run_job_id,
+    command_run_job_id,
+    job_is_known,
+    verification_run_job_id,
+)
 from app.services.leases import db_now
+from app.services.verification.execution import build_orchestrator
+from app.services.verification.orchestrator import ACTIVE_STATUSES as VERIFICATION_ACTIVE
+from app.services.verification.orchestrator import VerificationOrchestrator
 
 logger = structlog.get_logger(__name__)
 
@@ -183,6 +192,49 @@ async def _reap_if_lost(
         return False
 
 
+async def reap_lost_verification_jobs(
+    session_maker: async_sessionmaker[AsyncSession],
+    settings: Settings,
+    redis: ArqRedis,
+    *,
+    orchestrator: VerificationOrchestrator | None = None,
+) -> list[UUID]:
+    """End every active verification run whose queue job Redis no longer holds.
+
+    A verification job keeps itself in arq (``Retry(defer=…)``) for the run's whole life, so a
+    run whose job is gone will never move again and would hold the workspace's one-active
+    guard forever. Only runs idle for ``RUN_UNCLAIMED_GRACE_SECONDS`` are considered (the API
+    enqueues right after creating the row). Ending goes through ``end``, which also stops a fix
+    agent run. A Redis error skips the run, never ends it.
+    """
+    orchestrator = orchestrator or build_orchestrator(settings, session_maker=session_maker)
+    async with session_maker() as scan:
+        cutoff = db_now() - timedelta(seconds=settings.run_unclaimed_grace_seconds)
+        run_ids = (
+            await scan.scalars(
+                select(VerificationRun.id).where(
+                    VerificationRun.status.in_(VERIFICATION_ACTIVE),
+                    VerificationRun.updated_at < cutoff,
+                )
+            )
+        ).all()
+
+    reaped: list[UUID] = []
+    for run_id in run_ids:
+        try:
+            job_id = verification_run_job_id(run_id)
+            if await job_is_known(redis, settings.run_queue_name, job_id):
+                continue
+            if await orchestrator.end(run_id, "error", VERIFICATION_ACTIVE) is not None:
+                reaped.append(run_id)
+                reaper_lost_jobs_total.labels(kind="verification").inc()
+        except Exception:
+            logger.exception("lost_verification_reap_failed", run_id=str(run_id))
+    if reaped:
+        logger.warning("lost_verification_jobs_reaped", runs=[str(r) for r in reaped])
+    return reaped
+
+
 async def run_reaper(
     session_maker: async_sessionmaker[AsyncSession],
     settings: Settings,
@@ -211,6 +263,7 @@ async def run_reaper(
                     agent_runtime=agent_runtime,
                     command_runtime=command_runtime,
                 )
+                await reap_lost_verification_jobs(session_maker, settings, redis)
             reaper_sweeps_total.labels(result="ok").inc()
         except Exception:
             reaper_sweeps_total.labels(result="error").inc()

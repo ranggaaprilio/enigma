@@ -726,19 +726,27 @@ class AgentService:
         """Stop an active run. Idempotent: stopping a run that already ended (or a second click)
         changes nothing and returns the run as it is."""
         run = await self.get_run(workspace_id, run_id, user_id, require_drive=True)
-        if await self._transition(self.session, run.id, "stopped"):
-            self.runtime.request_stop(run.id)
-            await self._persist_event(
-                self.session, run.id, "status", "stopped", {"status": "stopped"}
-            )
-            # The run may be executing on a worker process; after the commit, so the worker
-            # sees `stopped` when it unwinds instead of writing its own terminal status.
-            await self.runtime.publish_control(run.id, "stop")
-            await self.session.refresh(run)
-            await self._record_run_finished(self.session, run)
-        else:
-            await self.session.refresh(run)  # it ended concurrently; report how
+        await self.stop_active_run(run.id)
+        await self.session.refresh(run)  # stopped now, or how it ended concurrently
         return run
+
+    async def stop_active_run(self, run_id: UUID) -> bool:
+        """Stop an active run on the system's behalf; ``True`` iff this call stopped it.
+
+        No permission check: for runs the platform itself started and must end (a verification
+        run's fix agent, whose author may since have lost access). Callers acting for a user
+        go through ``stop_run``.
+        """
+        if not await self._transition(self.session, run_id, "stopped"):
+            return False
+        self.runtime.request_stop(run_id)
+        await self._persist_event(self.session, run_id, "status", "stopped", {"status": "stopped"})
+        # The run may be executing on a worker process; after the commit, so the worker
+        # sees `stopped` when it unwinds instead of writing its own terminal status.
+        await self.runtime.publish_control(run_id, "stop")
+        run = await self.session.get(AgentRun, run_id, populate_existing=True)
+        await self._record_run_finished(self.session, run)
+        return True
 
     async def _transition(
         self, session: AsyncSession, run_id: UUID, status: str, **values

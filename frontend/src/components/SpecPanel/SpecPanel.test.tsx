@@ -15,6 +15,7 @@ import {
   listVerificationRuns,
   openSpecPullRequest,
   runSpecPhase,
+  stopVerificationRun,
   verifySpecImplement,
   type VerificationRunDetailResponse,
   type SpecPhaseName,
@@ -42,6 +43,7 @@ vi.mock("../../lib/api", async (importOriginal) => {
     getVerificationRun: vi.fn(),
     approveVerificationRun: vi.fn(),
     rejectVerificationRun: vi.fn(),
+    stopVerificationRun: vi.fn(),
     verifySpecImplement: vi.fn(),
     openSpecPullRequest: vi.fn(),
   };
@@ -280,6 +282,20 @@ describe("SpecPanel", () => {
 
       await waitFor(() => expect(approveVerificationRun).toHaveBeenCalledWith(workspace.id, "vr-1"));
       expect(approveSpecPhase).not.toHaveBeenCalled();
+    });
+
+    it("can stop the implement verification while it runs", async () => {
+      vi.mocked(listSpecWorkflows).mockResolvedValue([verifiedWorkflow()]);
+      vi.mocked(listVerificationRuns).mockResolvedValue([linkedRun({ status: "testing" })]);
+      vi.mocked(getVerificationRun).mockResolvedValue(linkedRun({ status: "testing" }));
+      vi.mocked(stopVerificationRun).mockResolvedValue({ ...linkedRun(), status: "rejected" });
+      vi.mocked(getSpecWorkflow).mockResolvedValue(verifiedWorkflow());
+      const user = userEvent.setup();
+
+      render(<SpecPanel workspace={workspace} />);
+
+      await user.click(await screen.findByRole("button", { name: "Stop" }));
+      await waitFor(() => expect(stopVerificationRun).toHaveBeenCalledWith(workspace.id, "vr-1"));
     });
 
     it("re-runs verification for implement awaiting review", async () => {
