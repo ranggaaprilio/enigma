@@ -230,10 +230,11 @@ export function DashboardRoute() {
     );
   }
 
-  const basePath =
-    projectId && teamId && workspaceId
+  const basePath = !workspaceId
+    ? "/"
+    : projectId && teamId
       ? `/projects/${projectId}/teams/${teamId}/workspaces/${workspaceId}`
-      : "/";
+      : `/workspaces/${workspaceId}`;
 
   return (
     // Everything below gates its actions on the caller's role in this workspace.

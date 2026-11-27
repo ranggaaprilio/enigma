@@ -456,6 +456,66 @@ describe("App auth routing", () => {
     );
   });
 
+  it("links a personal (team-less) workspace from the overview", async () => {
+    window.history.pushState({}, "", "/");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        if (url.includes("/dashboard/summary")) {
+          return Promise.resolve(
+            jsonResponse({
+              ...dashboardSummary,
+              recent_workspaces: [
+                {
+                  id: workspace.id,
+                  name: "Solo",
+                  status: "ready",
+                  project_id: null,
+                  project_name: null,
+                  team_id: null,
+                  team_name: null,
+                  created_at: "2026-05-23T00:00:00Z",
+                },
+              ],
+            }),
+          );
+        }
+        return fallbackResponse(url);
+      }),
+    );
+
+    render(<App />);
+
+    const card = await screen.findByRole("link", { name: /Solo/ });
+    expect(card).toHaveAttribute("href", `/workspaces/${workspace.id}`);
+  });
+
+  it("opens a personal workspace's dashboard with its own view URLs", async () => {
+    const personalBase = `/workspaces/${workspace.id}`;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn((url: string) => {
+        if (url.endsWith("/auth/me")) {
+          return Promise.resolve(jsonResponse(authUser));
+        }
+        return fallbackResponse(url);
+      }),
+    );
+    window.history.pushState({}, "", `${personalBase}/terminal`);
+
+    render(<App />);
+
+    const overview = await screen.findByRole("link", { name: "Overview" });
+    expect(overview).toHaveAttribute("href", personalBase);
+    const files = screen.getByRole("link", { name: "Files" });
+    expect(files).toHaveAttribute("href", `${personalBase}/files`);
+    await userEvent.click(files);
+    await waitFor(() => expect(window.location.pathname).toBe(`${personalBase}/files`));
+  });
+
   it("uses the sidebar as the only view navigation and updates active URLs", async () => {
     vi.stubGlobal(
       "fetch",

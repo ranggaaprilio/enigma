@@ -264,7 +264,11 @@ export function DashboardOverviewRoute() {
             {summary && summary.recent_workspaces.length > 0 ? (
               <div className="space-y-3">
                 {summary.recent_workspaces.map((w) => {
-                  const linkable = w.project_id && w.team_id;
+                  // A personal workspace (no team) opens on its own route.
+                  const to =
+                    w.project_id && w.team_id
+                      ? `/projects/${w.project_id}/teams/${w.team_id}/workspaces/${w.id}`
+                      : `/workspaces/${w.id}`;
                   const inner = (
                     <>
                       <div className="flex items-center justify-between gap-3">
@@ -282,21 +286,14 @@ export function DashboardOverviewRoute() {
                       </p>
                     </>
                   );
-                  return linkable ? (
+                  return (
                     <Link
                       key={w.id}
-                      to={`/projects/${w.project_id}/teams/${w.team_id}/workspaces/${w.id}`}
+                      to={to}
                       className="block rounded-xl border border-line bg-panel p-4 transition hover:border-primary hover:shadow-sm"
                     >
                       {inner}
                     </Link>
-                  ) : (
-                    <div
-                      key={w.id}
-                      className="rounded-xl border border-line bg-panel p-4"
-                    >
-                      {inner}
-                    </div>
                   );
                 })}
               </div>

@@ -40,6 +40,24 @@ export default function App() {
   );
 }
 
+// The workspace dashboard's views, shared by the team and the personal workspace routes.
+const dashboardViews = (
+  <>
+    <Route index element={<DashboardView view="overview" />} />
+    <Route path="repository" element={<DashboardView view="repository" />} />
+    <Route path="files" element={<DashboardView view="files" />} />
+    <Route path="commands" element={<DashboardView view="commands" />} />
+    <Route path="spec" element={<DashboardView view="spec" />} />
+    <Route path="agents" element={<DashboardView view="agent" />} />
+    <Route path="verify" element={<DashboardView view="verify" />} />
+    <Route path="usage" element={<DashboardView view="usage" />} />
+    <Route path="editor" element={<DashboardView view="editor" />} />
+    <Route path="terminal" element={<DashboardView view="terminal" />} />
+    <Route path="preview" element={<DashboardView view="preview" />} />
+    <Route path="audit" element={<DashboardView view="audit" />} />
+  </>
+);
+
 function AppRoutes() {
   return (
     <Routes>
@@ -113,18 +131,11 @@ function AppRoutes() {
         path="/projects/:projectId/teams/:teamId/workspaces/:workspaceId"
         element={<AdaptiveDashboardRoute />}
       >
-        <Route index element={<DashboardView view="overview" />} />
-        <Route path="repository" element={<DashboardView view="repository" />} />
-        <Route path="files" element={<DashboardView view="files" />} />
-        <Route path="commands" element={<DashboardView view="commands" />} />
-        <Route path="spec" element={<DashboardView view="spec" />} />
-        <Route path="agents" element={<DashboardView view="agent" />} />
-        <Route path="verify" element={<DashboardView view="verify" />} />
-        <Route path="usage" element={<DashboardView view="usage" />} />
-        <Route path="editor" element={<DashboardView view="editor" />} />
-        <Route path="terminal" element={<DashboardView view="terminal" />} />
-        <Route path="preview" element={<DashboardView view="preview" />} />
-        <Route path="audit" element={<DashboardView view="audit" />} />
+        {dashboardViews}
+      </Route>
+      {/* A personal workspace (created without a team) has no project/team in its URL. */}
+      <Route path="/workspaces/:workspaceId" element={<AdaptiveDashboardRoute />}>
+        {dashboardViews}
       </Route>
 
       {/* Platform-wide settings. Any authenticated user may look; only the platform owner
