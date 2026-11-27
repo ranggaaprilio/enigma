@@ -1,0 +1,62 @@
+# Reference opensandbox-server 1.2.1 config for Enigma (Plan 7a).
+# Guide: docs/self-host-opensandbox.md. Every [docker]/[egress]/[server] key below is
+# security-relevant; the values here were verified live (see the plan's Task 1 and the
+# integration suite, backend/tests/test_opensandbox_integration.py).
+#
+# Start it with the API key in the environment, never in this file:
+#   OPENSANDBOX_SERVER_API_KEY=<long random> opensandbox-server --config sandbox.toml
+# and give Enigma the same value as OPENSANDBOX_API_KEY. Never set
+# OPENSANDBOX_INSECURE_SERVER=YES outside a laptop: Enigma reports such a server as
+# `insecure` and offers it to nobody.
+
+[server]
+# A private address only the Enigma backend/worker reach. The server has no TLS of its own
+# and holds the Docker socket (root-equivalent): never expose it to users or the internet.
+host = "127.0.0.1"
+port = 8080
+max_sandbox_timeout_seconds = 86400
+
+[log]
+level = "INFO"
+
+[runtime]
+type = "docker"
+# execd v1.1.0 enforces EXECD_ACCESS_TOKEN, which Enigma sets per sandbox.
+execd_image = "opensandbox/execd:v1.1.0"
+
+[storage]
+# No host paths may be mounted into a sandbox. (Enigma also refuses to send `volumes`.)
+allowed_host_paths = []
+
+[store]
+type = "sqlite"
+path = "/var/lib/opensandbox/opensandbox.db"
+
+[docker]
+network_mode = "bridge"
+# Where sandbox ports (execd, previews) are published. A private IP the backend reaches,
+# never 0.0.0.0: every sandbox's execd is published here.
+publish_host = "127.0.0.1"
+port_range_min = 40000
+port_range_max = 60000
+# The container floor Enigma checks in every sandbox (CapEff=0, NoNewPrivs=1, non-root).
+# The server default drops only 9 capabilities; Enigma refuses sandboxes created that way.
+drop_capabilities = ["ALL"]
+no_new_privileges = true
+pids_limit = 4096
+apparmor_profile = ""
+seccomp_profile = ""
+
+[ingress]
+mode = "direct"
+
+[egress]
+image = "opensandbox/egress:v1.1.7"
+# Required. Enigma's egress policy denies private, link-local and CGNAT ranges for every
+# sandbox; only `dns+nft` enforces that for connections by IP (in `dns` mode a sandbox still
+# reached a sibling's execd). Without it the execd token is the only isolation left.
+mode = "dns+nft"
+readiness_timeout_seconds = 30.0
+
+[renew_intent]
+enabled = false

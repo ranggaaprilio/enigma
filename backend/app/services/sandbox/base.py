@@ -9,7 +9,7 @@ next to it and is selected per workspace through ``Workspace.runtime`` (``factor
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from app.core.config import Settings
@@ -26,6 +26,10 @@ class RuntimeUnavailableError(SandboxRuntimeError):
 
 class SandboxNotFoundError(SandboxRuntimeError):
     """The workspace has no sandbox, or the provider no longer knows it."""
+
+
+class InsecureRuntimeError(SandboxRuntimeError):
+    """The provider is reachable but not safe to put a tenant on (e.g. it skips auth)."""
 
 
 class ProvisioningError(SandboxRuntimeError):
@@ -47,6 +51,9 @@ class RuntimeCommandResult:
 class RuntimePreviewLink:
     url: str
     token: str
+    # Headers every request to ``url`` must carry (OpenSandbox's execd access token);
+    # ``token`` stays Daytona's renewable preview token.
+    headers: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

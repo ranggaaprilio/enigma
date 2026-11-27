@@ -32,7 +32,9 @@ class RuntimeHealth(BaseModel):
     status and a generic reason -- never a socket path, URL or version (Epic 06)."""
 
     configured: bool
-    status: str  # ok | error | unconfigured | disabled (SANDBOX_RUNTIMES_ALLOWED)
+    # ok | error | unconfigured | disabled (SANDBOX_RUNTIMES_ALLOWED) | insecure (reachable
+    # but not safe to place a tenant on: an OpenSandbox server that skips auth)
+    status: str
     reason: str | None = None
     # Docker only: this installation's sandboxes on the daemon, and when this process last
     # ran the upkeep pass (None where it does not run it, e.g. the API in queue mode). Shown

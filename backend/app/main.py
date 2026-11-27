@@ -36,7 +36,10 @@ from app.services.sandbox.availability import (
     require_metrics_token_for_docker,
     warn_if_default_runtime_unconfigured,
 )
-from app.services.sandbox_maintenance import start_sandbox_maintenance
+from app.services.sandbox_maintenance import (
+    start_opensandbox_maintenance,
+    start_sandbox_maintenance,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -83,6 +86,11 @@ async def lifespan(_app: FastAPI):
         if settings.run_execution_mode == "inline"
         else None
     )
+    opensandbox_upkeep = (
+        start_opensandbox_maintenance(async_session_maker, settings)
+        if settings.run_execution_mode == "inline"
+        else None
+    )
     # Epic 09: fleet-wide gauges (queue depth, active runs and spend by team) on /metrics.
     fleet_sampler = start_fleet_sampler(async_session_maker, settings)
     restore_sigterm = install_sigterm_drain(
@@ -94,7 +102,7 @@ async def lifespan(_app: FastAPI):
     lifecycle.begin_drain()
     fleet_sampler.cancel()
     await asyncio.gather(fleet_sampler, return_exceptions=True)
-    for task in (retention, sandbox_upkeep):
+    for task in (retention, sandbox_upkeep, opensandbox_upkeep):
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)

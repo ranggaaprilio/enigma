@@ -24,14 +24,14 @@ from typing import Literal
 import structlog
 
 from app.core.config import Settings, get_settings
-from app.services.sandbox.base import SandboxRuntime
+from app.services.sandbox.base import InsecureRuntimeError, SandboxRuntime
 
 logger = structlog.get_logger(__name__)
 
 PROVIDERS: tuple[str, ...] = ("daytona", "docker", "opensandbox")
 HEALTH_TIMEOUT_SECONDS = 3.0
 
-AvailabilityStatus = Literal["ok", "error", "unconfigured", "disabled"]
+AvailabilityStatus = Literal["ok", "error", "unconfigured", "disabled", "insecure"]
 
 PROVIDER_LABELS = {
     "daytona": "Daytona",
@@ -45,6 +45,7 @@ _REASONS = {
     ("docker", "error"): "The Docker daemon is not reachable",
     ("opensandbox", "unconfigured"): "No OpenSandbox server is configured",
     ("opensandbox", "error"): "The OpenSandbox server is not reachable",
+    ("opensandbox", "insecure"): "The OpenSandbox server does not require authentication",
 }
 DISABLED_REASON = "Not enabled on this deployment"
 
@@ -76,6 +77,9 @@ async def check_runtime(
         )
     try:
         await asyncio.wait_for(runtime.health(), timeout)
+    except InsecureRuntimeError:
+        logger.warning("sandbox_runtime_insecure", provider=provider)
+        return RuntimeAvailability(provider, True, "insecure", _REASONS[(provider, "insecure")])
     except Exception as error:  # TimeoutError included: a hung daemon is a down daemon
         logger.warning(
             "sandbox_runtime_unavailable", provider=provider, error_type=type(error).__name__

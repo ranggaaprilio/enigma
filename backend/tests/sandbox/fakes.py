@@ -1271,6 +1271,10 @@ class FakeOpenSandboxCommands:
 
     async def run(self, command: Any, *, opts: Any = None, handlers: Any = None) -> Any:
         self.run_calls.append((command, opts, handlers))
+        from app.services.sandbox.opensandbox import FLOOR_PROBE
+
+        if command == FLOOR_PROBE:  # the provider's security-floor check (Plan 7a)
+            return self._execution(0, self._sandbox.floor, "")
         if isinstance(command, list) and command and command[0] == "grep":
             return await self._grep(command, handlers)
         result = self._run_result(command)
@@ -1314,6 +1318,8 @@ class FakeOpenSandboxSandbox:
         self.files = FakeOpenSandboxFiles(self._store)
         self.commands = FakeOpenSandboxCommands(self, exec_handler)
         self.destroyed = False
+        # What the security-floor probe sees: caps dropped, no-new-privs, a non-root uid.
+        self.floor = "CapEff: 0000000000000000\nNoNewPrivs: 1\n1001\n"
         self.endpoint_ports: list[int] = []
         # execd /pty state: session_id -> FakePtyHandle (what the runtime seam sees).
         self.ptys: dict[str, FakePtyHandle] = {}
@@ -1338,18 +1344,59 @@ class FakeOpenSandboxSandbox:
 
 
 class FakeOpenSandboxManager:
-    """Management-API ``SandboxManager`` double for ``health``/``status``."""
+    """Management-API ``SandboxManager`` double: health, status, a paged listing filtered by
+    metadata (as the server does, AND-matched), and pause/resume/kill."""
 
     def __init__(self, state: str = "Running") -> None:
         self.state = state
         self.listed = False
+        self.sandboxes: list[SimpleNamespace] = []  # id, metadata (what the server stores)
+        self.filters: list[Any] = []
+        self.page_size = 2
+        self.paused: list[str] = []
+        self.resumed: list[str] = []
+        self.killed: list[str] = []
 
     async def list_sandbox_infos(self, filter: Any) -> SimpleNamespace:
         self.listed = True
-        return SimpleNamespace(sandbox_infos=[], pagination=None)
+        self.filters.append(filter)
+        wanted = getattr(filter, "metadata", None) or {}
+        matching = [
+            s for s in self.sandboxes
+            if all((s.metadata or {}).get(key) == value for key, value in wanted.items())
+        ]
+        page = getattr(filter, "page", None) or 1
+        chunk = matching[(page - 1) * self.page_size : page * self.page_size]
+        return SimpleNamespace(
+            sandbox_infos=chunk,
+            pagination=SimpleNamespace(
+                page=page, has_next_page=page * self.page_size < len(matching)
+            ),
+        )
 
     async def get_sandbox_info(self, sandbox_id: str) -> SimpleNamespace:
         return SimpleNamespace(status=SimpleNamespace(state=self.state))
+
+    async def pause_sandbox(self, sandbox_id: str) -> None:
+        self.paused.append(sandbox_id)
+        self.state = "Paused"
+
+    async def resume_sandbox(self, sandbox_id: str) -> None:
+        self.resumed.append(sandbox_id)
+        self.state = "Running"
+
+    async def kill_sandbox(self, sandbox_id: str) -> None:
+        self.killed.append(sandbox_id)
+
+
+class RecordingActivity:
+    """``SandboxActivityRecorder`` double: records which workspaces were touched."""
+
+    def __init__(self) -> None:
+        self.touched: list[Any] = []
+
+    async def touch(self, workspace_id: Any) -> None:
+        self.touched.append(workspace_id)
 
     async def close(self) -> None:
         return None
@@ -1365,7 +1412,9 @@ def opensandbox_runtime_with(
     from app.core.config import Settings
     from app.services.sandbox.opensandbox import OpenSandboxRuntime
 
-    runtime = OpenSandboxRuntime(Settings(opensandbox_api_url="http://127.0.0.1:8080"))
+    runtime = OpenSandboxRuntime(
+        Settings(opensandbox_api_url="http://127.0.0.1:8080", opensandbox_api_key="test-key")
+    )
     sandbox = FakeOpenSandboxSandbox(sandbox_id, state=state, exec_handler=exec_handler)
     manager = FakeOpenSandboxManager(state=state)
 
@@ -1380,13 +1429,13 @@ def opensandbox_runtime_with(
 
     # execd /pty seams: an in-memory stand-in for the HTTP+WebSocket API (the real
     # implementation lives in app.services.sandbox.opensandbox_pty).
-    async def pty_create_session(base_url: str, cwd: str | None) -> str:
+    async def pty_create_session(base_url: str, cwd: str | None, **_: Any) -> str:
         session_id = f"execd-{uuid4().hex[:8]}"
         sandbox.pty_creates.append(session_id)
         sandbox.ptys[session_id] = FakePtyHandle(session_id)
         return session_id
 
-    async def pty_status(base_url: str, server_session_id: str) -> tuple[bool, int]:
+    async def pty_status(base_url: str, server_session_id: str, **_: Any) -> tuple[bool, int]:
         return server_session_id in sandbox.ptys, 0
 
     async def pty_connect(
@@ -1398,13 +1447,14 @@ def opensandbox_runtime_with(
         takeover: bool,
         cols: int,
         rows: int,
+        **_: Any,
     ) -> FakePtyHandle:
         try:
             return sandbox.ptys[server_session_id]
         except KeyError:
             raise RuntimeError("no such execd PTY session") from None
 
-    async def pty_delete_session(base_url: str, server_session_id: str) -> None:
+    async def pty_delete_session(base_url: str, server_session_id: str, **_: Any) -> None:
         sandbox.pty_deletes.append(server_session_id)
         sandbox.ptys.pop(server_session_id, None)
 
@@ -1415,5 +1465,13 @@ def opensandbox_runtime_with(
     runtime._pty_session_status = pty_status  # type: ignore[method-assign]
     runtime._pty_connect = pty_connect  # type: ignore[method-assign]
     runtime._pty_delete_session = pty_delete_session  # type: ignore[method-assign]
+    runtime._installation = "test-installation"  # no database read in unit tests
+    runtime.activity = RecordingActivity()  # no sandbox_activity writes in unit tests
+    runtime._fake_manager = manager
+
+    async def auth_probe_status() -> int:
+        return 401  # a server that requires its API key
+
+    runtime._auth_probe_status = auth_probe_status  # type: ignore[method-assign]
     runtime._fake_sandbox = sandbox  # exposed for provider-level assertions
     return runtime
