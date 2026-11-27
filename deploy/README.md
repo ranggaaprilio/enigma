@@ -63,6 +63,17 @@ Nothing secret is in git or in an image layer. Provide these through your secret
 
 The preview proxy mounts only the keys it reads; the API, worker and Job get `enigma-secrets`.
 
+**Evidence screenshots (optional, not yet in the manifests).** Verification observations store a
+PNG in an S3-compatible bucket (AWS S3, R2, ...). To enable them:
+- Set `ARTIFACT_S3_BUCKET` (+ `ARTIFACT_S3_REGION`, and `ARTIFACT_S3_ENDPOINT_URL` for a
+  non-AWS store) on the API and the worker. Without a bucket, screenshots are skipped with a reason.
+- Add `ARTIFACT_S3_ACCESS_KEY_ID` / `ARTIFACT_S3_SECRET_ACCESS_KEY` to `enigma-secrets`, or use
+  workload identity with empty keys.
+- Allow egress from the API and worker to the store in `network-policies.yaml`.
+
+Keep the bucket private: images are served only through the authenticated API. Add a
+lifecycle rule to expire `verification/` objects; rows are deleted with their run, objects are not.
+
 ## Release sequence
 
 Every release is **migrate, then roll**. Old and new replicas share the migrated schema for the
