@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 from uuid import UUID
 
 import httpx
@@ -447,6 +447,10 @@ def create_preview_proxy_app(
     probes = {"live": live, "ready": ready, "health": health, "metrics": metrics}
 
     async def proxy_http(request: Request, path: str = "") -> Response:
+        try:
+            check_preview_path(path)
+        except UnsafePreviewPathError:
+            raise HTTPException(status_code=400, detail="Invalid preview path") from None
         original_host = request.headers.get("host", "")
         try:
             label = proxy_host_label(
@@ -631,6 +635,11 @@ def create_preview_proxy_app(
     app.add_api_route("/{path:path}", proxy_http, methods=HTTP_METHODS)
 
     async def proxy_websocket(websocket: WebSocket, path: str = "") -> None:
+        try:
+            check_preview_path(path)
+        except UnsafePreviewPathError:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return
         original_host = websocket.headers.get("host", "")
         try:
             label = proxy_host_label(
@@ -1181,6 +1190,31 @@ def _forward_headers(headers, blocked: set[str]) -> dict[str, str]:
     }
 
 
+class UnsafePreviewPathError(ValueError):
+    """A request path that would climb out of the preview's own prefix."""
+
+
+def check_preview_path(path: str) -> None:
+    """Refuse dot segments, however encoded, and backslashes.
+
+    OpenSandbox serves a preview at ``http://<host>:<execd>/proxy/<port>``: the sandbox's execd
+    control API shares that origin, and the proxy sends execd's access token with every
+    request. A path climbing out of ``/proxy/<port>`` would reach that API, so a preview
+    visitor could run commands in the sandbox. Browsers resolve dot segments before sending,
+    so a real page never needs them.
+    """
+    decoded = path
+    for _ in range(3):  # catch double encoding (%252e -> %2e -> .)
+        unquoted = unquote(decoded)
+        if unquoted == decoded:
+            break
+        decoded = unquoted
+    if "\\" in decoded or any(
+        segment in (".", "..") for segment in decoded.split("/")
+    ):
+        raise UnsafePreviewPathError("dot segments are not allowed in a preview path")
+
+
 def _upstream_url(
     base_url: str,
     path: str,
@@ -1188,13 +1222,17 @@ def _upstream_url(
     *,
     websocket: bool = False,
 ) -> str:
+    check_preview_path(path)
     parsed = urlsplit(base_url)
     scheme = parsed.scheme
     if websocket:
         scheme = "wss" if scheme == "https" else "ws"
     request_path = f"/{path}" if path else "/"
     base_path = parsed.path.rstrip("/")
-    return urlunsplit((scheme, parsed.netloc, f"{base_path}{request_path}", query, ""))
+    url = urlunsplit((scheme, parsed.netloc, f"{base_path}{request_path}", query, ""))
+    if base_path and not httpx.URL(url).path.startswith(f"{base_path}/"):
+        raise UnsafePreviewPathError("the preview path left its prefix")
+    return url
 
 
 # Matches one `frame-ancestors ...` directive of a CSP, with or without a trailing `;`.

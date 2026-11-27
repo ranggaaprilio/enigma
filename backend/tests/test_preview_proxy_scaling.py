@@ -704,7 +704,27 @@ def test_no_request_path_can_change_the_upstream_host(path):
         client.get(path)
 
     asyncio.run(http_client.aclose())
-    assert upstream_hosts == ["5173-sandbox.proxy.daytona.example"]
+    # Forwarded to the preview's own host, or (dot segments) refused before any upstream call.
+    assert set(upstream_hosts) <= {"5173-sandbox.proxy.daytona.example"}
+
+
+@pytest.mark.parametrize("path", ["/%2e%2e/%2e%2e/files", "/a/%2E%2E/%2e%2e/command"])
+def test_a_path_that_climbs_out_of_the_preview_is_refused_before_any_upstream_call(path):
+    _workspace, preview, session = _fixture()
+    upstream: list[str] = []
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        upstream.append(str(request.url))
+        return httpx.Response(200)
+
+    app, http_client = _capability_app(session, handler=handle)
+
+    with TestClient(app, base_url=f"http://{_capability_host(preview)}") as client:
+        response = client.get(path)
+
+    asyncio.run(http_client.aclose())
+    assert response.status_code == 400
+    assert upstream == []
 
 
 def test_spoofed_forwarding_headers_cannot_change_the_upstream_or_its_token():

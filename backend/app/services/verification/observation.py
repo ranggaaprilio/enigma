@@ -172,18 +172,21 @@ async def _capture_snapshot(
     async with httpx.AsyncClient(
         timeout=OBSERVE_TIMEOUT_SECONDS, transport=transport
     ) as client:
-        # Redirects are followed by hand: httpx keeps custom headers on a cross-origin hop,
-        # and the provider's (OpenSandbox's execd token) must only ever reach the preview's
-        # own origin, never a host the app redirects to.
+        # Redirects are followed by hand and only within the preview's own origin: httpx
+        # keeps custom headers (OpenSandbox's execd token) on a cross-origin hop, and a
+        # tenant app must not make the backend fetch a URL of its choosing (an internal
+        # address, cloud metadata). A redirect elsewhere is observed as the redirect itself.
         url = httpx.URL(link.url)
         origin = (url.scheme, url.host, url.port)
         for _ in range(MAX_REDIRECTS + 1):
-            same_origin = (url.scheme, url.host, url.port) == origin
-            response = await client.get(url, headers=link.headers if same_origin else None)
+            response = await client.get(url, headers=link.headers)
             location = response.headers.get("location")
             if not response.is_redirect or not location:
                 break
-            url = url.join(location)
+            target = url.join(location)
+            if (target.scheme, target.host, target.port) != origin:
+                break
+            url = target
 
     text = response.text
     title = _extract_title(text)

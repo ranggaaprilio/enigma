@@ -359,10 +359,48 @@ async def test_the_observation_never_sends_provider_headers_to_another_origin() 
     )
     await _capture_snapshot(link, transport=httpx.MockTransport(handler))
 
-    assert seen == [("h", "t"), ("h", "t"), ("attacker.example", None)]
+    # The app's own redirect is followed; one to another origin is never requested at all
+    # (the backend is not an open fetcher of tenant-chosen URLs).
+    assert seen == [("h", "t"), ("h", "t")]
 
 
 def test_the_preview_proxy_drops_a_visitor_supplied_execd_token() -> None:
     from app.preview_proxy import REQUEST_HEADERS_TO_STRIP
 
     assert "x-execd-access-token" in REQUEST_HEADERS_TO_STRIP
+
+
+# --- preview paths never leave the preview's own prefix --------------------------------------
+# OpenSandbox's preview URL is execd's own origin (`http://host:<execd>/proxy/<port>`), so a
+# path that climbed out of `/proxy/<port>` would reach execd's control API with the sandbox
+# token: a preview visitor could then run commands in the sandbox.
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "../../files/download",
+        "assets/../../../command",
+        "%2e%2e/%2e%2e/files/download",
+        "%2E%2e%2F%2e%2E%2Fcommand",
+        "..%2f..%2fcommand",
+        "a\\..\\..\\command",
+        "%252e%252e/%252e%252e/command",
+        ".",
+    ],
+)
+def test_a_preview_path_cannot_climb_out_of_its_prefix(path) -> None:
+    from app.preview_proxy import UnsafePreviewPathError, _upstream_url
+
+    with pytest.raises(UnsafePreviewPathError):
+        _upstream_url("http://127.0.0.1:46589/proxy/5173", path, "")
+
+
+@pytest.mark.parametrize("path", ["", "assets/app.js", "a.b/c..d/x", "api/v1/items", "%20space"])
+def test_ordinary_preview_paths_stay_under_the_prefix(path) -> None:
+    import httpx
+
+    from app.preview_proxy import _upstream_url
+
+    url = _upstream_url("http://127.0.0.1:46589/proxy/5173", path, "q=1")
+    assert httpx.URL(url).path.startswith("/proxy/5173/")
