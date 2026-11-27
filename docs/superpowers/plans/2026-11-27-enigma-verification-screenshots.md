@@ -152,6 +152,20 @@ Any failure leaves the observation **passed** on its snapshot, with `screenshot_
   - Objects are never deleted. Rows cascade with their run; use a bucket lifecycle rule on `verification/` (`deploy/README.md`).
   - The screenshot GET is not rate-limited, the same as the other read endpoints.
 
+## Live E2E fix (2026-11-27)
+
+The Plans 4–6 live E2E (portofnext) showed an empty hero. Chromium's `--screenshot` captures on `load`, which can fire before React hydrates and framer-motion reveals the content. On some pages `load` is held by third-party assets for 30–40 s, so the result was blank, slow or missing.
+
+**What did not work:** `--virtual-time-budget` (stops animations midway) and `--force-prefers-reduced-motion`.
+
+**The fix:** `cdp_capture.py` drives the same Chromium over `--remote-debugging-pipe` from the image's own Python (`-I -S`, stdlib only, source sent inline):
+1. Sets a 1280×800 viewport.
+2. Navigates, then waits for `load`, at most 20 s.
+3. Sleeps 2 s of real time, then captures.
+4. Kills the browser's process group, including on SIGTERM from `timeout`.
+
+Verified live: 3/3 full-hero captures in about 5 s. The full-page option was declined: sections revealed on scroll stay blank without scrolling.
+
 ## Out of scope
 
 - k8s manifests for the store (documented, follow-up), retention/lifecycle rules on the bucket, and deleting objects when a run is deleted (rows cascade, and objects are left for a bucket lifecycle rule).
