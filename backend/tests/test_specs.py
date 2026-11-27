@@ -1522,6 +1522,55 @@ async def test_open_pull_request_commits_pushes_and_links(db_session, monkeypatc
     assert note is not None
 
 
+class ScaffoldDiffRuntime(SpecReadRuntime):
+    """Also answers the scaffold count: the files the branch adds under Spec Kit's paths."""
+
+    def __init__(self, files, scaffold_stdout, exit_code=0):
+        super().__init__(files)
+        self.scaffold_stdout = scaffold_stdout
+        self.scaffold_exit_code = exit_code
+
+    async def exec(self, workspace, command, *, cwd=None, env=None, timeout=None):
+        if command.startswith("git diff --name-only "):
+            self.calls.append((command, cwd))
+            return type(
+                "R",
+                (),
+                {"exit_code": self.scaffold_exit_code, "stdout": self.scaffold_stdout, "stderr": ""},
+            )()
+        return await super().exec(workspace, command, cwd=cwd, env=env, timeout=timeout)
+
+
+@pytest.mark.parametrize(
+    ("stdout", "exit_code", "expected"),
+    [
+        (".specify/memory/constitution.md\n.specify/scripts/sh/common.sh\nAGENTS.md\n", 0, 3),
+        ("", 0, 0),  # the scaffold is already on the base branch
+        ("", 128, 0),  # no remote ref to compare with: say nothing rather than guess
+    ],
+)
+async def test_open_pull_request_flags_the_scaffold_the_branch_carries(
+    db_session, monkeypatch, stdout, exit_code, expected
+):
+    session, session_maker = db_session
+    user, workspace, workflow = await _completed_workflow(session)
+    harness = PullRequestHarness(monkeypatch)
+    runtime = ScaffoldDiffRuntime({}, stdout, exit_code)
+    service = SpecKitService(session, session_maker, Settings(), runtime=runtime)
+
+    await service.open_pull_request(workspace.id, workflow.id, user.id, github_client=harness.client)
+
+    [(command, cwd)] = [call for call in runtime.calls if call[0].startswith("git diff")]
+    assert "origin/main...HEAD" in command
+    assert ".specify" in command and ".enigma" in command
+    assert cwd == workflow.worktree_path
+    body = harness.requests[0][2]["body"]
+    if expected:
+        assert f"{expected} files" in body
+    else:
+        assert "Spec Kit scaffold" not in body
+
+
 async def test_open_pull_request_is_idempotent_once_linked(db_session, monkeypatch):
     session, session_maker = db_session
     user, workspace, workflow = await _completed_workflow(session)

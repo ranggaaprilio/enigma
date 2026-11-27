@@ -159,3 +159,28 @@ def test_confined_read_refuses_symlinks_out_of_the_worktree(tmp_path) -> None:
         result = _run_read(tree, rel)
         assert result.returncode != 0, rel
         assert "TOKEN" not in result.stdout, rel
+
+
+def test_body_flags_the_spec_kit_scaffold_a_first_pr_carries() -> None:
+    body = build_pr_body(
+        _workflow(),
+        repo_url="https://github.com/acme/shop.git",
+        spec_excerpt=None,
+        run=None,
+        approved_at=None,
+        scaffold_files=36,
+    )
+    assert "### Spec Kit scaffold" in body
+    assert "36 files" in body
+    assert "`.specify/`" in body
+
+
+def test_body_has_no_scaffold_section_once_the_scaffold_is_on_the_base() -> None:
+    body = build_pr_body(
+        _workflow(),
+        repo_url="https://github.com/acme/shop.git",
+        spec_excerpt=None,
+        run=None,
+        approved_at=None,
+    )
+    assert "Spec Kit scaffold" not in body

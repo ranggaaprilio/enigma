@@ -58,6 +58,7 @@ from app.services.spec_pull_request import (
     SPEC_READ_BYTES,
     build_pr_body,
     confined_read_command,
+    scaffold_diff_command,
 )
 from app.services.verification.orchestrator import PlanCriteria, VerificationRunAlreadyActiveError
 from app.services.verification.spec_link import (
@@ -1207,6 +1208,18 @@ class SpecKitService:
             return None
         return result.stdout
 
+    async def _count_scaffold_files(self, workspace: Workspace, workflow: SpecWorkflow) -> int:
+        """Spec Kit scaffold files the branch carries that the remote base does not have."""
+        result = await self.runtime.exec(
+            workspace,
+            scaffold_diff_command(workspace.default_branch or "main"),
+            cwd=workflow.worktree_path,
+            timeout=GIT_TIMEOUT_SECONDS,
+        )
+        if result.exit_code != 0:
+            return 0  # no remote ref to compare with: say nothing rather than guess
+        return sum(1 for line in (result.stdout or "").splitlines() if line.strip())
+
     async def _read_spec_excerpt(
         self, workspace: Workspace, workflow: SpecWorkflow
     ) -> str | None:
@@ -1429,6 +1442,7 @@ class SpecKitService:
                 .limit(1)
             ),
             approved_at=(await self._get_phase_row(workflow.id, "implement")).reviewed_at,
+            scaffold_files=await self._count_scaffold_files(workspace, workflow),
         )
         try:
             pr = await pull_requests.create(
