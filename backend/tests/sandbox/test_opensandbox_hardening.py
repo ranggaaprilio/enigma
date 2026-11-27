@@ -13,7 +13,6 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from structlog.testing import capture_logs
 
 from app.core.config import Settings
 from app.models import Workspace
@@ -189,7 +188,14 @@ def test_unsafe_create_requests_are_refused(unsafe) -> None:
 # --- the runtime uses it: create, connect, previews and terminals carry the token ----------
 
 
-async def test_provision_sends_the_safe_request_and_never_logs_the_token() -> None:
+async def test_provision_sends_the_safe_request_and_never_logs_the_token(monkeypatch) -> None:
+    from app.services.sandbox import opensandbox as module
+
+    logged: list[str] = []
+    for level in ("debug", "info", "warning", "error", "exception"):
+        monkeypatch.setattr(
+            module.logger, level, lambda event, **kw: logged.append(f"{event} {kw!r}")
+        )
     runtime = opensandbox_runtime_with()
     runtime.settings = _settings()
     runtime._installation = INSTALLATION
@@ -203,13 +209,12 @@ async def test_provision_sends_the_safe_request_and_never_logs_the_token() -> No
     runtime._create = create
     workspace = _workspace()
 
-    with capture_logs() as logs:
-        await runtime.provision(workspace)
+    await runtime.provision(workspace)
 
     [kwargs] = sent
     token = execd_token(runtime.settings, workspace.id)
     assert kwargs["env"]["EXECD_ACCESS_TOKEN"] == token
-    assert token not in repr(logs)
+    assert token not in repr(logged)
 
 
 async def test_every_connection_to_a_sandbox_carries_its_execd_token() -> None:
@@ -433,6 +438,16 @@ async def test_an_existing_sandbox_below_the_floor_is_refused_but_kept() -> None
     with pytest.raises(SandboxRuntimeError, match="CapEff"):
         await runtime.exec(_workspace(), "true")
     assert not fake.destroyed  # the user's files stay; recreate the workspace to fix it
+
+
+async def test_a_sandbox_below_the_floor_can_always_be_deleted() -> None:
+    """Teardown never runs the floor check: an unsafe sandbox must stay removable."""
+    runtime, fake, probes = _floor_runtime("CapEff: 00000000a80425fb\nNoNewPrivs: 1\n1001\n")
+
+    await runtime.delete(_workspace())
+
+    assert fake.destroyed
+    assert probes() == []
 
 
 # --- preview paths never leave the preview's own prefix --------------------------------------

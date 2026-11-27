@@ -626,7 +626,7 @@ class OpenSandboxRuntime:
             raise map_opensandbox_error(error) from error
         return floor_violations(_joined_lines(execution.logs.stdout))
 
-    async def _get_sandbox(self, workspace: Workspace) -> Sandbox:
+    async def _get_sandbox(self, workspace: Workspace, *, check_floor: bool = True) -> Sandbox:
         if not workspace.sandbox_id:
             raise SandboxNotFoundError("Workspace has no OpenSandbox sandbox")
         try:
@@ -635,7 +635,7 @@ class OpenSandboxRuntime:
             )
         except Exception as error:
             raise map_opensandbox_error(error) from error
-        if workspace.sandbox_id not in self._floor_checked:
+        if check_floor and workspace.sandbox_id not in self._floor_checked:
             # Adopted (created by another process or before this check existed): refuse to
             # run anything in it below the floor, but keep the user's files.
             violations = await self._floor_violations(sandbox)
@@ -672,7 +672,8 @@ class OpenSandboxRuntime:
         if not workspace.sandbox_id:
             return
         try:
-            sandbox = await self._get_sandbox(workspace)
+            # No floor check on teardown: a sandbox that fails it must stay removable.
+            sandbox = await self._get_sandbox(workspace, check_floor=False)
             await sandbox.destroy()
         except SandboxNotFoundError:
             return
@@ -808,7 +809,7 @@ class OpenSandboxRuntime:
         server_session_id = self._pty_sessions.pop(session_id, None)
         if server_session_id is None:
             return
-        sandbox = await self._get_sandbox(workspace)
+        sandbox = await self._get_sandbox(workspace, check_floor=False)  # teardown
         try:
             endpoint = await sandbox.get_endpoint(EXECD_PORT)
         except Exception as error:
