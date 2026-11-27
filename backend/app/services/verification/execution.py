@@ -19,7 +19,11 @@ from app.services.jobs import RunDispatcher, RunQueueUnavailableError, get_run_d
 from app.services.runtime import run_registry
 from app.services.sandbox import SandboxRuntime
 from app.services.verification.fixer import AgentFixer
-from app.services.verification.orchestrator import PlanCriteria, VerificationOrchestrator
+from app.services.verification.orchestrator import (
+    ACTIVE_STATUSES,
+    PlanCriteria,
+    VerificationOrchestrator,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -72,3 +76,18 @@ async def _drive_inline(orchestrator: VerificationOrchestrator, run_id: UUID) ->
         # guard (``advance`` already did for a failing step, but not for e.g. entering it).
         logger.exception("verification_run_failed", run_id=str(run_id))
         await orchestrator.fail(run_id)
+
+
+async def stop_verification_run(orchestrator: VerificationOrchestrator, run_id: UUID) -> str | None:
+    """Stop an active run as ``rejected``; the status it left, ``None`` if it was not active.
+
+    ``end`` also stops a fix agent run. An inline test or observation is cancelled with its
+    task (cancelling the sandbox command); an inline fix is left to exit on its next poll, so
+    the agent's own bookkeeping is never interrupted. A queue job exits on its next step.
+    """
+    previous = await orchestrator.end(run_id, "rejected", ACTIVE_STATUSES)
+    if previous in ("testing", "observing"):
+        task = run_registry.get_task(run_id)
+        if task is not None and not task.done():
+            task.cancel()
+    return previous

@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any, Protocol
 from uuid import UUID
 
+import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings, get_settings
@@ -26,6 +27,8 @@ from app.services.budgets import BudgetExceededError
 from app.services.capacity import RunCapacityExceededError
 from app.services.jobs import RunQueueUnavailableError
 from app.services.workspaces import WorkspaceAccessDeniedError, WorkspaceNotFoundError
+
+logger = structlog.get_logger(__name__)
 
 
 class FixRefusedError(Exception):
@@ -42,6 +45,8 @@ class Fixer(Protocol):
     ) -> UUID: ...
 
     async def status(self, agent_run_id: UUID) -> str | None: ...
+
+    async def stop(self, run: VerificationRun, agent_run_id: UUID) -> None: ...
 
 
 def build_fix_prompt(*, plan_ref: str, command: str, exit_code: Any, output: str) -> str:
@@ -129,3 +134,22 @@ class AgentFixer:
         async with self.session_maker() as session:
             agent_run = await session.get(AgentRun, agent_run_id)
             return agent_run.status if agent_run is not None else None
+
+    async def stop(self, run: VerificationRun, agent_run_id: UUID) -> None:
+        """Stop a fix agent run its verification run no longer waits for. Best effort.
+
+        Goes through ``AgentService.stop_active_run`` (idempotent, no permission check: the
+        run's author may since have lost access or been deleted), so the agent's events, lease
+        and ``stopped`` control message stay consistent; a failure is logged, never raised,
+        because the verification run has already ended.
+        """
+        try:
+            async with self.session_maker() as session:
+                service = self.service_factory(session, self.session_maker, self.settings)
+                await service.stop_active_run(agent_run_id)
+        except Exception:
+            logger.exception(
+                "verification_fix_stop_failed",
+                run_id=str(run.id),
+                agent_run_id=str(agent_run_id),
+            )

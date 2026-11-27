@@ -207,9 +207,7 @@ class VerificationOrchestrator:
             # dependency bug — anything the runner's SandboxRuntimeError/CommandTimeoutError
             # and the observer's httpx handling do not absorb) must still land the run in a
             # terminal state, or the one-active guard wedges the workspace forever.
-            async with self.session_maker() as session:
-                await self._transition(session, run_id, "error", ACTIVE_STATUSES)
-                await session.commit()
+            await self.end(run_id, "error", ACTIVE_STATUSES)
             raise
 
     async def _enter(self, workspace_id: UUID, run_id: UUID) -> bool:
@@ -319,13 +317,23 @@ class VerificationOrchestrator:
                 await self._transition(session, run.id, "observing", ("fixing",))
                 await session.commit()
                 return Step.CONTINUE
-            await session.execute(
+            recorded = await session.scalar(
                 update(VerificationRun)
-                .where(VerificationRun.id == run.id, VerificationRun.agent_run_id.is_(None))
+                .where(
+                    VerificationRun.id == run.id,
+                    VerificationRun.status == "fixing",
+                    VerificationRun.agent_run_id.is_(None),
+                )
                 .values(agent_run_id=agent_run_id)
+                .returning(VerificationRun.id)
                 .execution_options(synchronize_session=False)
             )
             await session.commit()
+            if recorded is None:
+                # The run was ended (stopped, reaped) while the agent started: nobody would
+                # ever wait for it, so it must not keep editing the worktree.
+                await self._stop_fix(run, agent_run_id)
+                return Step.CONTINUE
             logger.info(
                 "verification_fix_started", run_id=str(run.id), agent_run_id=str(agent_run_id)
             )
@@ -424,10 +432,35 @@ class VerificationOrchestrator:
 
     async def fail(self, run_id: UUID) -> bool:
         """End an active run as ``error`` (e.g. it could not be handed to the queue)."""
+        return await self.end(run_id, "error", ACTIVE_STATUSES) is not None
+
+    async def end(
+        self, run_id: UUID, status: str, from_statuses: tuple[str, ...]
+    ) -> str | None:
+        """End a run from outside its step loop; the status it left, ``None`` if unchanged.
+
+        The single place a run is ended by stop, failure, a crash or the reaper. The row is
+        locked so the status it leaves (and its fix agent run) are read exactly. A run ended
+        while ``fixing`` takes its fix agent run down too: nothing would ever wait for it,
+        and it would keep editing the worktree and hold the workspace's agent slot.
+        """
         async with self.session_maker() as session:
-            changed = await self._transition(session, run_id, "error", ACTIVE_STATUSES)
+            run = await session.scalar(
+                select(VerificationRun).where(VerificationRun.id == run_id).with_for_update()
+            )
+            if run is None or run.status not in from_statuses:
+                await session.commit()
+                return None
+            previous, agent_run_id = run.status, run.agent_run_id
+            await self._transition(session, run_id, status, from_statuses)
             await session.commit()
-            return changed
+        if previous == "fixing" and agent_run_id is not None:
+            await self._stop_fix(run, agent_run_id)
+        return previous
+
+    async def _stop_fix(self, run: VerificationRun, agent_run_id: UUID) -> None:
+        if self.fixer is not None:
+            await self.fixer.stop(run, agent_run_id)
 
     async def get_run(self, workspace_id: UUID, run_id: UUID) -> VerificationRun:
         """Fetch a run by id, refusing runs of another workspace."""

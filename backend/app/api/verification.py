@@ -17,7 +17,9 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.audit_support import record_audit_safely
 from app.api.auth import CURRENT_USER_DEP
+from app.api.rate_limits import SANDBOX_RATE_LIMIT_DEP
 from app.core.config import get_settings
 from app.core.lifecycle import lifecycle
 from app.db.session import get_db_session
@@ -29,7 +31,12 @@ from app.schemas.verification import (
     VerificationRunResponse,
 )
 from app.services.access import WorkspaceAccessDeniedError, require_workspace_access
-from app.services.verification.execution import build_orchestrator, start_verification_run
+from app.services.audit import AuditLogService
+from app.services.verification.execution import (
+    build_orchestrator,
+    start_verification_run,
+    stop_verification_run,
+)
 from app.services.verification.orchestrator import (
     PlanCriteria,
     VerificationOrchestrator,
@@ -193,6 +200,50 @@ async def _finalize_gate(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Verification run is not awaiting review (status={run.status})",
         )
+    return _run_response(await orch.get_run(workspace_id, run_id))
+
+
+@router.post(
+    "/runs/{run_id}/stop",
+    response_model=VerificationRunResponse,
+    dependencies=[SANDBOX_RATE_LIMIT_DEP],
+)
+async def stop_verification(
+    workspace_id: UUID,
+    run_id: UUID,
+    current_user: User = CURRENT_USER_DEP,
+    session: AsyncSession = DB_SESSION_DEP,
+) -> VerificationRunResponse:
+    """Stop an active run (a human cancel: ``rejected``, spec §6), with its fix agent run."""
+    workspace, _role = await _get_workspace(session, workspace_id, current_user)
+    orch = build_orchestrator(get_settings())
+    try:
+        run = await orch.get_run(workspace_id, run_id)
+    except (VerificationRunNotFoundError, VerificationRunNotInWorkspaceError):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Verification run not found"
+        ) from None
+    if run.spec_workflow_id is not None and workspace.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only the workspace owner can stop a Spec Kit verification",
+        )
+    previous = await stop_verification_run(orch, run_id)
+    if previous is None:
+        run = await orch.get_run(workspace_id, run_id)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Verification run is not active (status={run.status})",
+        )
+    await record_audit_safely(
+        AuditLogService(session),
+        user_id=current_user.id,
+        workspace_id=workspace_id,
+        action="verification_run_stopped",
+        target_type="verification_run",
+        target_id=run_id,
+        metadata={"previous_status": previous},
+    )
     return _run_response(await orch.get_run(workspace_id, run_id))
 
 

@@ -122,6 +122,22 @@ async def test_stop_is_idempotent(db_session):
     assert await notification_count(session, run.user_id) == 1
 
 
+async def test_stop_active_run_needs_no_user(db_session):
+    """Plan 5 review: a verification run's fix agent must be stoppable even after its author
+    lost access to the workspace (or was deleted), so the system stop checks no permission."""
+    session, session_maker = db_session
+    run = await seed_run(session, status="executing")
+    service = agent_service(session, session_maker)
+
+    assert await service.stop_active_run(run.id) is True
+    assert await service.stop_active_run(run.id) is False  # already ended: no second event
+
+    await session.refresh(run)
+    assert run.status == "stopped"
+    events = await events_of(session, run.id)
+    assert [(e.event_type, e.content) for e in events] == [("status", "stopped")]
+
+
 async def test_stopping_a_finished_run_is_a_clean_noop(db_session):
     session, session_maker = db_session
     run = await seed_run(session, status="completed", completed_at=datetime.now(UTC))
