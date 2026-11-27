@@ -5,6 +5,7 @@ import {
   approveVerificationRun,
   createVerificationRun,
   getVerificationRun,
+  getVerificationScreenshot,
   listVerificationRuns,
   rejectVerificationRun,
   stopVerificationRun,
@@ -417,15 +418,23 @@ function RunDetail({
         {run.evidence.length === 0 ? (
           <p className="text-sm text-ink/60">No evidence recorded for this run.</p>
         ) : (
-          run.evidence.map((item) => <EvidenceCard key={item.id} evidence={item} />)
+          run.evidence.map((item) => <EvidenceCard key={item.id} run={run} evidence={item} />)
         )}
       </section>
     </div>
   );
 }
 
-function EvidenceCard({ evidence }: { evidence: VerificationEvidenceResponse }) {
+function EvidenceCard({
+  run,
+  evidence,
+}: {
+  run: VerificationRunResponse;
+  evidence: VerificationEvidenceResponse;
+}) {
   const d = evidence.detail;
+  const screenshotCaptured = d.screenshot_captured === true;
+  const screenshotError = stringField(d, "screenshot_error");
   const Icon = evidence.kind === "test" ? FlaskConical : evidence.kind === "fix" ? Wrench : Eye;
   const url = stringField(d, "url");
   const errorText = stringField(d, "error");
@@ -462,10 +471,15 @@ function EvidenceCard({ evidence }: { evidence: VerificationEvidenceResponse }) 
           ) : (
             <p className="truncate">{url}</p>
           ))}
-        {evidence.path && (
-          <p className="truncate font-mono" title={evidence.path}>
-            {evidence.path}
-          </p>
+        {screenshotCaptured ? (
+          <EvidenceScreenshot
+            workspaceId={run.workspace_id}
+            runId={run.id}
+            evidenceId={evidence.id}
+            alt={stringField(d, "description") ?? "Screenshot of the running app"}
+          />
+        ) : (
+          screenshotError && <p className="text-ink/55">Screenshot unavailable: {screenshotError}</p>
         )}
         {errorText && <p className="text-danger">{errorText}</p>}
         {output && (
@@ -480,6 +494,48 @@ function EvidenceCard({ evidence }: { evidence: VerificationEvidenceResponse }) 
         )}
       </div>
     </article>
+  );
+}
+
+/** The PNG the observation captured, fetched with the session cookie (the store is private). */
+function EvidenceScreenshot({
+  workspaceId,
+  runId,
+  evidenceId,
+  alt,
+}: {
+  workspaceId: string;
+  runId: string;
+  evidenceId: string;
+  alt: string;
+}) {
+  const [src, setSrc] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    let objectUrl: string | null = null;
+    let cancelled = false;
+    getVerificationScreenshot(workspaceId, runId, evidenceId)
+      .then((blob) => {
+        if (cancelled) return;
+        objectUrl = URL.createObjectURL(blob);
+        setSrc(objectUrl);
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true);
+      });
+    return () => {
+      cancelled = true;
+      if (objectUrl) URL.revokeObjectURL(objectUrl);
+    };
+  }, [workspaceId, runId, evidenceId]);
+
+  if (failed) return <p className="text-ink/55">Screenshot could not be loaded.</p>;
+  if (!src) return <p className="text-ink/55">Loading screenshot…</p>;
+  return (
+    <a href={src} target="_blank" rel="noreferrer" className="block">
+      <img src={src} alt={alt} className="mt-1 w-full rounded-md border border-line" />
+    </a>
   );
 }
 

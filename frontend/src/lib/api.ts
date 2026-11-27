@@ -986,6 +986,16 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
   return payload as T;
 }
 
+/** Like {@link requestJson}, but for endpoints that respond with binary content (an image). */
+async function requestBlob(path: string): Promise<Blob> {
+  const response = await fetch(`${getApiBaseUrl()}${path}`, { credentials: "include" });
+  if (!response.ok) {
+    const payload = (await response.json().catch(() => null)) as { detail?: string } | null;
+    throw new ApiError(payload?.detail || "Request failed", response.status, parseRetryAfter(response));
+  }
+  return response.blob();
+}
+
 /** Like {@link requestJson}, but for endpoints that respond with `text/plain` instead of JSON. */
 async function requestText(path: string, init: RequestInit = {}): Promise<string> {
   const response = await fetch(`${getApiBaseUrl()}${path}`, {
@@ -2893,6 +2903,17 @@ export function verifySpecImplement(
   return requestJson<VerificationRunResponse>(
     `/workspaces/${workspaceId}/spec/workflows/${workflowId}/verify`,
     { method: "POST" },
+  );
+}
+
+/** The PNG screenshot captured for an observation (served from the private artifact store). */
+export function getVerificationScreenshot(
+  workspaceId: string,
+  runId: string,
+  evidenceId: string,
+): Promise<Blob> {
+  return requestBlob(
+    `${verificationRunsPath(workspaceId)}/${runId}/evidence/${evidenceId}/screenshot`,
   );
 }
 

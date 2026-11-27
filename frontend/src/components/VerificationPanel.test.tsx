@@ -113,7 +113,8 @@ describe("VerificationPanel", () => {
       "href",
       "https://preview.example/app",
     );
-    expect(within(evidence).getByText("screens/r1.png")).toBeInTheDocument();
+    // The old placeholder reference is no longer shown: the image (or why there is none) is.
+    expect(within(evidence).queryByText("screens/r1.png")).not.toBeInTheDocument();
   });
 
   it("shows an empty state when there are no runs", async () => {
@@ -342,6 +343,86 @@ describe("VerificationPanel", () => {
 
     expect(await screen.findByRole("alert")).toHaveTextContent("not active");
     expect(await screen.findByRole("button", { name: "Approve" })).toBeInTheDocument();
+  });
+
+  describe("observation screenshots (Plan 6)", () => {
+    function observed(detailOverrides: Record<string, unknown>): VerificationRunDetailResponse {
+      return detail({
+        evidence: [
+          {
+            id: "e2",
+            kind: "observation",
+            status: "passed",
+            detail: {
+              port: 5173,
+              url: "https://preview.example/app",
+              description: "Login page renders",
+              screenshot: "verification/r1/5173.png",
+              ...detailOverrides,
+            },
+            path: "verification/r1/5173.png",
+            created_at: "2026-11-26T00:00:20Z",
+          },
+        ],
+      });
+    }
+
+    function stubObjectUrls() {
+      const create = vi.fn(() => "blob:shot");
+      const revoke = vi.fn();
+      vi.stubGlobal("URL", Object.assign(URL, { createObjectURL: create, revokeObjectURL: revoke }));
+      return { create, revoke };
+    }
+
+    it("shows the captured screenshot", async () => {
+      const { create } = stubObjectUrls();
+      const fetchMock = stubFetch((url) => {
+        if (url.endsWith(`${BASE}?limit=20`)) return jsonResponse([run()]);
+        if (url.endsWith(`${BASE}/r1/evidence/e2/screenshot`)) {
+          return {
+            ok: true,
+            status: 200,
+            headers: new Headers({ "content-type": "image/png" }),
+            blob: () => Promise.resolve(new Blob(["png"], { type: "image/png" })),
+          } as unknown as Response;
+        }
+        if (url.endsWith(`${BASE}/r1`)) return jsonResponse(observed({ screenshot_captured: true }));
+        return undefined;
+      });
+
+      render(<VerificationPanel workspace={workspace} />);
+
+      const image = await screen.findByRole("img", { name: /Login page renders/ });
+      expect(image).toHaveAttribute("src", "blob:shot");
+      expect(create).toHaveBeenCalled();
+      expect(fetchMock).toHaveBeenCalledWith(
+        expect.stringMatching(/\/r1\/evidence\/e2\/screenshot$/),
+        expect.objectContaining({ credentials: "include" }),
+      );
+    });
+
+    it("explains a screenshot that could not be taken, without fetching one", async () => {
+      const fetchMock = stubFetch((url) => {
+        if (url.endsWith(`${BASE}?limit=20`)) return jsonResponse([run()]);
+        if (url.endsWith(`${BASE}/r1`)) {
+          return jsonResponse(
+            observed({ screenshot_captured: false, screenshot_error: "artifact storage is not configured" }),
+          );
+        }
+        return undefined;
+      });
+
+      render(<VerificationPanel workspace={workspace} />);
+
+      expect(
+        await screen.findByText(/Screenshot unavailable: artifact storage is not configured/),
+      ).toBeInTheDocument();
+      expect(screen.queryByRole("img")).not.toBeInTheDocument();
+      expect(fetchMock).not.toHaveBeenCalledWith(
+        expect.stringMatching(/screenshot$/),
+        expect.anything(),
+      );
+    });
   });
 
   it("refreshes the run after a gate conflict", async () => {
