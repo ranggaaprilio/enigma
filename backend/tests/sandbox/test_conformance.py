@@ -117,8 +117,10 @@ async def test_stream_command_delivers_output_and_exit_code(case) -> None:
         workspace, "run-1", "echo hi", cwd=None, env=None, timeout=5, on_stdout=out, on_stderr=err
     )
     assert exit_code == 0
-    # Providers may wrap the command (cwd/env prefix); the user's command still runs last.
-    assert "".join(stdout).startswith("ran:") and "".join(stdout).endswith("echo hi")
+    # Providers may wrap the command (cwd/env prefix); the user's command still runs last. A
+    # line-oriented provider (OpenSandbox) cannot tell a final newline apart, so ignore it.
+    streamed = "".join(stdout).rstrip("\n")
+    assert streamed.startswith("ran:") and streamed.endswith("echo hi")
     assert stderr == []
 
 

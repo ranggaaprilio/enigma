@@ -107,6 +107,21 @@ def map_opensandbox_error(error: Exception) -> SandboxRuntimeError:
     return SandboxRuntimeError(f"OpenSandbox operation failed ({type(error).__name__})")
 
 
+def _line_of(message: Any) -> str:
+    """One execd output message back as a line, newline included.
+
+    execd (opensandbox-server 1.2.1) sends stdout/stderr one line per message with the newline
+    stripped, and an empty line as ``"\n"``; partial writes are buffered until their newline.
+    """
+    text = message.text
+    return text if text == "\n" else f"{text}\n"
+
+
+def _joined_lines(messages: Sequence[Any]) -> str:
+    """Accumulated execd output as text (the final newline cannot be told apart, so none)."""
+    return "".join(_line_of(message) for message in messages).removesuffix("\n")
+
+
 def _execd_mode(mode: str) -> int:
     """``"755"`` -> ``755``: execd reads ``mode`` as octal *digits* (``ParseUint(s, 8, 32)``), so
     the SDK must send the digits as written, not their value (``int("755", 8)`` is 493, which
@@ -290,7 +305,7 @@ class OpenSandboxFileSystem:
             nonlocal kept
             if kept >= MAX_SEARCH_OUTPUT_BYTES:
                 return
-            text = message.text
+            text = _line_of(message)
             remaining = MAX_SEARCH_OUTPUT_BYTES - kept
             if len(text) > remaining:
                 text = text[:remaining]
@@ -485,8 +500,8 @@ class OpenSandboxRuntime:
             raise map_opensandbox_error(error) from error
         return RuntimeCommandResult(
             exit_code=execution.exit_code if execution.exit_code is not None else 1,
-            stdout="".join(msg.text for msg in execution.logs.stdout),
-            stderr="".join(msg.text for msg in execution.logs.stderr),
+            stdout=_joined_lines(execution.logs.stdout),
+            stderr=_joined_lines(execution.logs.stderr),
         )
 
     async def stream_command(
@@ -505,10 +520,10 @@ class OpenSandboxRuntime:
         sandbox = await self._get_sandbox(workspace)
 
         async def on_stdout_msg(message: Any) -> None:
-            await on_stdout(message.text)
+            await on_stdout(_line_of(message))
 
         async def on_stderr_msg(message: Any) -> None:
-            await on_stderr(message.text)
+            await on_stderr(_line_of(message))
 
         handlers = ExecutionHandlers(on_stdout=on_stdout_msg, on_stderr=on_stderr_msg)
         try:
