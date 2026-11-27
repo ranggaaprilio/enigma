@@ -7,12 +7,17 @@ owns the front of ``PATH`` (``~/.local/bin``); the image goes to a fresh ``mktem
 directory, is read back through the runtime's filesystem, validated as PNG and capped.
 ``--no-sandbox`` is required: the container already drops every capability, so Chromium's
 own namespace sandbox cannot start -- the container is the sandbox.
+
+Chromium is driven over the DevTools protocol by ``cdp_capture.py`` (sent as source and run
+by the image's ``/usr/bin/python3``), not by its ``--screenshot`` flag: that flag captures
+on ``load``, before a client-rendered page has hydrated and revealed its content.
 """
 
 from __future__ import annotations
 
 import re
 import shlex
+from pathlib import Path
 
 import structlog
 
@@ -24,7 +29,8 @@ logger = structlog.get_logger(__name__)
 PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 MAX_SCREENSHOT_BYTES = 2_000_000
 CAPTURE_TIMEOUT_SECONDS = 45
-VIEWPORT = "1280,800"
+# The in-sandbox driver, sent as source: it is never imported by the backend.
+_DRIVER_SOURCE = Path(__file__).with_name("cdp_capture.py").read_text()
 _ABSOLUTE_DIR = re.compile(r"^/[A-Za-z0-9._/-]+$")
 
 
@@ -33,12 +39,13 @@ class ScreenshotError(Exception):
 
 
 def capture_command(port: int) -> str:
+    # The image's own Python runs the driver isolated (-I -S): no PYTHON* env, no user or
+    # site packages and no cwd on sys.path, so nothing the tenant wrote can be imported.
     return (
         'd=$(/usr/bin/mktemp -d) && '
-        f"/usr/bin/timeout {CAPTURE_TIMEOUT_SECONDS} /usr/bin/chromium --headless=new "
-        "--no-sandbox --disable-gpu --disable-dev-shm-usage --hide-scrollbars "
-        f'--window-size={VIEWPORT} --screenshot="$d/shot.png" '
-        f'http://127.0.0.1:{int(port)}/ >/dev/null 2>&1; echo "$d"; '
+        f"/usr/bin/timeout -k 5 {CAPTURE_TIMEOUT_SECONDS} /usr/bin/python3 -I -S -c "
+        f"{shlex.quote(_DRIVER_SOURCE)} "
+        f'http://127.0.0.1:{int(port)}/ "$d/shot.png" "$d/profile" >/dev/null 2>&1; echo "$d"; '
         # The size, measured in the sandbox, so an oversize file is never downloaded.
         '/usr/bin/stat -L -c %s -- "$d/shot.png" 2>/dev/null || echo 0'
     )
