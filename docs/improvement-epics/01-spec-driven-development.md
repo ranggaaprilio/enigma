@@ -43,7 +43,9 @@ uv tool install specify-cli --from git+https://github.com/github/spec-kit.git
 
 # Scaffold inside a cloned repo (offline; --ignore-agent-tools skips the interactive
 # coding-agent CLI checks since Enigma drives its own provider)
-specify init . --integration claude --script sh --ignore-agent-tools --force
+# `generic` = Spec Kit's bring-your-own-agent integration (Enigma is not Claude Code)
+specify init . --integration generic --integration-options="--commands-dir .enigma/commands/" \
+  --script sh --ignore-agent-tools --force
 ```
 
 `specify init` lays down:
@@ -56,7 +58,8 @@ specify init . --integration claude --script sh --ignore-agent-tools --force
 │   ├── plan-template.md              # drives the `plan` phase
 │   └── tasks-template.md             # drives the `tasks` phase
 └── scripts/bash/                     # helper scripts (branch/feature numbering)
-.claude/commands/speckit.*.md         # the per-phase prompt definitions
+.enigma/commands/speckit.*.md         # the per-phase prompt definitions
+AGENTS.md                             # context block appended between SPECKIT markers
 ```
 
 Each feature gets a numbered folder:
