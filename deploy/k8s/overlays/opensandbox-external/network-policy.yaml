@@ -1,0 +1,27 @@
+# The base policies close every private range except Postgres/Redis ports. This opens exactly
+# the OpenSandbox server: its API (8080) and the range it publishes sandbox ports on
+# ([docker] port_range_min..max: every sandbox's execd and previews), on that one host, for the
+# pods that drive sandboxes. Policies are additive; nothing else changes. endPort needs
+# Kubernetes 1.25+.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: enigma-opensandbox-egress
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: enigma
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [api, worker, preview-proxy]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock: {cidr: 10.0.50.10/32}
+      ports:
+        - port: 8080
+          protocol: TCP
+        - port: 40000
+          endPort: 60000
+          protocol: TCP

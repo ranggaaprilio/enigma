@@ -114,7 +114,9 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Render manifests (kustomize)
-        run: kubectl kustomize deploy/k8s/overlays/production > rendered.yaml
+        run: |
+          kubectl kustomize deploy/k8s/overlays/production > rendered.yaml
+          kubectl kustomize deploy/k8s/overlays/opensandbox-external > rendered-opensandbox.yaml
 
       - name: Validate manifests (kubeconform, incl. KEDA CRDs)
         run: >-
@@ -122,7 +124,7 @@ jobs:
           -strict -summary -kubernetes-version 1.30.0
           -schema-location default
           -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
-          /work/rendered.yaml
+          /work/rendered.yaml /work/rendered-opensandbox.yaml
 
       - name: Build backend image
         run: docker build -t enigma-backend:ci backend

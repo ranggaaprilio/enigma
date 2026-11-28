@@ -1,0 +1,13 @@
+# Non-secret OpenSandbox settings for every backend process. The keys are in enigma-secrets.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: enigma-config
+data:
+  SANDBOX_RUNTIME_DEFAULT: opensandbox
+  # Private address only: the server has no TLS of its own and holds the Docker socket.
+  OPENSANDBOX_API_URL: http://10.0.50.10:8080
+  # Required outside `local`: a tag is refused.
+  OPENSANDBOX_SANDBOX_IMAGE: registry.example.com/enigma-sandbox@sha256:0000000000000000000000000000000000000000000000000000000000000000
+  OPENSANDBOX_SANDBOX_CPU: "2"
+  OPENSANDBOX_SANDBOX_MEMORY: 4Gi

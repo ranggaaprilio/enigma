@@ -431,6 +431,90 @@ def test_dev_scripts_start_the_opensandbox_stack():
     )
 
 
+# --- k8s with an external OpenSandbox server (Plan 7b) -------------------------------------
+
+OPENSANDBOX_OVERLAY = REPO / "deploy" / "k8s" / "overlays" / "opensandbox-external"
+
+
+def _overlay_doc(name: str) -> dict:
+    return yaml.safe_load((OPENSANDBOX_OVERLAY / name).read_text())
+
+
+def _opensandbox_server_ip() -> str:
+    from urllib.parse import urlparse
+
+    url = _overlay_doc("config-patch.yaml")["data"]["OPENSANDBOX_API_URL"]
+    return urlparse(url).hostname
+
+
+def test_opensandbox_overlay_layers_on_production():
+    kustomization = _overlay_doc("kustomization.yaml")
+    assert kustomization["resources"] == ["../production", "network-policy.yaml"]
+    # production's namespace applies only to its own resources: without this the egress policy
+    # would land in `default` and never select Enigma's pods.
+    production = yaml.safe_load((PRODUCTION / "kustomization.yaml").read_text())
+    assert kustomization["namespace"] == production["namespace"]
+    assert {p["path"] for p in kustomization["patches"]} == {
+        "config-patch.yaml",
+        "preview-proxy-patch.yaml",
+    }
+
+
+def test_opensandbox_overlay_points_at_a_private_server_and_a_pinned_image():
+    import ipaddress
+
+    data = _overlay_doc("config-patch.yaml")["data"]
+    assert data["SANDBOX_RUNTIME_DEFAULT"] == "opensandbox"
+    assert data["OPENSANDBOX_API_URL"].startswith("http://")
+    # The server has no TLS and holds the Docker socket: a private address only.
+    assert ipaddress.ip_address(_opensandbox_server_ip()).is_private
+    assert "@sha256:" in data["OPENSANDBOX_SANDBOX_IMAGE"]
+    # Keys come from enigma-secrets, never this ConfigMap.
+    assert not [key for key in data if SECRET_NAME_PATTERN.search(key)]
+
+
+def test_the_preview_proxy_gets_only_the_opensandbox_secrets_it_reads():
+    """The proxy takes named secrets (least privilege); it resolves each preview's execd
+    endpoint through the server's API and sends that sandbox's execd token."""
+    patch = _overlay_doc("preview-proxy-patch.yaml")
+    assert (patch["kind"], patch["metadata"]["name"]) == ("Deployment", "enigma-preview-proxy")
+    [container] = patch["spec"]["template"]["spec"]["containers"]
+    assert container["name"] == "preview-proxy"
+    refs = {
+        entry["name"]: entry["valueFrom"]["secretKeyRef"] for entry in container["env"]
+    }
+    assert refs == {
+        "OPENSANDBOX_API_KEY": {"name": "enigma-secrets", "key": "OPENSANDBOX_API_KEY"},
+        "OPENSANDBOX_EXECD_TOKEN_KEY": {
+            "name": "enigma-secrets",
+            "key": "OPENSANDBOX_EXECD_TOKEN_KEY",
+        },
+    }
+
+
+def test_opensandbox_egress_reaches_only_the_one_server():
+    """The server API port and the range sandbox ports are published on, on that one host; the
+    base policies keep every private range closed otherwise."""
+    policy = _overlay_doc("network-policy.yaml")
+    assert policy["kind"] == "NetworkPolicy"
+    assert policy["spec"]["policyTypes"] == ["Egress"]
+    selector = policy["spec"]["podSelector"]
+    assert selector["matchLabels"] == {"app.kubernetes.io/name": "enigma"}
+    assert selector["matchExpressions"] == [
+        {
+            "key": "app.kubernetes.io/component",
+            "operator": "In",
+            "values": ["api", "worker", "preview-proxy"],
+        }
+    ]
+    [rule] = policy["spec"]["egress"]
+    assert rule["to"] == [{"ipBlock": {"cidr": f"{_opensandbox_server_ip()}/32"}}]
+    assert rule["ports"] == [
+        {"port": 8080, "protocol": "TCP"},
+        {"port": 40000, "endPort": 60000, "protocol": "TCP"},
+    ]
+
+
 def test_production_manifests_never_reference_the_container_daemon():
     """The Kustomize production profile is Daytona-only (docs/local-docker-runtime)."""
     for manifest in (REPO / "deploy" / "k8s").rglob("*.yaml"):

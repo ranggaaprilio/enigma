@@ -1,0 +1,23 @@
+# The proxy takes named secrets only (least privilege, see base/preview-proxy.yaml). It resolves
+# each OpenSandbox preview's execd endpoint through the server's API and sends that sandbox's
+# execd token, so it needs both keys. API and workers get all of enigma-secrets already.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: enigma-preview-proxy
+spec:
+  template:
+    spec:
+      containers:
+        - name: preview-proxy
+          env:
+            - name: OPENSANDBOX_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: enigma-secrets
+                  key: OPENSANDBOX_API_KEY
+            - name: OPENSANDBOX_EXECD_TOKEN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: enigma-secrets
+                  key: OPENSANDBOX_EXECD_TOKEN_KEY

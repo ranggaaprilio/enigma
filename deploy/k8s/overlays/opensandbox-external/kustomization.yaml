@@ -1,0 +1,24 @@
+# Production with OpenSandbox as the sandbox runtime (Plan 7b), its server running OUTSIDE the
+# cluster on a dedicated VM (docs/self-host-opensandbox.md, "Kubernetes"). Nothing in the
+# cluster gets a container daemon socket. Daytona stays configured as the other provider.
+#
+# Before applying, replace in this directory:
+#   - 10.0.50.10, the server's private address (config-patch.yaml AND network-policy.yaml);
+#   - OPENSANDBOX_SANDBOX_IMAGE, your registry's enigma-sandbox image pinned by digest.
+# and add OPENSANDBOX_API_KEY and OPENSANDBOX_EXECD_TOKEN_KEY to `enigma-secrets`
+# (deploy/README.md). The server must run deploy/opensandbox/sandbox.toml with [server] host
+# and [docker] publish_host set to that private address.
+#   kubectl kustomize deploy/k8s/overlays/opensandbox-external
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# production's namespace covers only its own resources; this puts network-policy.yaml there too.
+namespace: enigma
+
+resources:
+  - ../production
+  - network-policy.yaml
+
+patches:
+  - path: config-patch.yaml
+  - path: preview-proxy-patch.yaml
