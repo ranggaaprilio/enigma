@@ -81,12 +81,12 @@ For a run with a source agent run, `AgentFixer.start` passes the source run's `w
 
 **Files:** `services/agents.py` (finaliser hook), `schemas/workspaces.py`, `api/workspaces.py`, tests.
 
-- [ ] Failing tests:
+- [x] Failing tests:
   - on: a completed run with criteria starts one linked verification, inline and in queue mode;
   - off: none;
   - never for a fix run, a Spec Kit phase run, a run with no criteria or a failed/stopped run;
   - a refusal never changes the agent run's status.
-- [ ] Implement.
+- [x] Implement. `agent_link.auto_verify_agent_run` is called at the end of `AgentService._record_run_finished` (after the run's status is committed; both completion paths end there), through a local import because the verification package imports `agents`. It never raises into the run. `WorkspaceResponse.auto_verify_agent_runs` reads an unflushed row's `None` as `false`.
 
 ### Task 4: Frontend
 

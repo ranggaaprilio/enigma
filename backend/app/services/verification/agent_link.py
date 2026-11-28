@@ -15,14 +15,23 @@ from __future__ import annotations
 from dataclasses import replace
 from uuid import UUID
 
+import structlog
 from sqlalchemy import select, update
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from app.models import AgentRun, VerificationRun, Workspace
+from app.core.config import Settings
+from app.models import AgentRun, SpecPhase, VerificationRun, Workspace
 from app.services.run_paths import join_subpath, resolve_worktree
-from app.services.verification.orchestrator import PlanCriteria, VerificationOrchestrator
+from app.services.verification.execution import build_orchestrator, start_verification_run
+from app.services.verification.orchestrator import (
+    PlanCriteria,
+    VerificationOrchestrator,
+    VerificationRunAlreadyActiveError,
+)
 from app.services.verification.spec_link import DEFAULT_MAX_ITERATIONS, test_command_criteria
 from app.services.worktrees import WorktreeNotFoundError
+
+logger = structlog.get_logger(__name__)
 
 # A prompt can be long; the run's plan reference only needs to say what was asked.
 PLAN_REF_MAX_CHARS = 4_000
@@ -124,3 +133,50 @@ async def create_agent_run_verification(
         )
         await session.commit()
     return verification
+
+
+async def auto_verify_agent_run(
+    session_maker: async_sessionmaker[AsyncSession], settings: Settings, run_id: UUID
+) -> UUID | None:
+    """Verify a just-completed agent run when its workspace asks for it (Plan 9 Task 3).
+
+    Returns the started verification run's id, or ``None`` when nothing was started: auto-verify
+    is off, the run did not complete, is a fix run or a Spec Kit phase run, is already verified,
+    has no criteria, or the workspace is busy verifying something else. Attributed to the run's
+    author. The caller must treat any exception as non-fatal to the agent run.
+    """
+    async with session_maker() as session:
+        run = await session.get(AgentRun, run_id)
+        if run is None or run.status != "completed":
+            return None
+        workspace = await session.get(Workspace, run.workspace_id)
+        if workspace is None or not workspace.auto_verify_agent_runs:
+            return None
+        spec_phase = await session.scalar(
+            select(SpecPhase.id).where(SpecPhase.agent_run_id == run.id).limit(1)
+        )
+        verified = await session.scalar(
+            select(VerificationRun.id).where(VerificationRun.source_agent_run_id == run.id).limit(1)
+        )
+        if spec_phase is not None or verified is not None:
+            return None
+        try:
+            await verifiable_agent_run(session, workspace.id, run.id)
+            criteria = await criteria_for_agent_run(session, workspace, run)
+        except (AgentRunNotVerifiableError, NoVerificationCriteriaError) as error:
+            logger.info("auto_verify_skipped", agent_run_id=str(run.id), reason=str(error))
+            return None
+
+    orchestrator = build_orchestrator(settings, session_maker=session_maker)
+    try:
+        verification = await create_agent_run_verification(
+            orchestrator, run, criteria, created_by=run.user_id
+        )
+    except VerificationRunAlreadyActiveError:
+        logger.info("auto_verify_skipped", agent_run_id=str(run.id), reason="workspace_busy")
+        return None
+    await start_verification_run(verification.id, settings, session_maker=session_maker)
+    logger.info(
+        "auto_verify_started", agent_run_id=str(run.id), verification_run_id=str(verification.id)
+    )
+    return verification.id

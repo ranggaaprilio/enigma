@@ -349,8 +349,11 @@ class SqlAlchemyWorkspaceService:
         snapshot: str | None | object = SNAPSHOT_UNSET,
         app_root: str | None | object = APP_ROOT_UNSET,
         env_file_path: str | None | object = ENV_FILE_PATH_UNSET,
+        auto_verify_agent_runs: bool | None = None,
     ) -> Workspace:
         workspace = await self.get_for_manager(workspace_id, owner_id)
+        if auto_verify_agent_runs is not None:
+            workspace.auto_verify_agent_runs = auto_verify_agent_runs
         # The stored git credential is the owner's and follows `repo_url`, so only the owner
         # may point it somewhere else (a teammate could otherwise send it to their own host).
         if repo_url is not None and workspace.owner_id != owner_id:

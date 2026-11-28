@@ -1450,6 +1450,8 @@ async def update_workspace(
             update_values["app_root"] = payload.app_root
         if "env_file_path" in payload.model_fields_set:
             update_values["env_file_path"] = payload.env_file_path
+        if payload.auto_verify_agent_runs is not None:
+            update_values["auto_verify_agent_runs"] = payload.auto_verify_agent_runs
         workspace = await service.update(**update_values)
     except WorkspaceNotFoundError:
         raise not_found() from None
