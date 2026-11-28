@@ -35,6 +35,7 @@ from app.services.sandbox import close_all
 from app.services.sandbox.availability import (
     require_metrics_token_for_docker,
     warn_if_default_runtime_unconfigured,
+    warn_if_deprecated_runtime_offered,
 )
 from app.services.sandbox_maintenance import (
     start_opensandbox_maintenance,
@@ -66,6 +67,7 @@ async def lifespan(_app: FastAPI):
     settings = get_settings()
     require_metrics_token_for_docker(settings)
     warn_if_default_runtime_unconfigured(settings)
+    warn_if_deprecated_runtime_offered(settings)
     for old_name, new_name in deprecated_setting_names().items():
         logger.warning("deprecated_setting_name", name=old_name, use=new_name)
     # Runs left active by a previous process (crash, deploy) have no owner any more; close

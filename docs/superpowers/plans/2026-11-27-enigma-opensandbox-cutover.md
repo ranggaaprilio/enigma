@@ -93,12 +93,12 @@ podman compose -f docker-compose.yml -f docker-compose.opensandbox.yml up
 
 **Files:** `services/sandbox/availability.py`, `api/health.py`, `main.py`, `frontend/src/lib/runtime.ts`, `CreateWorkspaceWizard.tsx`, tests (backend + vitest).
 
-- [ ] Failing tests:
+- [x] Failing tests:
   - `/health` `runtimes.docker.deprecated` is true (the others false);
   - one `deprecated_runtime` log at startup when Docker is allowed and configured, none otherwise;
   - the wizard labels Docker deprecated;
   - `runtimeErrorHint("opensandbox")` and the "no runtime" copy.
-- [ ] Implement.
+- [x] Implemented. The frontend `RuntimeHealth` type also gains the `insecure` status from 7a (the backend already sent it); the overview shows it like `error`.
 
 ### Task 4: k8s example overlay
 

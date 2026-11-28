@@ -14,6 +14,7 @@ from app.db.session import async_session_maker
 from app.services.redis import get_redis_client
 from app.services.sandbox import get_runtime_by_name
 from app.services.sandbox.availability import (
+    DEPRECATED_PROVIDERS,
     HEALTH_TIMEOUT_SECONDS,
     PROVIDERS,
     runtime_availability,
@@ -41,6 +42,8 @@ class RuntimeHealth(BaseModel):
     # only to a METRICS_TOKEN bearer when a token is set: operational detail, not status.
     managed_containers: int | None = None
     upkeep_last_pass_at: datetime | None = None
+    # Still selectable, but on its way out (Docker: replaced by OpenSandbox, Plan 7b).
+    deprecated: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -95,7 +98,12 @@ def upkeep_last_pass_at() -> datetime | None:
 
 async def check_runtime(provider: str) -> RuntimeHealth:
     found = await runtime_availability(provider)
-    entry = RuntimeHealth(configured=found.configured, status=found.status, reason=found.reason)
+    entry = RuntimeHealth(
+        configured=found.configured,
+        status=found.status,
+        reason=found.reason,
+        deprecated=provider in DEPRECATED_PROVIDERS,
+    )
     if provider == "docker" and found.available:
         entry.managed_containers = await count_managed_containers()
         entry.upkeep_last_pass_at = upkeep_last_pass_at()

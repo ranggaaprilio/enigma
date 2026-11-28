@@ -100,6 +100,21 @@ async def test_a_configured_provider_that_is_down_degrades_health(probes):
         "reason": "docker is error",
         "managed_containers": None,
         "upkeep_last_pass_at": None,
+        "deprecated": True,
+    }
+
+
+async def test_only_the_docker_provider_is_reported_deprecated(probes):
+    """Plan 7b: OpenSandbox replaces the custom Docker provider for self-hosting. Docker stays
+    selectable until it is removed, and operators and users see it is on its way out."""
+    probes(daytona="ok", docker="ok")
+
+    _, body = await _health()
+
+    assert {name: entry["deprecated"] for name, entry in body["runtimes"].items()} == {
+        "daytona": False,
+        "docker": True,
+        "opensandbox": False,
     }
 
 
