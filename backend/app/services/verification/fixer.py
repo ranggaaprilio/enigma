@@ -115,6 +115,14 @@ class AgentFixer:
             output=str(detail.get("output") or detail.get("error") or ""),
         )
         async with self.session_maker() as session:
+            # Plan 9: verifying an agent run, the fix continues it -- same worktree (so it lands
+            # on that branch) and same session (so the agent sees what it did). Spec Kit and
+            # hand-started runs have no source and start fresh, as does a deleted source.
+            source = (
+                await session.get(AgentRun, run.source_agent_run_id)
+                if run.source_agent_run_id is not None
+                else None
+            )
             service = self.service_factory(session, self.session_maker, self.settings)
             try:
                 agent_run = await service.create_run(
@@ -122,6 +130,8 @@ class AgentFixer:
                     run.created_by,
                     prompt,
                     working_dir=(run.criteria or {}).get("cwd"),
+                    worktree_id=source.worktree_id if source is not None else None,
+                    session_id=source.session_id if source is not None else None,
                 )
             except ServiceDrainingError:
                 # A rollout is not a reason to give up on the fix: wait for a live process.

@@ -28,6 +28,21 @@ class VerificationRunCreateRequest(BaseModel):
         return stripped or None
 
 
+class AgentRunVerifyRequest(BaseModel):
+    """Verify an agent run (Plan 9). Empty = derive the criteria from the run's context."""
+
+    test_command: str | None = Field(default=None, max_length=20_000)
+    observe_port: int | None = Field(default=None, ge=1, le=65_535)
+    max_iterations: int | None = Field(default=None, ge=1, le=20)
+
+    @field_validator("test_command")
+    @classmethod
+    def _strip(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
+
 class VerificationEvidenceResponse(BaseModel):
     id: UUID
     kind: VerificationEvidenceKind
@@ -45,6 +60,7 @@ class VerificationRunResponse(BaseModel):
     plan_ref: str
     status: VerificationRunStatus
     spec_workflow_id: UUID | None = None
+    source_agent_run_id: UUID | None = None
     created_at: datetime
     updated_at: datetime
 

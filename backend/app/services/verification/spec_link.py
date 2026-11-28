@@ -57,6 +57,20 @@ async def criteria_for_workflow(
             max_iterations=own.get("max_iterations") or DEFAULT_MAX_ITERATIONS,
         )
 
+    return await test_command_criteria(
+        session, workspace, workflow.worktree_path or workspace.workspace_path
+    )
+
+
+async def test_command_criteria(
+    session: AsyncSession, workspace: Workspace, checkout: str
+) -> PlanCriteria | None:
+    """The workspace's first enabled ``role="test"`` command, run in ``checkout`` under the
+    workspace's ``app_root`` and the command's own ``cwd``; ``None`` when there is none.
+
+    Shared by Spec Kit (the feature worktree) and ordinary agent runs (Plan 9: the run's
+    worktree, or the base clone).
+    """
     command = await session.scalar(
         select(CustomCommand)
         .where(
@@ -71,7 +85,7 @@ async def criteria_for_workflow(
         return None
     return PlanCriteria(
         test_command=command.command,
-        cwd=_cwd(workspace, workflow, command.cwd),
+        cwd=join_subpath(checkout, workspace.app_root, command.cwd),
         max_iterations=DEFAULT_MAX_ITERATIONS,
     )
 

@@ -335,3 +335,81 @@ class _NullSession:
 class _NullMaker:
     def __call__(self):
         return _NullSession()
+
+
+# --- Plan 9 Task 2: the fix continues the verified agent run --------------------------------
+
+
+class _RowSession(_NullSession):
+    def __init__(self, rows: dict) -> None:
+        self.rows = rows
+
+    async def get(self, _model, key):
+        return self.rows.get(key)
+
+
+class _RowMaker:
+    def __init__(self, rows: dict) -> None:
+        self.rows = rows
+
+    def __call__(self):
+        return _RowSession(self.rows)
+
+
+def _recording_service():
+    calls: list[dict] = []
+
+    class RecordingService:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def create_run(self, workspace_id, user_id, prompt, **kwargs):
+            calls.append(kwargs)
+            return type("Run", (), {"id": uuid4()})()
+
+    return RecordingService, calls
+
+
+def _fixing_run(**values) -> VerificationRun:
+    return VerificationRun(
+        workspace_id=uuid4(),
+        plan_ref="p",
+        status="fixing",
+        created_by=uuid4(),
+        criteria={"cwd": "worktrees/feature-sum"},
+        **values,
+    )
+
+
+async def test_a_fix_continues_the_verified_runs_worktree_and_session() -> None:
+    """Otherwise a run made in a worktree would be "fixed" on the base clone's branch, by an
+    agent that never saw what the original run did."""
+    source = type("Source", (), {"id": uuid4(), "worktree_id": uuid4(), "session_id": uuid4()})()
+    service, calls = _recording_service()
+    fixer = AgentFixer(session_maker=_RowMaker({source.id: source}), service_factory=service)
+
+    await fixer.start(
+        _Workspace(), _fixing_run(source_agent_run_id=source.id), _Evidence({"command": "t"})
+    )
+
+    assert calls == [
+        {
+            "working_dir": "worktrees/feature-sum",
+            "worktree_id": source.worktree_id,
+            "session_id": source.session_id,
+        }
+    ]
+
+
+@pytest.mark.parametrize("linked", [False, True], ids=["no-source", "source-gone"])
+async def test_a_fix_without_a_source_run_starts_fresh(linked) -> None:
+    """Spec Kit and hand-started runs are unchanged; a deleted source run is no reason to fail."""
+    service, calls = _recording_service()
+    fixer = AgentFixer(session_maker=_RowMaker({}), service_factory=service)
+    run = _fixing_run(source_agent_run_id=uuid4() if linked else None)
+
+    await fixer.start(_Workspace(), run, _Evidence({"command": "t"}))
+
+    assert calls == [
+        {"working_dir": "worktrees/feature-sum", "worktree_id": None, "session_id": None}
+    ]
