@@ -118,20 +118,24 @@ podman compose -f docker-compose.yml -f docker-compose.opensandbox.yml up
 - [x] A second weekly job, `opensandbox-compose`, starts the server from `docker-compose.opensandbox.yml` (default config: the Linux gateway) and runs the suite with `docker compose run backend`, the path operators use.
 - [x] The same steps ran locally with `OPENSANDBOX_SERVER_CONFIG=sandbox.compose-desktop.toml`, in a separate compose project (`-p enigma7b`, so `down -v` never touches the dev database): **10/10**, the server with `cap_drop: ALL` and `no-new-privileges`.
 
+**Security review (automated, on the commit):** the overlay lets the API pod reach the server, and the API pod also sends owner-configured requests (the LLM base URL), so an SSRF could aim there. Checked live from the `opensandbox` network: per sandbox the server publishes execd (every path `401` without the token), the egress sidecar (`/policy` `401`, other paths `404`) and one port with no listener; the server API is `401` without its key. Reachable, not usable; noted in the NetworkPolicy.
+
 ### Task 5: Docs and agent notes
 
 **Files:** `docs/self-host-opensandbox.md`, `docs/self-host-docker.md`, the `docker-compose.sandbox.yml` header, `.env.example`, `AGENTS.md`, `deploy/README.md`, this plan.
 
-- [ ] Status, compose path, migration note, k8s placement, deprecation banners.
+- [x] Status, compose path, migration note, k8s placement, deprecation banners.
 
 ### Task 6: Live E2E on the compose stack
 
-- [ ] `podman compose -f docker-compose.yml -f docker-compose.opensandbox.yml up`. Check:
-  - `/health` shows `opensandbox` ok and as the default;
-  - a new workspace lands on OpenSandbox by default;
-  - terminal, a preview through the proxy, and one agent run work;
-  - the 7a security suite passes from inside the backend container.
-- [ ] Clean up every sandbox and volume.
+- [x] Ran `docker-compose.yml` + `docker-compose.opensandbox.yml` with the desktop config, as a separate compose project (`-p enigma7b`) with throwaway secrets, on Podman machine. Results:
+  - `/health`: `opensandbox` ok and `sandbox_runtime_default = "opensandbox"`; `docker` reports `deprecated: true`.
+  - Upkeep: at startup the backend removed a labelled sandbox with no workspace row (`sandbox_orphan_removed`), the probe left over from the security-review check below.
+  - A workspace created with no runtime landed on OpenSandbox and reached `ready`; file write and read through execd worked.
+  - A server in the sandbox on port 3000 was detected as a preview, and fetching it through the compose **preview-proxy container** returned 200 with the page. So the proxy reaches execd at `host.docker.internal` with the sandbox's token.
+  - One agent run (deepseek-v4.1-flash, set in the shell; `.env` unchanged) wrote the requested file and completed in about 8 s.
+  - The 7a security suite, now 10 tests, passed from inside the compose backend container (Task 4b).
+- [x] Cleaned up: the workspace was deleted through the API, no sandbox was left, and `down -v` ran on `enigma7b` only.
 
 ## Exit criteria
 

@@ -58,10 +58,17 @@ Nothing secret is in git or in an image layer. Provide these through your secret
 | | `WORKSPACE_ENV_ENCRYPTION_KEY` | all (Fernet; changing it orphans stored credentials) |
 | | `METRICS_TOKEN` | all (required outside `local`) |
 | | `DAYTONA_API_KEY` | API, worker, preview proxy |
+| | `OPENSANDBOX_API_KEY`, `OPENSANDBOX_EXECD_TOKEN_KEY` | API, worker, preview proxy; only with `overlays/opensandbox-external` |
 | | `OPENAI_API_KEY`, `OPENHANDS_LLM_API_KEY` | optional LLM fallbacks (DB settings win) |
 | `enigma-keda-postgres` | `connection` | KEDA only: libpq URL of a read-only role with `SELECT` on `agent_runs`, `command_runs` |
 
 The preview proxy mounts only the keys it reads; the API, worker and Job get `enigma-secrets`.
+
+**OpenSandbox instead of Daytona (optional).** `overlays/opensandbox-external` layers on
+production: sandboxes run on an OpenSandbox server on a dedicated VM outside the cluster, and one
+NetworkPolicy opens egress to that host only. Replace its placeholders (server address, sandbox
+image digest) and see `docs/self-host-opensandbox.md`, "Kubernetes". No daemon socket ever
+reaches the cluster.
 
 **Evidence screenshots (optional, not yet in the manifests).** Verification observations store a
 PNG in an S3-compatible bucket (AWS S3, R2, ...). To enable them:

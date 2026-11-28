@@ -1,3 +1,6 @@
+# DEPRECATED (Plan 7b): use docker-compose.opensandbox.yml, the self-host default now
+# (docs/self-host-opensandbox.md). This provider keeps working until it is removed.
+#
 # Opt-in: run sandboxes as local Docker/Podman containers (runtime="docker") instead of, or
 # next to, Daytona. See docs/local-docker-runtime/.
 #

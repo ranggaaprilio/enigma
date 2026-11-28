@@ -3,6 +3,11 @@
 # ([docker] port_range_min..max: every sandbox's execd and previews), on that one host, for the
 # pods that drive sandboxes. Policies are additive; nothing else changes. endPort needs
 # Kubernetes 1.25+.
+#
+# These pods also make owner-configured outbound requests (the LLM base URL), so an owner could
+# aim one at this host. Every endpoint there needs a credential those requests never carry:
+# the server API its key, each sandbox's execd and its egress sidecar's /policy that sandbox's
+# execd token (all verified to answer 401 unauthenticated, Plan 7b Task 6).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
