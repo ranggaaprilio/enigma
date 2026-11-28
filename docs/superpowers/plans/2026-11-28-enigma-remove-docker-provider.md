@@ -96,13 +96,13 @@ The modules above, their tests and fakes, `docker-compose.sandbox.yml`, `.github
 
 **Files:** the compose, workflow and doc files listed above, `.env.example`, `AGENTS.md`, `README.md`, `CONTRIBUTING.md`, `SECURITY.md`, `sandbox/build-local-image.sh`, `docker-compose.opensandbox.yml` comments, `deploy/k8s/overlays/production/kustomization.yaml`, versions, this plan.
 
-- [ ] Delete and edit; add a "Removed in 0.2.0" note to the OpenSandbox guide's "Moving from Docker"; bump to 0.2.0.
+- [x] Deleted and edited; the OpenSandbox guide's "Moving from Docker (upgrading to v0.2.0)" carries the upgrade notes and the SQL; versions are 0.2.0 (backend, root and frontend `package.json`, the production overlay's image tags). Also updated: the issue and PR templates, `daytona/README.md`, a `sandbox/Dockerfile` comment. `DOCKER_SOCKET` stays: the OpenSandbox server mounts it.
 
 ### Task 5: Verify
 
-- [ ] Full backend and frontend suites; `ruff`, `tsc`, `vite build`.
-- [ ] A live run of the OpenSandbox suite through the compose override (separate `-p` project), because the shared upkeep code changed.
-- [ ] Migration safety: no migration is added; leftover docker rows are the operator's (upgrade notes).
+- [x] Backend: 1761 passed (2 known failures). Frontend: 335 passed. `ruff`, `tsc`, `eslint` and `vite build` are clean.
+- [x] Live run through the compose override (`-p enigma8`, desktop config): the security suite, the upkeep tests and `test_docker_removed.py` gave 26/27. The one failure was a test reading `OPENSANDBOX_UPKEEP` from the container's environment (the 7a test assumed it unset); it now pins the switch, 9/9.
+- [x] Migration safety: no migration is added; leftover docker rows are the operator's (upgrade notes).
 
 ## Exit criteria
 

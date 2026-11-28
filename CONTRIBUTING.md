@@ -25,7 +25,7 @@ The repository is a monorepo:
 | frontend | TypeScript 5 | `pnpm`, React 18, Vite, Tailwind 3, Vitest, ESLint | `frontend/` |
 
 The quickest way to a running stack is the [Quick Start](README.md#quick-start) in the README
-(compose with either local Docker sandboxes or Daytona). For working on the code itself:
+(compose with either OpenSandbox or Daytona sandboxes). For working on the code itself:
 
 ```bash
 # backend
@@ -61,11 +61,12 @@ pnpm test
 pnpm build
 ```
 
-Real-daemon tests for the Docker sandbox provider are opt-in and need a local Docker or Podman
-daemon:
+The OpenSandbox security suite is opt-in and needs a running OpenSandbox server (see
+[`docs/self-host-opensandbox.md`](docs/self-host-opensandbox.md#the-security-suite)):
 
 ```bash
-cd backend && DOCKER_INTEGRATION_TESTS=1 uv run pytest tests/test_docker_integration.py
+cd backend && OPENSANDBOX_INTEGRATION_TESTS=1 OPENSANDBOX_API_URL=http://127.0.0.1:8080 \
+  OPENSANDBOX_API_KEY=<key> uv run pytest tests/test_opensandbox_integration.py
 ```
 
 ## Conventions
@@ -80,7 +81,7 @@ cd backend && DOCKER_INTEGRATION_TESTS=1 uv run pytest tests/test_docker_integra
   `NNNN_snake_case.py`. A migration that drops, renames, retypes, or tightens a column must carry a
   `# contract: <why>` comment and ship one release after the expand step.
 - **Sandbox boundary.** Only `services/sandbox/daytona.py` may import the `daytona` SDK, and only
-  `services/sandbox/docker.py` may talk to the Docker daemon. Everything else goes through the
+  `services/sandbox/opensandbox.py` the `opensandbox` SDK. Everything else goes through the
   `SandboxRuntime` interface. `tests/sandbox/test_boundary.py` enforces this.
 - **Secrets.** Never log or return credentials. Use the existing Fernet cipher for anything stored.
 - **Process-local state** goes through `services/runtime.py`; module-level dicts of in-flight work
@@ -109,9 +110,9 @@ cd backend && DOCKER_INTEGRATION_TESTS=1 uv run pytest tests/test_docker_integra
 2. Keep the change focused. Unrelated refactors and formatting churn make review slower and
    belong in their own PR.
 3. Write commit messages in the imperative mood with a short type prefix, for example
-   `feat(sandbox): add disk quota to Docker provider` or `fix(agents): stop run on lease expiry`.
+   `feat(sandbox): add disk quota to OpenSandbox provider` or `fix(agents): stop run on lease expiry`.
 4. Update documentation that your change affects: `README.md`, `AGENTS.md`, `.env.example`,
-   `docs/self-host-docker.md`, or the relevant `docs/` plan.
+   `docs/self-host-opensandbox.md`, or the relevant `docs/` plan.
 5. Make sure the checks above pass locally, then open the pull request using the template.
    Describe what changed, why, and how you verified it.
 6. A maintainer will review. Please respond to review comments in the PR rather than force-pushing
@@ -119,7 +120,7 @@ cd backend && DOCKER_INTEGRATION_TESTS=1 uv run pytest tests/test_docker_integra
 
 ## Reporting bugs and requesting features
 
-Use the issue templates. A good bug report includes the sandbox runtime you use (Docker/Podman or
+Use the issue templates. A good bug report includes the sandbox runtime you use (OpenSandbox or
 Daytona), the `/health` output, relevant backend logs, and the steps to reproduce.
 
 ## Code of conduct

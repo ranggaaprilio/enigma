@@ -168,8 +168,11 @@ async def test_opensandbox_upkeep_runs_only_where_it_is_wanted(monkeypatch) -> N
     monkeypatch.setattr(OpenSandboxRuntime, "configured", property(lambda _: True))
     start = sandbox_maintenance.start_opensandbox_maintenance
 
-    assert start(None, Settings(sandbox_runtime_default="daytona")) is None  # type: ignore[arg-type]
-    task = start(None, Settings(sandbox_runtime_default="opensandbox"))  # type: ignore[arg-type]
+    # Unset pinned explicitly: a stray OPENSANDBOX_UPKEEP in the environment (the compose
+    # override sets it) must not decide this test (AGENTS.md gotcha 14).
+    unset = {"opensandbox_upkeep": None}
+    assert start(None, Settings(sandbox_runtime_default="daytona", **unset)) is None  # type: ignore[arg-type]
+    task = start(None, Settings(sandbox_runtime_default="opensandbox", **unset))  # type: ignore[arg-type]
     assert task is not None
     await asyncio.wait_for(task, 1)
     task = start(None, Settings(sandbox_runtime_default="daytona", opensandbox_upkeep=True))  # type: ignore[arg-type]

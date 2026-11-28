@@ -8,7 +8,7 @@
 
 ## How was it verified?
 
-<!-- Tests added or run, manual steps, sandbox runtime used (Docker/Podman/Daytona). -->
+<!-- Tests added or run, manual steps, sandbox runtime used (OpenSandbox/Daytona). -->
 
 ## Checklist
 

@@ -22,9 +22,11 @@
 # config keeps every security key of the reference deploy/opensandbox/sandbox.toml (pinned by
 # backend/tests/test_deployment.py), against which the security suite was proven.
 #
-# DOCKER_SOCKET is the daemon socket path *where the containers run* (see
-# docker-compose.sandbox.yml for Podman machine and rootless Podman paths). Rootless Podman is
-# not supported here: it publishes ports through pasta/slirp4netns.
+# DOCKER_SOCKET is the daemon socket path *where the containers run*:
+#   - Docker (Linux / Docker Desktop):  /var/run/docker.sock (default)
+#   - Podman machine (macOS/Windows):   the VM's socket — `podman machine inspect` shows it;
+#     for a rootful machine /var/run/docker.sock is a symlink to /run/podman/podman.sock
+# Rootless Podman is not supported here: it publishes ports through pasta/slirp4netns.
 
 x-opensandbox-client: &opensandbox-client
   SANDBOX_RUNTIME_DEFAULT: ${SANDBOX_RUNTIME_DEFAULT:-opensandbox}

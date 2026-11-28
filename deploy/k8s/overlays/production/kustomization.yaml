@@ -15,7 +15,7 @@ resources:
 images:
   - name: enigma-backend
     newName: ghcr.io/ranggaaprilio/enigma-backend
-    newTag: "0.1.0"
+    newTag: "0.2.0"
   - name: enigma-frontend
     newName: ghcr.io/ranggaaprilio/enigma-frontend
-    newTag: "0.1.0"
+    newTag: "0.2.0"

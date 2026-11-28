@@ -18,7 +18,7 @@ body:
     attributes:
       label: Steps to reproduce
       placeholder: |
-        1. Create a workspace on the Docker runtime
+        1. Create a workspace on the OpenSandbox runtime
         2. Connect a repository and clone
         3. ...
     validations:
@@ -28,8 +28,7 @@ body:
     attributes:
       label: Sandbox runtime
       options:
-        - Local Docker
-        - Local Podman
+        - OpenSandbox
         - Daytona
         - Not sandbox related
     validations:

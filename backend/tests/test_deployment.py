@@ -448,7 +448,7 @@ def test_the_docker_provider_override_is_gone():
 
 
 def test_production_manifests_never_reference_the_container_daemon():
-    """The Kustomize production profile is Daytona-only (docs/local-docker-runtime)."""
+    """No cluster manifest ever mounts a container daemon socket (OpenSandbox runs outside it)."""
     for manifest in (REPO / "deploy" / "k8s").rglob("*.yaml"):
         assert "docker.sock" not in manifest.read_text(), manifest
 
