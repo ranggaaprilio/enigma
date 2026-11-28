@@ -200,10 +200,12 @@ Enigma ditujukan untuk **satu tim yang menjalankannya sendiri**, bukan platform 
 | Deploy saat ada run aktif | Worker menunggu sampai ±2 jam | API menunggu 5 menit, lalu run berakhir `interrupted_by_restart`; deploy dilakukan saat sepi |
 | Batas waktu run (`agent_run_timeout_seconds`) | Hanya berlaku di worker | Dihapus; run inline memang tidak pernah punya batas waktu |
 | Hierarki Project → Team → Workspace | Keputusan tertunda | **Tetap di model data, disembunyikan untuk satu tim** — D4 |
-| Redis | — | **Tetap**, hanya untuk rate limit |
+| Redis | — | **Tetap**, untuk rate limit (dan presence sampai A1 menghapusnya) |
 | Manifest Kubernetes dasar, tracing, retensi, cap run, opsi PgBouncer | Dibekukan | Tetap; tidak membebani langkah lain |
 
 **Kenapa hierarki tidak diratakan.** Akses selain pemilik ke sebuah workspace *adalah* keanggotaan team (`services/access.py`), dan budget ber-scope team. Meratakannya berarti migrasi data dan model akses baru. Project dan team default yang dibuat otomatis, ditambah UI yang menyembunyikan levelnya selama hanya ada satu, memberi hampir semua manfaatnya tanpa mengubah skema.
+
+**Tidak ada keanggotaan otomatis.** Pendaftaran terbuka, dan anggota team bisa membaca semua workspace team serta transkrip agent. Karena itu pendaftar baru tetap di luar sampai owner atau lead menambahkannya, persis seperti hari ini; D4 hanya membuat penambahan itu satu aksi di satu halaman.
 
 **Komunikasi antar bot tidak memakai Redis.** Permintaan dan jawaban (§13) adalah baris di Postgres, dan peran berjalan bergantian dalam satu proses.
 
@@ -378,7 +380,7 @@ Setiap baris punya **satu** pemilik yang membuatnya; langkah lain hanya menambah
 | `docker-compose.yml`, `docker-compose.opensandbox.yml`, `deploy/k8s/`, `tests/test_deployment.py` | sudah ada | D3 (Kubernetes: worker, KEDA, satu replika API), D1 (worker di compose); A4 (sebutan code-server) |
 | Fixture test bersama (`tests/run_fixtures.py`) | D0 | Semua track memakainya |
 | Migrasi kontrak (satu-satunya) | A10 | D2 menitipkan kolom queue |
-| Project/team default, pendaftar berikutnya masuk sebagai `viewer`, UI yang menyembunyikan hierarki | D4 | A9 dan D4 sama-sama mengubah `AppSidebar.tsx` — rebase |
+| Project/team default, satu halaman Members, UI yang menyembunyikan hierarki (tanpa keanggotaan otomatis) | D4 | A9 dan D4 sama-sama mengubah `AppSidebar.tsx` — rebase |
 | Port untuk Observe/probe pada kriteria turunan (`spec_link`, `agent_link`) | B6 | C4a, C4b (menggabungkan probe QA) |
 | `agent_sessions.proposed_criteria` | C4a | — |
 | `spec_workflows.qa_*`, `workspaces.qa_before_implement`, cek di `_assert_prerequisites` | C4b | — |
