@@ -104,18 +104,19 @@ podman compose -f docker-compose.yml -f docker-compose.opensandbox.yml up
 
 **Files:** `deploy/k8s/overlays/opensandbox-external/*`, `backend/tests/test_deployment.py`, `.github/workflows/ci.yml`, `deploy/README.md`.
 
-- [ ] Failing tests:
+- [x] Failing tests:
   - the overlay builds on base and sets `SANDBOX_RUNTIME_DEFAULT=opensandbox`;
   - the API key and execd key come from the Secret, never a ConfigMap;
   - its NetworkPolicy allows egress only to the one server CIDR, on the server port and the published range;
   - no `docker.sock` (the existing guard covers it).
-- [ ] Implement; `kubectl kustomize` it in CI next to production (kubeconform).
+- [x] Implemented; CI renders it next to production and kubeconform validates both. Rendering it (kubectl 1.30, kubeconform 0.6.7: 26/26 valid) caught a real bug the file tests missed: production's `namespace` covers only its own resources, so the new NetworkPolicy landed in `default` and selected nothing. The overlay now sets `namespace: enigma`, pinned by a test.
 
 ### Task 4b: The Linux variant in CI
 
 **Files:** `.github/workflows/opensandbox-integration.yml`.
 
-- [ ] The weekly workflow starts the server **in a container** from `sandbox.compose.toml` on the fixed-subnet network and runs the suite from a container on that network (the Linux gateway path), in addition to today's host-run server.
+- [x] A second weekly job, `opensandbox-compose`, starts the server from `docker-compose.opensandbox.yml` (default config: the Linux gateway) and runs the suite with `docker compose run backend`, the path operators use.
+- [x] The same steps ran locally with `OPENSANDBOX_SERVER_CONFIG=sandbox.compose-desktop.toml`, in a separate compose project (`-p enigma7b`, so `down -v` never touches the dev database): **10/10**, the server with `cap_drop: ALL` and `no-new-privileges`.
 
 ### Task 5: Docs and agent notes
 
