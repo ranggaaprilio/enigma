@@ -209,8 +209,8 @@ export function CreateWorkspaceWizard({
   const help = PROVIDER_HELP[resolvedProvider];
   const remote = parseGitRemote(form.repoUrl);
   const runtimes = runtimeOptions(health);
-  // A snapshot names a Daytona image; Docker always runs DOCKER_SANDBOX_IMAGE.
-  const usesSnapshot = form.runtime !== "docker";
+  // A snapshot names a Daytona image; OpenSandbox always runs OPENSANDBOX_SANDBOX_IMAGE.
+  const usesSnapshot = form.runtime !== "opensandbox";
 
   function validate(step: Step): string | null {
     if (step === "source") return form.source ? null : "Choose how to start the workspace.";

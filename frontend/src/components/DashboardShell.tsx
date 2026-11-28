@@ -393,8 +393,8 @@ export function WorkspaceStatusPill({
   }[status];
 
   const label = status === "none" ? "No workspace" : `Workspace ${status}`;
-  // Idle Docker sandboxes are stopped, not deleted; the next use starts them again.
-  const wakesOnUse = status === "stopped" && runtime === "docker";
+  // Idle OpenSandbox sandboxes are paused, not deleted; the next use resumes them.
+  const wakesOnUse = status === "stopped" && runtime === "opensandbox";
   const errorHint = status === "error" ? runtimeErrorHint(runtime) : null;
   return (
     <span

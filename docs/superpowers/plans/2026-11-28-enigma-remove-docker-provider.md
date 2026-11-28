@@ -86,11 +86,11 @@ The modules above, their tests and fakes, `docker-compose.sandbox.yml`, `.github
 
 **Files:** `lib/api.ts`, `lib/runtime.ts`, `CreateWorkspaceWizard.tsx`, `DashboardRoute.tsx`, `ProviderBadge.tsx`, `DashboardShell.tsx`, `DashboardOverviewRoute.tsx`, `LandingRoute.tsx`, tests.
 
-- [ ] Failing tests:
+- [x] Failing tests:
   - the create form offers daytona and opensandbox only;
   - an existing docker workspace reads "Docker (removed)" with the recreate hint;
   - the snapshot field follows Daytona only.
-- [ ] Implement; drop the health fields that are gone.
+- [x] Implement; drop the health fields that are gone. An idle-paused OpenSandbox workspace now says it "wakes on next use" (the hint was Docker-only), the Container badge marks OpenSandbox, and the Daytona snapshot field shows only for Daytona.
 
 ### Task 4: Infra, CI, docs, version
 

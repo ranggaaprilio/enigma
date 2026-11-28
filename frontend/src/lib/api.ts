@@ -1,4 +1,4 @@
-export type RuntimeName = "daytona" | "docker" | "opensandbox";
+export type RuntimeName = "daytona" | "opensandbox";
 
 /** One sandbox provider on `/health`: never more than configured yes/no and a generic reason. */
 export type RuntimeHealth = {
@@ -7,12 +7,6 @@ export type RuntimeHealth = {
   // "insecure": reachable but not safe for tenants (an OpenSandbox server that skips auth).
   status: "ok" | "error" | "unconfigured" | "disabled" | "insecure";
   reason: string | null;
-  /** Docker only: this installation's sandboxes on the daemon. */
-  managed_containers: number | null;
-  /** Docker only: when the backend last ran its sandbox upkeep pass. */
-  upkeep_last_pass_at: string | null;
-  /** Still selectable, but being replaced (Docker → OpenSandbox). */
-  deprecated?: boolean;
 };
 
 export type HealthResponse = {

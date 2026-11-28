@@ -64,15 +64,13 @@ afterEach(() => {
 
 function healthWith(
   daytona: "ok" | "error" | "unconfigured",
-  docker: "ok" | "error" | "unconfigured",
-  sandboxDefault: "daytona" | "docker" = "daytona",
+  opensandbox: "ok" | "error" | "unconfigured",
+  sandboxDefault: "daytona" | "opensandbox" = "daytona",
 ) {
   const entry = (status: "ok" | "error" | "unconfigured", reason: string) => ({
     configured: status !== "unconfigured",
     status,
     reason: status === "ok" ? null : reason,
-    managed_containers: null,
-    upkeep_last_pass_at: null,
   });
   return {
     status: "ok",
@@ -82,7 +80,7 @@ function healthWith(
     sandbox_runtime_default: sandboxDefault,
     runtimes: {
       daytona: entry(daytona, "No Daytona API key is configured"),
-      docker: entry(docker, "The Docker daemon is not reachable"),
+      opensandbox: entry(opensandbox, "The OpenSandbox server is not reachable"),
     },
   };
 }
@@ -304,30 +302,31 @@ describe("CreateWorkspaceWizard", () => {
   describe("runtime picker", () => {
     it("offers both runtimes and preselects the server default", async () => {
       stubFetch((url) =>
-        url.endsWith("/health") ? jsonResponse(healthWith("ok", "ok", "docker")) : undefined,
+        url.endsWith("/health") ? jsonResponse(healthWith("ok", "ok", "opensandbox")) : undefined,
       );
-      const createFn = vi.fn().mockResolvedValue({ ...created, runtime: "docker" });
+      const createFn = vi.fn().mockResolvedValue({ ...created, runtime: "opensandbox" });
       render(
         <CreateWorkspaceWizard open onClose={vi.fn()} onCreated={vi.fn()} createFn={createFn} />,
       );
       await toBlankDetails();
 
-      const docker = await screen.findByRole("radio", { name: /Local Docker/ });
+      const opensandbox = await screen.findByRole("radio", { name: /OpenSandbox/ });
       const daytona = screen.getByRole("radio", { name: /Daytona/ });
-      expect(docker).toBeChecked();
+      expect(screen.queryByRole("radio", { name: /Docker/ })).not.toBeInTheDocument();
+      expect(opensandbox).toBeChecked();
       expect(daytona).toBeEnabled();
       // A snapshot only means something on Daytona.
       expect(screen.queryByLabelText(/snapshot/i)).not.toBeInTheDocument();
 
       await userEvent.click(daytona);
       expect(screen.getByLabelText(/Daytona snapshot/)).toBeInTheDocument();
-      await userEvent.click(docker);
+      await userEvent.click(opensandbox);
       await userEvent.click(screen.getByRole("button", { name: "Next" }));
-      expect(screen.getByText("Local Docker")).toBeInTheDocument(); // review row
+      expect(screen.getByText("OpenSandbox")).toBeInTheDocument(); // review row
       await userEvent.click(screen.getByRole("button", { name: "Create workspace" }));
 
       await waitFor(() => expect(createFn).toHaveBeenCalled());
-      expect(createFn.mock.calls[0][0]).toMatchObject({ source: "blank", runtime: "docker" });
+      expect(createFn.mock.calls[0][0]).toMatchObject({ source: "blank", runtime: "opensandbox" });
     });
 
     it("disables an unavailable runtime, says why, and selects the other", async () => {
@@ -342,7 +341,7 @@ describe("CreateWorkspaceWizard", () => {
       const daytona = await screen.findByRole("radio", { name: /Daytona/ });
       expect(daytona).toBeDisabled();
       expect(screen.getByText("No Daytona API key is configured")).toBeInTheDocument();
-      expect(screen.getByRole("radio", { name: /Local Docker/ })).toBeChecked();
+      expect(screen.getByRole("radio", { name: /OpenSandbox/ })).toBeChecked();
     });
 
     it("blocks creation when neither runtime is available", async () => {
@@ -357,7 +356,7 @@ describe("CreateWorkspaceWizard", () => {
       );
       await toBlankDetails();
 
-      await screen.findByText("The Docker daemon is not reachable");
+      await screen.findByText("The OpenSandbox server is not reachable");
       await userEvent.click(screen.getByRole("button", { name: "Next" }));
       expect(
         screen.getByText(
@@ -367,21 +366,21 @@ describe("CreateWorkspaceWizard", () => {
       expect(createFn).not.toHaveBeenCalled();
     });
 
-    it("checks again on request, picking up a daemon that came back", async () => {
-      let docker: "error" | "ok" = "error";
+    it("checks again on request, picking up a server that came back", async () => {
+      let opensandbox: "error" | "ok" = "error";
       stubFetch((url) =>
-        url.endsWith("/health") ? jsonResponse(healthWith("unconfigured", docker)) : undefined,
+        url.endsWith("/health") ? jsonResponse(healthWith("unconfigured", opensandbox)) : undefined,
       );
       render(
         <CreateWorkspaceWizard open onClose={vi.fn()} onCreated={vi.fn()} createFn={vi.fn()} />,
       );
       await toBlankDetails();
-      await screen.findByText("The Docker daemon is not reachable");
+      await screen.findByText("The OpenSandbox server is not reachable");
 
-      docker = "ok";
+      opensandbox = "ok";
       await userEvent.click(screen.getByRole("button", { name: "Check again" }));
 
-      expect(await screen.findByRole("radio", { name: /Local Docker/ })).toBeChecked();
+      expect(await screen.findByRole("radio", { name: /OpenSandbox/ })).toBeChecked();
       expect(screen.queryByRole("button", { name: "Check again" })).not.toBeInTheDocument();
     });
   });
