@@ -723,7 +723,7 @@ async def test_env_template_lists_keys_without_values_and_groups_by_scope(worksp
     assert "# Service: API Server" in body
 
 
-@pytest.mark.parametrize("default_runtime", ["daytona", "docker"])
+@pytest.mark.parametrize("default_runtime", ["daytona", "opensandbox"])
 async def test_sqlalchemy_workspace_create_refreshes_before_return(tmp_path, default_runtime):
     class EmptyResult:
         def scalar_one_or_none(self):
@@ -922,20 +922,20 @@ async def test_create_workspace_passes_the_chosen_runtime(workspace_context):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         await _login(client)
         response = await client.post(
-            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "docker"}
+            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "opensandbox"}
         )
 
     assert response.status_code == 201, response.text
-    assert response.json()["runtime"] == "docker"
+    assert response.json()["runtime"] == "opensandbox"
 
 
 async def test_create_workspace_with_an_unavailable_runtime_is_422(workspace_context):
     _, service, _ = workspace_context
-    service.unavailable_runtimes.add("docker")
+    service.unavailable_runtimes.add("opensandbox")
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         await _login(client)
         response = await client.post(
-            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "docker"}
+            "/workspaces", json={"name": "Local", "source": "blank", "runtime": "opensandbox"}
         )
         unknown = await client.post(
             "/workspaces", json={"name": "Local", "source": "blank", "runtime": "k8s"}
@@ -1144,23 +1144,21 @@ def _availability(**statuses: str):
 
 
 async def test_sqlalchemy_create_uses_the_requested_runtime():
-    settings = Settings(
-        sandbox_runtime_default="daytona", metrics_token="scrape-secret", docker_upkeep=True
-    )
+    settings = Settings(sandbox_runtime_default="daytona")
     service = SqlAlchemyWorkspaceService(
         session=_FakeCreateSession(),  # type: ignore[arg-type]
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
         runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
         initializer=_RecordingInitializer(),  # type: ignore[arg-type]
-        availability=_availability(daytona="ok", docker="ok"),
+        availability=_availability(daytona="ok", opensandbox="ok"),
     )
 
     workspace = await service.create(
         owner_id=uuid4(), name="Local", repo_url=None, default_branch="main", source="blank",
-        runtime="docker",
+        runtime="opensandbox",
     )
 
-    assert workspace.runtime == "docker"
+    assert workspace.runtime == "opensandbox"
 
 
 async def test_sqlalchemy_create_refuses_an_unavailable_runtime_before_writing_a_row():
@@ -1173,13 +1171,13 @@ async def test_sqlalchemy_create_refuses_an_unavailable_runtime_before_writing_a
         cipher=WorkspaceSecretCipher(settings.workspace_env_encryption_key),
         runtime=_FakeProvisionRuntime(settings),  # type: ignore[arg-type]
         initializer=_RecordingInitializer(),  # type: ignore[arg-type]
-        availability=_availability(daytona="ok", docker="error"),
+        availability=_availability(daytona="ok", opensandbox="error"),
     )
 
     with pytest.raises(RuntimeChoiceError):
         await service.create(
             owner_id=uuid4(), name="Local", repo_url=None, default_branch="main",
-            source="blank", runtime="docker",
+            source="blank", runtime="opensandbox",
         )
 
     assert session.added == [] and session.commits == 0  # nothing half-provisioned

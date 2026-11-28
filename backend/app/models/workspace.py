@@ -66,7 +66,7 @@ class Workspace(Base):
     )
     default_branch: Mapped[str] = mapped_column(String(120), nullable=False, default="main")
     runtime: Mapped[str] = mapped_column(String(32), nullable=False, default="daytona")
-    # The provider's sandbox id (a Daytona sandbox or a Docker container). Migration 0039
+    # The provider's sandbox id (a Daytona or OpenSandbox sandbox). Migration 0039
     # dropped the old ``daytona_sandbox_id`` name.
     sandbox_id: Mapped[str | None] = mapped_column(
         String(160), nullable=True, unique=True, index=True

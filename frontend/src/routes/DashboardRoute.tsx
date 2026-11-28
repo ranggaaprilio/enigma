@@ -189,7 +189,7 @@ export function DashboardRoute() {
     workspaceState.status === "loading" ? "loading" : workspace?.status ?? "none";
 
   // The provider's actionable detail (e.g. a process killed for lack of memory). Read once per
-  // workspace, never polled: a poll would count as activity and keep a Docker sandbox awake.
+  // workspace, never polled: a poll would count as activity and keep a sandbox awake.
   // Not while provisioning: GET /status also stores the provider's status on the row.
   const [statusDetail, setStatusDetail] = useState<string | null>(null);
   const workspaceKey = workspace && workspace.status !== "creating" ? workspace.id : null;
@@ -1473,8 +1473,8 @@ function WorkspaceMetadataForm({
           hint="Connecting credentials from the Repository tab also sets this."
         />
       </div>
-      {/* Docker always runs DOCKER_SANDBOX_IMAGE; a snapshot only means something on Daytona. */}
-      {workspace.runtime !== "docker" && (
+      {/* A snapshot only means something on Daytona; OpenSandbox runs OPENSANDBOX_SANDBOX_IMAGE. */}
+      {workspace.runtime === "daytona" && (
         <div className="mt-4">
           <TextInput
             label="Daytona snapshot"

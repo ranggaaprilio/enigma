@@ -1,6 +1,5 @@
 import asyncio
 import time
-from datetime import datetime
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -9,20 +8,16 @@ from sqlalchemy import text
 
 from app.core.config import get_settings
 from app.core.lifecycle import lifecycle
-from app.core.metrics import metrics_token_authorized
 from app.db.session import async_session_maker
 from app.services.redis import get_redis_client
-from app.services.sandbox import get_runtime_by_name
 from app.services.sandbox.availability import (
-    DEPRECATED_PROVIDERS,
-    HEALTH_TIMEOUT_SECONDS,
     PROVIDERS,
     runtime_availability,
 )
 
 router = APIRouter(tags=["health"])
 
-# /health is unauthenticated: provider probes (a Daytona API call, Docker daemon calls) are
+# /health is unauthenticated: provider probes (a Daytona or OpenSandbox API call) are
 # shared by every caller for this long, one in flight at a time, so a flood of /health never
 # becomes a flood of upstream calls (Epic 06 security review).
 RUNTIME_HEALTH_TTL_SECONDS = 5.0
@@ -37,13 +32,6 @@ class RuntimeHealth(BaseModel):
     # but not safe to place a tenant on: an OpenSandbox server that skips auth)
     status: str
     reason: str | None = None
-    # Docker only: this installation's sandboxes on the daemon, and when this process last
-    # ran the upkeep pass (None where it does not run it, e.g. the API in queue mode). Shown
-    # only to a METRICS_TOKEN bearer when a token is set: operational detail, not status.
-    managed_containers: int | None = None
-    upkeep_last_pass_at: datetime | None = None
-    # Still selectable, but on its way out (Docker: replaced by OpenSandbox, Plan 7b).
-    deprecated: bool = False
 
 
 class HealthResponse(BaseModel):
@@ -83,31 +71,9 @@ async def check_redis() -> str:
     return "ok"
 
 
-async def count_managed_containers() -> int | None:
-    runtime = get_runtime_by_name("docker")
-    try:
-        found = await asyncio.wait_for(runtime.managed_sandboxes(), HEALTH_TIMEOUT_SECONDS)
-    except Exception:
-        return None
-    return len(found)
-
-
-def upkeep_last_pass_at() -> datetime | None:
-    return getattr(get_runtime_by_name("docker"), "last_upkeep_at", None)
-
-
 async def check_runtime(provider: str) -> RuntimeHealth:
     found = await runtime_availability(provider)
-    entry = RuntimeHealth(
-        configured=found.configured,
-        status=found.status,
-        reason=found.reason,
-        deprecated=provider in DEPRECATED_PROVIDERS,
-    )
-    if provider == "docker" and found.available:
-        entry.managed_containers = await count_managed_containers()
-        entry.upkeep_last_pass_at = upkeep_last_pass_at()
-    return entry
+    return RuntimeHealth(configured=found.configured, status=found.status, reason=found.reason)
 
 
 async def check_runtimes() -> dict[str, RuntimeHealth]:
@@ -144,14 +110,7 @@ async def health(request: Request) -> HealthResponse | JSONResponse:
         redis_status = "error"
 
     runtimes = await shared_runtimes(request)
-    if not metrics_token_authorized(
-        request.headers.get("authorization", ""), settings.metrics_token
-    ):
-        runtimes = {
-            name: entry.model_copy(update={"managed_containers": None, "upkeep_last_pass_at": None})
-            for name, entry in runtimes.items()
-        }
-    # An unconfigured or disabled provider is not a fault (a Docker-only install has no
+    # An unconfigured or disabled provider is not a fault (an OpenSandbox-only install has no
     # Daytona key), but a configured, enabled one that is down is, and so is having nowhere
     # to put a workspace.
     configured = [

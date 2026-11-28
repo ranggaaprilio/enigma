@@ -22,7 +22,7 @@ import { RUNTIMES, runtimeLabel } from "../lib/runtime";
 
 type HealthValue = "ok" | "error" | "unconfigured" | "disabled" | "insecure" | "pending";
 
-// Both sandbox providers (local-docker-runtime Epic 06): "unconfigured" and "disabled" are not faults.
+// Every sandbox provider: "unconfigured" and "disabled" are not faults.
 const SUBSYSTEMS: { label: string; read: (health: HealthResponse) => HealthValue }[] = [
   { label: "Database", read: (health) => health.database },
   { label: "Redis", read: (health) => health.redis },

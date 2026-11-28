@@ -2,7 +2,7 @@
 
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) runs each workspace in a container managed by its own server (`opensandbox-server`). Enigma talks to it as `runtime="opensandbox"`.
 
-**Status:** the self-host default (Plan 7b, `docs/superpowers/plans/2026-11-27-enigma-opensandbox-cutover.md`). The security suite in this guide passed against the reference config, both with the server on the host and inside compose. The custom Docker provider (`docs/self-host-docker.md`) is **deprecated**: it still works, but new installs should use OpenSandbox. Daytona stays the optional cloud provider.
+**Status:** the self-host default (Plan 7b, `docs/superpowers/plans/2026-11-27-enigma-opensandbox-cutover.md`). The security suite in this guide passed against the reference config, both with the server on the host and inside compose. The custom Docker provider (`runtime="docker"`) was **removed** after `v0.1.0`, the last release with it (Plan 8, `docs/superpowers/plans/2026-11-28-enigma-remove-docker-provider.md`); see "Moving from Docker" below. Daytona stays the optional cloud provider.
 
 ## Security first
 
@@ -54,7 +54,7 @@ What the override does:
 
 For a server on its own machine, the placement this guide recommends for production:
 
-1. **Image.** Build the sandbox image once: `./sandbox/build-local-image.sh` (`enigma-sandbox:latest`, shared with Docker and Daytona). For production, push it to a registry and pin it by digest. `OPENSANDBOX_SANDBOX_IMAGE=registry/enigma-sandbox@sha256:…` is required outside `local`.
+1. **Image.** Build the sandbox image once: `./sandbox/build-local-image.sh` (`enigma-sandbox:latest`, built from the same `sandbox/Dockerfile` as the Daytona snapshot). For production, push it to a registry and pin it by digest. `OPENSANDBOX_SANDBOX_IMAGE=registry/enigma-sandbox@sha256:…` is required outside `local`.
 2. **Server.** Copy `deploy/opensandbox/sandbox.toml` and adjust `host`, `publish_host` and the store path. Pre-pull `opensandbox/execd:v1.1.0` and `opensandbox/egress:v1.1.7`; without them, the first create can time out. Then start it:
 
    ```bash
@@ -80,14 +80,16 @@ For a server on its own machine, the placement this guide recommends for product
 
 OpenSandbox's own Kubernetes runtime (controller and CRDs) is not used and was not verified.
 
-## Moving from Docker
+## Moving from Docker (upgrading to v0.2.0)
 
-Existing Docker workspaces keep running; the Docker provider is deprecated, not removed. `/health` marks it `deprecated`, the API logs `deprecated_runtime` at startup while it is offered, and the create form shows "Local Docker (deprecated)". There is no in-place migration of a sandbox: git is the source of truth.
-1. Push the workspace's branches.
-2. Create a new workspace on OpenSandbox from the same repository.
-3. Delete the Docker one.
+v0.2.0 removes the Docker provider; `v0.1.0` is the last release with it. There is no in-place migration of a sandbox: git is the source of truth. After the upgrade:
+- `SANDBOX_RUNTIME_DEFAULT=docker`, or docker in `SANDBOX_RUNTIMES_ALLOWED`, stops the API at startup with a message naming `v0.1.0`. Use `opensandbox` or `daytona`.
+- Leftover `DOCKER_*` variables are ignored and logged once as `removed_setting_name`. `DOCKER_REAPER_INTERVAL_SECONDS` is now `SANDBOX_UPKEEP_INTERVAL_SECONDS` (the old name still works for one release). `docker-compose.sandbox.yml` is gone; use `docker-compose.opensandbox.yml`.
+- A workspace with `runtime='docker'` has no provider: every call to it fails with 503, and it cannot be deleted through the API. The create form and `/health` no longer list Docker.
 
-To stop offering Docker for new workspaces, leave it out of `SANDBOX_RUNTIMES_ALLOWED` (for example `opensandbox,daytona`).
+Remove Docker workspaces in one of two ways:
+- **Before upgrading** (on v0.1.0): push each workspace's branches, create a new workspace on OpenSandbox from the same repository, and delete the Docker one through the UI. That also removes its container.
+- **After upgrading**, in SQL: `DELETE FROM workspaces WHERE runtime = 'docker';`. Every foreign key to `workspaces` cascades, except `audit_logs`, which is set null so the audit trail stays. Then remove the leftover containers by hand (`docker ps -a --filter label=enigma.managed`).
 
 ## Upkeep
 

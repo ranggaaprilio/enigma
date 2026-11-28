@@ -1,5 +1,3 @@
-from datetime import UTC, datetime
-
 import pytest
 from httpx import ASGITransport, AsyncClient
 
@@ -41,12 +39,6 @@ def probes(monkeypatch):
     monkeypatch.setattr(health_module, "check_database", _ok)
     monkeypatch.setattr(health_module, "check_redis", _ok)
 
-    async def three() -> int:
-        return 3
-
-    monkeypatch.setattr(health_module, "count_managed_containers", three)
-    monkeypatch.setattr(health_module, "upkeep_last_pass_at", lambda: None)
-
     def set_providers(**statuses: str) -> None:
         app.state.runtime_health = None
         monkeypatch.setattr(health_module, "runtime_availability", _providers(**statuses))
@@ -62,18 +54,18 @@ async def _health(headers: dict | None = None) -> tuple[int, dict]:
 
 
 @pytest.mark.parametrize(
-    ("daytona", "docker", "code", "overall"),
+    ("daytona", "opensandbox", "code", "overall"),
     [
         ("ok", "ok", 200, "ok"),
         ("unconfigured", "ok", 200, "ok"),  # the no-subscription self-host profile
-        ("ok", "unconfigured", 200, "ok"),  # a Daytona-only install, as before the series
+        ("ok", "unconfigured", 200, "ok"),  # a Daytona-only install
         ("unconfigured", "unconfigured", 503, "degraded"),  # nowhere to put a workspace
     ],
 )
 async def test_health_reports_each_provider_in_every_configured_combination(
-    probes, daytona, docker, code, overall
+    probes, daytona, opensandbox, code, overall
 ):
-    probes(daytona=daytona, docker=docker)
+    probes(daytona=daytona, opensandbox=opensandbox)
 
     status_code, body = await _health()
 
@@ -81,51 +73,23 @@ async def test_health_reports_each_provider_in_every_configured_combination(
     assert body["status"] == overall
     assert body["daytona"] == daytona  # the field existing monitors read
     assert body["sandbox_runtime_default"] == "daytona"
+    assert set(body["runtimes"]) == {"daytona", "opensandbox"}
     assert body["runtimes"]["daytona"]["status"] == daytona
     assert body["runtimes"]["daytona"]["configured"] is (daytona != "unconfigured")
-    assert body["runtimes"]["docker"]["status"] == docker
-    assert body["runtimes"]["docker"]["managed_containers"] == (3 if docker == "ok" else None)
-    assert body["runtimes"]["daytona"]["managed_containers"] is None
+    assert body["runtimes"]["opensandbox"]["status"] == opensandbox
 
 
 async def test_a_configured_provider_that_is_down_degrades_health(probes):
-    probes(daytona="ok", docker="error")
+    probes(daytona="ok", opensandbox="error")
 
     status_code, body = await _health()
 
     assert status_code == 503 and body["status"] == "degraded"
-    assert body["runtimes"]["docker"] == {
+    assert body["runtimes"]["opensandbox"] == {
         "configured": True,
         "status": "error",
-        "reason": "docker is error",
-        "managed_containers": None,
-        "upkeep_last_pass_at": None,
-        "deprecated": True,
+        "reason": "opensandbox is error",
     }
-
-
-async def test_only_the_docker_provider_is_reported_deprecated(probes):
-    """Plan 7b: OpenSandbox replaces the custom Docker provider for self-hosting. Docker stays
-    selectable until it is removed, and operators and users see it is on its way out."""
-    probes(daytona="ok", docker="ok")
-
-    _, body = await _health()
-
-    assert {name: entry["deprecated"] for name, entry in body["runtimes"].items()} == {
-        "daytona": False,
-        "docker": True,
-        "opensandbox": False,
-    }
-
-
-async def test_health_reports_when_the_docker_upkeep_last_ran(probes, monkeypatch):
-    probes(docker="ok")
-    ran = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr(health_module, "upkeep_last_pass_at", lambda: ran)
-
-    _, body = await _health()
-
-    assert body["runtimes"]["docker"]["upkeep_last_pass_at"] == "2026-10-30T12:00:00Z"
 
 
 async def test_health_returns_degraded_when_dependency_fails(probes, monkeypatch):
@@ -195,28 +159,9 @@ async def test_requests_carry_a_correlation_id_header(monkeypatch):
         assert supplied.headers.get("X-Request-ID") == "trace-123"
 
 
-async def test_operational_detail_needs_the_metrics_token_when_one_is_set(probes, monkeypatch):
-    """/health is unauthenticated: the sandbox count and upkeep timing are for operators."""
-    probes(docker="ok")
-    ran = datetime(2026, 10, 30, 12, 0, tzinfo=UTC)
-    monkeypatch.setattr(health_module, "upkeep_last_pass_at", lambda: ran)
-    monkeypatch.setattr(
-        health_module, "get_settings", lambda: Settings(metrics_token="scrape-secret")
-    )
-
-    _, anonymous = await _health()
-    _, operator = await _health({"authorization": "Bearer scrape-secret"})
-
-    assert anonymous["runtimes"]["docker"]["status"] == "ok"
-    assert anonymous["runtimes"]["docker"]["managed_containers"] is None
-    assert anonymous["runtimes"]["docker"]["upkeep_last_pass_at"] is None
-    assert operator["runtimes"]["docker"]["managed_containers"] == 3
-    assert operator["runtimes"]["docker"]["upkeep_last_pass_at"] == "2026-10-30T12:00:00Z"
-
-
 async def test_provider_probes_are_shared_for_a_few_seconds(probes, monkeypatch):
-    """An anonymous flood of /health must not become a flood of daemon and Daytona calls."""
-    probes(daytona="ok", docker="ok")
+    """An anonymous flood of /health must not become a flood of provider API calls."""
+    probes(daytona="ok", opensandbox="ok")
     calls: list[str] = []
     inner = health_module.runtime_availability
 
@@ -230,14 +175,13 @@ async def test_provider_probes_are_shared_for_a_few_seconds(probes, monkeypatch)
         status_code, _ = await _health()
         assert status_code == 200
 
-    assert sorted(calls) == ["daytona", "docker", "opensandbox"]  # one probe per provider, not five
+    assert sorted(calls) == ["daytona", "opensandbox"]  # one probe per provider, not five
 
 
 async def test_a_disabled_provider_is_not_a_fault(probes):
-    probes(daytona="ok", docker="disabled")
+    probes(daytona="ok", opensandbox="disabled")
 
     status_code, body = await _health()
 
     assert status_code == 200 and body["status"] == "ok"
-    assert body["runtimes"]["docker"]["status"] == "disabled"
-    assert body["runtimes"]["docker"]["managed_containers"] is None
+    assert body["runtimes"]["opensandbox"]["status"] == "disabled"

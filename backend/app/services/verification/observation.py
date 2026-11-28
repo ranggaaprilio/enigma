@@ -68,8 +68,8 @@ async def observe(
     """
     runtime = runtime or get_sandbox_runtime()
 
-    # Best effort: make the listening port reachable before we fetch it (a Docker sandbox
-    # relays a loopback-only dev server; Daytona/OpenSandbox need nothing). Never raises.
+    # Best effort: make the listening port reachable before we fetch it, where the provider
+    # needs a step for it. Never raises.
     try:
         await runtime.expose_port(workspace, port)
     except SandboxRuntimeError as error:

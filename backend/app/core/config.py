@@ -123,7 +123,8 @@ class Settings(BaseSettings):
     # an API key, e.g. one started with OPENSANDBOX_INSECURE_SERVER=YES.
     opensandbox_allow_insecure: bool = False
     # Idle pause and orphan sweep for OpenSandbox sandboxes; unset = on when the default
-    # runtime is opensandbox (as DOCKER_UPKEEP). Same window and interval as Docker's.
+    # runtime is opensandbox. Window: SANDBOX_AUTO_STOP_MINUTES; interval:
+    # SANDBOX_UPKEEP_INTERVAL_SECONDS.
     opensandbox_upkeep: bool | None = None
     opensandbox_sandbox_image: str = "enigma-sandbox:latest"
     opensandbox_require_image_digest: bool | None = None
@@ -140,8 +141,8 @@ class Settings(BaseSettings):
         default="/home/daytona",
         validation_alias=AliasChoices("sandbox_home", "daytona_sandbox_home"),
     )
-    # Idle sandboxes stop after this long (0 = never). Daytona enforces it itself; the Docker
-    # provider's reaper does (Epic 05). DAYTONA_AUTO_STOP_MINUTES is still accepted.
+    # Idle sandboxes stop after this long (0 = never). Daytona enforces it itself; OpenSandbox
+    # sandboxes are paused by Enigma's upkeep. DAYTONA_AUTO_STOP_MINUTES is still accepted.
     sandbox_auto_stop_minutes: int = Field(
         default=30,
         ge=0,
@@ -162,8 +163,8 @@ class Settings(BaseSettings):
             "preview_proxy_ttl_seconds", "daytona_preview_proxy_ttl_seconds"
         ),
     )
-    # Sandbox egress policy for every provider (Daytona's network settings; on Docker,
-    # block_all makes each sandbox network internal). DAYTONA_NETWORK_* still accepted.
+    # Sandbox egress policy for every provider (Daytona's network settings; OpenSandbox's
+    # per-sandbox network policy). DAYTONA_NETWORK_* still accepted.
     sandbox_network_block_all: bool = Field(
         default=False,
         validation_alias=AliasChoices("sandbox_network_block_all", "daytona_network_block_all"),
@@ -172,64 +173,20 @@ class Settings(BaseSettings):
         default_factory=list,
         validation_alias=AliasChoices("sandbox_network_allow_list", "daytona_network_allow_list"),
     )
-    # Provider for newly created workspaces ("daytona" | "docker"). Existing rows keep theirs.
-    sandbox_runtime_default: Literal["daytona", "docker", "opensandbox"] = "daytona"
+    # Provider for newly created workspaces. Existing rows keep theirs.
+    sandbox_runtime_default: Literal["daytona", "opensandbox"] = "daytona"
     # Providers users may pick for new workspaces (comma-separated); empty = every provider.
     # Existing workspaces keep running on theirs. Must include sandbox_runtime_default.
     sandbox_runtimes_allowed: str | list[str] = Field(default_factory=list)
-    # Local Docker/Podman provider (docs/local-docker-runtime). Unset docker_host = the
-    # default unix socket; Podman: point it at `podman system service`'s socket.
-    docker_host: str | None = None
-    docker_sandbox_image: str = "enigma-sandbox:latest"
-    # Legacy shared network (Epics 02-04). Since Epic 05 every sandbox gets its own network
-    # (`enigma-sbx-<workspace>`); a sandbox still on this one is moved off it on provision.
-    docker_sandbox_network: str = "enigma-sandboxes"
-    # Per-sandbox networks are carved from this pool. Explicit subnets keep many sandboxes
-    # within reach of the daemon's default address pools (~31 networks on Docker).
-    docker_sandbox_subnet_pool: str = "10.213.0.0/16"
-    docker_sandbox_subnet_prefix: int = Field(default=28, ge=16, le=29)
-    # The preview proxy's name on every sandbox network; the backend attaches the proxy
-    # containers (found by this label) under it, and a sandbox's port relay admits
-    # connections from this name's addresses only (Epic 04).
-    docker_preview_proxy_host: str = "preview-proxy"
-    docker_preview_proxy_label: str = "enigma.preview-proxy=1"
-    # With SANDBOX_NETWORK_ALLOW_LIST, sandbox networks are internal and their only way out
-    # is the egress proxy (app/egress_proxy.py), attached to each under this name; sandbox
-    # commands and terminals get HTTP(S)_PROXY pointing at it.
-    docker_egress_proxy_host: str = "egress-proxy"
-    docker_egress_proxy_label: str = "enigma.egress-proxy=1"
-    docker_egress_proxy_port: int = Field(default=3128, gt=0, lt=65536)
-    # Must exist in the image and must not be root (enforced at provision).
-    docker_sandbox_user: str = "daytona"
-    docker_sandbox_cpus: float = Field(default=2.0, gt=0)
-    docker_sandbox_memory_mb: int = Field(default=4096, gt=0)
-    docker_provision_timeout_seconds: int = Field(default=60, gt=0)
-    # Commands (exec/stream) in flight at once per process; each holds a thread meanwhile.
-    docker_max_concurrent_execs: int = Field(default=64, gt=0)
-    # Fork-bomb floor per sandbox (Epic 05 tunes the full resource profile).
-    docker_sandbox_pids_limit: int = Field(default=4096, gt=0)
-    # Epic 05: /tmp is a tmpfs (cleared on restart; counts against the memory limit) and the
-    # open-file limit is explicit rather than the daemon's default.
-    docker_sandbox_tmp_mb: int = Field(default=1024, gt=0)
-    docker_sandbox_nofile: int = Field(default=65536, gt=0)
-    # Per-sandbox disk quota on the container's writable layer (the workspace lives there:
-    # sandboxes get no mounts). 0 = none. Needs a daemon storage driver that supports
-    # `--storage-opt size` (overlay2 on xfs mounted with pquota, btrfs, zfs); elsewhere the
-    # daemon refuses the create and provisioning fails saying so.
-    docker_sandbox_disk_mb: int = Field(default=0, ge=0)
-    # A sandbox with a live exec or terminal is spared by the idle reaper, but only until it
-    # has been idle this long: "busy" is read from the sandbox, which its tenant controls.
-    sandbox_busy_max_minutes: int = Field(default=240, gt=0)
-    # How often the Docker upkeep pass runs (proxy re-attach, idle auto-stop).
-    docker_reaper_interval_seconds: int = Field(default=60, gt=0)
-    # Docker sandboxes live on one daemon, so in queue mode the API, every worker and the
-    # proxy must share it. Setting this is the operator's statement that they do; without
-    # it, creating a Docker workspace in queue mode is refused (Epic 06).
-    docker_single_host: bool = False
-    # Run the Docker upkeep loop (idle stop, orphan sweep, proxy re-attach) in this process.
-    # Unset = only when Docker is the default. A mixed install (Daytona default, Docker picked
-    # per workspace) sets it true; Docker workspaces are refused wherever it is off.
-    docker_upkeep: bool | None = None
+    # How often the sandbox upkeep pass runs (OpenSandbox idle pause and orphan sweep).
+    # DOCKER_REAPER_INTERVAL_SECONDS is still accepted for one release (Plan 8).
+    sandbox_upkeep_interval_seconds: int = Field(
+        default=60,
+        gt=0,
+        validation_alias=AliasChoices(
+            "sandbox_upkeep_interval_seconds", "docker_reaper_interval_seconds"
+        ),
+    )
     agent_provider: str = "auto"
     openai_api_key: str | None = None
     openai_model: str = "gpt-4.1-mini"
@@ -346,12 +303,6 @@ class Settings(BaseSettings):
     def runtime_allowed(self, provider: str) -> bool:
         return not self.sandbox_runtimes_allowed or provider in self.sandbox_runtimes_allowed
 
-    @property
-    def docker_upkeep_enabled(self) -> bool:
-        if self.docker_upkeep is not None:
-            return self.docker_upkeep
-        return self.sandbox_runtime_default == "docker"
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -361,6 +312,13 @@ class Settings(BaseSettings):
         # checks such as `enforce_secure_defaults`).
         hide_input_in_errors=True,
     )
+
+    @field_validator("sandbox_runtime_default", mode="before")
+    @classmethod
+    def refuse_the_removed_docker_provider(cls, value):
+        if isinstance(value, str) and value.strip().lower() == "docker":
+            raise ValueError(DOCKER_REMOVED)
+        return value
 
     @field_validator("opensandbox_sandbox_cpu")
     @classmethod
@@ -447,7 +405,9 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def check_runtimes_allowed(self) -> "Settings":
-        unknown = sorted(set(self.sandbox_runtimes_allowed) - {"daytona", "docker", "opensandbox"})
+        if "docker" in self.sandbox_runtimes_allowed:
+            raise ValueError(DOCKER_REMOVED)
+        unknown = sorted(set(self.sandbox_runtimes_allowed) - {"daytona", "opensandbox"})
         if unknown:
             raise ValueError(f"sandbox_runtimes_allowed names unknown providers: {unknown}")
         if not self.runtime_allowed(self.sandbox_runtime_default):
@@ -550,7 +510,41 @@ DEPRECATED_SETTING_NAMES = {
     "DAYTONA_PREVIEW_PROXY_TTL_SECONDS": "PREVIEW_PROXY_TTL_SECONDS",
     "DAYTONA_NETWORK_BLOCK_ALL": "SANDBOX_NETWORK_BLOCK_ALL",
     "DAYTONA_NETWORK_ALLOW_LIST": "SANDBOX_NETWORK_ALLOW_LIST",
+    # Plan 8: the upkeep interval outlived the Docker provider it was named after.
+    "DOCKER_REAPER_INTERVAL_SECONDS": "SANDBOX_UPKEEP_INTERVAL_SECONDS",
 }
+
+DOCKER_REMOVED = (
+    "the Docker sandbox provider was removed after v0.1.0; use opensandbox "
+    "(docs/self-host-opensandbox.md), or stay on v0.1.0"
+)
+
+# Settings of the removed Docker provider (Plan 8). Ignored (`extra="ignore"`), but logged once
+# at startup so operators can clean up their environment.
+REMOVED_SETTING_NAMES = (
+    "DOCKER_HOST",
+    "DOCKER_SANDBOX_IMAGE",
+    "DOCKER_SANDBOX_NETWORK",
+    "DOCKER_SANDBOX_SUBNET_POOL",
+    "DOCKER_SANDBOX_SUBNET_PREFIX",
+    "DOCKER_PREVIEW_PROXY_HOST",
+    "DOCKER_PREVIEW_PROXY_LABEL",
+    "DOCKER_EGRESS_PROXY_HOST",
+    "DOCKER_EGRESS_PROXY_LABEL",
+    "DOCKER_EGRESS_PROXY_PORT",
+    "DOCKER_SANDBOX_USER",
+    "DOCKER_SANDBOX_CPUS",
+    "DOCKER_SANDBOX_MEMORY_MB",
+    "DOCKER_PROVISION_TIMEOUT_SECONDS",
+    "DOCKER_MAX_CONCURRENT_EXECS",
+    "DOCKER_SANDBOX_PIDS_LIMIT",
+    "DOCKER_SANDBOX_TMP_MB",
+    "DOCKER_SANDBOX_NOFILE",
+    "DOCKER_SANDBOX_DISK_MB",
+    "DOCKER_SINGLE_HOST",
+    "DOCKER_UPKEEP",
+    "SANDBOX_BUSY_MAX_MINUTES",
+)
 
 
 def deprecated_setting_names(
@@ -561,3 +555,13 @@ def deprecated_setting_names(
     if env_file and os.path.exists(env_file):
         names |= {key.upper() for key in dotenv_values(env_file)}
     return {old: new for old, new in DEPRECATED_SETTING_NAMES.items() if old in names}
+
+
+def removed_setting_names(
+    environ: Mapping[str, str] | None = None, *, env_file: str | None = ".env"
+) -> list[str]:
+    """Settings of the removed Docker provider still set in the environment or ``env_file``."""
+    names = {key.upper() for key in (os.environ if environ is None else environ)}
+    if env_file and os.path.exists(env_file):
+        names |= {key.upper() for key in dotenv_values(env_file)}
+    return [name for name in REMOVED_SETTING_NAMES if name in names]

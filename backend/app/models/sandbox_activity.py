@@ -13,7 +13,7 @@ class SandboxActivity(Base):
 
     Written, debounced, by whichever process touched the sandbox (API, worker or preview
     proxy), so the idle clock survives restarts and is shared across processes. Read by
-    the Docker idle reaper; Daytona enforces auto-stop itself and never writes here.
+    the OpenSandbox idle pause; Daytona enforces auto-stop itself and never writes here.
     """
 
     __tablename__ = "sandbox_activity"
@@ -31,8 +31,8 @@ class SandboxActivity(Base):
 class SandboxInstallation(Base):
     """This database's identity on a shared container daemon (Epic 05): one row, one id.
 
-    Docker sandboxes and networks carry it as a label, and the upkeep loop only touches
-    those, so another Enigma stack on the same daemon is never mistaken for orphans."""
+    OpenSandbox sandboxes carry it as metadata, and the upkeep loop only touches those, so
+    another Enigma stack on the same server is never mistaken for orphans."""
 
     __tablename__ = "sandbox_installation"
     __table_args__ = (

@@ -8,7 +8,7 @@ from pathlib import Path
 APP_DIR = Path(__file__).resolve().parents[2] / "app"
 SANDBOX_DIR = APP_DIR / "services" / "sandbox"
 
-_SDK_IMPORT = re.compile(r"^\s*(from|import)\s+(daytona|docker|opensandbox)\b")
+_SDK_IMPORT = re.compile(r"^\s*(from|import)\s+(daytona|opensandbox)\b")
 _LEAK = re.compile(r"\bget_sandbox\(|\bsandbox\.fs\.|\bsandbox\.git\.|\bdaytona_sandbox_id\b")
 
 

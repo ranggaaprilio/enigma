@@ -3,12 +3,12 @@ name: OpenSandbox integration
 # The OpenSandbox provider against a real opensandbox-server started from the reference
 # config (Plan 7a Task 7): OPENSANDBOX_INTEGRATION_TESTS=1 tests/test_opensandbox_integration.py.
 # This security suite (container floor, sibling isolation, auth, egress, terminal, upkeep) is
-# the gate for making OpenSandbox the self-host default (Plan 7b). Opt-in and weekly, like the
-# Docker one: it builds the ~9 GB sandbox image and needs outbound network from sandboxes.
+# the gate for making OpenSandbox the self-host default (Plan 7b). Opt-in and weekly: it builds
+# the ~9 GB sandbox image and needs outbound network from sandboxes.
 "on":
   workflow_dispatch:
   schedule:
-    - cron: "0 4 * * 1"  # Mondays 04:00 UTC, after the Docker suite
+    - cron: "0 4 * * 1"  # Mondays 04:00 UTC
 
 permissions:
   contents: read

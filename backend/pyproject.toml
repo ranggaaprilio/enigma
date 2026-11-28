@@ -1,6 +1,6 @@
 [project]
 name = "execute-dashboard-backend"
-version = "0.1.0"
+version = "0.2.0"
 description = "FastAPI backend for the Execute Dashboard foundation."
 readme = "README.md"
 requires-python = ">=3.12"
@@ -30,7 +30,6 @@ dependencies = [
   "opentelemetry-instrumentation-aiohttp-client==0.60b1",
   "opentelemetry-sdk==1.39.1",
   "opentelemetry-exporter-otlp-proto-http==1.39.1",
-  "docker>=7.1",
   "aioboto3>=15.5.0",
 ]
 

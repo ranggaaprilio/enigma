@@ -36,7 +36,7 @@ def _runtime(*, files=None, stdout=None, exit_code=0, error=None):
 
 
 def _workspace() -> Workspace:
-    return Workspace(sandbox_id="sbx", workspace_path="workspace", runtime="docker")
+    return Workspace(sandbox_id="sbx", workspace_path="workspace", runtime="opensandbox")
 
 
 async def test_captures_the_app_inside_the_sandbox_and_cleans_up() -> None:

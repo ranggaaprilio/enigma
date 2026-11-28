@@ -28,7 +28,7 @@ class WorkspaceCreateRequest(BaseModel):
     default_branch: str = Field(default="main", min_length=1, max_length=120)
     snapshot: str | None = Field(default=None, max_length=255)
     # None = SANDBOX_RUNTIME_DEFAULT (or the other provider when only it is available).
-    runtime: Literal["daytona", "docker", "opensandbox"] | None = None
+    runtime: Literal["daytona", "opensandbox"] | None = None
 
     @field_validator("name", "default_branch")
     @classmethod

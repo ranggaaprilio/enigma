@@ -1,4 +1,5 @@
-"""The shared idle clock for local Docker sandboxes (local-docker-runtime Epic 05).
+"""The shared idle clock for sandboxes Enigma pauses itself (OpenSandbox; first built for the
+removed Docker provider, local-docker-runtime Epic 05).
 
 A sandbox is used from three processes (API, worker, preview proxy), so its last-activity
 time lives in Postgres (``sandbox_activity``), never in memory. Each process debounces its

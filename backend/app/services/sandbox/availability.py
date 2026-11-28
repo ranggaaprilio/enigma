@@ -1,4 +1,5 @@
-"""Which sandbox providers can take a new workspace (local-docker-runtime Epic 06).
+"""Which sandbox providers can take a new workspace (local-docker-runtime Epic 06; Docker removed
+in Plan 8).
 
 ``check_runtime`` asks a provider, bounded by a short timeout: an unconfigured one is never
 probed, and a failing or hanging probe is an ``error``. Reasons are generic on purpose --
@@ -28,21 +29,18 @@ from app.services.sandbox.base import InsecureRuntimeError, SandboxRuntime
 
 logger = structlog.get_logger(__name__)
 
-PROVIDERS: tuple[str, ...] = ("daytona", "docker", "opensandbox")
+PROVIDERS: tuple[str, ...] = ("daytona", "opensandbox")
 HEALTH_TIMEOUT_SECONDS = 3.0
 
 AvailabilityStatus = Literal["ok", "error", "unconfigured", "disabled", "insecure"]
 
 PROVIDER_LABELS = {
     "daytona": "Daytona",
-    "docker": "Local Docker",
     "opensandbox": "OpenSandbox",
 }
 _REASONS = {
     ("daytona", "unconfigured"): "No Daytona API key is configured",
     ("daytona", "error"): "Daytona is not reachable",
-    ("docker", "unconfigured"): "No Docker daemon is configured",
-    ("docker", "error"): "The Docker daemon is not reachable",
     ("opensandbox", "unconfigured"): "No OpenSandbox server is configured",
     ("opensandbox", "error"): "The OpenSandbox server is not reachable",
     ("opensandbox", "insecure"): "The OpenSandbox server does not require authentication",
@@ -112,54 +110,11 @@ def warn_if_default_runtime_unconfigured(settings: Settings) -> None:
             return
 
 
-# Plan 7b: OpenSandbox replaces the custom Docker provider for self-hosting. A deprecated
-# provider keeps working (existing workspaces, an explicit choice) until it is removed.
-DEPRECATED_PROVIDERS = {"docker": "opensandbox"}
-
-
-def warn_if_deprecated_runtime_offered(settings: Settings) -> None:
-    """At startup: say so when new workspaces can still land on a deprecated provider."""
-    for provider, replacement in DEPRECATED_PROVIDERS.items():
-        if settings.runtime_allowed(provider) and _runtime(provider).configured:
-            logger.warning("deprecated_runtime", provider=provider, replacement=replacement)
-
-
-def require_metrics_token_for_docker(settings: Settings) -> None:
-    """The preview proxy sits on every Docker sandbox's network, so a tenant can reach its
-    /health and /metrics; with Docker as the default they are never left open."""
-    if settings.sandbox_runtime_default == "docker" and not has_metrics_token(settings):
-        raise RuntimeError(
-            "METRICS_TOKEN is required when SANDBOX_RUNTIME_DEFAULT=docker: the preview proxy "
-            "is reachable from every sandbox, and its /health and /metrics are token-gated."
-        )
-
-
 Availability = Callable[[str], Awaitable[RuntimeAvailability]]
 
 
 def has_metrics_token(settings: Settings) -> bool:
     return bool(settings.metrics_token and settings.metrics_token.strip())
-
-
-def _check_placement(provider: str, settings: Settings) -> None:
-    """Deployment rules for Docker. The user gets a generic refusal; the operator's reason
-    goes to the log, so a non-admin never learns the deployment's topology."""
-    if provider != "docker":
-        return
-    if not settings.docker_upkeep_enabled:
-        # Nothing would stop it when idle, sweep it when orphaned, or re-attach the preview
-        # proxy to its network after a proxy restart.
-        reason = "docker_upkeep_disabled"
-    elif settings.run_execution_mode == "queue" and not settings.docker_single_host:
-        reason = "queue_mode_without_docker_single_host"
-    elif not has_metrics_token(settings):
-        # The preview proxy is attached to every Docker sandbox's network: without a token
-        # its /health and /metrics would be open to the tenant's code.
-        reason = "metrics_token_missing"
-    else:
-        return
-    logger.warning("sandbox_runtime_refused", provider=provider, reason=reason)
-    raise RuntimeChoiceError("Local Docker is not available for this deployment")
 
 
 def _refusal(found: RuntimeAvailability) -> RuntimeChoiceError:
@@ -179,13 +134,11 @@ async def choose_runtime(
         found = await availability(requested)
         if not found.available:
             raise _refusal(found)
-        _check_placement(requested, settings)
         return requested
 
     default = settings.sandbox_runtime_default
     found = await availability(default)
     if found.available:
-        _check_placement(default, settings)
         return default
     for other in (p for p in PROVIDERS if p != default):
         if not settings.runtime_allowed(other):
@@ -193,7 +146,6 @@ async def choose_runtime(
         fallback = await availability(other)
         if not fallback.available:
             continue
-        _check_placement(other, settings)
         logger.warning("sandbox_runtime_default_fallback", default=default, chosen=other)
         return other
     raise _refusal(found)

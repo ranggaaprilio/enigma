@@ -5,8 +5,9 @@ AI agent workspace platform built with FastAPI, React, PostgreSQL, and Redis.
 Organises work in a three-tier hierarchy: **Projects → Teams → Workspaces**.
 Each workspace is an isolated sandbox with a full dev environment — git, files, terminal, AI agent
 runner, `code-server` editor, live preview server, and a spec-driven development pipeline. The
-sandbox runs either on [Daytona](https://daytona.io/) or as a **local Docker/Podman container on
-your own machine**, so Enigma can be fully self-hosted without any subscription. The agent and
+sandbox runs either on [Daytona](https://daytona.io/) or on a self-hosted
+[OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) server **on your own machine**, so
+Enigma can be fully self-hosted without any subscription. The agent and
 every git/build operation execute **inside** the sandbox; the platform only orchestrates them.
 
 ## Contents
@@ -18,7 +19,7 @@ every git/build operation execute **inside** the sandbox; the platform only orch
   - [Sandbox strategy](#sandbox-strategy)
   - [Git strategy](#git-strategy)
 - [Quick Start](#quick-start)
-  - [Option A: local Docker/Podman sandboxes (no subscription)](#option-a-local-dockerpodman-sandboxes-no-subscription)
+  - [Option A: OpenSandbox sandboxes (no subscription)](#option-a-opensandbox-sandboxes-no-subscription)
   - [Option B: Daytona sandboxes](#option-b-daytona-sandboxes)
 - [Services](#services)
 - [Development](#development)
@@ -84,7 +85,7 @@ that accepts a base URL — the direct `openai` provider hardcodes `api.openai.c
 flowchart TD
     A([Register / Login]) --> B[Create a Project]
     B --> C[Create a Team in the Project]
-    C --> D[Create a Workspace<br/>pick runtime: Docker or Daytona]
+    C --> D[Create a Workspace<br/>pick runtime: OpenSandbox or Daytona]
     D -->|provisions on creation| S[(Sandbox)]
     D --> E[Connect a git repo + credential]
     E --> F[Clone repository into the sandbox]
@@ -118,18 +119,21 @@ Enigma ships two interchangeable sandbox providers behind one `SandboxRuntime` i
 (`backend/app/services/sandbox/`). A workspace is pinned to the provider it was created with; an
 installation can offer one or both, and `/health` reports each.
 
-| | **Local Docker / Podman** (`runtime="docker"`) | **Daytona** (`runtime="daytona"`) |
+| | **OpenSandbox** (`runtime="opensandbox"`) | **Daytona** (`runtime="daytona"`) |
 |---|---|---|
-| What a sandbox is | One long-lived container per workspace on your own daemon, on its own bridge network | One Daytona sandbox per workspace, created from a snapshot |
-| Needs | Docker Engine 24+ or Podman 5+, `enigma-sandbox:latest` built locally, `METRICS_TOKEN` | A Daytona account/API key and the published custom snapshot |
-| Isolation | `cap_drop=ALL`, `no-new-privileges`, pids/CPU/memory limits, no mounts, per-sandbox network, optional egress allow-list via a dedicated egress proxy, optional disk quota | Daytona's isolation plus its network policy |
-| Scale | **Single host.** API, workers, and preview proxy must share the daemon | Multi-replica Kubernetes deployment (`deploy/k8s`) |
+| What a sandbox is | One container per workspace, managed by an `opensandbox-server` you run (next to the stack or on its own VM) | One Daytona sandbox per workspace, created from a snapshot |
+| Needs | Docker Engine 24+ or Podman 5+ for the server, `enigma-sandbox:latest` built locally, `OPENSANDBOX_API_KEY`, `OPENSANDBOX_EXECD_TOKEN_KEY`, `METRICS_TOKEN` | A Daytona account/API key and the published custom snapshot |
+| Isolation | Server-wide container floor (`drop_capabilities = ["ALL"]`, `no_new_privileges`, pids limit, non-root), checked by Enigma on every sandbox; a per-sandbox execd token; an egress policy that always denies private ranges (`dns+nft`) | Daytona's isolation plus its network policy |
+| Scale | The server runs on one host; Enigma reaches it over a private network, also from Kubernetes (`deploy/k8s/overlays/opensandbox-external`) | Multi-replica Kubernetes deployment (`deploy/k8s`) |
 | Cost | Your hardware | Per-sandbox billing; idle sandboxes auto-stop |
 | Feature surface | Identical: agent, files, git, terminal, editor, preview, services, worktrees, Spec Kit | Identical |
 
 Both providers run the **same image** (`sandbox/Dockerfile`), so a project behaves the same
-wherever it runs. The full operator guide for the Docker profile is
-[`docs/self-host-docker.md`](docs/self-host-docker.md).
+wherever it runs. The full operator guide for OpenSandbox is
+[`docs/self-host-opensandbox.md`](docs/self-host-opensandbox.md). The custom Docker provider
+(`runtime="docker"`) was removed after `v0.1.0`; see
+[Moving from Docker](docs/self-host-opensandbox.md#moving-from-docker-upgrading-to-v020) for
+leftover workspaces.
 
 ### Sandbox strategy
 
@@ -145,9 +149,9 @@ flowchart LR
     end
 
     RT -->|SDK / REST| DAY[(Daytona API)]
-    RT -->|daemon socket| DOCK[(Docker / Podman daemon)]
+    RT -->|API + per-sandbox execd token| OSB[(OpenSandbox server)]
     DAY -->|create from snapshot| SB
-    DOCK -->|run enigma-sandbox:latest| SB
+    OSB -->|run enigma-sandbox:latest| SB
 
     subgraph SB[Workspace Sandbox]
         direction TB
@@ -193,7 +197,6 @@ Key points:
   the background (toolchain + dependencies only). The app's `dev` task is started on demand from the
   **Run App** button; the panel then polls for the open port and exposes it through the preview proxy
   on port 8001 using short-lived signed URLs. An app that was run auto-resumes after a sandbox sleep.
-  On Docker, a dev server bound to `127.0.0.1` is relayed to the proxy and only to the proxy.
 - **Editor** runs `code-server` on port 13337 inside the sandbox and serves it through the same
   proxy, on a **stable** hostname (`editor-<token>.<proxy-host>`) minted once per workspace. The
   hostname has to be stable because code-server keeps its whole workbench state (open editors,
@@ -248,7 +251,6 @@ Key points:
   `services/git_providers.py`; token auth rides on a per-command HTTP basic header with the
   provider's username (`x-access-token` / `oauth2` / `x-token-auth`), SSH auth uses a
   server-generated deploy key materialised in the sandbox only for the duration of a command.
-  (With the Docker egress allow-list enabled, only HTTPS/token git can leave the sandbox.)
 - **Pull requests** are created from a worktree's branch into the default branch via the GitHub REST
   API and cached in the `pull_requests` table for listing.
 - **Spec-Driven Development** commits each phase's artifact to the feature branch
@@ -261,10 +263,10 @@ Key points:
 - [Podman](https://podman.io/) 5+ or Docker Engine 24+ with Compose support — `podman` is the default.
 - An LLM endpoint for the agent: any OpenAI-compatible endpoint (OpenAI, a LiteLLM proxy, Ollama,
   LM Studio, …). It can be entered from the UI after first login.
-- **Either** a Docker/Podman daemon to host sandboxes locally (Option A) **or** a
+- **Either** a Docker/Podman daemon for a local OpenSandbox server (Option A) **or** a
   [Daytona](https://daytona.io/) account and API key (Option B).
 
-### Option A: local Docker/Podman sandboxes (no subscription)
+### Option A: OpenSandbox sandboxes (no subscription)
 
 1. Build the sandbox image once (needs network access at build time):
    ```bash
@@ -278,34 +280,38 @@ Key points:
    ```bash
    AUTH_SECRET_KEY=...                  # python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
    WORKSPACE_ENV_ENCRYPTION_KEY=...     # python3 -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())'
-   METRICS_TOKEN=...                    # required with Docker sandboxes
+   OPENSANDBOX_API_KEY=...              # long random value; the server's API key
+   OPENSANDBOX_EXECD_TOKEN_KEY=...      # long random value; keys each sandbox's execd token
+   METRICS_TOKEN=...                    # required with OpenSandbox sandboxes
    DAYTONA_API_KEY=                     # leave empty
-   SANDBOX_RUNTIME_DEFAULT=docker
    ```
-   On a Podman machine or rootless Podman, also set `DOCKER_SOCKET` to the daemon socket path
-   (see [`docs/self-host-docker.md`](docs/self-host-docker.md#socket-path)).
+   On macOS or Windows (Podman machine, Docker Desktop), also set
+   `OPENSANDBOX_SERVER_CONFIG=sandbox.compose-desktop.toml`. If the daemon socket is not at
+   `/var/run/docker.sock`, set `DOCKER_SOCKET` (see the header of `docker-compose.opensandbox.yml`).
 
-3. Start the stack with the sandbox override, which mounts the daemon socket into the backend
-   and worker only, labels the preview proxy, and runs the egress proxy:
+3. Start the stack with the OpenSandbox override, which runs the server next to the stack (the
+   only service that gets the daemon socket) and makes `opensandbox` the default runtime:
    ```bash
-   podman compose -f docker-compose.yml -f docker-compose.sandbox.yml up --build -d
-   # or: docker compose -f docker-compose.yml -f docker-compose.sandbox.yml up --build -d
+   npm run dev:opensandbox
+   # = podman compose -f docker-compose.yml -f docker-compose.opensandbox.yml up --build
+   # or: npm run dev:opensandbox:docker
    ```
+   Pre-pull `opensandbox/execd:v1.1.0` and `opensandbox/egress:v1.1.7` once, or the first create
+   can time out.
 
 4. Run database migrations (required on first start and after any update):
    ```bash
    podman compose exec backend uv run alembic upgrade head
    ```
 
-5. Check `http://localhost:8000/health` — it should report `"docker": {"status": "ok"}` — then
-   open the app, register the first user (the platform owner), and create a workspace.
+5. Check `http://localhost:8000/health` — it should report `runtimes.opensandbox.status = "ok"` —
+   then open the app, register the first user (the platform owner), and create a workspace.
 
-> **Security note.** The daemon socket is root-equivalent on the host. Run this profile on a
-> machine or VM you are happy to hand to everyone who can log in to Enigma, bind other host
-> services to `127.0.0.1`, and consider `SANDBOX_NETWORK_ALLOW_LIST` or
-> `SANDBOX_NETWORK_BLOCK_ALL=true` to restrict sandbox egress. Details and tuning
-> (CPU/memory/pids/disk limits, idle stop, backup/restore) are in
-> [`docs/self-host-docker.md`](docs/self-host-docker.md).
+> **Security note.** The OpenSandbox server holds the daemon socket, which is root-equivalent on
+> the host. Run this profile on a machine or VM you are happy to hand to everyone who can log in
+> to Enigma, and consider `SANDBOX_NETWORK_ALLOW_LIST` or `SANDBOX_NETWORK_BLOCK_ALL=true` to
+> restrict sandbox egress. Server placement, the security controls, upkeep and the security suite
+> are in [`docs/self-host-opensandbox.md`](docs/self-host-opensandbox.md).
 
 ### Option B: Daytona sandboxes
 
@@ -334,7 +340,7 @@ Key points:
 
 5. Open the app and register the first user.
 
-Both options can be combined: keep `DAYTONA_API_KEY` set *and* start with the sandbox override,
+Both options can be combined: keep `DAYTONA_API_KEY` set *and* start with the OpenSandbox override,
 and the workspace create form lets each user pick a runtime. `SANDBOX_RUNTIMES_ALLOWED` limits
 which ones are offered.
 
@@ -363,7 +369,7 @@ which ones are offered.
 | Backend (FastAPI) | 8000 | Auto-reload with `--reload`; API docs at `/docs` |
 | Preview proxy | 8001 | Proxies sandbox previews and the embedded editor for both runtimes |
 | Worker (arq) | — | `--profile queue`; executes runs when `RUN_EXECUTION_MODE=queue` |
-| Egress proxy | 3128 (internal) | `docker-compose.sandbox.yml` only; enforces `SANDBOX_NETWORK_ALLOW_LIST` for Docker sandboxes |
+| OpenSandbox server | 8080 (internal) | `docker-compose.opensandbox.yml` only; manages sandboxes, holds the daemon socket, publishes no host port |
 | PgBouncer | 5432 (internal) | `--profile pgbouncer`; optional connection pooler |
 | PostgreSQL 16 | 5432 | Persisted in `postgres_data` volume |
 | Redis 7 | 6379 | Persisted in `redis_data` volume |
@@ -388,10 +394,13 @@ pnpm test
 pnpm build
 ```
 
-Real-daemon tests for the Docker provider are opt-in:
+The OpenSandbox security suite runs against a real server and is opt-in:
 ```bash
-cd backend && DOCKER_INTEGRATION_TESTS=1 uv run pytest tests/test_docker_integration.py
+cd backend && OPENSANDBOX_INTEGRATION_TESTS=1 OPENSANDBOX_API_URL=http://127.0.0.1:8080 \
+  OPENSANDBOX_API_KEY=<key> uv run pytest tests/test_opensandbox_integration.py
 ```
+To run it through the compose override, see
+[`docs/self-host-opensandbox.md`](docs/self-host-opensandbox.md#the-security-suite).
 
 > See `AGENTS.md` for the full command reference, architecture notes, and gotchas (async-only
 > backend, `asyncpg` driver, `podman` default, no-component-library frontend, sandbox provider
@@ -405,19 +414,17 @@ Copy `.env.example` to `.env`. Key variables:
 |---|---|---|
 | `AUTH_SECRET_KEY` | Yes | Secret for signing session tokens. Compose refuses to start without it |
 | `WORKSPACE_ENV_ENCRYPTION_KEY` | Yes | Fernet key for encrypting workspace env vars, repo tokens, and the global LLM API key. Rotating it invalidates all three |
-| `SANDBOX_RUNTIME_DEFAULT` | No | Provider for new workspaces when the user does not choose: `daytona` (default) or `docker` |
+| `SANDBOX_RUNTIME_DEFAULT` | No | Provider for new workspaces when the user does not choose: `daytona` (default) or `opensandbox` (the OpenSandbox override sets it) |
 | `SANDBOX_RUNTIMES_ALLOWED` | No | Comma-separated providers offered for new workspaces (empty = all; must include the default) |
 | `SANDBOX_AUTO_STOP_MINUTES` | No | Idle minutes before a sandbox stops, on both runtimes (default `30`, `0` = never) |
 | `SANDBOX_NETWORK_BLOCK_ALL` / `SANDBOX_NETWORK_ALLOW_LIST` | No | Sandbox egress policy: block everything, or allow only the given CIDRs. Applies to both runtimes |
-| `DAYTONA_API_KEY` | Option B | Daytona API key for sandbox provisioning. Leave empty for a Docker-only install |
+| `DAYTONA_API_KEY` | Option B | Daytona API key for sandbox provisioning. Leave empty for an OpenSandbox-only install |
 | `DAYTONA_API_URL` / `DAYTONA_TARGET` | No | Self-hosted Daytona URL / target region |
 | `DAYTONA_DEFAULT_SNAPSHOT` | Option B | Custom snapshot name (e.g. `enigma-mise-code`), needed for preview/editor/SDD |
-| `METRICS_TOKEN` | Option A | Bearer token for `/health` and `/metrics` on the preview proxy. Required with Docker sandboxes and outside `ENVIRONMENT=local` |
-| `DOCKER_SOCKET` | Option A | Daemon socket path on the host (default `/var/run/docker.sock`) |
-| `DOCKER_SANDBOX_IMAGE` | No | Image for Docker sandboxes (default `enigma-sandbox:latest`) |
-| `DOCKER_SANDBOX_CPUS` / `DOCKER_SANDBOX_MEMORY_MB` / `DOCKER_SANDBOX_PIDS_LIMIT` / `DOCKER_SANDBOX_DISK_MB` | No | Per-sandbox limits on Docker (defaults `2` / `4096` / `4096` / `0` = no disk quota) |
-| `DOCKER_SANDBOX_SUBNET_POOL` | No | Pool for per-sandbox networks (default `10.213.0.0/16`); pick a range your LAN does not use |
-| `DOCKER_SINGLE_HOST` | Queue mode | Set `true` when API, workers, and proxy share one daemon; otherwise Docker workspaces are refused in `RUN_EXECUTION_MODE=queue` |
+| `METRICS_TOKEN` | Option A | Bearer token for `/health` and `/metrics` on the preview proxy. Required by the OpenSandbox override and outside `ENVIRONMENT=local` |
+| `OPENSANDBOX_API_KEY` | Option A | The OpenSandbox server's API key. Without it, OpenSandbox is reported `insecure` and never offered |
+| `OPENSANDBOX_EXECD_TOKEN_KEY` | Option A | Keys each sandbox's execd access token. Required outside `ENVIRONMENT=local`; rotating it locks Enigma out of existing sandboxes until they are recreated |
+| `OPENSANDBOX_SERVER_CONFIG` | No | Compose only: server config under `deploy/opensandbox/` (default `sandbox.compose.toml`; `sandbox.compose-desktop.toml` on Podman machine / Docker Desktop) |
 | `RUN_EXECUTION_MODE` | No | `inline` (default, runs inside the API) or `queue` (arq workers) |
 | `AGENT_PROVIDER` | No | Agent engine: `openhands`, `openai`, or `auto`. **Fallback only** — the global LLM settings stored from the UI take precedence |
 | `OPENHANDS_LLM_BASE_URL` / `OPENHANDS_LLM_API_KEY` / `OPENHANDS_LLM_MODEL` | No | Fallback OpenAI-compatible endpoint. Overridden by the DB-backed global LLM settings |
@@ -436,8 +443,8 @@ Compose is the dev and single-host self-host setup (`--reload`, bind mounts). Pr
 Kubernetes from `deploy/k8s` (Kustomize), using the default (last) stage of each Dockerfile:
 separate API, worker (KEDA, scales on queue depth) and preview-proxy deployments, a static nginx
 frontend, zero-downtime rolling updates, and a migrate Job before every rollout. The Kubernetes
-deployment is **Daytona-only**; the Docker sandbox provider is a single-host option and is not
-scheduled across nodes. Secrets, release steps, rollback and scaling knobs:
+deployment uses Daytona, or an OpenSandbox server on a dedicated VM outside the cluster
+(`deploy/k8s/overlays/opensandbox-external`). Secrets, release steps, rollback and scaling knobs:
 [`deploy/README.md`](deploy/README.md).
 
 ## Sandbox image
@@ -449,7 +456,7 @@ The stock `daytonaio/sandbox` image lacks these and **cannot** install them at r
 sandbox egress blocks `curl | sh`. The build host needs network access; the tools are baked in.
 
 ```bash
-./sandbox/build-local-image.sh     # Docker/Podman: tags enigma-sandbox:latest on the local daemon
+./sandbox/build-local-image.sh     # OpenSandbox: tags enigma-sandbox:latest on the local daemon
 ./daytona/build-snapshot.sh        # Daytona: builds and publishes snapshot "enigma-mise-code"
 ```
 
@@ -458,13 +465,12 @@ workspaces after an image change so they pick it up. See `daytona/README.md` for
 
 ## Documentation
 
-- [`docs/self-host-docker.md`](docs/self-host-docker.md) — operator guide for the local Docker/Podman profile.
+- [`docs/self-host-opensandbox.md`](docs/self-host-opensandbox.md) — operator guide for self-hosting with OpenSandbox.
 - [`deploy/README.md`](deploy/README.md) — Kubernetes runbook.
 - [`AGENTS.md`](AGENTS.md) — architecture, commands, and gotchas for contributors (human and AI).
 - `docs/implementation-plan/` — the original MVP build plan.
 - `docs/improvement-epics/` — post-MVP feature epics.
 - `docs/horizontal-scale/` — control-plane scaling (queue mode, leases, retention, stateless proxy, Kubernetes).
-- `docs/local-docker-runtime/` — design of the Docker sandbox provider.
 - `docs/hybrid-runtime-migration/`, `docs/copilot-workspace-parity/` — planned work.
 
 ## Contributing
@@ -475,8 +481,8 @@ workflow, coding conventions, and the checks a pull request must pass, and
 
 ## Security
 
-Enigma runs AI agents and previewed code inside sandboxes and, in the Docker profile, holds the
-daemon socket. Please report vulnerabilities privately as described in
+Enigma runs AI agents and previewed code inside sandboxes, and a self-hosted OpenSandbox server
+holds the daemon socket. Please report vulnerabilities privately as described in
 [`SECURITY.md`](SECURITY.md) rather than opening a public issue.
 
 ## License

@@ -28,8 +28,8 @@
 ARG BASE_SNAPSHOT=daytonaio/sandbox:0.8.0
 FROM ${BASE_SNAPSHOT}
 
-# tmux backs the reconnectable terminal sessions on the local Docker runtime
-# (docs/local-docker-runtime/03); the base already ships git, openssh-client, GNU
+# tmux was added for the terminals of the Docker runtime (removed after v0.1.0) and stays
+# available in every sandbox; the base already ships git, openssh-client, GNU
 # coreutils `timeout` and `setsid`. Root only for the package install, then straight back
 # to the unprivileged user every later layer (and the running sandbox) uses.
 USER root

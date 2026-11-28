@@ -45,12 +45,12 @@ async def test_an_unconfigured_provider_is_never_probed() -> None:
         probed = True
         return "ok"
 
-    result = await check_runtime(_Runtime(configured=False, health=probe), "docker")
+    result = await check_runtime(_Runtime(configured=False, health=probe), "opensandbox")
     assert result == RuntimeAvailability(
-        provider="docker",
+        provider="opensandbox",
         configured=False,
         status="unconfigured",
-        reason="No Docker daemon is configured",
+        reason="No OpenSandbox server is configured",
     )
     assert probed is False and result.available is False
 
@@ -61,10 +61,10 @@ async def test_a_healthy_provider_is_available() -> None:
 
 
 async def test_a_failing_or_hanging_probe_is_an_error_with_a_generic_reason() -> None:
-    failed = await check_runtime(_Runtime(health=_fails), "docker")
+    failed = await check_runtime(_Runtime(health=_fails), "opensandbox")
     assert failed.status == "error"
     # Never the infrastructure detail (socket path, URL) from the underlying error.
-    assert failed.reason == "The Docker daemon is not reachable"
+    assert failed.reason == "The OpenSandbox server is not reachable"
 
     hung = await check_runtime(_Runtime(health=_hangs), "daytona", timeout=0.05)
     assert (hung.status, hung.reason) == ("error", "Daytona is not reachable")
@@ -84,24 +84,16 @@ def _availability(**statuses: str):
 
 
 def _settings(**values) -> Settings:
-    return Settings(
-        **{
-            "sandbox_runtime_default": "daytona",
-            "metrics_token": "scrape-secret",
-            "docker_upkeep": True,
-            **values,
-        }
-    )
+    return Settings(**{"sandbox_runtime_default": "daytona", **values})
 
 
 async def test_an_explicit_available_runtime_is_used() -> None:
-    choose = _availability(daytona="ok", docker="ok", opensandbox="ok")
-    assert await choose_runtime("docker", _settings(), choose) == "docker"
+    choose = _availability(daytona="ok", opensandbox="ok")
     assert await choose_runtime("daytona", _settings(), choose) == "daytona"
     assert await choose_runtime("opensandbox", _settings(), choose) == "opensandbox"
 
 
-async def test_opensandbox_unavailable_is_refused_not_swapped() -> None:
+async def test_an_explicit_unavailable_runtime_is_refused_not_swapped() -> None:
     with pytest.raises(RuntimeChoiceError) as raised:
         await choose_runtime(
             "opensandbox", _settings(), _availability(daytona="ok", opensandbox="error")
@@ -109,95 +101,24 @@ async def test_opensandbox_unavailable_is_refused_not_swapped() -> None:
     assert raised.value.message == "OpenSandbox is not available: opensandbox error"
 
 
-async def test_no_choice_falls_back_to_opensandbox_when_default_and_docker_are_down() -> None:
-    """With three providers the fallback walks all the others, not just one."""
-    choose = _availability(docker="error", opensandbox="ok")  # no Daytona key
-    assert await choose_runtime(None, _settings(), choose) == "opensandbox"
-
-
-async def test_an_explicit_unavailable_runtime_is_refused_not_swapped() -> None:
-    with pytest.raises(RuntimeChoiceError) as raised:
-        await choose_runtime("docker", _settings(), _availability(daytona="ok", docker="error"))
-    assert raised.value.message == "Local Docker is not available: docker error"
-
-
 async def test_no_choice_takes_the_default_when_it_is_available() -> None:
-    choose = _availability(daytona="ok", docker="ok")
+    choose = _availability(daytona="ok", opensandbox="ok")
     assert await choose_runtime(None, _settings(), choose) == "daytona"
     assert (
-        await choose_runtime(None, _settings(sandbox_runtime_default="docker"), choose)
-        == "docker"
+        await choose_runtime(None, _settings(sandbox_runtime_default="opensandbox"), choose)
+        == "opensandbox"
     )
 
 
 async def test_no_choice_falls_back_to_the_other_provider_when_the_default_is_down() -> None:
-    choose = _availability(docker="ok")  # no Daytona key: the self-host profile
-    assert await choose_runtime(None, _settings(), choose) == "docker"
+    choose = _availability(opensandbox="ok")  # no Daytona key: the self-host profile
+    assert await choose_runtime(None, _settings(), choose) == "opensandbox"
 
 
 async def test_no_choice_with_neither_available_reports_the_default() -> None:
     with pytest.raises(RuntimeChoiceError) as raised:
-        await choose_runtime(None, _settings(), _availability(docker="error"))
+        await choose_runtime(None, _settings(), _availability(opensandbox="error"))
     assert raised.value.message == "Daytona is not available: daytona unconfigured"
-
-
-async def test_docker_in_queue_mode_needs_the_single_host_flag() -> None:
-    choose = _availability(daytona="ok", docker="ok")
-    queue = _settings(run_execution_mode="queue")
-    with pytest.raises(RuntimeChoiceError) as raised:
-        await choose_runtime("docker", queue, choose)
-    # Generic for the user; the operator finds the reason in the log.
-    assert raised.value.message == "Local Docker is not available for this deployment"
-    single_host = _settings(run_execution_mode="queue", docker_single_host=True)
-    assert await choose_runtime("docker", single_host, choose) == "docker"
-    # Daytona is unaffected by the flag.
-    assert await choose_runtime("daytona", queue, choose) == "daytona"
-
-
-async def test_the_fallback_to_docker_respects_the_queue_rule_too() -> None:
-    with pytest.raises(RuntimeChoiceError):
-        queue = _settings(run_execution_mode="queue")
-        await choose_runtime(None, queue, _availability(docker="ok"))
-
-
-async def test_docker_is_refused_without_a_metrics_token_even_when_not_the_default() -> None:
-    """A Docker sandbox sits on a network the preview proxy is attached to, so with no token
-    its tenant could read the proxy's /health and /metrics."""
-    choose = _availability(daytona="ok", docker="ok")
-    for token in (None, "", "   "):
-        with pytest.raises(RuntimeChoiceError):
-            await choose_runtime("docker", _settings(metrics_token=token), choose)
-    assert await choose_runtime("daytona", _settings(metrics_token=None), choose) == "daytona"
-
-
-async def test_docker_is_refused_where_no_upkeep_would_look_after_it() -> None:
-    """Idle stop, the orphan sweep and the proxy re-attach run only where upkeep runs: a
-    Docker workspace elsewhere would never be stopped and its previews break on the next
-    proxy restart."""
-    choose = _availability(daytona="ok", docker="ok")
-    with pytest.raises(RuntimeChoiceError):
-        await choose_runtime("docker", _settings(docker_upkeep=None), choose)
-    with pytest.raises(RuntimeChoiceError):
-        await choose_runtime(
-            "docker", _settings(sandbox_runtime_default="docker", docker_upkeep=False), choose
-        )
-    # Unset follows the default: on a Docker default, upkeep runs.
-    docker_default = _settings(sandbox_runtime_default="docker", docker_upkeep=None)
-    assert await choose_runtime(None, docker_default, choose) == "docker"
-
-
-def test_docker_as_default_requires_a_metrics_token() -> None:
-    from app.services.sandbox.availability import require_metrics_token_for_docker
-
-    for token in (None, "  "):
-        with pytest.raises(RuntimeError, match="METRICS_TOKEN"):
-            require_metrics_token_for_docker(
-                _settings(sandbox_runtime_default="docker", metrics_token=token)
-            )
-    require_metrics_token_for_docker(
-        _settings(sandbox_runtime_default="docker", metrics_token="s3cret")
-    )
-    require_metrics_token_for_docker(_settings(metrics_token=None))  # Daytona default
 
 
 def test_an_unconfigured_default_with_a_configured_other_logs_a_warning(monkeypatch) -> None:
@@ -205,12 +126,12 @@ def test_an_unconfigured_default_with_a_configured_other_logs_a_warning(monkeypa
 
     from app.services.sandbox import availability
 
-    runtimes = {"daytona": _Runtime(configured=False), "docker": _Runtime()}
+    runtimes = {"daytona": _Runtime(configured=False), "opensandbox": _Runtime()}
     monkeypatch.setattr(availability, "_runtime", runtimes.__getitem__)
     with capture_logs() as logs:
         availability.warn_if_default_runtime_unconfigured(_settings())
     assert [entry["event"] for entry in logs] == ["sandbox_runtime_default_unconfigured"]
-    assert logs[0]["fallback"] == "docker"
+    assert logs[0]["fallback"] == "opensandbox"
 
     runtimes["daytona"] = _Runtime()
     with capture_logs() as logs:
@@ -219,28 +140,27 @@ def test_an_unconfigured_default_with_a_configured_other_logs_a_warning(monkeypa
 
 
 async def test_a_provider_left_out_of_the_allow_list_is_refused_when_picked() -> None:
-    choose = _availability(daytona="ok", docker="ok")
+    choose = _availability(daytona="ok", opensandbox="ok")
     with pytest.raises(RuntimeChoiceError) as raised:
-        await choose_runtime("docker", _settings(sandbox_runtimes_allowed="daytona"), choose)
-    assert raised.value.message == "Local Docker is not available: Not enabled on this deployment"
+        await choose_runtime("opensandbox", _settings(sandbox_runtimes_allowed="daytona"), choose)
+    assert raised.value.message == "OpenSandbox is not available: Not enabled on this deployment"
 
 
 async def test_no_choice_never_falls_back_to_a_disallowed_provider() -> None:
     allowed = _settings(sandbox_runtimes_allowed="daytona")
     with pytest.raises(RuntimeChoiceError) as raised:
-        await choose_runtime(None, allowed, _availability(docker="ok"))
+        await choose_runtime(None, allowed, _availability(opensandbox="ok"))
     assert raised.value.message == "Daytona is not available: daytona unconfigured"
 
 
 def test_the_allow_list_must_name_known_providers_and_include_the_default() -> None:
-    assert _settings(sandbox_runtimes_allowed="daytona, docker").sandbox_runtimes_allowed == [
-        "daytona",
-        "docker",
-    ]
+    assert _settings(
+        sandbox_runtimes_allowed="daytona, opensandbox"
+    ).sandbox_runtimes_allowed == ["daytona", "opensandbox"]
     with pytest.raises(ValueError, match="unknown providers"):
         _settings(sandbox_runtimes_allowed="daytona,k8s")
     with pytest.raises(ValueError, match="must include sandbox_runtime_default"):
-        _settings(sandbox_runtimes_allowed="docker")
+        _settings(sandbox_runtimes_allowed="opensandbox")
 
 
 async def test_runtime_availability_reports_a_disallowed_provider_as_disabled(
@@ -260,7 +180,7 @@ async def test_runtime_availability_reports_a_disallowed_provider_as_disabled(
         availability, "get_settings", lambda: _settings(sandbox_runtimes_allowed="daytona")
     )
 
-    found = await availability.runtime_availability("docker")
+    found = await availability.runtime_availability("opensandbox")
 
     assert (found.status, found.available, found.reason) == (
         "disabled",
@@ -270,43 +190,12 @@ async def test_runtime_availability_reports_a_disallowed_provider_as_disabled(
     assert probed is False
 
 
-@pytest.mark.parametrize(
-    ("docker_configured", "allowed", "logged"),
-    [
-        (True, "", True),
-        (False, "", False),  # not set up: nothing to warn about
-        (True, "daytona,opensandbox", False),  # not offered for new workspaces
-    ],
-)
-def test_offering_the_deprecated_docker_provider_logs_once_at_startup(
-    monkeypatch, docker_configured, allowed, logged
-) -> None:
-    from structlog.testing import capture_logs
-
-    from app.services.sandbox import availability
-
-    runtimes = {
-        "daytona": _Runtime(),
-        "docker": _Runtime(configured=docker_configured),
-        "opensandbox": _Runtime(),
-    }
-    monkeypatch.setattr(availability, "_runtime", runtimes.__getitem__)
-    with capture_logs() as logs:
-        availability.warn_if_deprecated_runtime_offered(
-            _settings(sandbox_runtimes_allowed=allowed)
-        )
-    expected = [{"event": "deprecated_runtime", "provider": "docker", "replacement": "opensandbox"}]
-    assert [
-        {k: entry[k] for k in ("event", "provider", "replacement")} for entry in logs
-    ] == (expected if logged else [])
-
-
 def test_the_startup_warning_ignores_a_disallowed_fallback(monkeypatch) -> None:
     from structlog.testing import capture_logs
 
     from app.services.sandbox import availability
 
-    runtimes = {"daytona": _Runtime(configured=False), "docker": _Runtime()}
+    runtimes = {"daytona": _Runtime(configured=False), "opensandbox": _Runtime()}
     monkeypatch.setattr(availability, "_runtime", runtimes.__getitem__)
     with capture_logs() as logs:
         availability.warn_if_default_runtime_unconfigured(

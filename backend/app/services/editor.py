@@ -48,8 +48,6 @@ class EditorService:
 
     The launch command is unchanged from the new-tab era -- code-server still binds
     ``0.0.0.0:13337`` with ``--auth none`` inside the sandbox, which is never reachable directly.
-    On the Docker provider every sandbox shares one bridge network, so there it binds
-    ``127.0.0.1`` and the proxy-only port relay (``sandbox/port_relay.py``) carries it.
     What changed is the URL handed to the browser: it used to be a Daytona signed preview URL
     (a bearer credential in the address bar, rotating hourly); it is now
     ``https://editor-<alias>.<proxy-host>/?folder=...``, a stable origin with no credential,
@@ -78,14 +76,10 @@ class EditorService:
             raise EditorWorkspacePathError
         folder = await self._resolve_folder(workspace, worktree_id)
         existing = await self._latest_for_workspace(workspace.id, user_id)
-        # Docker sandboxes share one bridge network, so code-server (`--auth none`) listens on
-        # loopback there and only the proxy-only port relay reaches it (Epic 04). Daytona's
-        # preview edge is per-sandbox: unchanged.
-        loopback_only = workspace.runtime == "docker"
         try:
             result = await self.runtime.exec(
                 workspace,
-                self._ensure_command(folder, loopback_only=loopback_only),
+                self._ensure_command(folder),
                 cwd=workspace.workspace_path,
                 timeout=self.settings.editor_install_timeout_seconds,
             )
@@ -100,8 +94,6 @@ class EditorService:
                     "code-server could not be started in the sandbox. "
                     "Install it in the sandbox image or enable editor auto-install."
                 )
-            if loopback_only:
-                await self.runtime.expose_port(workspace, self.settings.editor_port)
         except SandboxRuntimeError as error:
             raise EditorRuntimeError(str(error)) from error
 
@@ -221,12 +213,11 @@ class EditorService:
             raise EditorWorktreeError("Worktree not found") from error
         return self._absolute_workspace_path(path)
 
-    def _ensure_command(self, folder: str, *, loopback_only: bool = False) -> str:
+    def _ensure_command(self, folder: str) -> str:
         binary = self.settings.editor_code_server_binary
         port = self.settings.editor_port
         quoted_folder = quote(folder, safe="/")
         run_log = "/tmp/execute-code-server.log"
-        bind = "127.0.0.1" if loopback_only else "0.0.0.0"
         listening = f"grep -qi ':{port:04X} [0-9A-F:]* 0A' /proc/net/tcp /proc/net/tcp6 2>/dev/null"
         install_log = "/tmp/execute-code-server-install.log"
         # Make a user-local install discoverable without needing sudo/PATH reloads.
@@ -248,16 +239,11 @@ class EditorService:
                 # launch line below (local-docker-runtime Epic 04).
                 (
                     f"{listening} || "
-                    f"nohup {binary} --auth none --bind-addr {bind}:{port} "
+                    f"nohup {binary} --auth none --bind-addr 0.0.0.0:{port} "
                     f"{quoted_folder} >{run_log} 2>&1 &"
                 ),
             ]
         )
-        if loopback_only:
-            # The relay can only take over a port that is already listening.
-            lines.append(
-                f"for i in $(seq 1 60); do {listening} && exit 0; sleep 0.5; done; exit 1"
-            )
         return "\n".join(lines)
 
     async def _get_workspace(self, workspace_id: UUID, user_id: UUID) -> Workspace:

@@ -3,7 +3,7 @@
 Each case yields a ready runtime and a workspace bound to it. The ``daytona`` case drives the
 real ``DaytonaRuntime`` over SDK-level fakes; the ``fake`` case is the interface-level double
 consumer tests inject, so it can never drift from what real providers promise. A new provider
-adds one case here (Epic 02: the Docker runtime over a fake daemon).
+adds one case here (``opensandbox`` drives the real adapter over SDK-level fakes).
 """
 
 from __future__ import annotations
@@ -22,9 +22,7 @@ from app.services.sandbox.daytona import DaytonaRuntime
 from tests.sandbox.fakes import (
     FakeDaytonaClient,
     FakeDaytonaSandbox,
-    FakeDockerClient,
     FakeSandboxRuntime,
-    docker_runtime_with,
     make_workspace,
     opensandbox_runtime_with,
 )
@@ -52,18 +50,13 @@ def echo(command: str) -> RuntimeCommandResult:
 PENDING: dict[str, dict[str, str]] = {}
 
 
-@pytest.fixture(params=["daytona", "docker", "fake", "opensandbox"])
+@pytest.fixture(params=["daytona", "fake", "opensandbox"])
 def case(request):
     reason = PENDING.get(request.param, {}).get(request.node.originalname)
     if reason:
         request.applymarker(
             pytest.mark.xfail(strict=True, raises=SandboxRuntimeError, reason=reason)
         )
-    if request.param == "docker":
-        client = FakeDockerClient(exec_handler=echo)
-        runtime = docker_runtime_with(client)
-        container = client.add_container("execute-conformance")
-        return runtime, make_workspace(container.id, runtime="docker")
     if request.param == "daytona":
         sandbox = FakeDaytonaSandbox("sandbox-1", exec_handler=echo)
         runtime = DaytonaRuntime(Settings(daytona_api_key="test"))

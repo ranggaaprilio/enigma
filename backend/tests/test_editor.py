@@ -259,7 +259,7 @@ async def editor_db_session():
     await engine.dispose()
 
 
-@pytest.mark.parametrize("runtime_name", ["daytona", "docker"])
+@pytest.mark.parametrize("runtime_name", ["daytona", "opensandbox"])
 async def test_editor_session_records_the_workspace_provider_as_bind_host(
     editor_db_session, runtime_name
 ):
@@ -298,10 +298,4 @@ async def test_editor_session_records_the_workspace_provider_as_bind_host(
     assert editor.bind_host == runtime_name
     [launch] = runtime.exec_calls
     port = get_settings().editor_port
-    if runtime_name == "docker":
-        # Security: sandboxes share one bridge, so code-server (`--auth none`) stays on
-        # loopback and only the proxy-only relay reaches it.
-        assert f"--bind-addr 127.0.0.1:{port}" in launch["command"]
-        assert runtime.exposed_ports == [port]
-    else:
-        assert f"--bind-addr 0.0.0.0:{port}" in launch["command"]
+    assert f"--bind-addr 0.0.0.0:{port}" in launch["command"]

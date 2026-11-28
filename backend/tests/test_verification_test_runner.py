@@ -46,7 +46,7 @@ async def _seed(maker):
             name="Verify",
             slug=uuid4().hex[:12],
             default_branch="main",
-            runtime="docker",
+            runtime="opensandbox",
             status="ready",
             workspace_path="workspace",
             sandbox_id=uuid4().hex,

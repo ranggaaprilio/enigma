@@ -32,7 +32,7 @@ from app.services.sandbox.opensandbox import (
     floor_violations,
 )
 from app.services.sandbox_maintenance import reconcile_opensandbox_orphans
-from tests.test_sandbox_maintenance import maker  # noqa: F401  (fixture)
+from tests.upkeep_fixtures import maker  # noqa: F401  (fixture)
 
 pytestmark = pytest.mark.skipif(
     os.getenv("OPENSANDBOX_INTEGRATION_TESTS") != "1",

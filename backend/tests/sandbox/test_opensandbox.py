@@ -161,7 +161,7 @@ async def test_file_modes_reach_execd_as_octal_digits() -> None:
 
 async def test_relative_paths_resolve_against_the_sandbox_home() -> None:
     """Workspaces store a relative ``workspace_path`` (``"workspace"``). Daytona resolves it
-    against the sandbox home and the Docker provider mirrors that; execd resolves it against
+    against the sandbox home; execd resolves it against
     ``/``, where ``mkdir /workspace`` is denied for the sandbox user. So the provider must
     make relative paths absolute itself, for files and for command working directories."""
     from app.core.config import get_settings
