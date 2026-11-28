@@ -7,6 +7,8 @@
   "scripts": {
     "dev": "podman compose up --build",
     "dev:docker": "docker compose up --build",
+    "dev:opensandbox": "podman compose -f docker-compose.yml -f docker-compose.opensandbox.yml up --build",
+    "dev:opensandbox:docker": "docker compose -f docker-compose.yml -f docker-compose.opensandbox.yml up --build",
     "test:backend": "cd backend && uv run pytest",
     "test:frontend": "cd frontend && pnpm test",
     "lint:frontend": "cd frontend && pnpm lint"

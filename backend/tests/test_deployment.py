@@ -273,6 +273,248 @@ def test_the_sandbox_override_runs_the_docker_upkeep():
         assert _merged_env(service)["DOCKER_UPKEEP"] == "${DOCKER_UPKEEP:-true}", service
 
 
+# --- OpenSandbox compose override (Plan 7b) --------------------------------------------------
+
+OPENSANDBOX_OVERRIDE = REPO / "docker-compose.opensandbox.yml"
+OPENSANDBOX_DEPLOY = REPO / "deploy" / "opensandbox"
+OPENSANDBOX_CLIENTS = ("backend", "worker", "preview-proxy")
+OPENSANDBOX_CONNECTION = (
+    "OPENSANDBOX_API_URL",
+    "OPENSANDBOX_API_KEY",
+    "OPENSANDBOX_EXECD_TOKEN_KEY",
+)
+OPENSANDBOX_SANDBOX_SETTINGS = (
+    "OPENSANDBOX_SANDBOX_IMAGE",
+    "OPENSANDBOX_SANDBOX_CPU",
+    "OPENSANDBOX_SANDBOX_MEMORY",
+    "OPENSANDBOX_SANDBOX_DISK",
+    "OPENSANDBOX_UPKEEP",
+)
+
+
+def _opensandbox_override() -> dict:
+    return yaml.safe_load(OPENSANDBOX_OVERRIDE.read_text())
+
+
+def _opensandbox_env(service: str) -> dict[str, str]:
+    """A service's environment with the OpenSandbox override applied (compose merges maps)."""
+    base = yaml.safe_load((REPO / "docker-compose.yml").read_text())["services"][service]
+    override = _opensandbox_override()["services"].get(service, {})
+    return {**base.get("environment", {}), **override.get("environment", {})}
+
+
+def _flat_toml(path: Path) -> dict[str, object]:
+    import tomllib
+
+    def flatten(table: dict, prefix: str = "") -> dict[str, object]:
+        out: dict[str, object] = {}
+        for key, value in table.items():
+            if isinstance(value, dict):
+                out.update(flatten(value, f"{prefix}{key}."))
+            else:
+                out[f"{prefix}{key}"] = value
+        return out
+
+    return flatten(tomllib.loads(path.read_text()))
+
+
+def test_base_compose_forwards_the_opensandbox_settings():
+    """The base file lists env explicitly, so an install pointing at an external OpenSandbox
+    server (no override) needs these forwarded, or OpenSandbox is silently unconfigured."""
+    services = yaml.safe_load((REPO / "docker-compose.yml").read_text())["services"]
+    for name in OPENSANDBOX_CLIENTS:
+        env = services[name]["environment"]
+        for key in OPENSANDBOX_CONNECTION:
+            assert env[key] == f"${{{key}:-}}", (name, key)
+    for name in ("backend", "worker"):
+        env = services[name]["environment"]
+        for key in OPENSANDBOX_SANDBOX_SETTINGS:
+            assert key in env, (name, key)
+        assert env["OPENSANDBOX_SANDBOX_IMAGE"] == (
+            "${OPENSANDBOX_SANDBOX_IMAGE:-enigma-sandbox:latest}"
+        )
+
+
+def test_opensandbox_override_gives_the_socket_only_to_the_server():
+    """The server is the one root-equivalent service; Enigma's own services reach sandboxes
+    only through its API and execd, so none of them gets the daemon socket."""
+    override = _opensandbox_override()
+    assert set(override["services"]) == {"opensandbox-server", *OPENSANDBOX_CLIENTS}
+    server = override["services"]["opensandbox-server"]
+    assert _socket_mounts(server) == [
+        "${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
+    ]
+    for name in OPENSANDBOX_CLIENTS:
+        assert _socket_mounts(override["services"][name]) == [], name
+
+
+def test_opensandbox_server_is_pinned_private_and_keyed():
+    server = _opensandbox_override()["services"]["opensandbox-server"]
+    assert re.fullmatch(
+        r"docker\.io/opensandbox/server:release-1\.2\.1@sha256:[0-9a-f]{64}", server["image"]
+    )
+    # No host port: only Enigma's services reach it, over the compose networks.
+    assert "ports" not in server
+    assert server["environment"]["OPENSANDBOX_SERVER_API_KEY"].startswith(
+        "${OPENSANDBOX_API_KEY:?"
+    )
+    assert (
+        "./deploy/opensandbox/${OPENSANDBOX_SERVER_CONFIG:-sandbox.compose.toml}"
+        ":/etc/opensandbox/config.toml:ro"
+    ) in server["volumes"]
+    assert "opensandbox-data:/data" in server["volumes"]
+    assert "opensandbox-data" in _opensandbox_override()["volumes"]
+    assert "healthcheck" in server
+
+
+def test_opensandbox_override_makes_it_the_default_for_enigmas_services():
+    for name in OPENSANDBOX_CLIENTS:
+        env = _opensandbox_env(name)
+        assert env["SANDBOX_RUNTIME_DEFAULT"] == "${SANDBOX_RUNTIME_DEFAULT:-opensandbox}", name
+        assert env["OPENSANDBOX_API_URL"] == "http://opensandbox-server:8080", name
+        for key in ("OPENSANDBOX_API_KEY", "OPENSANDBOX_EXECD_TOKEN_KEY", "METRICS_TOKEN"):
+            assert env[key].startswith(f"${{{key}:?"), (name, key)
+        depends = _opensandbox_override()["services"][name]["depends_on"]
+        assert depends["opensandbox-server"] == {"condition": "service_healthy"}, name
+    for name in ("backend", "worker"):
+        assert _opensandbox_env(name)["OPENSANDBOX_UPKEEP"] == "${OPENSANDBOX_UPKEEP:-true}"
+
+
+def test_only_enigmas_sandbox_clients_join_the_opensandbox_network():
+    """Sandbox ports are published on this network's gateway (the Linux variant), so only the
+    server and the services that drive sandboxes may sit on it."""
+    override = _opensandbox_override()
+    ipam = override["networks"]["opensandbox"]["ipam"]["config"]
+    assert ipam == [{"subnet": "10.214.0.0/24", "gateway": "10.214.0.1"}]
+    assert override["services"]["opensandbox-server"]["networks"] == ["opensandbox"]
+    for name in OPENSANDBOX_CLIENTS:
+        # Listing networks replaces the default one, which reaches postgres and redis.
+        assert set(override["services"][name]["networks"]) == {"default", "opensandbox"}, name
+
+
+ALLOWED_COMPOSE_DIFFERENCES = {"server.host", "docker.publish_host", "docker.host_ip", "store.path"}
+
+
+@pytest.mark.parametrize(
+    ("config", "publish_host", "host_ip"),
+    [
+        ("sandbox.compose.toml", "10.214.0.1", "10.214.0.1"),
+        ("sandbox.compose-desktop.toml", "127.0.0.1", "host.docker.internal"),
+    ],
+)
+def test_compose_server_configs_keep_every_reference_security_key(config, publish_host, host_ip):
+    """Only where ports are published and where the store lives may differ from the
+    reference config the security suite was proven against."""
+    reference = _flat_toml(OPENSANDBOX_DEPLOY / "sandbox.toml")
+    variant = _flat_toml(OPENSANDBOX_DEPLOY / config)
+    changed = {
+        key
+        for key in reference.keys() | variant.keys()
+        if reference.get(key) != variant.get(key)
+    }
+    assert changed <= ALLOWED_COMPOSE_DIFFERENCES, changed - ALLOWED_COMPOSE_DIFFERENCES
+    assert variant["server.host"] == "0.0.0.0"
+    assert variant["docker.publish_host"] == publish_host
+    assert variant["docker.host_ip"] == host_ip
+    assert variant["store.path"] == "/data/opensandbox.db"
+
+
+def test_dev_scripts_start_the_opensandbox_stack():
+    import json
+
+    scripts = json.loads((REPO / "package.json").read_text())["scripts"]
+    assert scripts["dev:opensandbox"] == (
+        "podman compose -f docker-compose.yml -f docker-compose.opensandbox.yml up --build"
+    )
+    assert scripts["dev:opensandbox:docker"] == (
+        "docker compose -f docker-compose.yml -f docker-compose.opensandbox.yml up --build"
+    )
+
+
+# --- k8s with an external OpenSandbox server (Plan 7b) -------------------------------------
+
+OPENSANDBOX_OVERLAY = REPO / "deploy" / "k8s" / "overlays" / "opensandbox-external"
+
+
+def _overlay_doc(name: str) -> dict:
+    return yaml.safe_load((OPENSANDBOX_OVERLAY / name).read_text())
+
+
+def _opensandbox_server_ip() -> str:
+    from urllib.parse import urlparse
+
+    url = _overlay_doc("config-patch.yaml")["data"]["OPENSANDBOX_API_URL"]
+    return urlparse(url).hostname
+
+
+def test_opensandbox_overlay_layers_on_production():
+    kustomization = _overlay_doc("kustomization.yaml")
+    assert kustomization["resources"] == ["../production", "network-policy.yaml"]
+    # production's namespace applies only to its own resources: without this the egress policy
+    # would land in `default` and never select Enigma's pods.
+    production = yaml.safe_load((PRODUCTION / "kustomization.yaml").read_text())
+    assert kustomization["namespace"] == production["namespace"]
+    assert {p["path"] for p in kustomization["patches"]} == {
+        "config-patch.yaml",
+        "preview-proxy-patch.yaml",
+    }
+
+
+def test_opensandbox_overlay_points_at_a_private_server_and_a_pinned_image():
+    import ipaddress
+
+    data = _overlay_doc("config-patch.yaml")["data"]
+    assert data["SANDBOX_RUNTIME_DEFAULT"] == "opensandbox"
+    assert data["OPENSANDBOX_API_URL"].startswith("http://")
+    # The server has no TLS and holds the Docker socket: a private address only.
+    assert ipaddress.ip_address(_opensandbox_server_ip()).is_private
+    assert "@sha256:" in data["OPENSANDBOX_SANDBOX_IMAGE"]
+    # Keys come from enigma-secrets, never this ConfigMap.
+    assert not [key for key in data if SECRET_NAME_PATTERN.search(key)]
+
+
+def test_the_preview_proxy_gets_only_the_opensandbox_secrets_it_reads():
+    """The proxy takes named secrets (least privilege); it resolves each preview's execd
+    endpoint through the server's API and sends that sandbox's execd token."""
+    patch = _overlay_doc("preview-proxy-patch.yaml")
+    assert (patch["kind"], patch["metadata"]["name"]) == ("Deployment", "enigma-preview-proxy")
+    [container] = patch["spec"]["template"]["spec"]["containers"]
+    assert container["name"] == "preview-proxy"
+    refs = {
+        entry["name"]: entry["valueFrom"]["secretKeyRef"] for entry in container["env"]
+    }
+    assert refs == {
+        "OPENSANDBOX_API_KEY": {"name": "enigma-secrets", "key": "OPENSANDBOX_API_KEY"},
+        "OPENSANDBOX_EXECD_TOKEN_KEY": {
+            "name": "enigma-secrets",
+            "key": "OPENSANDBOX_EXECD_TOKEN_KEY",
+        },
+    }
+
+
+def test_opensandbox_egress_reaches_only_the_one_server():
+    """The server API port and the range sandbox ports are published on, on that one host; the
+    base policies keep every private range closed otherwise."""
+    policy = _overlay_doc("network-policy.yaml")
+    assert policy["kind"] == "NetworkPolicy"
+    assert policy["spec"]["policyTypes"] == ["Egress"]
+    selector = policy["spec"]["podSelector"]
+    assert selector["matchLabels"] == {"app.kubernetes.io/name": "enigma"}
+    assert selector["matchExpressions"] == [
+        {
+            "key": "app.kubernetes.io/component",
+            "operator": "In",
+            "values": ["api", "worker", "preview-proxy"],
+        }
+    ]
+    [rule] = policy["spec"]["egress"]
+    assert rule["to"] == [{"ipBlock": {"cidr": f"{_opensandbox_server_ip()}/32"}}]
+    assert rule["ports"] == [
+        {"port": 8080, "protocol": "TCP"},
+        {"port": 40000, "endPort": 60000, "protocol": "TCP"},
+    ]
+
+
 def test_production_manifests_never_reference_the_container_daemon():
     """The Kustomize production profile is Daytona-only (docs/local-docker-runtime)."""
     for manifest in (REPO / "deploy" / "k8s").rglob("*.yaml"):

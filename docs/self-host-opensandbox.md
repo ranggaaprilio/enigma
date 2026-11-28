@@ -2,7 +2,7 @@
 
 [OpenSandbox](https://github.com/opensandbox-group/OpenSandbox) runs each workspace in a container managed by its own server (`opensandbox-server`). Enigma talks to it as `runtime="opensandbox"`.
 
-**Status:** opt-in. Docker (`docs/self-host-docker.md`) stays the self-host default until the security suite in this guide passes against your server. That suite is the gate for making OpenSandbox the default (Plan 7b).
+**Status:** the self-host default (Plan 7b, `docs/superpowers/plans/2026-11-27-enigma-opensandbox-cutover.md`). The security suite in this guide passed against the reference config, both with the server on the host and inside compose. The custom Docker provider (`docs/self-host-docker.md`) is **deprecated**: it still works, but new installs should use OpenSandbox. Daytona stays the optional cloud provider.
 
 ## Security first
 
@@ -26,7 +26,33 @@ What the server itself requires:
 - **Private networking.** Bind `[server] host` and `[docker] publish_host` to private addresses that only Enigma's backend and worker reach. The server has no TLS.
 - **Never** `OPENSANDBOX_INSECURE_SERVER=YES` outside a laptop.
 
-## Setup
+## Quick start: compose
+
+The server runs next to the stack, from `docker-compose.opensandbox.yml`:
+
+```bash
+./sandbox/build-local-image.sh            # once: enigma-sandbox:latest
+# .env: OPENSANDBOX_API_KEY, OPENSANDBOX_EXECD_TOKEN_KEY and METRICS_TOKEN (long random values)
+# macOS / Windows (Podman machine, Docker Desktop) also:
+#   OPENSANDBOX_SERVER_CONFIG=sandbox.compose-desktop.toml
+npm run dev:opensandbox                   # podman compose -f docker-compose.yml -f docker-compose.opensandbox.yml up --build
+```
+
+New workspaces then go to OpenSandbox; `/health` shows `runtimes.opensandbox.status = "ok"` and `sandbox_runtime_default = "opensandbox"`. Pre-pull `opensandbox/execd:v1.1.0` and `opensandbox/egress:v1.1.7` once, or the first create can time out.
+
+What the override does:
+- **The server** is `opensandbox/server:release-1.2.1`, pinned by digest. It is the only service that gets the daemon socket, and it publishes no host port. It starts with `cap_drop: ALL` and `no-new-privileges` (little help while it holds the socket, but free).
+- **Enigma's services** (backend, worker, preview proxy) get `SANDBOX_RUNTIME_DEFAULT=opensandbox`, the server's address and both keys, and wait for the server's healthcheck. Backend and worker run the upkeep loop.
+- **Where sandbox ports go.** The server publishes every sandbox's execd and preview ports on a host address that Enigma's services reach. Sandboxes cannot reach it, because their egress policy denies private ranges (the suite checks this).
+  - Linux (`sandbox.compose.toml`, the default): the gateway of the `opensandbox` compose network, `10.214.0.1`.
+  - Podman machine / Docker Desktop (`sandbox.compose-desktop.toml`): the host's loopback, reached through `host.docker.internal`. Their port forwarder binds published ports on the desktop side, where the compose gateway does not exist.
+  - Other processes or containers on the same host *can* reach these ports; then each sandbox's execd token is the only barrier. Run it on a host that serves nothing else, or firewall `40000-60000` to the `opensandbox` bridge.
+- Both configs keep every security key of `deploy/opensandbox/sandbox.toml`; `backend/tests/test_deployment.py` fails if they drift.
+- Rootless Podman is not supported on this path (it publishes ports through pasta/slirp4netns).
+
+## Server elsewhere (a VM)
+
+For a server on its own machine, the placement this guide recommends for production:
 
 1. **Image.** Build the sandbox image once: `./sandbox/build-local-image.sh` (`enigma-sandbox:latest`, shared with Docker and Daytona). For production, push it to a registry and pin it by digest. `OPENSANDBOX_SANDBOX_IMAGE=registry/enigma-sandbox@sha256:…` is required outside `local`.
 2. **Server.** Copy `deploy/opensandbox/sandbox.toml` and adjust `host`, `publish_host` and the store path. Pre-pull `opensandbox/execd:v1.1.0` and `opensandbox/egress:v1.1.7`; without them, the first create can time out. Then start it:
@@ -42,8 +68,26 @@ What the server itself requires:
    - `OPENSANDBOX_EXECD_TOKEN_KEY` (`python -c 'import secrets; print(secrets.token_urlsafe(48))'`)
    - optionally `OPENSANDBOX_SANDBOX_CPU` / `_MEMORY` / `_DISK` (defaults 2 / 4Gi / none)
 
-   Users can then pick OpenSandbox when they create a workspace. `SANDBOX_RUNTIME_DEFAULT=opensandbox` makes it the default, but **only after the security suite passes**.
+   Set `SANDBOX_RUNTIME_DEFAULT=opensandbox` to make it the default. The base `docker-compose.yml` forwards every `OPENSANDBOX_*` setting, so this works without the override.
 4. **Check.** `/health` should show `runtimes.opensandbox.status = "ok"`. If it shows `insecure`, the key is missing or the server does not enforce it.
+
+## Kubernetes
+
+`deploy/k8s/overlays/opensandbox-external` layers on the production overlay. The server runs **outside** the cluster, on a dedicated VM set up as in "Server elsewhere"; nothing in the cluster gets a daemon socket.
+- Replace the placeholders: the server's private address (`config-patch.yaml` and `network-policy.yaml`) and the sandbox image digest.
+- Add `OPENSANDBOX_API_KEY` and `OPENSANDBOX_EXECD_TOKEN_KEY` to `enigma-secrets` (`deploy/README.md`).
+- On the server, set `[server] host` and `[docker] publish_host` to that private address. The overlay's NetworkPolicy opens egress from the API, workers and preview proxy to that one host only: the API port and the published port range `40000-60000`.
+
+OpenSandbox's own Kubernetes runtime (controller and CRDs) is not used and was not verified.
+
+## Moving from Docker
+
+Existing Docker workspaces keep running; the Docker provider is deprecated, not removed. `/health` marks it `deprecated`, the API logs `deprecated_runtime` at startup while it is offered, and the create form shows "Local Docker (deprecated)". There is no in-place migration of a sandbox: git is the source of truth.
+1. Push the workspace's branches.
+2. Create a new workspace on OpenSandbox from the same repository.
+3. Delete the Docker one.
+
+To stop offering Docker for new workspaces, leave it out of `SANDBOX_RUNTIMES_ALLOWED` (for example `opensandbox,daytona`).
 
 ## Upkeep
 
@@ -61,9 +105,18 @@ OPENSANDBOX_INTEGRATION_TESTS=1 OPENSANDBOX_API_URL=http://127.0.0.1:8080 \
   OPENSANDBOX_API_KEY=<key> uv run pytest tests/test_opensandbox_integration.py
 ```
 
+For the compose path, run it from the backend container, as the weekly CI job `opensandbox-compose` does (use a separate project name so `down -v` never touches your dev database):
+
+```bash
+podman compose -p enigma-suite -f docker-compose.yml -f docker-compose.opensandbox.yml up -d --wait opensandbox-server postgres redis
+podman compose -p enigma-suite -f docker-compose.yml -f docker-compose.opensandbox.yml run --rm \
+  -e OPENSANDBOX_INTEGRATION_TESTS=1 -e ENVIRONMENT=local backend \
+  sh -lc "uv sync --locked && uv run alembic upgrade head && uv run pytest tests/test_opensandbox_integration.py"
+```
+
 It checks:
 - the container floor;
-- that sandbox A cannot reach sandbox B's execd, by token and by network;
+- that sandbox A cannot reach sandbox B's execd, by token, by network, and at its published endpoint;
 - unauthenticated API and execd calls are refused;
 - the egress allow-list;
 - a terminal that survives a reconnect;

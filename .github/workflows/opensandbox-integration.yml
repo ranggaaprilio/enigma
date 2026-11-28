@@ -110,3 +110,60 @@ jobs:
         run: |
           docker ps -a --format '{{.Names}}' | grep '^sandbox-' | tee /tmp/leaked || true
           test ! -s /tmp/leaked
+
+  # Plan 7b: the self-host path. The server runs in a container from
+  # docker-compose.opensandbox.yml with the Linux config (sandbox ports published on the
+  # `opensandbox` network's gateway), and the suite runs inside the compose backend container,
+  # so it reaches the server and sandboxes exactly as Enigma does. A Podman machine or Docker
+  # Desktop cannot exercise this variant (their port forwarder binds on the desktop side).
+  opensandbox-compose:
+    name: OpenSandbox provider (server in compose, Linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    env:
+      COMPOSE: docker compose -f docker-compose.yml -f docker-compose.opensandbox.yml
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Free disk space for the sandbox image
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          docker system prune -af
+          df -h /
+
+      - name: Build the sandbox image
+        run: CONTAINER_CLI=docker ./sandbox/build-local-image.sh
+
+      - name: Pull the execd and egress images
+        run: docker pull opensandbox/execd:v1.1.0 && docker pull opensandbox/egress:v1.1.7
+
+      - name: Generate throwaway secrets
+        run: |
+          gen() { python3 -c 'import secrets; print(secrets.token_urlsafe(32))'; }
+          fernet=$(python3 -c 'import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())')
+          for pair in "OPENSANDBOX_API_KEY=$(gen)" "OPENSANDBOX_EXECD_TOKEN_KEY=$(gen)" \
+            "METRICS_TOKEN=$(gen)" "AUTH_SECRET_KEY=$(gen)" "WORKSPACE_ENV_ENCRYPTION_KEY=$fernet"; do
+            echo "::add-mask::${pair#*=}"
+            echo "$pair" >> "$GITHUB_ENV"
+          done
+
+      - name: Start the server, Postgres and Redis
+        run: $COMPOSE up -d --wait opensandbox-server postgres redis
+
+      - name: Test (from the compose backend container)
+        run: >-
+          $COMPOSE run --rm -e OPENSANDBOX_INTEGRATION_TESTS=1 -e ENVIRONMENT=local backend
+          sh -lc "uv sync --locked && uv run alembic upgrade head
+          && uv run pytest tests/test_opensandbox_integration.py -v"
+
+      - name: Server log
+        if: failure()
+        run: $COMPOSE logs opensandbox-server
+
+      - name: No sandbox left behind
+        if: always()
+        run: |
+          docker ps -a --format '{{.Names}}' | grep '^sandbox-' | tee /tmp/leaked || true
+          $COMPOSE down -v
+          test ! -s /tmp/leaked

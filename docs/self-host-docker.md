@@ -1,5 +1,11 @@
 # Self-hosting Enigma with local Docker sandboxes
 
+> **Deprecated (Plan 7b).** OpenSandbox is now the self-host runtime: see
+> [docs/self-host-opensandbox.md](self-host-opensandbox.md) (`npm run dev:opensandbox`). This
+> provider still works and existing Docker workspaces keep running, but it will be removed in a
+> later release. `/health` marks it `deprecated` and the create form shows "Local Docker
+> (deprecated)". To move a workspace: push its branches and recreate it on OpenSandbox.
+
 This guide covers running Enigma without a Daytona subscription. Every workspace runs in a
 container on your own Docker or Podman daemon. The full Enigma experience works here:
 - the agent

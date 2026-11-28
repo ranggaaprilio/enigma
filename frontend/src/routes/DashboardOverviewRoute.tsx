@@ -20,7 +20,7 @@ import {
 } from "../lib/api";
 import { RUNTIMES, runtimeLabel } from "../lib/runtime";
 
-type HealthValue = "ok" | "error" | "unconfigured" | "disabled" | "pending";
+type HealthValue = "ok" | "error" | "unconfigured" | "disabled" | "insecure" | "pending";
 
 // Both sandbox providers (local-docker-runtime Epic 06): "unconfigured" and "disabled" are not faults.
 const SUBSYSTEMS: { label: string; read: (health: HealthResponse) => HealthValue }[] = [
@@ -319,7 +319,7 @@ function HealthRow({
   const tone =
     value === "ok"
       ? { dot: "bg-signal", text: "text-signal" }
-      : value === "error"
+      : value === "error" || value === "insecure"
         ? { dot: "bg-danger", text: "text-danger" }
         : { dot: "bg-muted-soft", text: "text-muted" };
   return (

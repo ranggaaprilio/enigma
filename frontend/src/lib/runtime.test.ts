@@ -107,9 +107,32 @@ describe("defaultRuntime", () => {
   });
 });
 
+describe("deprecated providers", () => {
+  it("still offers a deprecated provider, marked and pointing at its replacement", () => {
+    const options = runtimeOptions(
+      health(entry("ok"), { ...entry("ok"), deprecated: true }, "opensandbox", entry("ok")),
+    );
+    expect(options.map((o) => [o.value, o.label, o.available])).toEqual([
+      ["daytona", "Daytona", true],
+      ["docker", "Local Docker (deprecated)", true],
+      ["opensandbox", "OpenSandbox", true],
+    ]);
+    expect(options[1].description).toBe("Being replaced by OpenSandbox");
+    expect(options[2].description).toBe("Sandbox managed by an OpenSandbox server");
+  });
+
+  it("keeps the reason when a deprecated provider is unavailable", () => {
+    const options = runtimeOptions(
+      health(entry("ok"), { ...entry("error", "The Docker daemon is not reachable"), deprecated: true }),
+    );
+    expect(options[1]).toMatchObject({ available: false, reason: "The Docker daemon is not reachable" });
+  });
+});
+
 describe("runtimeErrorHint", () => {
-  it("points a Docker workspace at the daemon", () => {
+  it("points a workspace at what runs its sandbox", () => {
     expect(runtimeErrorHint("docker")).toBe("Is the Docker daemon running?");
+    expect(runtimeErrorHint("opensandbox")).toBe("Is the OpenSandbox server running?");
     expect(runtimeErrorHint("daytona")).toBeNull();
   });
 });

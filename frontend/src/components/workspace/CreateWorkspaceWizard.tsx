@@ -224,7 +224,7 @@ export function CreateWorkspaceWizard({
         return "Enter an HTTPS or SSH repository URL.";
       }
       if (runtimes.length > 0 && !form.runtime) {
-        return "No sandbox runtime is available. Ask an administrator to configure Daytona or Docker.";
+        return "No sandbox runtime is available. Ask an administrator to configure OpenSandbox or Daytona.";
       }
       return null;
     }

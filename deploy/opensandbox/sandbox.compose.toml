@@ -1,0 +1,65 @@
+# opensandbox-server 1.2.1 in compose, on a Linux Docker/Podman host (the default).
+# Started by docker-compose.opensandbox.yml. Every security key is identical to the reference
+# config the security suite was proven against (sandbox.toml); only the listen address, where
+# sandbox ports are published and the store path differ. backend/tests/test_deployment.py pins
+# that. Guide: docs/self-host-opensandbox.md.
+#
+# The API key comes from the environment (OPENSANDBOX_SERVER_API_KEY = OPENSANDBOX_API_KEY).
+
+[server]
+# Inside its container; no host port is published (docker-compose.opensandbox.yml), so only
+# the services on the compose networks reach it.
+host = "0.0.0.0"
+port = 8080
+max_sandbox_timeout_seconds = 86400
+
+[log]
+level = "INFO"
+
+[runtime]
+type = "docker"
+# execd v1.1.0 enforces EXECD_ACCESS_TOKEN, which Enigma sets per sandbox.
+execd_image = "opensandbox/execd:v1.1.0"
+
+[storage]
+# No host paths may be mounted into a sandbox. (Enigma also refuses to send `volumes`.)
+allowed_host_paths = []
+
+[store]
+type = "sqlite"
+path = "/data/opensandbox.db"
+
+[docker]
+network_mode = "bridge"
+# Sandbox ports (execd, previews) are published on the gateway of the compose network
+# `opensandbox` (10.214.0.0/24), which only the server, backend, worker and preview proxy join.
+# Never 0.0.0.0. Sandboxes cannot reach it (their egress policy denies private ranges), but it
+# is a host address: other containers on the host can, and then the per-sandbox execd token is
+# the only barrier. Dedicate the host, or firewall 40000-60000 on it to that bridge.
+# On Podman machine / Docker Desktop this address does not exist on the host side; use
+# sandbox.compose-desktop.toml there (OPENSANDBOX_SERVER_CONFIG).
+publish_host = "10.214.0.1"
+host_ip = "10.214.0.1"
+port_range_min = 40000
+port_range_max = 60000
+# The container floor Enigma checks in every sandbox (CapEff=0, NoNewPrivs=1, non-root).
+# The server default drops only 9 capabilities; Enigma refuses sandboxes created that way.
+drop_capabilities = ["ALL"]
+no_new_privileges = true
+pids_limit = 4096
+apparmor_profile = ""
+seccomp_profile = ""
+
+[ingress]
+mode = "direct"
+
+[egress]
+image = "opensandbox/egress:v1.1.7"
+# Required. Enigma's egress policy denies private, link-local and CGNAT ranges for every
+# sandbox; only `dns+nft` enforces that for connections by IP (in `dns` mode a sandbox still
+# reached a sibling's execd). Without it the execd token is the only isolation left.
+mode = "dns+nft"
+readiness_timeout_seconds = 30.0
+
+[renew_intent]
+enabled = false

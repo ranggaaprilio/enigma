@@ -359,7 +359,11 @@ describe("CreateWorkspaceWizard", () => {
 
       await screen.findByText("The Docker daemon is not reachable");
       await userEvent.click(screen.getByRole("button", { name: "Next" }));
-      expect(screen.getByText(/No sandbox runtime is available/)).toBeInTheDocument();
+      expect(
+        screen.getByText(
+          "No sandbox runtime is available. Ask an administrator to configure OpenSandbox or Daytona.",
+        ),
+      ).toBeInTheDocument();
       expect(createFn).not.toHaveBeenCalled();
     });
 

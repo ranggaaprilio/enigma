@@ -112,6 +112,18 @@ def warn_if_default_runtime_unconfigured(settings: Settings) -> None:
             return
 
 
+# Plan 7b: OpenSandbox replaces the custom Docker provider for self-hosting. A deprecated
+# provider keeps working (existing workspaces, an explicit choice) until it is removed.
+DEPRECATED_PROVIDERS = {"docker": "opensandbox"}
+
+
+def warn_if_deprecated_runtime_offered(settings: Settings) -> None:
+    """At startup: say so when new workspaces can still land on a deprecated provider."""
+    for provider, replacement in DEPRECATED_PROVIDERS.items():
+        if settings.runtime_allowed(provider) and _runtime(provider).configured:
+            logger.warning("deprecated_runtime", provider=provider, replacement=replacement)
+
+
 def require_metrics_token_for_docker(settings: Settings) -> None:
     """The preview proxy sits on every Docker sandbox's network, so a tenant can reach its
     /health and /metrics; with Docker as the default they are never left open."""

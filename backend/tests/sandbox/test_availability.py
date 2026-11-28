@@ -270,6 +270,37 @@ async def test_runtime_availability_reports_a_disallowed_provider_as_disabled(
     assert probed is False
 
 
+@pytest.mark.parametrize(
+    ("docker_configured", "allowed", "logged"),
+    [
+        (True, "", True),
+        (False, "", False),  # not set up: nothing to warn about
+        (True, "daytona,opensandbox", False),  # not offered for new workspaces
+    ],
+)
+def test_offering_the_deprecated_docker_provider_logs_once_at_startup(
+    monkeypatch, docker_configured, allowed, logged
+) -> None:
+    from structlog.testing import capture_logs
+
+    from app.services.sandbox import availability
+
+    runtimes = {
+        "daytona": _Runtime(),
+        "docker": _Runtime(configured=docker_configured),
+        "opensandbox": _Runtime(),
+    }
+    monkeypatch.setattr(availability, "_runtime", runtimes.__getitem__)
+    with capture_logs() as logs:
+        availability.warn_if_deprecated_runtime_offered(
+            _settings(sandbox_runtimes_allowed=allowed)
+        )
+    expected = [{"event": "deprecated_runtime", "provider": "docker", "replacement": "opensandbox"}]
+    assert [
+        {k: entry[k] for k in ("event", "provider", "replacement")} for entry in logs
+    ] == (expected if logged else [])
+
+
 def test_the_startup_warning_ignores_a_disallowed_fallback(monkeypatch) -> None:
     from structlog.testing import capture_logs
 

@@ -33,10 +33,11 @@ export function runtimeOptions(health: HealthResponse | null): RuntimeOption[] {
   const offered = RUNTIMES.filter((value) => health.runtimes[value]?.status !== "disabled");
   return offered.map((value) => {
     const entry = health.runtimes[value];
+    const deprecated = entry?.deprecated === true;
     return {
       value,
-      label: LABELS[value],
-      description: DESCRIPTIONS[value],
+      label: deprecated ? `${LABELS[value]} (deprecated)` : LABELS[value],
+      description: deprecated ? "Being replaced by OpenSandbox" : DESCRIPTIONS[value],
       available: entry?.status === "ok",
       reason: entry?.status === "ok" ? null : (entry?.reason ?? "Unavailable"),
     };
@@ -53,5 +54,7 @@ export function defaultRuntime(health: HealthResponse | null): RuntimeName | nul
 
 /** A next step for a workspace in `error`, when the provider suggests one. */
 export function runtimeErrorHint(runtime: string | null | undefined): string | null {
-  return runtime === "docker" ? "Is the Docker daemon running?" : null;
+  if (runtime === "docker") return "Is the Docker daemon running?";
+  if (runtime === "opensandbox") return "Is the OpenSandbox server running?";
+  return null;
 }
