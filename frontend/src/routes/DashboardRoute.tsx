@@ -270,9 +270,13 @@ export function DashboardRoute() {
 }
 
 /** The verification panel, opened on `?run=<id>` when a link (the Agent tab's chip) names one. */
+// `?run=` comes from a link anyone can craft; only a run id may reach the API paths.
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 function VerifyView({ workspace }: { workspace: WorkspaceResponse }) {
   const [searchParams] = useSearchParams();
-  const runId = searchParams.get("run");
+  const requested = searchParams.get("run");
+  const runId = requested && RUN_ID_PATTERN.test(requested) ? requested : null;
   return (
     <VerificationPanel
       key={`${workspace.id}:${runId ?? ""}`}

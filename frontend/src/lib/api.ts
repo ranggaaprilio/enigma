@@ -2842,7 +2842,7 @@ export type VerificationRunCreatePayload = {
 };
 
 function verificationRunsPath(workspaceId: string) {
-  return `/workspaces/${workspaceId}/verification/runs`;
+  return `/workspaces/${encodeURIComponent(workspaceId)}/verification/runs`;
 }
 
 export function listVerificationRuns(
@@ -2865,7 +2865,7 @@ export function getVerificationRun(
   runId: string,
 ): Promise<VerificationRunDetailResponse> {
   return requestJson<VerificationRunDetailResponse>(
-    `${verificationRunsPath(workspaceId)}/${runId}`,
+    `${verificationRunsPath(workspaceId)}/${encodeURIComponent(runId)}`,
   );
 }
 
@@ -2898,7 +2898,7 @@ export function verifyAgentRun(
   payload: VerifyAgentRunPayload = {},
 ): Promise<VerificationRunDetailResponse> {
   return requestJson<VerificationRunDetailResponse>(
-    `/workspaces/${workspaceId}/verification/agent-runs/${runId}`,
+    `/workspaces/${encodeURIComponent(workspaceId)}/verification/agent-runs/${encodeURIComponent(runId)}`,
     { method: "POST", body: JSON.stringify(payload) },
   );
 }
@@ -2908,7 +2908,7 @@ export function approveVerificationRun(
   runId: string,
 ): Promise<VerificationRunResponse> {
   return requestJson<VerificationRunResponse>(
-    `${verificationRunsPath(workspaceId)}/${runId}/approve`,
+    `${verificationRunsPath(workspaceId)}/${encodeURIComponent(runId)}/approve`,
     { method: "POST" },
   );
 }
@@ -2942,7 +2942,7 @@ export function getVerificationScreenshot(
   evidenceId: string,
 ): Promise<Blob> {
   return requestBlob(
-    `${verificationRunsPath(workspaceId)}/${runId}/evidence/${evidenceId}/screenshot`,
+    `${verificationRunsPath(workspaceId)}/${encodeURIComponent(runId)}/evidence/${encodeURIComponent(evidenceId)}/screenshot`,
   );
 }
 
@@ -2952,7 +2952,7 @@ export function stopVerificationRun(
   runId: string,
 ): Promise<VerificationRunResponse> {
   return requestJson<VerificationRunResponse>(
-    `${verificationRunsPath(workspaceId)}/${runId}/stop`,
+    `${verificationRunsPath(workspaceId)}/${encodeURIComponent(runId)}/stop`,
     { method: "POST" },
   );
 }
@@ -2962,7 +2962,7 @@ export function rejectVerificationRun(
   runId: string,
 ): Promise<VerificationRunResponse> {
   return requestJson<VerificationRunResponse>(
-    `${verificationRunsPath(workspaceId)}/${runId}/reject`,
+    `${verificationRunsPath(workspaceId)}/${encodeURIComponent(runId)}/reject`,
     { method: "POST" },
   );
 }
