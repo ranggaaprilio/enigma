@@ -401,6 +401,7 @@ class VerificationOrchestrator:
         criteria: PlanCriteria | None = None,
         created_by: UUID | None = None,
         spec_workflow_id: UUID | None = None,
+        source_agent_run_id: UUID | None = None,
     ) -> VerificationRun:
         """Create a run parked at ``planning`` (not yet driven), with its criteria persisted.
 
@@ -428,6 +429,7 @@ class VerificationOrchestrator:
                     criteria=criteria_to_row(criteria) if criteria is not None else {},
                     created_by=created_by,
                     spec_workflow_id=spec_workflow_id,
+                    source_agent_run_id=source_agent_run_id,
                 )
                 session.add(run)
                 await session.commit()
@@ -483,10 +485,15 @@ class VerificationOrchestrator:
         limit: int = 20,
         offset: int = 0,
         spec_workflow_id: UUID | None = None,
+        source_agent_run_id: UUID | None = None,
     ) -> list[VerificationRun]:
         statement = select(VerificationRun).where(VerificationRun.workspace_id == workspace_id)
         if spec_workflow_id is not None:
             statement = statement.where(VerificationRun.spec_workflow_id == spec_workflow_id)
+        if source_agent_run_id is not None:
+            statement = statement.where(
+                VerificationRun.source_agent_run_id == source_agent_run_id
+            )
         async with self.session_maker() as session:
             rows = await session.scalars(
                 statement.order_by(VerificationRun.created_at.desc(), VerificationRun.id.desc())

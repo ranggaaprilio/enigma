@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from typing import NamedTuple
 from uuid import UUID
 
+import structlog
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -53,6 +54,8 @@ from app.services.runtime import (
 from app.services.runtime import run_lock as default_run_lock
 from app.services.sandbox import get_sandbox_runtime
 from app.services.workspaces import WorkspaceSecretCipher
+
+logger = structlog.get_logger(__name__)
 
 TERMINAL_RUN_STATUSES = ("completed", "error", "stopped")
 # Partial unique index backing the one-active-run-per-workspace rule across replicas.
@@ -1236,6 +1239,19 @@ class AgentService:
                 ),
             },
         )
+
+        if run.status == "completed":
+            await self._auto_verify(run.id)
+
+    async def _auto_verify(self, run_id: UUID) -> None:
+        """Plan 9: hand a completed run to opt-in auto-verify. Never fails the run."""
+        # Imported here: the verification package imports this module (the fix agent).
+        from app.services.verification import agent_link
+
+        try:
+            await agent_link.auto_verify_agent_run(self.session_maker, self.settings, run_id)
+        except Exception:
+            logger.exception("auto_verify_failed", agent_run_id=str(run_id))
 
     def _apply_estimated_cost(self, run: AgentRun) -> None:
         """Derive and store run.estimated_cost from the captured token counts + pricing map."""

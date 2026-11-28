@@ -822,3 +822,31 @@ describe("templates and credentials", () => {
     await expect(getRepositoryCredential("ws")).rejects.toBeInstanceOf(ApiError);
   });
 });
+
+describe("verification paths", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("encodes ids so a crafted ?run= can never reach another API path", async () => {
+    const { approveVerificationRun, getVerificationRun, verifyAgentRun } = await import("./api");
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({}),
+      text: async () => "{}",
+      headers: new Headers({ "content-type": "application/json" }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await getVerificationRun("ws", "../../../auth/logout").catch(() => undefined);
+    await approveVerificationRun("ws", "../x").catch(() => undefined);
+    await verifyAgentRun("ws", "a/../b", {}).catch(() => undefined);
+
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls[0]).toContain("/verification/runs/..%2F..%2F..%2Fauth%2Flogout");
+    expect(urls[1]).toContain("/verification/runs/..%2Fx/approve");
+    expect(urls[2]).toContain("/verification/agent-runs/a%2F..%2Fb");
+    for (const url of urls) expect(url).not.toMatch(/\/\.\.\//);
+  });
+});

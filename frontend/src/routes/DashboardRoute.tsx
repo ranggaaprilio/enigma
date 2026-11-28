@@ -1,5 +1,5 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useState } from "react";
-import { Outlet, useOutletContext, useParams } from "react-router";
+import { Outlet, useOutletContext, useParams, useSearchParams } from "react-router";
 
 import { useAuth, WorkspaceRoleContext } from "../auth/context";
 import { AgentTab } from "../components/AgentTab";
@@ -13,6 +13,7 @@ import { PreviewPanel } from "../components/PreviewPanel";
 import { SpecPanel } from "../components/SpecPanel";
 import { TerminalPanel } from "../components/TerminalPanel";
 import { VerificationPanel } from "../components/VerificationPanel";
+import { AutoVerifySetting } from "../components/workspace/AutoVerifySetting";
 import { WorktreesPanel } from "../components/WorktreesPanel";
 import { ConfirmModal } from "../components/ui/ConfirmModal";
 import { Spinner } from "../components/ui/Spinner";
@@ -268,6 +269,23 @@ export function DashboardRoute() {
   );
 }
 
+/** The verification panel, opened on `?run=<id>` when a link (the Agent tab's chip) names one. */
+// `?run=` comes from a link anyone can craft; only a run id may reach the API paths.
+const RUN_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+function VerifyView({ workspace }: { workspace: WorkspaceResponse }) {
+  const [searchParams] = useSearchParams();
+  const requested = searchParams.get("run");
+  const runId = requested && RUN_ID_PATTERN.test(requested) ? requested : null;
+  return (
+    <VerificationPanel
+      key={`${workspace.id}:${runId ?? ""}`}
+      workspace={workspace}
+      initialRunId={runId}
+    />
+  );
+}
+
 export function DashboardView({ view }: { view: DashboardViewId }) {
   const {
     health,
@@ -336,7 +354,7 @@ export function DashboardView({ view }: { view: DashboardViewId }) {
   }
 
   if (view === "verify") {
-    return <VerificationPanel key={workspace.id} workspace={workspace} />;
+    return <VerifyView workspace={workspace} />;
   }
 
   if (view === "usage") {
@@ -647,6 +665,7 @@ function WorkspaceSettings({
     <>
       <section className="mt-4 grid gap-4">
         <WorkspaceMetadataForm workspace={workspace} onWorkspaceChanged={onWorkspaceChanged} />
+        <AutoVerifySetting workspace={workspace} onWorkspaceChanged={onWorkspaceChanged} />
       </section>
       <EnvVarEditor
         workspace={workspace}

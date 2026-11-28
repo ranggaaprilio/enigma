@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { type ReactNode, useState } from "react";
 import {
   AlertCircle,
   Bot,
@@ -27,6 +27,8 @@ interface TurnViewProps {
   workspaceId: string;
   agentError?: string | null;
   streamError?: string | null;
+  /** Rendered under the turn's actions (the verification chip and Verify action). */
+  footer?: ReactNode;
 }
 
 /**
@@ -41,6 +43,7 @@ export function TurnView({
   workspaceId,
   agentError,
   streamError,
+  footer,
 }: TurnViewProps) {
   const [showFiles, setShowFiles] = useState(false);
   const [showComments, setShowComments] = useState(false);
@@ -169,6 +172,8 @@ export function TurnView({
             )}
           </div>
         )}
+
+        {footer}
       </div>
     </article>
   );

@@ -1,0 +1,118 @@
+# Enigma — Verify an Ordinary Agent Run (Plan 9)
+
+> **For agentic workers:** Execute task-by-task with TDD (red → green → refactor). Tick the `- [x]` steps as they land.
+
+**Goal:** The self-test loop (test → observe → fix → human gate) works for any agent run, not only Spec Kit's `implement`. A user finishes an agent run and gets proof that it works, on the same branch the agent worked on.
+
+**Spec:** `docs/superpowers/specs/2026-11-26-enigma-verifiable-agent-loop-design.md` §3 (the core loop is the product, not a Spec Kit feature).
+
+## Current state (verified, 2026-11-28)
+
+- **A verification run can be started by hand.** `POST /workspaces/{id}/verification/runs` (`api/verification.py`, `VerificationPanel.tsx`) takes a typed `test_command`, `observe_port`, `cwd` and `max_iterations`. It knows nothing about which agent run produced the code.
+- **Spec Kit links its runs.** `verification_runs.spec_workflow_id` links a run to its workflow. `spec_link.criteria_for_workflow` derives criteria from the workflow's own `verification`, else the workspace's first enabled `role="test"` custom command, with cwd = worktree + `app_root` + command cwd. Review runs are superseded when the code changes.
+- **The fixer ignores the agent's branch.** `AgentFixer.start` (`verification/fixer.py:118`) calls `AgentService.create_run(workspace, created_by, prompt, working_dir=cwd)`: no `worktree_id` and no `session_id`. For a run made in a worktree, the fix agent targets the base checkout's branch. It also starts a new conversation, so it does not see what the original agent did.
+- **Agent runs.** `agent_runs` has `worktree_id` and `session_id`. A run ends `completed | error | stopped` (`AgentService`, `TERMINAL_RUN_STATUSES`). The fix runs a verification starts are recorded as `verification_runs.agent_run_id`.
+
+## Design
+
+### 1. A verification run can name the agent run it verifies
+
+- **Migration `0045_verification_source_agent_run`** (expand-only): `verification_runs.source_agent_run_id` (FK `agent_runs`, `ON DELETE SET NULL`, indexed).
+- **`POST /workspaces/{id}/agent/runs/{run_id}/verify`** (owner/driver of the workspace, sandbox rate limit):
+  - **Refusals:** 409 when the run is not `completed`; 409 when it is itself a fix run (some verification run's `agent_run_id`), so a fix is never verified on its own.
+  - **Criteria:** from the body when given (`test_command`, `observe_port`, `max_iterations`). Otherwise from the run's own context, the same rule Spec Kit uses (`spec_link` is generalised, not copied): the workspace's first enabled `role="test"` command, with cwd = the run's worktree path (or the base checkout) + `app_root` + command cwd. With neither, 422 with an actionable message ("add a test command with role 'test', or give one").
+  - **Linking:** `plan_ref` is the run's prompt (truncated), `source_agent_run_id` is the run, and `created_by` is the caller.
+  - **Supersede:** a newer verification of the same run supersedes that run's earlier ones still in `review` (→ `rejected`), as Spec Kit does.
+  - **Response:** 202 with the run. It then executes like any verification run (inline task or queue job).
+- `GET /agent/runs/{id}` and the run list carry `verification`: the latest linked run's `id` and `status`, or null.
+
+### 2. The fix lands on the agent's branch, in its conversation
+
+For a run with a source agent run, `AgentFixer.start` passes the source run's `worktree_id` and `session_id` to `create_run`. The fix is then a new turn of the same session, on the same worktree branch. Runs without a source (manual, Spec Kit) are unchanged.
+
+### 3. Auto-verify (opt-in, per workspace)
+
+- `workspaces.auto_verify_agent_runs` (bool, default false), in the same migration. It is set through `PATCH /workspaces/{id}`.
+- When an agent run ends `completed` and auto-verify is on, the run's finaliser starts a verification exactly as the endpoint would, **only if criteria exist**. It never starts one for a fix run, a Spec Kit phase run (`spec_phases.agent_run_id`), or a run that already has one. A refusal (no criteria, budget, caps) is logged, never fatal to the run.
+- It works in queue mode too: the finaliser runs in the worker and uses the same `start_verification_run` path.
+
+### 4. UI
+
+- **AgentTab (run history and thread):**
+  - A completed run shows **Verify**. It opens a small dialog prefilled with the derived test command, editable, plus an optional port.
+  - A verified run shows a status chip (testing / fixing / review / approved / rejected / error) that opens the evidence in the existing VerificationPanel view.
+- **Workspace settings:** an "Auto-verify agent runs" toggle, with a hint when no `role="test"` command exists.
+
+## Non-goals
+
+- New evidence kinds, or changes to the orchestrator's state machine.
+- Verifying runs that ended `error` or `stopped` (the agent did not finish).
+- Spec Kit behaviour: unchanged. Its runs keep `spec_workflow_id` and its own gate.
+
+## Tasks
+
+### Task 1: Link and start (backend, TDD)
+
+**Files:** migration `0045`, `models/verification.py`, `models/workspace.py`, `services/verification/spec_link.py` (generalised criteria), `api/agents.py` (or `api/verification.py`), `schemas/agents.py`, tests.
+
+- [x] Failing tests:
+  - `/verify` on a completed run creates a linked run with derived criteria (base checkout and worktree cwd);
+  - it refuses a non-completed run and a fix run (409) and a run with no criteria (422);
+  - a newer verify supersedes the previous run in review;
+  - the run detail and the list carry `verification`;
+  - migration safety stays expand-only.
+- [x] Implement.
+- **As built (deviations from the design above):**
+  - The route is `POST /workspaces/{id}/verification/agent-runs/{run_id}`, in the verification router, which already has the session and gate patterns.
+  - Instead of a `verification` field on agent run responses (which would change the agent service protocol and every fake), `VerificationRunResponse` carries `source_agent_run_id` and `GET /verification/runs` filters by it.
+  - The migration is `0045_verify_agent_runs`: Alembic's `alembic_version` column is `varchar(32)`, so the longer id failed.
+  - The `role="test"` lookup moved to `spec_link.test_command_criteria`, now shared by Spec Kit and agent runs.
+
+### Task 2: Fix on the agent's branch and session (TDD)
+
+**Files:** `verification/fixer.py`, tests.
+
+- [x] Failing tests:
+  - a run with a source passes that run's `worktree_id` and `session_id`;
+  - a run without one passes neither (Spec Kit and manual runs unchanged).
+- [x] Implement.
+
+### Task 3: Auto-verify (TDD)
+
+**Files:** `services/agents.py` (finaliser hook), `schemas/workspaces.py`, `api/workspaces.py`, tests.
+
+- [x] Failing tests:
+  - on: a completed run with criteria starts one linked verification, inline and in queue mode;
+  - off: none;
+  - never for a fix run, a Spec Kit phase run, a run with no criteria or a failed/stopped run;
+  - a refusal never changes the agent run's status.
+- [x] Implement. `agent_link.auto_verify_agent_run` is called at the end of `AgentService._record_run_finished` (after the run's status is committed; both completion paths end there), through a local import because the verification package imports `agents`. It never raises into the run. `WorkspaceResponse.auto_verify_agent_runs` reads an unflushed row's `None` as `false`.
+
+### Task 4: Frontend
+
+**Files:** `lib/api.ts`, `components/AgentTab/*`, `VerificationPanel.tsx` (open a run by id), workspace settings, tests.
+
+- [x] Failing tests:
+  - Verify shows only on completed, non-fix runs and posts the edited criteria;
+  - the chip shows each status and opens the evidence;
+  - the auto-verify toggle saves, and hints when no test command exists.
+- [x] Implement. `TurnVerification` sits in the session thread's turn footer, and `useRunVerifications` makes one list call per open session (newest 100 verifications, mapped by `source_agent_run_id`), polling while any is active. The chip links to `../verify?run=<id>`; `VerificationPanel` takes `initialRunId`. `AutoVerifySetting` lives under Workspace settings. Known limits: Verify still shows on fix runs (the run response has no `agent_run_id`; the backend's 409 explains it), and a run whose verification is older than the newest 100 shows no chip.
+
+### Task 5: Docs and live E2E
+
+- [x] AGENTS.md gotcha 33, plan ticks.
+- [x] **Live E2E** on the compose OpenSandbox stack (`-p enigma9`, desktop config, deepseek-v4.1-flash set in the shell): a blank workspace with worktree `feature/calc` and a `role="test"` command `python3 -m unittest -q`.
+  - **Verify on a worktree run.** An agent run in the worktree wrote `calc.py` with `return a - b` and its test. Verify: test failed (exit 1) → fix agent → test passed (exit 0) → review → approved.
+    - The fix run's `worktree_id` was the `feature/calc` worktree, and `working_dir` was `worktrees/feature-calc`.
+    - The worktree's `calc.py` became `return a + b`; the base checkout still held only `README.md`.
+  - **Auto-verify.** With it on, the next completed run got its verification at once, which reached review (tests passing).
+  - **Session.** A session turn that broke `mul` was auto-verified (failed → fix → passed). The fix appeared as the **second turn of the same session**. Auto-verify skipped the fix run itself (`auto_verify_skipped`, "This is a fix run…").
+- [x] **Bug found by the E2E, fixed test-first.** The orchestrator clears `verification_runs.agent_run_id` when a fix ends (it names only the current fix), so a finished fix run could be verified on its own (202). `agent_link.is_fix_run` now also reads the `fix` evidence (`detail.agent_run_id`). After a restart the same call was a 409.
+- [x] **Security review (automated), fixed.** `?run=` on the Verify view reached API paths unencoded: client-side path traversal, which could aim the poll or a gate POST at another endpoint with the user's cookies. The verification helpers in `api.ts` now encode every id, and `VerifyView` accepts only a UUID. A regression test failed without the fix.
+- [x] Cleaned up: the workspace was deleted through the API, no sandbox was left, and `down -v` ran on `enigma9` only.
+
+## Exit criteria
+
+- Any completed agent run can be verified from its own context, and a fix never lands outside the agent's worktree.
+- Auto-verify is opt-in, never loops on fix runs, and never fails a run.
+- Suites green (known unrelated failures only); the live E2E passes.

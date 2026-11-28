@@ -97,6 +97,13 @@ class Workspace(Base):
         default=False,
         server_default=text("false"),
     )
+    # Plan 9: verify every completed agent run (when a test command exists). Off by default.
+    auto_verify_agent_runs: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default=text("false"),
+    )
     # Which worktree the current dev server was launched in (NULL = base clone).
     dev_worktree_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),

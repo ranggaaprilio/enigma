@@ -31,6 +31,7 @@ function run(overrides: Partial<VerificationRunResponse> = {}): VerificationRunR
     workspace_id: WORKSPACE_ID,
     plan_ref: "specs/001-login/plan.md",
     status: "review",
+    source_agent_run_id: null,
     created_at: "2026-11-26T00:00:00Z",
     updated_at: "2026-11-26T00:01:00Z",
     ...overrides,
@@ -95,6 +96,22 @@ afterEach(() => {
 });
 
 describe("VerificationPanel", () => {
+  it("opens on the run it was given rather than the newest one", async () => {
+    const fetchMock = stubFetch((url) => {
+      if (url.endsWith(`${BASE}?limit=20`))
+        return jsonResponse([run({ id: "r2", plan_ref: "newest" }), run()]);
+      if (url.endsWith(`${BASE}/r1`)) return jsonResponse(detail());
+      if (url.endsWith(`${BASE}/r2`)) return jsonResponse(detail({ id: "r2", plan_ref: "newest" }));
+      return undefined;
+    });
+
+    render(<VerificationPanel workspace={workspace} initialRunId="r1" />);
+
+    const evidence = await screen.findByRole("region", { name: "Evidence" });
+    expect(within(evidence).getByText("pytest -q")).toBeInTheDocument();
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(`${BASE}/r2`))).toBe(false);
+  });
+
   it("lists runs and shows the selected run's test and observation evidence", async () => {
     stubFetch((url) => {
       if (url.endsWith(`${BASE}?limit=20`)) return jsonResponse([run()]);

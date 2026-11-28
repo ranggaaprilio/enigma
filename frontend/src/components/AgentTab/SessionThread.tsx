@@ -17,6 +17,8 @@ import { useAgentRunStream } from "../../lib/useAgentRunStream";
 import { usePermissions } from "../../auth/permissions";
 import { Notice } from "./Notice";
 import { PromptComposer } from "./PromptComposer";
+import { TurnVerification } from "./TurnVerification";
+import { useRunVerifications } from "./useRunVerifications";
 import { TurnView } from "./TurnView";
 
 interface SessionThreadProps {
@@ -107,10 +109,17 @@ export function SessionThread({
     };
   }, [loadDetail]);
 
+  const { can } = usePermissions();
+  const canRunAgent = can("agent.run");
+  const verifications = useRunVerifications(workspaceId, canRunAgent);
+  const refreshVerifications = verifications.refresh;
+
   const handleTerminal = useCallback(() => {
     // The turn finished; reload persisted turns/events and refresh the session summary.
     void loadDetail();
-  }, [loadDetail]);
+    // An auto-verify may have started for it.
+    refreshVerifications().catch(() => undefined);
+  }, [loadDetail, refreshVerifications]);
 
   const {
     events: streamEvents,
@@ -122,8 +131,6 @@ export function SessionThread({
     onTerminal: handleTerminal,
   });
 
-  const { can } = usePermissions();
-  const canRunAgent = can("agent.run");
   const turns = detail?.turns ?? [];
   const isRunning = activeTurnId !== null;
   const isObserving = isRunning && viewerRole === "observer";
@@ -296,6 +303,17 @@ export function SessionThread({
                 isActive={turn.id === activeTurnId}
                 events={turn.id === activeTurnId ? streamEvents : turnEvents[turn.id] ?? []}
                 agentError={turn.id === activeTurnId ? agentError : null}
+                footer={
+                  turn.id === activeTurnId ? null : (
+                    <TurnVerification
+                      workspaceId={workspaceId}
+                      runId={turn.id}
+                      canVerify={canRunAgent && turn.status === "completed"}
+                      verification={verifications.byRun.get(turn.id) ?? null}
+                      onStarted={verifications.add}
+                    />
+                  )
+                }
               />
             ))
           )}

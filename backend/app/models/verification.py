@@ -72,6 +72,14 @@ class VerificationRun(Base):
     agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("agent_runs.id", ondelete="SET NULL"), nullable=True
     )
+    # The ordinary agent run whose code this run verifies, if any (Plan 9). Its fix agent runs in
+    # that run's worktree and session.
+    source_agent_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("agent_runs.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     # The Spec Kit workflow whose ``implement`` phase this run verifies, if any.
     spec_workflow_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("spec_workflows.id", ondelete="SET NULL"), nullable=True

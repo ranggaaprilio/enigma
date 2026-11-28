@@ -73,6 +73,8 @@ class WorkspaceUpdateRequest(BaseModel):
     # Repo-relative path (below app_root) where resolved env vars are materialised as a .env
     # file before each service launch. `None` clears it (no file written).
     env_file_path: str | None = Field(default=None, max_length=512)
+    # Plan 9: verify every completed agent run (needs a role="test" command to do anything).
+    auto_verify_agent_runs: bool | None = None
 
     @field_validator("app_root")
     @classmethod
@@ -128,6 +130,7 @@ class WorkspaceResponse(BaseModel):
     workspace_path: str
     app_root: str | None = None
     env_file_path: str | None = None
+    auto_verify_agent_runs: bool = False
     status: WorkspaceStatus
     created_at: datetime
     updated_at: datetime
@@ -141,6 +144,12 @@ class WorkspaceResponse(BaseModel):
     @classmethod
     def default_runtime(cls, value: str | None) -> str:
         return value or "daytona"
+
+    @field_validator("auto_verify_agent_runs", mode="before")
+    @classmethod
+    def default_auto_verify(cls, value: bool | None) -> bool:
+        # A row not yet flushed has no column default applied.
+        return bool(value)
 
     @field_validator("source", mode="before")
     @classmethod
