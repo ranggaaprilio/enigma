@@ -165,6 +165,34 @@ async def test_a_fix_run_is_never_verified_on_its_own(db_session, monkeypatch):
     assert started == []
 
 
+async def test_a_finished_fix_run_is_still_recognised(db_session, monkeypatch):
+    """After a fix the orchestrator clears ``agent_run_id`` (it tracks the *current* fix only);
+    the fix evidence keeps the id, and that is enough to refuse it (found live, Plan 9 E2E)."""
+    from app.models import VerificationEvidence
+
+    session, user, workspace, started = await _setup(db_session, monkeypatch)
+    await _test_command(session, workspace)
+    fix = await _agent_run(session, workspace, user)
+    finished = VerificationRun(workspace_id=workspace.id, plan_ref="p", status="approved")
+    session.add(finished)
+    await session.flush()
+    session.add(
+        VerificationEvidence(
+            run_id=finished.id,
+            kind="fix",
+            status="passed",
+            detail={"agent_run_id": str(fix.id), "agent_status": "completed"},
+        )
+    )
+    await session.flush()
+
+    resp = await _verify(workspace.id, fix.id)
+
+    assert resp.status_code == 409
+    assert "fix" in resp.json()["detail"].lower()
+    assert started == []
+
+
 async def test_a_run_without_criteria_says_how_to_add_them(db_session, monkeypatch):
     session, user, workspace, started = await _setup(db_session, monkeypatch)
     agent_run = await _agent_run(session, workspace, user)

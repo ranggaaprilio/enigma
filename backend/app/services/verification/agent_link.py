@@ -20,7 +20,7 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.config import Settings
-from app.models import AgentRun, SpecPhase, VerificationRun, Workspace
+from app.models import AgentRun, SpecPhase, VerificationEvidence, VerificationRun, Workspace
 from app.services.run_paths import join_subpath, resolve_worktree
 from app.services.verification.execution import build_orchestrator, start_verification_run
 from app.services.verification.orchestrator import (
@@ -61,14 +61,30 @@ async def verifiable_agent_run(
         raise AgentRunNotFoundError
     if run.status != "completed":
         raise AgentRunNotVerifiableError("Only a completed agent run can be verified.")
-    fix_of = await session.scalar(
-        select(VerificationRun.id).where(VerificationRun.agent_run_id == run.id).limit(1)
-    )
-    if fix_of is not None:
+    if await is_fix_run(session, run.id):
         raise AgentRunNotVerifiableError(
             "This is a fix run of a verification; verify the run that started it."
         )
     return run
+
+
+async def is_fix_run(session: AsyncSession, run_id: UUID) -> bool:
+    """Whether a verification started this agent run as a fix. ``agent_run_id`` names only the
+    *current* fix (the orchestrator clears it when the fix ends); the ``fix`` evidence keeps it."""
+    current = await session.scalar(
+        select(VerificationRun.id).where(VerificationRun.agent_run_id == run_id).limit(1)
+    )
+    if current is not None:
+        return True
+    recorded = await session.scalar(
+        select(VerificationEvidence.id)
+        .where(
+            VerificationEvidence.kind == "fix",
+            VerificationEvidence.detail["agent_run_id"].astext == str(run_id),
+        )
+        .limit(1)
+    )
+    return recorded is not None
 
 
 async def criteria_for_agent_run(
