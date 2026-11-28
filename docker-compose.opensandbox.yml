@@ -1,0 +1,96 @@
+# The self-host default (Plan 7b): sandboxes are managed by an OpenSandbox server running next
+# to the stack. Guide: docs/self-host-opensandbox.md.
+#
+#   ./sandbox/build-local-image.sh          # once: builds enigma-sandbox:latest
+#   podman compose -f docker-compose.yml -f docker-compose.opensandbox.yml up   # npm run dev:opensandbox
+#   # queue mode: add --profile queue
+#
+# .env needs OPENSANDBOX_API_KEY and OPENSANDBOX_EXECD_TOKEN_KEY (long random values) and
+# METRICS_TOKEN. On Podman machine or Docker Desktop (macOS, Windows) also set
+# OPENSANDBOX_SERVER_CONFIG=sandbox.compose-desktop.toml (see that file for why).
+#
+# SECURITY: the server holds the container daemon socket, which is root-equivalent on the host.
+# It is the only service that gets it: backend, worker and preview proxy reach sandboxes through
+# the server's API and each sandbox's execd, with a per-sandbox token. The server publishes no
+# host port. Sandbox ports are published on the gateway of the `opensandbox` network (Linux) or
+# on the host's loopback (desktop). Those are host addresses: OpenSandbox sandboxes cannot reach
+# them (their egress policy denies private ranges), but other processes or containers on the
+# same host can, and then each sandbox's execd token is the only barrier. Run this on a host
+# that serves nothing else, or firewall the published range (40000-60000) to the `opensandbox`
+# bridge. The preview proxy gets the server's API key too: it resolves each preview's execd
+# endpoint through the server's API (as it holds DAYTONA_API_KEY for Daytona). The server
+# config keeps every security key of the reference deploy/opensandbox/sandbox.toml (pinned by
+# backend/tests/test_deployment.py), against which the security suite was proven.
+#
+# DOCKER_SOCKET is the daemon socket path *where the containers run* (see
+# docker-compose.sandbox.yml for Podman machine and rootless Podman paths). Rootless Podman is
+# not supported here: it publishes ports through pasta/slirp4netns.
+
+x-opensandbox-client: &opensandbox-client
+  SANDBOX_RUNTIME_DEFAULT: ${SANDBOX_RUNTIME_DEFAULT:-opensandbox}
+  OPENSANDBOX_API_URL: http://opensandbox-server:8080
+  OPENSANDBOX_API_KEY: ${OPENSANDBOX_API_KEY:?set OPENSANDBOX_API_KEY in .env (the OpenSandbox server's API key)}
+  OPENSANDBOX_EXECD_TOKEN_KEY: ${OPENSANDBOX_EXECD_TOKEN_KEY:?set OPENSANDBOX_EXECD_TOKEN_KEY in .env (keys each sandbox's execd token)}
+  # The preview proxy reaches sandbox endpoints: /health and /metrics must never be open.
+  METRICS_TOKEN: ${METRICS_TOKEN:?set METRICS_TOKEN in .env (required with OpenSandbox sandboxes)}
+
+x-opensandbox-wait: &opensandbox-wait
+  opensandbox-server:
+    condition: service_healthy
+
+services:
+  opensandbox-server:
+    image: docker.io/opensandbox/server:release-1.2.1@sha256:8782b93fbf01c27bb0a54584d06f4810ad5abf979727b9e0c39564cfde6ad4cf
+    environment:
+      OPENSANDBOX_SERVER_API_KEY: ${OPENSANDBOX_API_KEY:?set OPENSANDBOX_API_KEY in .env (the OpenSandbox server's API key)}
+    volumes:
+      - ${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock
+      - ./deploy/opensandbox/${OPENSANDBOX_SERVER_CONFIG:-sandbox.compose.toml}:/etc/opensandbox/config.toml:ro
+      - opensandbox-data:/data
+    # SELinux hosts (Podman machine, Fedora/RHEL) deny a container the daemon socket without
+    # this; hosts without SELinux ignore it.
+    # It holds the socket, so this limits little, but it costs nothing.
+    cap_drop:
+      - ALL
+    security_opt:
+      - label=disable
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks:
+      - opensandbox
+    restart: unless-stopped
+
+  backend:
+    environment:
+      <<: *opensandbox-client
+      OPENSANDBOX_UPKEEP: ${OPENSANDBOX_UPKEEP:-true}
+    depends_on: *opensandbox-wait
+    networks: [default, opensandbox]
+  worker:
+    environment:
+      <<: *opensandbox-client
+      OPENSANDBOX_UPKEEP: ${OPENSANDBOX_UPKEEP:-true}
+    depends_on: *opensandbox-wait
+    networks: [default, opensandbox]
+  preview-proxy:
+    environment: *opensandbox-client
+    depends_on: *opensandbox-wait
+    networks: [default, opensandbox]
+
+networks:
+  # Sandbox ports are published on its gateway (sandbox.compose.toml), so its subnet is fixed.
+  # Only the server and Enigma's sandbox clients join it. It must stay a private range (sandbox
+  # egress denies those); a collision with another network fails `up`, never opens anything.
+  opensandbox:
+    ipam:
+      config:
+        - subnet: 10.214.0.0/24
+          gateway: 10.214.0.1
+
+volumes:
+  # The server's sandbox store (sqlite).
+  opensandbox-data: {}

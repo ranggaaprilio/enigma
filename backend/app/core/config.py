@@ -379,6 +379,14 @@ class Settings(BaseSettings):
             raise ValueError(f"{info.field_name.upper()} must be a quantity such as 4Gi or 512Mi")
         return value
 
+    @field_validator("opensandbox_upkeep", "opensandbox_require_image_digest", mode="before")
+    @classmethod
+    def empty_switch_is_unset(cls, value):
+        # Compose forwards these as `${NAME:-}`: empty means "decide from the defaults".
+        if isinstance(value, str) and value.strip() == "":
+            return None
+        return value
+
     @property
     def opensandbox_upkeep_enabled(self) -> bool:
         if self.opensandbox_upkeep is not None:

@@ -128,6 +128,20 @@ async def test_a_sibling_sandbox_cannot_reach_another_ones_execd(made) -> None:
     assert code != "200", f"sandbox A reached sandbox B's execd ({code})"
 
 
+async def test_a_sandbox_cannot_reach_another_ones_published_endpoint(made) -> None:
+    """With the server in a container, sandbox ports are published on a host-side address
+    (the compose gateway, or host.docker.internal on a desktop) that Enigma's services reach.
+    A sandbox must not reach them there either."""
+    runtime, a = await _provision(made)
+    _, b = await _provision(made)
+    base = await _execd_base(runtime, b)
+
+    url = f"{base}/files/info?path=/etc/hostname"
+    code = await _sh(runtime, a, f"curl -s -m 5 -o /dev/null -w '%{{http_code}}' '{url}'; true")
+
+    assert code != "200", f"sandbox A reached sandbox B's execd at {base} ({code})"
+
+
 async def test_unauthenticated_calls_are_refused(made) -> None:
     runtime, workspace = await _provision(made)
     base = await _execd_base(runtime, workspace)

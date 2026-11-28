@@ -95,6 +95,13 @@ def test_malformed_resources_are_refused_at_startup(field, value) -> None:
         _settings(**{field: value})
 
 
+@pytest.mark.parametrize("field", ["opensandbox_upkeep", "opensandbox_require_image_digest"])
+def test_an_empty_optional_switch_means_unset(field) -> None:
+    """Compose forwards `${OPENSANDBOX_UPKEEP:-}`: an empty value must mean "decide from the
+    defaults", not fail startup."""
+    assert getattr(Settings(**{field: ""}), field) is None
+
+
 def test_a_tag_is_refused_when_a_digest_is_required() -> None:
     settings = _settings(opensandbox_require_image_digest=True)
     with pytest.raises(ProvisioningError, match="digest"):
