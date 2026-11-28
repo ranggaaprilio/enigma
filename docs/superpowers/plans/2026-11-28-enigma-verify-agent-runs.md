@@ -100,13 +100,16 @@ For a run with a source agent run, `AgentFixer.start` passes the source run's `w
 
 ### Task 5: Docs and live E2E
 
-- [ ] AGENTS.md (a gotcha for the link and the fixer rule), plan ticks.
-- [ ] Live E2E on the compose OpenSandbox stack (separate `-p` project):
-  - an agent run in a worktree introduces a bug;
-  - **Verify** goes red → the fix agent runs **on the same worktree branch and session** → green → review → approve;
-  - auto-verify starts one on the next run.
-
-  It uses real LLM calls, so it needs confirmation before running.
+- [x] AGENTS.md gotcha 33, plan ticks.
+- [x] **Live E2E** on the compose OpenSandbox stack (`-p enigma9`, desktop config, deepseek-v4.1-flash set in the shell): a blank workspace with worktree `feature/calc` and a `role="test"` command `python3 -m unittest -q`.
+  - **Verify on a worktree run.** An agent run in the worktree wrote `calc.py` with `return a - b` and its test. Verify: test failed (exit 1) → fix agent → test passed (exit 0) → review → approved.
+    - The fix run's `worktree_id` was the `feature/calc` worktree, and `working_dir` was `worktrees/feature-calc`.
+    - The worktree's `calc.py` became `return a + b`; the base checkout still held only `README.md`.
+  - **Auto-verify.** With it on, the next completed run got its verification at once, which reached review (tests passing).
+  - **Session.** A session turn that broke `mul` was auto-verified (failed → fix → passed). The fix appeared as the **second turn of the same session**. Auto-verify skipped the fix run itself (`auto_verify_skipped`, "This is a fix run…").
+- [x] **Bug found by the E2E, fixed test-first.** The orchestrator clears `verification_runs.agent_run_id` when a fix ends (it names only the current fix), so a finished fix run could be verified on its own (202). `agent_link.is_fix_run` now also reads the `fix` evidence (`detail.agent_run_id`). After a restart the same call was a 409.
+- [x] **Security review (automated), fixed.** `?run=` on the Verify view reached API paths unencoded: client-side path traversal, which could aim the poll or a gate POST at another endpoint with the user's cookies. The verification helpers in `api.ts` now encode every id, and `VerifyView` accepts only a UUID. A regression test failed without the fix.
+- [x] Cleaned up: the workspace was deleted through the API, no sandbox was left, and `down -v` ran on `enigma9` only.
 
 ## Exit criteria
 
