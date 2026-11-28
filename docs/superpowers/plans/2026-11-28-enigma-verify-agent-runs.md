@@ -92,11 +92,11 @@ For a run with a source agent run, `AgentFixer.start` passes the source run's `w
 
 **Files:** `lib/api.ts`, `components/AgentTab/*`, `VerificationPanel.tsx` (open a run by id), workspace settings, tests.
 
-- [ ] Failing tests:
+- [x] Failing tests:
   - Verify shows only on completed, non-fix runs and posts the edited criteria;
   - the chip shows each status and opens the evidence;
   - the auto-verify toggle saves, and hints when no test command exists.
-- [ ] Implement.
+- [x] Implement. `TurnVerification` sits in the session thread's turn footer, and `useRunVerifications` makes one list call per open session (newest 100 verifications, mapped by `source_agent_run_id`), polling while any is active. The chip links to `../verify?run=<id>`; `VerificationPanel` takes `initialRunId`. `AutoVerifySetting` lives under Workspace settings. Known limits: Verify still shows on fix runs (the run response has no `agent_run_id`; the backend's 409 explains it), and a run whose verification is older than the newest 100 shows no chip.
 
 ### Task 5: Docs and live E2E
 

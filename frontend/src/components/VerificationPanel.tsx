@@ -39,12 +39,19 @@ const GATE_CALLS = {
 
 /** Human Evidence View: trigger a verification run, inspect the evidence it collected, and
  * approve or reject it at the human gate. */
-export function VerificationPanel({ workspace }: { workspace: WorkspaceResponse }) {
+export function VerificationPanel({
+  workspace,
+  initialRunId = null,
+}: {
+  workspace: WorkspaceResponse;
+  /** Select this run on open instead of the newest one. */
+  initialRunId?: string | null;
+}) {
   const { can } = usePermissions();
   const canDrive = can("agent.run");
 
   const [runs, setRuns] = useState<VerificationRunResponse[] | null>(null);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(initialRunId);
   const [detail, setDetail] = useState<VerificationRunDetailResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [gateBusy, setGateBusy] = useState(false);

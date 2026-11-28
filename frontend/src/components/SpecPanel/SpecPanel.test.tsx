@@ -197,6 +197,7 @@ describe("SpecPanel", () => {
         plan_ref: "specs/001-add-sso-login/plan.md",
         status: "review",
         spec_workflow_id: "wf-1",
+        source_agent_run_id: null,
         created_at: "2026-11-27T00:00:00Z",
         updated_at: "2026-11-27T00:01:00Z",
         evidence: [

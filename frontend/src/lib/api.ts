@@ -145,6 +145,9 @@ export type WorkspaceResponse = {
   viewer_role: WorkspaceRole | null;
   /** Path (relative to the sandbox) a `.env` file is written to on service start; null = disabled. */
   env_file_path: string | null;
+  /** Verify every completed agent run with the workspace's test command (and let an agent fix
+   * failures). */
+  auto_verify_agent_runs: boolean;
 };
 
 export type WorkspaceStatusResponse = Pick<
@@ -181,6 +184,7 @@ export type WorkspaceUpdatePayload = Partial<
   app_root?: string | null;
   /** Send `null` to disable writing a `.env` file. */
   env_file_path?: string | null;
+  auto_verify_agent_runs?: boolean;
 };
 
 export type EnvVarScope = "workspace" | "service";
@@ -2818,6 +2822,8 @@ export type VerificationRunResponse = {
   status: VerificationRunStatus;
   /** The Spec Kit workflow whose `implement` phase this run verifies, if any. */
   spec_workflow_id?: string | null;
+  /** The ordinary agent run this run verifies, if any. */
+  source_agent_run_id: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -2843,8 +2849,12 @@ export function listVerificationRuns(
   workspaceId: string,
   limit = 20,
   specWorkflowId?: string,
+  options: { sourceAgentRunId?: string } = {},
 ): Promise<VerificationRunResponse[]> {
-  const filter = specWorkflowId ? `&spec_workflow_id=${encodeURIComponent(specWorkflowId)}` : "";
+  let filter = specWorkflowId ? `&spec_workflow_id=${encodeURIComponent(specWorkflowId)}` : "";
+  if (options.sourceAgentRunId) {
+    filter += `&source_agent_run_id=${encodeURIComponent(options.sourceAgentRunId)}`;
+  }
   return requestJson<VerificationRunResponse[]>(
     `${verificationRunsPath(workspaceId)}?limit=${limit}${filter}`,
   );
@@ -2869,6 +2879,28 @@ export function createVerificationRun(
     method: "POST",
     body: JSON.stringify(payload),
   });
+}
+
+/** Overrides for verifying an agent run; anything left out is derived server-side (the
+ * workspace's `role="test"` command, no observation, the default iteration budget). */
+export type VerifyAgentRunPayload = {
+  test_command?: string;
+  observe_port?: number;
+  max_iterations?: number;
+};
+
+/** Verify a completed agent run in its own worktree (202, the run at `planning`). 409 when the
+ * run is not completed, is itself a fix run, or the workspace already has an active
+ * verification; 422 when no test command can be derived. */
+export function verifyAgentRun(
+  workspaceId: string,
+  runId: string,
+  payload: VerifyAgentRunPayload = {},
+): Promise<VerificationRunDetailResponse> {
+  return requestJson<VerificationRunDetailResponse>(
+    `/workspaces/${workspaceId}/verification/agent-runs/${runId}`,
+    { method: "POST", body: JSON.stringify(payload) },
+  );
 }
 
 export function approveVerificationRun(

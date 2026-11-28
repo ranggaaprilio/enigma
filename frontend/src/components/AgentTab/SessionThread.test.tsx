@@ -1,11 +1,13 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type {
   AgentRunResponse,
   AgentSessionDetailResponse,
   AgentSessionResponse,
+  VerificationRunResponse,
 } from "../../lib/api";
 import { SessionThread } from "./SessionThread";
 
@@ -237,5 +239,227 @@ describe("SessionThread", () => {
       await screen.findByText(/Workspace already has an active agent run/i),
     ).toBeInTheDocument();
     expect(input).toHaveValue("Add tests");
+  });
+});
+
+describe("SessionThread verification", () => {
+  function verificationRun(
+    overrides: Partial<VerificationRunResponse> = {},
+  ): VerificationRunResponse {
+    return {
+      id: "vr-1",
+      workspace_id: WS,
+      plan_ref: "agent-run:run-1",
+      status: "review",
+      source_agent_run_id: "run-1",
+      created_at: "2026-11-28T10:00:00Z",
+      updated_at: "2026-11-28T10:00:00Z",
+      ...overrides,
+    };
+  }
+
+  /** Routes the session, its runs and the verification endpoints; `extra` handles the rest. */
+  function stubFetch(
+    turns: AgentRunResponse[],
+    verifications: VerificationRunResponse[],
+    extra: (url: string, init?: RequestInit) => unknown = () => undefined,
+  ) {
+    const fetchMock = vi.fn((url: string, init?: RequestInit) => {
+      const handled = extra(url, init);
+      if (handled !== undefined) return Promise.resolve(handled);
+      if (url.includes("/verification/runs")) return Promise.resolve(jsonResponse(verifications));
+      if (url.includes("/agent/sessions/sess-1")) return Promise.resolve(jsonResponse(detailWith(turns)));
+      const runMatch = turns.find((t) => url.includes(`/agent/runs/${t.id}`));
+      if (runMatch) return Promise.resolve(jsonResponse({ ...runMatch, events: [] }));
+      return Promise.resolve(jsonResponse({}));
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  }
+
+  function renderThread() {
+    return render(
+      <MemoryRouter initialEntries={[`/workspaces/${WS}/agents`]}>
+        <Routes>
+          <Route
+            path="/workspaces/:workspaceId/agents"
+            element={
+              <SessionThread
+                workspaceId={WS}
+                session={makeSession()}
+                worktreeId={null}
+                worktreeBranch={null}
+                onSessionUpdated={vi.fn()}
+              />
+            }
+          />
+          <Route path="/workspaces/:workspaceId/verify" element={<LocationProbe />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+  }
+
+  function LocationProbe() {
+    const location = useLocation();
+    return <p data-testid="location">{`${location.pathname}${location.search}`}</p>;
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("offers Verify only on completed runs", async () => {
+    stubWebSocket();
+    stubFetch(
+      [
+        makeRun({ id: "run-1", prompt: "First", status: "completed" }),
+        makeRun({ id: "run-2", prompt: "Second", status: "error" }),
+        makeRun({ id: "run-3", prompt: "Third", status: "stopped" }),
+      ],
+      [],
+    );
+    renderThread();
+
+    expect(await screen.findByText("Third")).toBeInTheDocument();
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Verify" })).toHaveLength(1));
+    const turn = screen.getByText("First").closest("article") as HTMLElement;
+    expect(within(turn).getByRole("button", { name: "Verify" })).toBeInTheDocument();
+  });
+
+  it("posts the edited criteria and shows the new run's chip", async () => {
+    stubWebSocket();
+    const fetchMock = stubFetch([makeRun({ id: "run-1", prompt: "First" })], [], (url, init) => {
+      if (url.includes("/verification/agent-runs/run-1") && init?.method === "POST")
+        return jsonResponse(
+          { ...verificationRun({ status: "planning" }), evidence: [] },
+          true,
+          202,
+        );
+      return undefined;
+    });
+    renderThread();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Verify" }));
+    const command = screen.getByLabelText(/test command/i);
+    expect(command).toHaveAttribute("placeholder", expect.stringMatching(/workspace's test command/i));
+    await userEvent.type(command, "pnpm test");
+    await userEvent.type(screen.getByLabelText(/observe port/i), "5173");
+    await userEvent.click(screen.getByRole("button", { name: "Start" }));
+
+    const post = fetchMock.mock.calls.find(
+      ([url, init]) => url.includes("/verification/agent-runs/run-1") && init?.method === "POST",
+    );
+    expect(post).toBeDefined();
+    expect(JSON.parse(String(post?.[1]?.body))).toEqual({
+      test_command: "pnpm test",
+      observe_port: 5173,
+    });
+    expect(await screen.findByRole("link", { name: /verification: verifying/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Start" })).not.toBeInTheDocument();
+  });
+
+  it("sends an empty body when nothing is overridden", async () => {
+    stubWebSocket();
+    const fetchMock = stubFetch([makeRun({ id: "run-1", prompt: "First" })], [], (url, init) => {
+      if (url.includes("/verification/agent-runs/run-1") && init?.method === "POST")
+        return jsonResponse({ ...verificationRun({ status: "planning" }), evidence: [] }, true, 202);
+      return undefined;
+    });
+    renderThread();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Verify" }));
+    await userEvent.click(screen.getByRole("button", { name: "Start" }));
+
+    await waitFor(() => {
+      const post = fetchMock.mock.calls.find(([url]) => url.includes("/verification/agent-runs/"));
+      expect(JSON.parse(String(post?.[1]?.body))).toEqual({});
+    });
+  });
+
+  it("shows the server's detail when verification cannot start", async () => {
+    stubWebSocket();
+    const detail =
+      "This workspace has no test command. Add a custom command with role 'test', or give a test command to run.";
+    stubFetch([makeRun({ id: "run-1", prompt: "First" })], [], (url, init) => {
+      if (url.includes("/verification/agent-runs/run-1") && init?.method === "POST")
+        return jsonResponse({ detail }, false, 422);
+      return undefined;
+    });
+    renderThread();
+
+    await userEvent.click(await screen.findByRole("button", { name: "Verify" }));
+    await userEvent.click(screen.getByRole("button", { name: "Start" }));
+
+    expect(await screen.findByText(detail)).toBeInTheDocument();
+    // The form stays open so the user can add a command and retry.
+    expect(screen.getByRole("button", { name: "Start" })).toBeInTheDocument();
+  });
+
+  it.each([
+    ["planning", "Verifying"],
+    ["testing", "Testing"],
+    ["fixing", "Fixing"],
+    ["observing", "Observing"],
+    ["review", "Awaiting review"],
+    ["approved", "Approved"],
+    ["rejected", "Rejected"],
+    ["error", "Error"],
+  ] as const)("labels a %s verification as %s", async (status, label) => {
+    stubWebSocket();
+    stubFetch([makeRun({ id: "run-1", prompt: "First" })], [verificationRun({ status })]);
+    renderThread();
+
+    expect(
+      await screen.findByRole("link", { name: `Verification: ${label}` }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the newest verification of a run and opens its evidence", async () => {
+    stubWebSocket();
+    stubFetch(
+      [makeRun({ id: "run-1", prompt: "First" }), makeRun({ id: "run-2", prompt: "Second" })],
+      [
+        // Newest first, as the API returns them.
+        verificationRun({ id: "vr-new", status: "approved", created_at: "2026-11-28T11:00:00Z" }),
+        verificationRun({ id: "vr-old", status: "rejected", created_at: "2026-11-28T10:00:00Z" }),
+      ],
+    );
+    renderThread();
+
+    const chip = await screen.findByRole("link", { name: "Verification: Approved" });
+    expect(screen.queryByRole("link", { name: "Verification: Rejected" })).not.toBeInTheDocument();
+    // Only the verified run carries a chip.
+    const second = screen.getByText("Second").closest("article") as HTMLElement;
+    expect(within(second).queryByRole("link", { name: /verification/i })).not.toBeInTheDocument();
+
+    await userEvent.click(chip);
+    expect(await screen.findByTestId("location")).toHaveTextContent(
+      `/workspaces/${WS}/verify?run=vr-new`,
+    );
+  });
+
+  it("hides Verify while the run's verification is active, and polls it", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    stubWebSocket();
+    let status: VerificationRunResponse["status"] = "testing";
+    const fetchMock = stubFetch([makeRun({ id: "run-1", prompt: "First" })], [], (url) => {
+      if (url.includes("/verification/runs")) return jsonResponse([verificationRun({ status })]);
+      return undefined;
+    });
+    renderThread();
+
+    expect(await screen.findByRole("link", { name: "Verification: Testing" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Verify" })).not.toBeInTheDocument();
+
+    status = "review";
+    const listCalls = () =>
+      fetchMock.mock.calls.filter(([url]) => url.includes("/verification/runs")).length;
+    const before = listCalls();
+    await vi.advanceTimersByTimeAsync(3_000);
+    await waitFor(() => expect(listCalls()).toBeGreaterThan(before));
+    expect(
+      await screen.findByRole("link", { name: "Verification: Awaiting review" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Verify" })).toBeInTheDocument();
   });
 });
