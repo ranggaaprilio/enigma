@@ -389,53 +389,37 @@ def test_health_on_the_probe_host_checks_postgres_and_daytona():
         "runtimes": {
             "daytona": {"configured": True, "status": "ok", "reason": None},
             # Only its default provider is probed (Epic 06).
-            "docker": {"configured": None, "status": "skipped", "reason": None},
             "opensandbox": {"configured": None, "status": "skipped", "reason": None},
         },
     }
     assert runtime.health_calls == 1
 
 
-def test_health_on_a_docker_install_reports_docker_without_a_daemon_call():
-    """local-docker-runtime Epic 04: the proxy holds no daemon socket (it dials sandboxes by
-    name on the sandbox network), so it reports the Docker provider without probing it,
-    and a Docker-only install is not "degraded" for lacking a Daytona key."""
+def test_health_on_an_opensandbox_install_probes_opensandbox():
+    """The default provider is the one probed, and an OpenSandbox-only install is not
+    "degraded" for lacking a Daytona key."""
     _workspace, _preview, session = _fixture()
     runtime = FakeRuntime()
     app, http_client = _capability_app(
-        session,
-        runtime=runtime,
-        settings=_settings(sandbox_runtime_default="docker", metrics_token="scrape-secret"),
+        session, runtime=runtime, settings=_settings(sandbox_runtime_default="opensandbox")
     )
 
     with TestClient(app, base_url=f"http://{PROBE_HOST}") as client:
-        response = client.get("/health", headers={"authorization": "Bearer scrape-secret"})
+        response = client.get("/health")
 
     asyncio.run(http_client.aclose())
     assert response.status_code == 200
     assert response.json() == {
         "status": "ok",
         "database": "ok",
-        "docker": "skipped",
+        "opensandbox": "ok",
         "runtimes": {
             "daytona": {"configured": None, "status": "skipped", "reason": None},
-            "docker": {"configured": None, "status": "skipped", "reason": None},
-            "opensandbox": {"configured": None, "status": "skipped", "reason": None},
+            "opensandbox": {"configured": True, "status": "ok", "reason": None},
         },
     }
-    assert runtime.health_calls == 0
+    assert runtime.health_calls == 1
 
-
-def test_the_proxy_refuses_to_start_on_docker_without_a_metrics_token():
-    """It sits on every sandbox network, so a tenant can reach its /health and /metrics."""
-    _workspace, _preview, session = _fixture()
-    settings = _settings(sandbox_runtime_default="docker")
-    app, http_client = _capability_app(session, settings=settings)
-
-    with pytest.raises(RuntimeError, match="METRICS_TOKEN"), TestClient(app):
-        pass
-
-    asyncio.run(http_client.aclose())
 
 
 @pytest.mark.parametrize("path", ["/live", "/ready", "/health", "/metrics"])

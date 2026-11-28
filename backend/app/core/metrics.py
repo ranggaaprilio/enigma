@@ -106,7 +106,7 @@ reaper_sweeps_total = Counter(
 
 sandbox_maintenance_actions_total = Counter(
     "sandbox_maintenance_actions_total",
-    "Docker sandbox upkeep actions (local-docker-runtime Epic 05), by action.",
+    "Sandbox upkeep actions (idle pause, orphan removal), by provider and action.",
     labelnames=("provider", "action"),
 )
 

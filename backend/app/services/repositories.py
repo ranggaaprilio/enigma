@@ -774,10 +774,9 @@ class RepositoryService:
         GitHub, ``oauth2`` for GitLab, ``x-token-auth`` or the account name for Bitbucket).
         It is passed as ``GIT_CONFIG_COUNT``/``KEY``/``VALUE`` environment (git >= 2.31 reads
         them like ``-c``; the sandbox image ships a newer git), which keeps it out of
-        ``.git/config``, the remote URL and the command string we hand the runtime. On the
-        Docker runtime that keeps it out of ``ps`` too; how a provider applies ``env`` is its
-        own business (Daytona's is a field of its exec API). SSH auth
-        materialises the deploy key inside the sandbox for the duration of the command and
+        ``.git/config``, the remote URL and the command string we hand the runtime. How a
+        provider applies ``env`` is its own business (Daytona's is a field of its exec API).
+        SSH auth materialises the deploy key inside the sandbox for the duration of the command and
         points ``GIT_SSH_COMMAND`` at it. Nothing is persisted either way.
         """
         if auth.kind == "ssh":

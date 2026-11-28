@@ -25,7 +25,7 @@ async def _workspace(maker) -> Workspace:
         user = User(id=uuid4(), email=f"{uuid4().hex}@example.com", password_hash="x",
                     role="owner", is_active=True)
         workspace = Workspace(id=uuid4(), owner_id=user.id, name="Idle", slug=uuid4().hex[:12],
-                              default_branch="main", runtime="docker", status="ready",
+                              default_branch="main", runtime="opensandbox", status="ready",
                               workspace_path="workspace", sandbox_id=uuid4().hex)
         session.add(user)
         await session.flush()

@@ -15,7 +15,7 @@ from app.services.sandbox_maintenance import (
     reconcile_opensandbox_orphans,
 )
 from tests.sandbox.fakes import opensandbox_runtime_with
-from tests.test_sandbox_maintenance import _workspace, maker  # noqa: F401 (fixture)
+from tests.upkeep_fixtures import _workspace, maker  # noqa: F401 (fixture)
 
 
 def _ours(sandbox_id: str, workspace_id: str, installation: str = "test-installation"):
@@ -143,12 +143,12 @@ async def test_orphans_of_this_installation_are_removed(maker) -> None:  # noqa:
 async def test_idle_opensandboxes_are_paused_and_busy_ones_left(maker) -> None:  # noqa: F811
     idle = await _workspace(maker, runtime="opensandbox", sandbox_id="sbx-idle", idle_minutes=120)
     busy = await _workspace(maker, runtime="opensandbox", sandbox_id="sbx-busy", idle_minutes=1)
-    docker = await _workspace(maker, runtime="docker", sandbox_id="ctr", idle_minutes=120)
+    other = await _workspace(maker, runtime="daytona", sandbox_id="dtn", idle_minutes=120)
     runtime = UpkeepRuntime([])
     settings = Settings(sandbox_auto_stop_minutes=30)
 
     paused = await pause_idle_opensandboxes(
-        maker, settings, runtime, only={idle.id, busy.id, docker.id}
+        maker, settings, runtime, only={idle.id, busy.id, other.id}
     )
 
     assert paused == 1

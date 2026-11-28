@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse
 from prometheus_fastapi_instrumentator import Instrumentator
 
 from app.api.router import api_router
-from app.core.config import deprecated_setting_names, get_settings
+from app.core.config import deprecated_setting_names, get_settings, removed_setting_names
 from app.core.lifecycle import (
     ServiceDrainingError,
     drain_in_flight_runs,
@@ -32,15 +32,8 @@ from app.services.reconciliation import reconcile_interrupted_runs
 from app.services.retention import start_retention
 from app.services.runtime import RedisEventBus, event_bus, run_registry
 from app.services.sandbox import close_all
-from app.services.sandbox.availability import (
-    require_metrics_token_for_docker,
-    warn_if_default_runtime_unconfigured,
-    warn_if_deprecated_runtime_offered,
-)
-from app.services.sandbox_maintenance import (
-    start_opensandbox_maintenance,
-    start_sandbox_maintenance,
-)
+from app.services.sandbox.availability import warn_if_default_runtime_unconfigured
+from app.services.sandbox_maintenance import start_opensandbox_maintenance
 
 logger = structlog.get_logger(__name__)
 
@@ -65,11 +58,12 @@ async def unhandled_exception_handler(request: Request, _exc: Exception) -> JSON
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     settings = get_settings()
-    require_metrics_token_for_docker(settings)
     warn_if_default_runtime_unconfigured(settings)
-    warn_if_deprecated_runtime_offered(settings)
     for old_name, new_name in deprecated_setting_names().items():
         logger.warning("deprecated_setting_name", name=old_name, use=new_name)
+    for name in removed_setting_names():
+        # Plan 8: a setting of the removed Docker provider; ignored, so say so once.
+        logger.warning("removed_setting_name", name=name)
     # Runs left active by a previous process (crash, deploy) have no owner any more; close
     # them out before serving so their workspaces are not blocked. Fails startup if Postgres
     # is unreachable, which /ready would report as not ready anyway. In queue mode the API owns
@@ -82,12 +76,7 @@ async def lifespan(_app: FastAPI):
         if settings.run_execution_mode == "inline"
         else None
     )
-    # Docker sandbox upkeep (local-docker-runtime Epic 05) follows the same split.
-    sandbox_upkeep = (
-        start_sandbox_maintenance(async_session_maker, settings)
-        if settings.run_execution_mode == "inline"
-        else None
-    )
+    # OpenSandbox upkeep (Plan 7a Task 5) follows the same split.
     opensandbox_upkeep = (
         start_opensandbox_maintenance(async_session_maker, settings)
         if settings.run_execution_mode == "inline"
@@ -104,7 +93,7 @@ async def lifespan(_app: FastAPI):
     lifecycle.begin_drain()
     fleet_sampler.cancel()
     await asyncio.gather(fleet_sampler, return_exceptions=True)
-    for task in (retention, sandbox_upkeep, opensandbox_upkeep):
+    for task in (retention, opensandbox_upkeep):
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)

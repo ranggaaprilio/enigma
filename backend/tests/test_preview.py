@@ -402,7 +402,7 @@ async def test_detect_exposes_the_detected_port(preview_db_session):
         slug=f"demo-{uuid4().hex[:8]}",
         repo_url="https://github.com/example/demo",
         default_branch="main",
-        runtime="docker",
+        runtime="opensandbox",
         sandbox_id=f"sandbox-{uuid4().hex[:8]}",
         workspace_path="workspace",
         status="ready",

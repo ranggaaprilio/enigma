@@ -184,95 +184,6 @@ def test_base_compose_never_mounts_the_container_daemon_socket():
         assert _socket_mounts(service) == [], name
 
 
-def test_sandbox_override_gives_the_socket_only_to_the_daemon_clients():
-    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
-    clients = {"backend", "worker"}
-    assert set(override["services"]) == clients | {"preview-proxy", "egress-proxy"}
-    for name in clients:
-        service = override["services"][name]
-        assert _socket_mounts(service) == [
-            "${DOCKER_SOCKET:-/var/run/docker.sock}:/var/run/docker.sock"
-        ]
-        # They reach sandboxes through `docker exec`, never the network, so they stay off
-        # the sandboxes' bridge and a sandbox cannot reach the API or the worker.
-        assert "networks" not in service, name
-
-
-def test_sandbox_override_marks_the_preview_proxy_for_the_backend_to_attach():
-    """local-docker-runtime Epic 05: every sandbox has its own network, and the backend
-    attaches the proxy (found by this label) to each. The proxy parses untrusted traffic,
-    so it never gets the daemon socket, and no shared sandbox network exists any more."""
-    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
-    proxy = override["services"]["preview-proxy"]
-    assert _socket_mounts(proxy) == []
-    assert proxy["labels"] == {"enigma.preview-proxy": "1"}
-    # On every sandbox network at once, so it must never forward packets between them.
-    assert proxy["sysctls"] == {"net.ipv4.ip_forward": "0"}
-    assert "networks" not in proxy
-    assert set(override.get("networks", {})) == {"egress"}  # the egress proxy's own
-
-
-def test_sandbox_override_runs_a_locked_down_egress_proxy_with_no_secrets():
-    """SANDBOX_NETWORK_ALLOW_LIST on Docker: sandbox networks are internal and the egress
-    proxy is their only way out. It parses every tenant's traffic, so it gets no socket and
-    no secret, runs unprivileged, never routes, and its own network reaches nothing else."""
-    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())
-    proxy = override["services"]["egress-proxy"]
-    assert _socket_mounts(proxy) == []
-    assert proxy["volumes"] == ["./backend/app:/app/app:ro"]
-    assert "env_file" not in proxy
-    assert set(proxy["environment"]) == {
-        "SANDBOX_NETWORK_ALLOW_LIST",
-        "DOCKER_SANDBOX_SUBNET_POOL",
-    }
-    assert proxy["environment"]["SANDBOX_NETWORK_ALLOW_LIST"] == (
-        "${SANDBOX_NETWORK_ALLOW_LIST:-${DAYTONA_NETWORK_ALLOW_LIST:-}}"
-    )
-    assert proxy["labels"] == {"enigma.egress-proxy": "1"}
-    assert proxy["user"] == "65534:65534" and proxy["read_only"] is True
-    assert proxy["cap_drop"] == ["ALL"]
-    assert proxy["security_opt"] == ["no-new-privileges:true"]
-    assert proxy["sysctls"] == {"net.ipv4.ip_forward": "0"}
-    assert proxy["networks"] == ["egress"]
-    assert "ports" not in proxy
-    for name, service in override["services"].items():
-        if name != "egress-proxy":
-            assert "egress" not in (service.get("networks") or []), name
-
-
-def _merged_env(service: str) -> dict[str, str]:
-    """A service's environment with the sandbox override applied (compose merges maps)."""
-    base = yaml.safe_load((REPO / "docker-compose.yml").read_text())["services"][service]
-    override = yaml.safe_load((REPO / "docker-compose.sandbox.yml").read_text())["services"]
-    return {**base.get("environment", {}), **override.get(service, {}).get("environment", {})}
-
-
-def test_the_sandbox_egress_policy_reaches_the_services_that_create_sandboxes():
-    """The egress policy is read from .env by compose and must reach the backend and worker
-    -- under its new name or the deprecated DAYTONA_* one -- with and without the Docker
-    override; a dropped setting would silently leave sandboxes with open egress."""
-    for service in ("backend", "worker"):
-        for env in (
-            yaml.safe_load((REPO / "docker-compose.yml").read_text())["services"][service][
-                "environment"
-            ],
-            _merged_env(service),
-        ):
-            assert env["SANDBOX_NETWORK_BLOCK_ALL"] == (
-                "${SANDBOX_NETWORK_BLOCK_ALL:-${DAYTONA_NETWORK_BLOCK_ALL:-false}}"
-            ), service
-            assert env["SANDBOX_NETWORK_ALLOW_LIST"] == (
-                "${SANDBOX_NETWORK_ALLOW_LIST:-${DAYTONA_NETWORK_ALLOW_LIST:-}}"
-            ), service
-
-
-def test_the_sandbox_override_runs_the_docker_upkeep():
-    """Docker workspaces are refused wherever upkeep is off; the override turns it on even
-    for a mixed install whose default stays Daytona."""
-    for service in ("backend", "worker"):
-        assert _merged_env(service)["DOCKER_UPKEEP"] == "${DOCKER_UPKEEP:-true}", service
-
-
 # --- OpenSandbox compose override (Plan 7b) --------------------------------------------------
 
 OPENSANDBOX_OVERRIDE = REPO / "docker-compose.opensandbox.yml"
@@ -513,6 +424,27 @@ def test_opensandbox_egress_reaches_only_the_one_server():
         {"port": 8080, "protocol": "TCP"},
         {"port": 40000, "endPort": 60000, "protocol": "TCP"},
     ]
+
+
+def test_the_sandbox_egress_policy_reaches_the_services_that_create_sandboxes():
+    """The egress policy is read from .env by compose and must reach the backend and worker --
+    under its new name or the deprecated DAYTONA_* one -- with and without the OpenSandbox
+    override; a dropped setting would silently leave sandboxes with open egress."""
+    base = yaml.safe_load((REPO / "docker-compose.yml").read_text())["services"]
+    for service in ("backend", "worker"):
+        for env in (base[service]["environment"], _opensandbox_env(service)):
+            assert env["SANDBOX_NETWORK_BLOCK_ALL"] == (
+                "${SANDBOX_NETWORK_BLOCK_ALL:-${DAYTONA_NETWORK_BLOCK_ALL:-false}}"
+            ), service
+            assert env["SANDBOX_NETWORK_ALLOW_LIST"] == (
+                "${SANDBOX_NETWORK_ALLOW_LIST:-${DAYTONA_NETWORK_ALLOW_LIST:-}}"
+            ), service
+
+
+def test_the_docker_provider_override_is_gone():
+    """Plan 8: OpenSandbox's override is the self-host path; the Docker one must not return."""
+    assert not (REPO / "docker-compose.sandbox.yml").exists()
+    assert not (REPO / ".github" / "workflows" / "docker-integration.yml").exists()
 
 
 def test_production_manifests_never_reference_the_container_daemon():

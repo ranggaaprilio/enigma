@@ -25,7 +25,6 @@ from app.services.sandbox.base import (
     SandboxRuntime,
 )
 from app.services.sandbox.daytona import DaytonaRuntime
-from app.services.sandbox.docker import DockerRuntime
 from app.services.sandbox.opensandbox import OpenSandboxRuntime
 
 logger = structlog.get_logger(__name__)
@@ -34,7 +33,6 @@ DEFAULT_PROVIDER = "daytona"
 
 _FACTORIES: dict[str, Callable[[Settings], SandboxRuntime]] = {
     "daytona": DaytonaRuntime,
-    "docker": DockerRuntime,
     "opensandbox": OpenSandboxRuntime,
 }
 _instances: dict[str, SandboxRuntime] = {}

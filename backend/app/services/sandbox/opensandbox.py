@@ -227,7 +227,7 @@ def assert_safe_create_kwargs(kwargs: Mapping[str, Any], settings: Settings) -> 
         raise ProvisioningError("refusing an OpenSandbox sandbox without a network policy")
 
 # Upper bound on ``find_files`` output kept in backend memory, and on how long the search may
-# run — the same bounds the Docker provider applies (``docker_fs.py``). The SDK accumulates
+# run. The SDK accumulates
 # stdout into ``execution.logs`` by default, so a large tree would hold the whole match set in
 # memory; ``find_files`` streams with ``skip_accumulation`` and caps what it keeps.
 MAX_SEARCH_OUTPUT_BYTES = 8 * 1024 * 1024
@@ -452,7 +452,7 @@ class OpenSandboxFileSystem:
 
     async def find_files(self, path: str, pattern: str) -> Sequence[Any]:
         # A fixed-string content search, as Daytona's is — not the SDK's glob ``files.search``.
-        # Bounded like the Docker provider: a hard timeout, and stdout is streamed with
+        # Bounded: a hard timeout, and stdout is streamed with
         # ``skip_accumulation`` so the SDK never buffers the whole match set in memory; we keep
         # only the first ``MAX_SEARCH_OUTPUT_BYTES`` and drop the record the cap cut.
         if "\n" in pattern:

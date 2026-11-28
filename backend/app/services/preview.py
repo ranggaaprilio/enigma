@@ -311,8 +311,8 @@ class PreviewService:
         return row.branch
 
     async def _expose(self, workspace: Workspace, port: int) -> None:
-        """Make the listening port reachable through the proxy (a Docker sandbox relays a
-        loopback-only dev server; Daytona needs nothing). Best effort: the session row is
+        """Make the listening port reachable through the proxy, where the provider needs a
+        step for it (Daytona needs nothing). Best effort: the session row is
         already recorded, and a still-unreachable app surfaces as the proxy's usual 502."""
         try:
             await self.runtime.expose_port(workspace, port)

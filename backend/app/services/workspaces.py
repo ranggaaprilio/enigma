@@ -256,7 +256,7 @@ class SqlAlchemyWorkspaceService:
         always restored, so ``reprovision`` sees a new sandbox and seeds it: keeping this id
         would make a provider that finds the same sandbox by name skip seeding and mark an
         empty workspace ready. If the removal fails, the sandbox is logged for an operator
-        (the Docker upkeep also removes orphans).
+        (the OpenSandbox upkeep also removes orphans).
         """
         try:
             await self.runtime.delete(workspace)
